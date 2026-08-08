@@ -1,0 +1,9 @@
+# Eiopago runtime state and sealed local handoff artifacts
+.guardian/runtime/
+.guardian/checkpoints/
+.guardian/manifests/
+.guardian/test-runs/
+
+# Node/tooling
+node_modules/
+*.log

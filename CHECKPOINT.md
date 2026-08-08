@@ -1,3 +1,53 @@
+# CHECKPOINT — M1-H0 revisionato e consolidato
+
+## Ultima sessione — review mirata e commit issue #6
+
+- Data: 2026-08-08; sessione Pi `019fe02e-522e-714d-b0e2-8cd1ff15d3b9`.
+- Gate verificato: `PI_PROVIDER=openai-codex`, `PI_MODEL=gpt-5.6-sol`, `PI_REASONING_LEVEL=high`; repository `F:/dev/eiopago`, branch `feat/pi-usage-guardian-foundation`, HEAD/upstream iniziale `80b8193`, identità Git `kinderp <a.caristia@gmail.com>`, nessun index lock.
+- Letti regole operative, sola precedente prima sezione del checkpoint, Ledger, handoff MVP, ADR-0015 e diff pertinenti. Issue GitHub #6 letta direttamente in sola lettura; audit e SP-01…SP-04 non ripetuti.
+- Review mirata chiusa sulle decisioni vincolanti: `REQUIRES_RUNNER`, **FINISH CURRENT ATOMIC OPERATION**, replacement paused/no-history, admission locale unica e `RESUME_DISPATCH_UNKNOWN` fail-closed restano invariati.
+- Corretto il tracking degli effetti `edit`/`write`: Pi non ripete `args` in `tool_execution_end`, quindi il Runner conserva il path ammesso da `tool_call` e lo usa come effect reference terminale; mutazioni senza riferimento restano `HUMAN_DECISION_REQUIRED`.
+- Aggiunto takeover/pause minimo `/eio takeover` (`/eio pause` accettato): latch durevole `HUMAN_TAKEOVER`, queue/retry/compaction chiusi e safe point tool-aware, senza avviare integrazioni o Cost Guard.
+- Rafforzato Continuity Check su GitState del checkpoint e policy model/reasoning del manifest. Il prompt E2E verifica esplicitamente `current_item` e `next_step`.
+- Gestiti create cancellato/ambiguo come `HANDOFF_FAILED`: nessun secondo target, checkpoint preservato e istruzioni numerate persistite/visibili da `/eio status`; nessun manifest finale viene inventato senza il vero target ID.
+- Verifiche finali: `npm run check` pass su 16 moduli; `npm test` **8/8 pass** (core offline 4/4, E2E Pi reale/provider fake 4/4, inclusi `/eio takeover`, `/eio handoff manual` e failure create), zero tentativi rete nei test.
+- Consolidato esclusivamente il vertical slice M1-H0 e i suoi artefatti applicativi/documentali; PDF e lavoro preesistente SP/audit non sono stati inclusi né alterati intenzionalmente. Nessuna configurazione `~/.pi` modificata.
+- Limiti invariati: `node:sqlite` experimental; provider fake offline; create-session→journal non ACID; recovery unattended/hardening fuori scope. Issue #6 resta soggetta ad acceptance esterna, che il commit non implica.
+- `checkpoint_message`: “M1-H0 review chiusa: handoff paused/no-history, takeover e fallback fail-closed verificati”.
+
+**Nome sessione suggerito:** `eiopago-m1-h0-acceptance`
+
+**Prompt minimo di ripresa:**
+
+> Verifica Git e profilo; leggi regole operative, prima sezione di `CHECKPOINT.md`, `TASK_PLAN.md`, `docs/m1-h0-handoff-mvp.md` e ADR-0015. Valuta soltanto acceptance/finding di M1-H0 issue #6 sul commit indicato nel messaggio precedente; non ripetere audit o SP-01…SP-04 e non iniziare Cost Guard, M1.1/M1.2, provider o integrazioni esterne senza nuova autorizzazione.
+
+# CHECKPOINT — M1-H0 Automatic Session Handoff MVP implementato
+
+## Ultima sessione — issue #6, vertical slice owner-controlled
+
+- Data: 2026-08-08; sessione Pi `019fe012-6014-7a8d-8858-d04c64260f56`.
+- Gate verificato prima delle decisioni: `PI_PROVIDER=openai-codex`, `PI_MODEL=gpt-5.6-sol`, `PI_REASONING_LEVEL=high`. Repository reale `F:/dev/eiopago`, branch `feat/pi-usage-guardian-foundation`, HEAD/upstream `80b8193`, nessun index lock; modifiche SP-01…SP-04 e PDF preesistenti preservati.
+- Letti regole operative, sola prima sezione del checkpoint, SP-01/SP-02/SP-03/SP-04, ADR-0015, roadmap, contratti pertinenti e documentazione/esempi Pi necessari. Audit e spike chiusi non sono stati ripetuti; Cost Guard completo, supervised-auto, provider esterni, dashboard e SP-05+ non sono stati iniziati.
+- Creato `TASK_PLAN.md` revisionato `PLAN-M1-H0-0001`, Markdown canonico con import deterministico read-only, DAG/evidence validation e digest SHA-256 dei byte; item M1-H0 chiuso con evidenze, Cost Guard esplicitamente fuori Ledger/scope.
+- Implementato storage SQLite versionato in `src/storage.mjs`: WAL, `synchronous=FULL`, authority metadata, latch fail-closed, journal append-only, active-source ownership, operation outcome, artifact index, authorization/admission unique e dispatch intent. Runtime e artefatti generati restano sotto `.guardian/` e sono ignorati da Git.
+- Implementati checkpoint e Resume Context Manifest sealed in `src/artifact-store.mjs`/`src/handoff.mjs`: temp+fsync+rename, payload/content digest, digest dei byte, immutabilità per ID, secret scan, checkpoint parent/DAG, Git snapshot e manifest sigillato solo dopo il vero target ID.
+- Implementato Runner minimo in `src/runner.mjs`: provider transport posseduto e wrappato dal gate, nessuna estensione/skill esterna, tool allowlist profilata, queue/retry/compaction ownership e Extension inline UI/comandi. `REQUIRES_RUNNER` resta rispettato; il soft gate Extension non viene presentato come hard stop.
+- Implementato safe point SP-03 in `src/safety.mjs`: latch durevole prima degli effetti, clear queue, cancel retry/compaction, abort cooperativo, attesa terminale e policy **FINISH CURRENT ATOMIC OPERATION**. Tool non profilati non sono ammessi; mutazione unknown o senza effect reference converge su `HUMAN_DECISION_REQUIRED`.
+- Implementati `/eio handoff manual|confirm`, alias `/eiopago`, `/eio resume` e `/eio status`. Il target Pi nasce con parent, paused e senza message/history; `manual` lascia latch e prompt in editor, `confirm` autorizza soltanto dopo Continuity Check nella replacement session.
+- Continuity Check rilegge Ledger, checkpoint/manifest e digest, Git completo/status, source/target/parent, target no-history/idle, current item/next step, minimal reads realmente disponibili, model/reasoning policy e latch generation; non auto-corregge mismatch.
+- Resume: rilascio latch esclusivamente `human:*`, authorization e admission nello stesso commit SQLite con unique `resume_prompt_id`/idempotency key; dispatch intent prima di `sendUserMessage`. Successo registra `RESUME_DISPATCHED` e ACK; ogni errore post-intent diventa `RESUME_DISPATCH_UNKNOWN` e non viene ritentato. Nessuna exactly-once provider execution dichiarata.
+- Test: `npm run check` pass su 16 moduli; `npm test` **6/6 pass**. Offline core **4/4** copre Ledger, immutabilità/tamper, latch/admission/dispatch unknown e safe point. E2E **2/2** usa vero `AgentSessionRuntime`/`SessionManager` Pi 0.83.0, provider fake, source→checkpoint→target paused/no-history→resume, parent header, ordine journal, admission unica, retry/reload idempotente e manual paused; zero tentativi rete.
+- Documentazione aggiunta: `docs/m1-h0-handoff-mvp.md`; roadmap aggiornata solo per registrare il gate M1-H0 locale. Contratti e ownership ADR non sono stati cambiati.
+- Limiti espliciti: `node:sqlite` è ancora marcato experimental da Node 22.19; E2E usa runtime Pi reale ma provider fake offline; nessun sandbox rete OS o paid-provider test; create-session→journal resta saga non ACID e un outcome ambiguo blocca il secondo target; crash recovery unattended e hardening restano M1.1/M1.2.
+- Nessun commit eseguito e nessuna configurazione `~/.pi` modificata. Stato: **M1-H0 implementato e testato localmente; review/consolidamento pendenti, acceptance esterna non implicita**.
+- `checkpoint_message`: “M1-H0: handoff Pi paused/no-history e resume idempotente verificati”.
+
+**Nome sessione suggerito:** `eiopago-m1-h0-review-consolidate`
+
+**Prompt minimo di ripresa:**
+
+> Verifica profilo/Git; leggi regole operative, prima sezione di `CHECKPOINT.md`, `TASK_PLAN.md`, `docs/m1-h0-handoff-mvp.md`, ADR-0015 e i diff M1-H0. Non ripetere audit o SP-01…SP-04. Esegui review mirata di issue #6, `npm run check`, `npm test` e, se conforme, consolida/committa esclusivamente M1-H0 preservando `REQUIRES_RUNNER`, FINISH CURRENT ATOMIC OPERATION e `RESUME_DISPATCH_UNKNOWN` fail-closed. Non iniziare Cost Guard completo, M1.1/M1.2, provider o integrazioni esterne senza nuova autorizzazione.
+
 # CHECKPOINT — M0.1 Contract and Boundary Freeze completata
 
 ## Ultima sessione — M0.1 Contract and Boundary Freeze (corrente)
