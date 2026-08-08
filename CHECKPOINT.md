@@ -1,3 +1,64 @@
+# CHECKPOINT — M1-H0 riaccettato sui tre finding mirati
+
+## Ultima sessione — nuova acceptance sul diff corrente
+
+- Data: 2026-08-08; sessione Pi `019fe0d1-9320-756b-b429-96e43af51ac4`.
+- Gate verificato: `PI_PROVIDER=openai-codex`, `PI_MODEL=gpt-5.6-sol`, `PI_REASONING_LEVEL=high`; repository `F:/dev/eiopago`, branch `feat/pi-usage-guardian-foundation`, HEAD `7439ef68f3e859c8655c8be07846a07064c0edb4`, upstream `80b8193b5a9559bde7c6c20d806042c4c5263d18`, identità Git `kinderp <a.caristia@gmail.com>`, nessun index lock. Worktree dirty preesistente preservato.
+- Ambito eseguito esclusivamente come nuova acceptance dei tre finding M1-H0 sul diff corrente. Audit e SP-01…SP-04 non ripetuti; Cost Guard, M1.1/M1.2 e integrazioni esterne non iniziati.
+- Esito: **PASS**. Il takeover escalato a `HUMAN_TAKEOVER` resta engaged e la stale confirm non rilascia il latch, non crea authorization/admission e non raggiunge il dispatch.
+- Esito: **PASS**. I digest SHA-256 di index e worktree sono valorizzati, trasportati e confrontati fail-closed; il test rileva byte dirty e staged diversi anche con status porcelain invariato.
+- Esito: **PASS**. Il Ledger canonico valida `current_item`/`next_item`; manifest e resume prompt li preservano e l'E2E aggiorna realmente la fonte da `PLAN-E2E-1` a `PLAN-E2E-2` dopo il lavoro source e prima dell'handoff.
+- Verifiche eseguite: test mirati **3/3 pass**; `npm run check` pass su 16 moduli; `npm test` **10/10 pass** (core offline 6/6, E2E Pi reale/provider fake 4/4); `git diff --check` pass, con soli warning informativi LF→CRLF.
+- `TASK_PLAN.md` avanzato a `PLAN-M1-H0-0003`, stato `DONE`, lifecycle chiuso (`current_item=null`, `next_item=null`) con evidenza di questa acceptance. Nessun file applicativo modificato durante l'acceptance e nessun commit eseguito.
+- Invarianti confermati nel solo ambito valutato: `REQUIRES_RUNNER`, **FINISH CURRENT ATOMIC OPERATION** e `RESUME_DISPATCH_UNKNOWN` fail-closed senza retry cieco.
+- `checkpoint_message`: “M1-H0 riaccettato: tre finding corretti e 10/10 test pass”.
+
+**Nome sessione suggerito:** `eiopago-post-m1-h0-owner-gate`
+
+**Prompt minimo di ripresa:**
+
+> Verifica Git/profilo e leggi la prima sezione di `CHECKPOINT.md`. M1-H0 è accettato e il Ledger è chiuso; non iniziare Cost Guard, M1.1/M1.2 o integrazioni esterne senza nuova autorizzazione esplicita.
+
+# CHECKPOINT — Tre finding M1-H0 corretti, nuova acceptance pendente
+
+## Ultima sessione — correzioni mirate sul commit 7439ef6
+
+- Data: 2026-08-08; sessione Pi `019fe0c5-a9b8-71b8-a6a8-5542af82887c`.
+- Gate verificato: `PI_PROVIDER=openai-codex`, `PI_MODEL=gpt-5.6-sol`, `PI_REASONING_LEVEL=high`; repository `F:/dev/eiopago`, branch `feat/pi-usage-guardian-foundation`, HEAD `7439ef68f3e859c8655c8be07846a07064c0edb4`, upstream `80b8193b5a9559bde7c6c20d806042c4c5263d18`, identità Git `kinderp <a.caristia@gmail.com>`, nessun index lock. Worktree preesistente dirty preservato.
+- Ambito eseguito esclusivamente sui tre finding M1-H0 autorizzati. Audit e SP-01…SP-04 non ripetuti; Cost Guard, M1.1/M1.2 e integrazioni esterne non iniziati.
+- **Takeover corretto:** `authorizeAndAdmit()` rifiuta transazionalmente `HUMAN_TAKEOVER_ACTIVE`; una conferma handoff pendente non rilascia il latch, non crea authorization/admission e non avvia dispatch.
+- **Git continuity corretta:** `GitState` calcola digest SHA-256 verificabili dell'index e dei byte/mode del worktree tracciato o untracked non ignorato; `sameGitState()` richiede e confronta entrambi. Checkpoint e manifest li trasportano e Continuity li valida. Il test riproduce byte dirty e staged diversi con status porcelain invariato.
+- **Ledger lifecycle corretto:** il Ledger canonico revisionato espone e valida `current_item`/`next_item`; manifest e resume prompt li preservano. L'E2E aggiorna realmente la fonte Markdown da `PLAN-E2E-1` a `PLAN-E2E-2` dopo il lavoro source e prima dell'handoff, poi verifica revisione, digest e lifecycle ripreso. `TASK_PLAN.md` è ora `PLAN-M1-H0-0002`, con item dei finding corrente fino alla nuova acceptance esterna.
+- Verifiche finali: `npm run check` pass su 16 moduli; `npm test` **10/10 pass** (core offline 6/6, E2E Pi reale/provider fake 4/4); `git diff --check` pass. Nessun commit eseguito.
+- Garanzie invarianti preservate: `REQUIRES_RUNNER`, **FINISH CURRENT ATOMIC OPERATION** e `RESUME_DISPATCH_UNKNOWN` fail-closed senza retry cieco.
+- `checkpoint_message`: “M1-H0: corretti takeover stale-confirm, digest Git e lifecycle Ledger current/next”.
+
+**Nome sessione suggerito:** `eiopago-m1-h0-reacceptance`
+
+**Prompt minimo di ripresa:**
+
+> Verifica Git/profilo e leggi la prima sezione di `CHECKPOINT.md`. Esegui soltanto nuova acceptance dei tre finding M1-H0 sul diff corrente; non ripetere audit/SP e non iniziare Cost Guard, M1.1/M1.2 o integrazioni esterne.
+
+# CHECKPOINT — M1-H0 acceptance bloccata da finding mirati
+
+## Ultima sessione — acceptance issue #6 sul commit 7439ef6
+
+- Data: 2026-08-08; sessione Pi `019fe0c1-0a7c-77db-8563-b7eb915fc746`.
+- Gate verificato: `PI_PROVIDER=openai-codex`, `PI_MODEL=gpt-5.6-sol`, `PI_REASONING_LEVEL=high`; repository `F:/dev/eiopago`, branch `feat/pi-usage-guardian-foundation`, HEAD `7439ef68f3e859c8655c8be07846a07064c0edb4`, upstream `80b8193b5a9559bde7c6c20d806042c4c5263d18`, identità Git `kinderp <a.caristia@gmail.com>`, nessun index lock. Worktree preesistente dirty preservato; il codice/test valutato coincide col commit.
+- Letti regole operative, sola precedente prima sezione del checkpoint, `TASK_PLAN.md`, handoff MVP, ADR-0015 e issue GitHub #6 in sola lettura. Audit e SP-01…SP-04 non ripetuti; Cost Guard, M1.1/M1.2 e integrazioni esterne non iniziati.
+- Esito acceptance: **BLOCKED**. Il commit copre gran parte del vertical slice e `npm run check` passa su 16 moduli; `npm test` passa **8/8**, ma restano tre finding vincolanti.
+- **P1 — takeover aggirabile:** `authorizeAndAdmit()` verifica solo stato/generation del latch e non la causa `HUMAN_TAKEOVER`; una conferma handoff già pendente può quindi rilasciare il takeover, committare admission e proseguire. Riproduzione locale: latch escalato a takeover → admission `COMMITTED`, latch `RELEASED` da `human:stale-confirm`.
+- **P1 — Git continuity incompleta:** `observeGitState()` lascia `index_digest`/`worktree_digest` null e `sameGitState()` confronta solo identità e righe porcelain. Cambiare i byte di un file già dirty senza cambiarne lo status produce `sameGitState=true`, quindi un mismatch reale può passare continuity.
+- **P2 — Ledger/E2E non soddisfa current/next e update:** il Ledger canonico non contiene `current_item`/`next_item`; il reader deriva soltanto `current_item` dal primo item `IN_PROGRESS` e non espone `next_item`. Nel Ledger committato, tutto `DONE` produce `current_item=null`. Inoltre l'handoff importa il Ledger read-only e l'E2E usa una fixture già predisposta, senza dimostrare il criterio issue #6 “Ledger aggiornato” durante il flusso.
+- Nessun file applicativo modificato e nessun commit eseguito. Unica modifica della sessione: questo checkpoint operativo.
+- `checkpoint_message`: “M1-H0 acceptance bloccata: takeover, digest Git dirty e lifecycle Ledger/E2E da correggere”.
+
+**Nome sessione suggerito:** `eiopago-m1-h0-fix-acceptance`
+
+**Prompt minimo di ripresa:**
+
+> Verifica Git/profilo; leggi regole operative, prima sezione di `CHECKPOINT.md`, issue #6, `TASK_PLAN.md`, `docs/m1-h0-handoff-mvp.md` e ADR-0015. Con nuova autorizzazione, correggi soltanto i tre finding M1-H0 sul commit 7439ef6: takeover non rilasciabile da conferma pendente, digest Git index/worktree verificabili e lifecycle Ledger current/next con E2E che dimostri l'update. Mantieni `REQUIRES_RUNNER`, FINISH CURRENT ATOMIC OPERATION e `RESUME_DISPATCH_UNKNOWN` fail-closed; non ripetere audit/SP-01…SP-04 e non iniziare Cost Guard, M1.1/M1.2 o integrazioni esterne.
+
 # CHECKPOINT — M1-H0 revisionato e consolidato
 
 ## Ultima sessione — review mirata e commit issue #6

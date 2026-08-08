@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ArtifactStore } from "../src/artifact-store.mjs";
 import { GuardianError } from "../src/errors.mjs";
+import { observeGitState, sameGitState } from "../src/git-state.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "../src/safety.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
@@ -16,7 +18,7 @@ function minimalLedger(path, overrides = {}) {
     schema_version: "0.1.0", task_id: "TASK-T", title: "t", objective: "o",
     requirements_version: "REQ-1", plan_revision_id: "PLAN-1", status: "IN_PROGRESS",
     completion_criteria: ["tested"], risk: "HIGH", created_at: "2026-08-08T00:00:00Z",
-    updated_at: "2026-08-08T00:00:00Z", next_step: "next",
+    updated_at: "2026-08-08T00:00:00Z", current_item: "ITEM-1", next_item: null, next_step: "next",
     task_items: [{ task_item_id: "ITEM-1", task_id: "TASK-T", title: "i", description: "d", status: "IN_PROGRESS", depends_on: [], completion_criteria: ["x"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "M1-H0", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "human" }],
     ...overrides,
   };
@@ -28,10 +30,39 @@ test("Ledger computes a byte digest and rejects DONE without evidence", () => {
   minimalLedger(path);
   const first = new TaskLedger(path).read();
   assert.equal(first.current_item, "ITEM-1");
+  assert.equal(first.next_item, null);
   assert.match(first.content_digest, /^sha256:[a-f0-9]{64}$/);
   const invalid = { task_items: [{ task_item_id: "ITEM-1", task_id: "TASK-T", title: "i", description: "d", status: "DONE", depends_on: [], completion_criteria: ["x"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "M1-H0", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "human" }] };
   minimalLedger(path, invalid);
   assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "DONE_WITHOUT_EVIDENCE");
+});
+
+test("Git continuity digests detect byte changes with unchanged porcelain status", () => {
+  const root = temp();
+  execFileSync("git", ["init"], { cwd: root });
+  execFileSync("git", ["config", "user.email", "core@example.invalid"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Eiopago Core"], { cwd: root });
+  writeFileSync(join(root, "tracked.txt"), "committed\n");
+  execFileSync("git", ["add", "tracked.txt"], { cwd: root });
+  execFileSync("git", ["commit", "-m", "fixture"], { cwd: root });
+
+  writeFileSync(join(root, "tracked.txt"), "dirty version one\n");
+  const dirtyOne = observeGitState(root);
+  writeFileSync(join(root, "tracked.txt"), "dirty version two\n");
+  const dirtyTwo = observeGitState(root);
+  assert.deepEqual(dirtyOne.status_entries, dirtyTwo.status_entries);
+  assert.equal(dirtyOne.index_digest, dirtyTwo.index_digest);
+  assert.notEqual(dirtyOne.worktree_digest, dirtyTwo.worktree_digest);
+  assert.equal(sameGitState(dirtyOne, dirtyTwo), false);
+
+  execFileSync("git", ["add", "tracked.txt"], { cwd: root });
+  const stagedTwo = observeGitState(root);
+  writeFileSync(join(root, "tracked.txt"), "dirty version three\n");
+  execFileSync("git", ["add", "tracked.txt"], { cwd: root });
+  const stagedThree = observeGitState(root);
+  assert.deepEqual(stagedTwo.status_entries, stagedThree.status_entries);
+  assert.notEqual(stagedTwo.index_digest, stagedThree.index_digest);
+  assert.equal(sameGitState(stagedTwo, stagedThree), false);
 });
 
 test("sealed artifacts are immutable, indexed, and detect byte tampering", () => {
@@ -67,6 +98,30 @@ test("SQLite linearizes latch release and one resume admission", () => {
   assert.equal(intent.idempotent, false);
   storage.finishDispatch("HO-one", "UNKNOWN", "ambiguous transport");
   assert.throws(() => storage.beginDispatch("HO-one", "DSP-two", 2), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+  storage.close();
+});
+
+test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
+  const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  storage.ensureLatch("TASK-T");
+  const latch = storage.engageLatch("TASK-T", "HANDOFF", "human:test");
+  storage.reserveHandoff({
+    handoff_id: "HO-stale-confirm", source_session_id: "SES-source", target_session_id: "SES-target",
+    task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
+    resume_prompt_id: "RP-stale-confirm", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
+  });
+  storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/eio-takeover");
+  assert.throws(
+    () => storage.authorizeAndAdmit("HO-stale-confirm", "human:stale-confirm", "resume:RP-stale-confirm", "ADM-stale-confirm"),
+    (error) => error.code === "HUMAN_TAKEOVER_ACTIVE",
+  );
+  const blocked = storage.getHandoff("HO-stale-confirm");
+  const takeover = storage.getLatch("TASK-T");
+  assert.equal(blocked.admission_state, "NOT_COMMITTED");
+  assert.equal(blocked.state, "RESUME_READY");
+  assert.equal(takeover.state, "ENGAGED");
+  assert.equal(takeover.reason, "HUMAN_TAKEOVER");
+  assert.equal(storage.events("HO-stale-confirm").some((event) => event.event_type === "LATCH_RELEASED" || event.event_type === "RESUME_ADMISSION_COMMITTED"), false);
   storage.close();
 });
 

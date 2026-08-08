@@ -241,6 +241,7 @@ export class GuardianStorage {
       invariant(actor.startsWith("human:"), "HUMAN_AUTHORIZATION_REQUIRED");
       const latch = this.getLatch(h.task_id);
       invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
+      invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE", "A pending handoff confirmation cannot release a human takeover");
       const releaseGeneration = latch.generation + 1;
       const release = this.appendEvent("LATCH_RELEASED", { task_id: h.task_id, generation: releaseGeneration, actor }, { handoffId: id, eventKey: `latch-release:${h.task_id}:${releaseGeneration}` });
       this.db.prepare("UPDATE latches SET state='RELEASED',generation=?,released_at=?,released_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=?")

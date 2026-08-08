@@ -4,7 +4,7 @@
 
 Il vertical slice standalone implementa esclusivamente:
 
-- `TASK_PLAN.md` come Master Task Ledger Markdown canonico e import read-only;
+- `TASK_PLAN.md` come Master Task Ledger Markdown canonico e import read-only, con `current_item`/`next_item` espliciti e revisionati alla fonte;
 - SQLite locale versionato (`node:sqlite`, WAL, `synchronous=FULL`) per latch, journal, handoff, operation outcome, authorization, admission e dispatch intent;
 - checkpoint JSON e Resume Context Manifest sealed con scrittura temp+fsync+rename, digest dei byte e indice SQLite;
 - Guardian Runner con provider transport admission fail-closed e allowlist di tool profilati;
@@ -46,7 +46,9 @@ In Pi gestito dal Runner:
 - Tool non profilati (incluso `bash` in questo MVP) non sono ammessi dal Runner.
 - Mutazione con outcome unknown o senza effect reference produce `HUMAN_DECISION_REQUIRED`; `edit`/`write` conservano il path ammesso fino a `tool_execution_end` perché quell'evento Pi non ripete gli argomenti.
 - Checkpoint e manifest non vengono riscritti sotto lo stesso ID con byte diversi.
-- Continuity confronta Ledger, digest, Git, lineage, parent, target vuoto/paused, model e reasoning policy.
+- Una conferma handoff pendente non può rilasciare un latch escalato a `HUMAN_TAKEOVER` né committare l'admission.
+- `GitState` include digest SHA-256 verificabili di index e byte del worktree; Continuity confronta Ledger, digest Git, lineage, parent, target vuoto/paused, model e reasoning policy.
+- Il lifecycle canonico del Ledger espone `current_item` e `next_item`; ogni update resta una nuova revisione della fonte Markdown, mai una reverse sync silenziosa dal DB.
 - `resume_prompt_id` ha una authorization e una admission; l'idempotency key è unica.
 - Qualsiasi errore dopo il dispatch intent viene classificato `RESUME_DISPATCH_UNKNOWN`; il Runner non ritenta automaticamente.
 - La creazione Pi e il journal SQLite non sono una singola transazione ACID: outcome ambiguo/cancellato della create resta `HANDOFF_FAILED` senza secondo target automatico. Checkpoint e istruzioni numerate di riconciliazione manuale restano visibili in `/eio status`; il manifest finale non viene falsamente sigillato finché manca il vero target ID.
@@ -55,4 +57,4 @@ Non viene dichiarata exactly-once provider execution.
 
 ## Verifica M1-H0
 
-`npm run check` valida i 16 moduli. `npm test` esegue 4 test core offline e 4 E2E con Pi/SessionManager reali e provider fake: happy path confirm, comandi reali `/eio takeover` e `/eio handoff manual` paused/no-history, più failure ambiguo con checkpoint/istruzioni preservati. I test bloccano `fetch` e osservano zero tentativi rete.
+`npm run check` valida i 16 moduli. `npm test` esegue 6 test core offline e 4 E2E con Pi/SessionManager reali e provider fake. I core riproducono anche stale confirm dopo takeover e modifiche Git a porcelain invariato. L'happy path E2E aggiorna realmente la fixture canonica da `PLAN-E2E-1` a `PLAN-E2E-2` durante il flusso, avanza `current_item`/`next_item` e verifica revisione/digest nel manifest e nel resume prompt. Restano coperti `/eio takeover`, `/eio handoff manual` paused/no-history e il failure ambiguo con checkpoint/istruzioni preservati. I test bloccano `fetch` e osservano zero tentativi rete.

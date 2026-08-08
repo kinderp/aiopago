@@ -41,6 +41,7 @@ export class HandoffService {
       parent_checkpoint_id: parentHandoff?.checkpoint_id ?? null,
       task_id: plan.task_id,
       current_item: plan.current_item,
+      next_item: plan.next_item,
       next_step: plan.next_step,
       task_plan_revision: plan.plan_revision_id,
       task_plan_digest: plan.content_digest,
@@ -164,10 +165,11 @@ export class HandoffService {
     invariant(sameGitState(checkpoint.payload.git_state, h.expected_git_state), "CHECKPOINT_MISMATCH", "git state");
     invariant(m.resume_manifest_id === h.resume_manifest_id && m.handoff_id === h.handoff_id && m.resume_prompt_id === h.resume_prompt_id, "MANIFEST_MISMATCH");
     invariant(m.source_session_id === h.source_session_id && m.replacement_session_id === h.target_session_id && m.parent_session_id === h.source_session_id, "STALE_HANDOFF");
+    invariant(m.repository === h.expected_git_state.repository_id && m.worktree === h.expected_git_state.workdir && m.branch === h.expected_git_state.branch && m.base_sha === h.expected_git_state.base_sha && m.head_sha === h.expected_git_state.head_sha && m.index_digest === h.expected_git_state.index_digest && m.worktree_digest === h.expected_git_state.worktree_digest && JSON.stringify(m.git_status_summary) === JSON.stringify(h.expected_git_state.status_entries), "MANIFEST_MISMATCH", "git state");
     invariant(targetSession.sessionId === h.target_session_id && historyEntries.length === 0 && targetSession.isIdle, "REPLACEMENT_NOT_PAUSED_NO_HISTORY");
     invariant(normalizePath(header.parentSession) === h.parent_session_file, "PARENT_LINEAGE_MISMATCH");
     invariant(sameGitState(h.expected_git_state, currentGit), "GIT_STATE_MISMATCH");
-    invariant(m.current_item === plan.current_item && m.next_step === plan.next_step, "CONTINUITY_FAILED", "current item/next step");
+    invariant(m.current_item === plan.current_item && m.next_item === plan.next_item && m.next_step === plan.next_step, "CONTINUITY_FAILED", "current item/next item/next step");
     invariant(m.model_policy === h.model_policy && m.reasoning_policy === h.reasoning_policy, "CONTINUITY_FAILED", "model/reasoning policy");
     const repositoryRoot = dirname(this.ledger.path);
     invariant(m.minimal_reads.every((path) => typeof path === "string" && path.length > 0 && existsSync(resolve(repositoryRoot, path))), "CONTINUITY_FAILED", "minimal reads unavailable");
@@ -268,6 +270,7 @@ export class HandoffService {
       task_id: h.task_id,
       objective: this.ledger.read().objective,
       current_item: h.current_item,
+      next_item: h.next_item,
       next_step: h.next_step,
       task_plan_revision: h.task_plan_revision,
       task_plan_digest: h.task_plan_digest,
@@ -284,6 +287,8 @@ export class HandoffService {
       worktree: h.expected_git_state.workdir,
       base_sha: h.expected_git_state.base_sha,
       head_sha: h.expected_git_state.head_sha,
+      index_digest: h.expected_git_state.index_digest,
+      worktree_digest: h.expected_git_state.worktree_digest,
       git_status_summary: h.expected_git_state.status_entries,
       relevant_decisions: ["docs/adr/0015-m0-boundaries-and-contract-freeze.md"],
       relevant_tests: ["npm test", "npm run test:e2e"],
@@ -317,6 +322,7 @@ export class HandoffService {
       `handoff_id=${h.handoff_id}`,
       `resume_prompt_id=${h.resume_prompt_id}`,
       `current_item=${manifest.current_item}`,
+      `next_item=${manifest.next_item}`,
       `next_step=${manifest.next_step}`,
       `minimal_reads=${manifest.minimal_reads.join("|")}`,
       "Read only the listed authoritative artifacts. Do not reconstruct state from previous conversation history.",

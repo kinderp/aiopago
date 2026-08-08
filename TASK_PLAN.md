@@ -2,9 +2,9 @@
 
 **Authority:** Markdown canonico standalone
 **Schema:** `eiopago.task-ledger/0.1.0`
-**Current revision:** `PLAN-M1-H0-0001`
+**Current revision:** `PLAN-M1-H0-0003`
 **Requirements version:** `REQ-M1-H0-ISSUE-6`
-**Updated:** 2026-08-08T07:15:00Z
+**Updated:** 2026-08-08T10:02:40Z
 
 Il blocco JSON seguente è la rappresentazione deterministica importata dal Runner. Il digest della revisione è SHA-256 dei byte completi di questo file e non viene scritto nel file stesso.
 
@@ -15,7 +15,7 @@ Il blocco JSON seguente è la rappresentazione deterministica importata dal Runn
   "title": "Automatic Session Handoff MVP",
   "objective": "Consegnare il vertical slice manual/confirm da una sessione Pi a una replacement paused/no-history con checkpoint e resume idempotente.",
   "requirements_version": "REQ-M1-H0-ISSUE-6",
-  "plan_revision_id": "PLAN-M1-H0-0001",
+  "plan_revision_id": "PLAN-M1-H0-0003",
   "status": "DONE",
   "completion_criteria": [
     "Ledger Markdown importato senza sync inversa silenziosa",
@@ -31,11 +31,14 @@ Il blocco JSON seguente è la rappresentazione deterministica importata dal Runn
   ],
   "risk": "MEDIUM",
   "created_at": "2026-08-08T06:35:45Z",
-  "updated_at": "2026-08-08T07:15:00Z",
-  "next_step": "M1-H0 consolidato: attendere review/acceptance esterna; non iniziare M1 o il Cost Guard senza nuova autorizzazione.",
+  "updated_at": "2026-08-08T10:02:40Z",
+  "current_item": null,
+  "next_item": null,
+  "next_step": "M1-H0 accettato; attendere una nuova autorizzazione senza iniziare Cost Guard, M1.1/M1.2 o integrazioni esterne.",
   "evidence": [
-    "test/core.test.mjs: 4/4 pass",
-    "test/pi-e2e.test.mjs: 4/4 pass con runtime Pi reale e provider fake",
+    "npm run check: 16 moduli pass (acceptance session 019fe0d1-9320-756b-b429-96e43af51ac4)",
+    "npm test: 10/10 pass, inclusi core offline 6/6 ed E2E Pi/provider fake 4/4",
+    "git diff --check: pass",
     "docs/m1-h0-handoff-mvp.md"
   ],
   "model_policy": "openai-codex/gpt-5.6-sol",
@@ -69,6 +72,30 @@ Il blocco JSON seguente è la rappresentazione deterministica importata dal Runn
       "milestone": "M1-H0",
       "last_updated_at": "2026-08-08T07:15:00Z",
       "last_updated_by": "Pi session 019fe02e-522e-714d-b0e2-8cd1ff15d3b9"
+    },
+    {
+      "task_item_id": "ITEM-M1-H0-02",
+      "task_id": "TASK-EIOPAGO-M1-H0",
+      "title": "Correzione dei tre finding di acceptance M1-H0",
+      "description": "Rendere takeover non rilasciabile da conferma pendente, verificare i digest Git index/worktree e modellare il lifecycle Ledger current/next con prova E2E dell'update.",
+      "status": "DONE",
+      "depends_on": ["ITEM-M1-H0-01"],
+      "completion_criteria": [
+        "Una conferma pendente non rilascia HUMAN_TAKEOVER né committa admission",
+        "Continuity rileva cambi di byte a status porcelain invariato tramite digest index/worktree",
+        "Ledger canonico espone current_item/next_item e l'E2E dimostra una revisione lifecycle durante il flusso",
+        "Nuova acceptance esterna registrata"
+      ],
+      "evidence": [
+        "test/core.test.mjs: stale confirm/takeover e digest Git a porcelain invariato",
+        "test/pi-e2e.test.mjs: update PLAN-E2E-1 → PLAN-E2E-2 durante il flusso",
+        "Acceptance session 019fe0d1-9320-756b-b429-96e43af51ac4: PASS sui tre finding; npm run check, npm test e git diff --check pass"
+      ],
+      "requirements_refs": ["GitHub issue #6 acceptance findings"],
+      "risk": "HIGH",
+      "milestone": "M1-H0",
+      "last_updated_at": "2026-08-08T10:02:40Z",
+      "last_updated_by": "Pi session 019fe0d1-9320-756b-b429-96e43af51ac4"
     }
   ]
 }

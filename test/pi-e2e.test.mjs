@@ -11,16 +11,36 @@ import { GuardianStorage } from "../src/storage.mjs";
 
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
 
-function fixtureLedger(root) {
+function writeFixtureLedger(root, advanced = false) {
   const minimalReads = ["TASK_PLAN.md", "docs/adr.md", "docs/safe.md", "docs/resume.md"];
+  const setup = {
+    task_item_id: "ITEM-E2E-SETUP", task_id: "TASK-E2E", title: "Prepare source", description: "fixture setup",
+    status: advanced ? "DONE" : "IN_PROGRESS", depends_on: [], completion_criteria: ["source response observed"],
+    evidence: advanced ? ["provider fake source response"] : [], requirements_refs: ["M1-H0"], risk: "HIGH", milestone: "M1-H0",
+    last_updated_at: advanced ? "2026-08-08T00:01:00Z" : "2026-08-08T00:00:00Z", last_updated_by: "test",
+  };
+  const handoff = {
+    task_item_id: "ITEM-E2E-HANDOFF", task_id: "TASK-E2E", title: "Run handoff", description: "fixture handoff",
+    status: advanced ? "IN_PROGRESS" : "PLANNED", depends_on: ["ITEM-E2E-SETUP"], completion_criteria: ["handoff resumed"],
+    evidence: [], requirements_refs: ["M1-H0"], risk: "HIGH", milestone: "M1-H0",
+    last_updated_at: advanced ? "2026-08-08T00:01:00Z" : "2026-08-08T00:00:00Z", last_updated_by: "test",
+  };
   const task = {
     schema_version: "0.1.0", task_id: "TASK-E2E", title: "E2E", objective: "Pi real runtime handoff",
-    requirements_version: "REQ-E2E-1", plan_revision_id: "PLAN-E2E-1", status: "IN_PROGRESS",
-    completion_criteria: ["E2E pass"], risk: "HIGH", created_at: "2026-08-08T00:00:00Z", updated_at: "2026-08-08T00:00:00Z",
-    next_step: "Continue only the E2E fixture", model_policy: "offline-fake/offline-fake", reasoning_policy: "off", minimal_reads: minimalReads,
-    task_items: [{ task_item_id: "ITEM-E2E", task_id: "TASK-E2E", title: "E2E", description: "fixture", status: "IN_PROGRESS", depends_on: [], completion_criteria: ["pass"], evidence: [], requirements_refs: ["M1-H0"], risk: "HIGH", milestone: "M1-H0", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "test" }],
+    requirements_version: "REQ-E2E-1", plan_revision_id: advanced ? "PLAN-E2E-2" : "PLAN-E2E-1", status: "IN_PROGRESS",
+    completion_criteria: ["E2E pass"], risk: "HIGH", created_at: "2026-08-08T00:00:00Z",
+    updated_at: advanced ? "2026-08-08T00:01:00Z" : "2026-08-08T00:00:00Z",
+    current_item: advanced ? "ITEM-E2E-HANDOFF" : "ITEM-E2E-SETUP",
+    next_item: advanced ? null : "ITEM-E2E-HANDOFF",
+    next_step: advanced ? "Resume the updated handoff item" : "Complete source setup and advance the Ledger",
+    model_policy: "offline-fake/offline-fake", reasoning_policy: "off", minimal_reads: minimalReads,
+    task_items: [setup, handoff],
   };
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
+}
+
+function fixtureLedger(root) {
+  writeFixtureLedger(root);
   mkdirSync(join(root, "docs"));
   for (const name of ["adr.md", "safe.md", "resume.md"]) writeFileSync(join(root, "docs", name), `# ${name}\n`);
   writeFileSync(join(root, ".gitignore"), ".guardian/\n");
@@ -72,8 +92,17 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
   const x = await makeRunner();
   try {
     const source = x.runner.runtime.session;
+    const initialPlan = x.runner.ledger.read();
+    assert.equal(initialPlan.current_item, "ITEM-E2E-SETUP");
+    assert.equal(initialPlan.next_item, "ITEM-E2E-HANDOFF");
     await source.prompt("SOURCE_ONLY_MARKER");
     assert.equal(x.calls, 1);
+    writeFixtureLedger(x.root, true);
+    const updatedPlan = x.runner.ledger.read();
+    assert.equal(updatedPlan.plan_revision_id, "PLAN-E2E-2");
+    assert.notEqual(updatedPlan.content_digest, initialPlan.content_digest);
+    assert.equal(updatedPlan.current_item, "ITEM-E2E-HANDOFF");
+    assert.equal(updatedPlan.next_item, null);
     const sourceId = source.sessionId;
     const sourceFile = source.sessionFile.replaceAll("\\", "/");
     const result = await x.runner.handoffDirect({ mode: "confirm", confirm: true });
@@ -86,16 +115,27 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     const serialized = JSON.stringify(entries);
     assert.equal(serialized.includes("SOURCE_ONLY_MARKER"), false);
     assert.equal(serialized.includes("EIOPAGO_RESUME_V1"), true);
-    assert.equal(serialized.includes("current_item=ITEM-E2E"), true);
-    assert.equal(serialized.includes("next_step=Continue only the E2E fixture"), true);
+    assert.equal(serialized.includes("task_plan_revision=PLAN-E2E-2"), true);
+    assert.equal(serialized.includes("current_item=ITEM-E2E-HANDOFF"), true);
+    assert.equal(serialized.includes("next_item=null"), true);
+    assert.equal(serialized.includes("next_step=Resume the updated handoff item"), true);
     assert.equal(x.calls, 2);
     const checkpoint = x.runner.artifacts.verify("checkpoint", result.checkpoint_id, result.checkpoint_digest);
     const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
     assert.equal(checkpoint.payload.parent_checkpoint_id, null);
+    assert.equal(checkpoint.payload.plan_revision_id, "PLAN-E2E-2");
+    assert.equal(result.expected_git_state.status_entries.some((entry) => entry.includes("TASK_PLAN.md")), true);
     assert.equal(manifest.payload.replacement_session_id, result.target_session_id);
-    assert.equal(manifest.payload.current_item, "ITEM-E2E");
-    assert.equal(manifest.payload.next_step, "Continue only the E2E fixture");
+    assert.equal(manifest.payload.current_item, "ITEM-E2E-HANDOFF");
+    assert.equal(manifest.payload.next_item, null);
+    assert.equal(manifest.payload.next_step, "Resume the updated handoff item");
+    assert.equal(manifest.payload.task_plan_revision, "PLAN-E2E-2");
+    assert.equal(manifest.payload.task_plan_digest, updatedPlan.content_digest);
     assert.equal(manifest.payload.head_sha, result.expected_git_state.head_sha);
+    assert.match(result.expected_git_state.index_digest, /^sha256:[a-f0-9]{64}$/);
+    assert.match(result.expected_git_state.worktree_digest, /^sha256:[a-f0-9]{64}$/);
+    assert.equal(manifest.payload.index_digest, result.expected_git_state.index_digest);
+    assert.equal(manifest.payload.worktree_digest, result.expected_git_state.worktree_digest);
     assert.equal(Object.hasOwn(manifest.payload, "transcript"), false);
     assert.equal(manifest.payload.minimal_reads.includes(`.guardian/checkpoints/${result.checkpoint_id}.json`), true);
     const handoffEvents = x.runner.storage.events(result.handoff_id);
