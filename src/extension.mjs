@@ -5,6 +5,26 @@ function safeNotify(ctx, text, type) {
   try { ctx.ui.notify(text, type); } catch { console.error(`[eiopago] ${text}`); }
 }
 
+async function adviseHandoff(runner, ctx) {
+  if (!ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
+  const task = runner.ledger.read();
+  if (!runner.storage.isAdmissionOpen(task.task_id)) return;
+  const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
+  if (!proposal) return;
+  const percent = Math.round(proposal.percent);
+  try {
+    const prepare = await ctx.ui.confirm(
+      "Eiopago",
+      `Context: ${percent}% (soglia configurata: ${proposal.thresholdPercent}%)\nHandoff consigliato.\n\nPreparare il passaggio a una nuova sessione?`,
+    );
+    if (!prepare) return;
+    ctx.ui.setEditorText("/eio handoff confirm");
+    safeNotify(ctx, "Comando /eio handoff confirm preparato. Premi Invio per avviare il percorso M1-H0.", "info");
+  } catch (error) {
+    safeNotify(ctx, `Context Handoff Advisor non disponibile: ${message(error)}`, "warning");
+  }
+}
+
 export function createGuardianExtension(runner) {
   return function guardianExtension(pi) {
     pi.registerCommand("eio", {
@@ -46,6 +66,8 @@ export function createGuardianExtension(runner) {
       }
     }
 
+    pi.on("session_start", () => runner.contextAdvisor.reset());
+
     pi.on("input", (_event, ctx) => {
       const task = runner.ledger.read();
       if (!runner.storage.isAdmissionOpen(task.task_id)) {
@@ -54,6 +76,8 @@ export function createGuardianExtension(runner) {
       }
       return { action: "continue" };
     });
+
+    pi.on("turn_end", (_event, ctx) => adviseHandoff(runner, ctx));
 
     pi.on("tool_call", (event) => {
       try { runner.toolTracker.admit(event.toolCallId, event.toolName, event.input); }

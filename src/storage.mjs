@@ -91,6 +91,17 @@ export class GuardianStorage {
         admitted_at TEXT NOT NULL,
         terminal_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS runner_session_bindings(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoffs(handoff_id),
+        replacement_session_id TEXT NOT NULL UNIQUE,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+        bound_at TEXT NOT NULL,
+        bind_event_id TEXT NOT NULL UNIQUE REFERENCES journal(event_id),
+        superseded_at TEXT,
+        superseded_reason TEXT
+      );
       CREATE TABLE IF NOT EXISTS artifacts(
         kind TEXT NOT NULL,
         artifact_id TEXT NOT NULL,
@@ -104,10 +115,12 @@ export class GuardianStorage {
       CREATE INDEX IF NOT EXISTS journal_handoff_seq ON journal(handoff_id, seq);
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id, state);
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
         ('journal','Guardian SQLite append-only','1.0.0'),
         ('latches','Guardian SQLite canonical runtime','1.0.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
+        ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Guardian SQLite canonical runtime','1.0.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
@@ -197,6 +210,48 @@ export class GuardianStorage {
   findHandoffByTarget(targetSessionId) {
     const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE target_session_id=? ORDER BY created_at DESC LIMIT 1").get(targetSessionId);
     return row ? this.getHandoff(row.handoff_id) : null;
+  }
+
+  bindRunnerSession(handoffId, binding) {
+    return this.transaction(() => {
+      const handoff = this.getHandoff(handoffId);
+      invariant(handoff?.state === "REPLACEMENT_SESSION_CREATED_PAUSED" && handoff.target_session_id === binding.replacement_session_id, "RUNNER_BINDING_STATE_INVALID");
+      const prior = this.db.prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
+      if (prior) {
+        invariant(prior.status === "ACTIVE" && prior.replacement_session_id === binding.replacement_session_id && prior.runner_instance_id === binding.runner_instance_id && prior.session_binding_id === binding.session_binding_id, "RUNNER_BINDING_CONFLICT");
+        return this.getRunnerSessionBinding(handoffId);
+      }
+      const data = {
+        handoff_id: handoffId,
+        replacement_session_id: binding.replacement_session_id,
+        runner_instance_id: binding.runner_instance_id,
+        session_binding_id: binding.session_binding_id,
+      };
+      const event = this.appendEvent("RUNNER_SESSION_BOUND", data, { handoffId, eventKey: `runner-binding:${handoffId}` });
+      this.db.prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)")
+        .run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", event.occurred_at, event.event_id);
+      return this.getRunnerSessionBinding(handoffId);
+    });
+  }
+
+  getRunnerSessionBinding(handoffId) {
+    const row = this.db.prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
+    if (!row) return null;
+    const event = this.db.prepare("SELECT event_type,data_json FROM journal WHERE event_id=? AND handoff_id=?").get(row.bind_event_id, handoffId);
+    invariant(event?.event_type === "RUNNER_SESSION_BOUND", "RUNNER_BINDING_JOURNAL_MISMATCH");
+    return { schema_version: "1.0.0", ...row, event_data: JSON.parse(event.data_json) };
+  }
+
+  supersedeRunnerSessionBinding(handoffId, reason) {
+    return this.transaction(() => {
+      const binding = this.getRunnerSessionBinding(handoffId);
+      if (!binding || binding.status === "SUPERSEDED") return binding;
+      const now = utcNow();
+      this.db.prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
+        .run(now, reason, handoffId);
+      this.appendEvent("RUNNER_SESSION_BINDING_SUPERSEDED", { reason }, { handoffId, eventKey: `runner-binding-superseded:${handoffId}` });
+      return this.getRunnerSessionBinding(handoffId);
+    });
   }
 
   latestHandoffForTask(taskId) {

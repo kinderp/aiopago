@@ -1,11 +1,13 @@
 import { join, resolve } from "node:path";
 import { ArtifactStore } from "./artifact-store.mjs";
-import { stableId } from "./canonical.mjs";
+import { opaqueId, stableId } from "./canonical.mjs";
+import { ContextHandoffAdvisor } from "./context-advisor.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
 import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
+import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
@@ -32,7 +34,11 @@ export class GuardianRunner {
       compaction: { enabled: false },
       retry: { enabled: false },
     });
-    const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
+    const contextAdvisor = options.contextAdvisor ?? new ContextHandoffAdvisor({
+      thresholdPercent: options.contextHandoffThresholdPercent ?? process.env.EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT,
+    });
+    const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
+    const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
     runner.handoffService = new HandoffService({
@@ -41,6 +47,7 @@ export class GuardianRunner {
       ledger,
       observeGit: options.observeGit ?? (() => observeGitState(cwd)),
       safePoint: runner.safePoint,
+      runnerInstanceId,
       modelPolicy,
       reasoningPolicy,
     });
@@ -56,7 +63,7 @@ export class GuardianRunner {
 
   async createRuntime(options) {
     const { coding } = this.pi;
-    const inline = { name: "eiopago-m1-h0", factory: createGuardianExtension(this) };
+    const inline = { name: "eiopago-m1-h1", factory: createGuardianExtension(this) };
     const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
       const services = await coding.createAgentSessionServices({
         cwd,
@@ -117,12 +124,13 @@ export class GuardianRunner {
       sourceSession: this.runtime.session,
       mode,
       actor: "human:/eio-handoff",
-      replacePaused: async (parentSession, onPaused) => {
+      replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         let pausedResult;
         try {
           const result = await ctx.newSession({
             parentSession,
+            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
             withSession: async (replacementCtx) => {
               const target = this.commandTarget(replacementCtx);
               pausedResult = await onPaused(target);
@@ -159,10 +167,13 @@ export class GuardianRunner {
       sourceSession: this.runtime.session,
       mode,
       actor: "human:test-or-host",
-      replacePaused: async (parentSession, onPaused) => {
+      replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         try {
-          const result = await this.runtime.newSession({ parentSession });
+          const result = await this.runtime.newSession({
+            parentSession,
+            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
+          });
           if (result.cancelled) return result;
           const target = {
             session: this.runtime.session,

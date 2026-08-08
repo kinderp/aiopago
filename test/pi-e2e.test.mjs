@@ -7,6 +7,7 @@ import test from "node:test";
 import { HandoffService } from "../src/handoff.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
+import { readRuntimeRunnerBinding, RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
@@ -46,9 +47,32 @@ function fixtureLedger(root) {
   writeFileSync(join(root, ".gitignore"), ".guardian/\n");
 }
 
-async function makeRunner() {
+function writeOwnerGateLedger(root) {
+  const blockedStep = "Owner gate: execute /eio handoff confirm";
+  const resumedStep = "Validate replacement continuity and finish H1-02 metrics";
+  const task = {
+    schema_version: "0.1.0", task_id: "TASK-E2E", title: "E2E owner gate", objective: "Advance a blocked handoff gate before sealing",
+    requirements_version: "REQ-E2E-1", plan_revision_id: "PLAN-E2E-GATE-1", status: "BLOCKED",
+    completion_criteria: ["owner gate handoff resumes"], risk: "HIGH", created_at: "2026-08-08T00:00:00Z", updated_at: "2026-08-08T00:00:00Z",
+    current_item: null, next_item: "ITEM-H1-02", next_step: blockedStep,
+    model_policy: "offline-fake/offline-fake", reasoning_policy: "off", minimal_reads: ["TASK_PLAN.md", "docs/adr.md", "docs/safe.md", "docs/resume.md"],
+    owner_gate: {
+      kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/eio handoff confirm", item_id: "ITEM-H1-02",
+      satisfied_plan_revision_id: "PLAN-E2E-GATE-2", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: "ITEM-H1-03", satisfied_next_step: resumedStep,
+    },
+    task_items: [
+      { task_item_id: "ITEM-H1-01", task_id: "TASK-E2E", title: "Advisor", description: "done", status: "DONE", depends_on: [], completion_criteria: ["done"], evidence: ["verified"], requirements_refs: [], risk: "MEDIUM", milestone: "M1-H1", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "test" },
+      { task_item_id: "ITEM-H1-02", task_id: "TASK-E2E", title: "Resume", description: "replacement work", status: "BLOCKED", depends_on: ["ITEM-H1-01"], completion_criteria: ["resumed"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "M1-H1", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "test" },
+      { task_item_id: "ITEM-H1-03", task_id: "TASK-E2E", title: "Acceptance", description: "accept", status: "PLANNED", depends_on: ["ITEM-H1-02"], completion_criteria: ["accepted"], evidence: [], requirements_refs: [], risk: "MEDIUM", milestone: "M1-H1", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "test" },
+    ],
+  };
+  writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
+}
+
+async function makeRunner({ ownerGate = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "eiopago-pi-e2e-"));
   fixtureLedger(root);
+  if (ownerGate) writeOwnerGateLedger(root);
   git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Eiopago E2E"]);
   git(root, ["add", "."]); git(root, ["commit", "-m", "fixture"]);
   const pi = await loadPi();
@@ -126,6 +150,15 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     assert.equal(checkpoint.payload.plan_revision_id, "PLAN-E2E-2");
     assert.equal(result.expected_git_state.status_entries.some((entry) => entry.includes("TASK_PLAN.md")), true);
     assert.equal(manifest.payload.replacement_session_id, result.target_session_id);
+    assert.equal(manifest.payload.runner_instance_id, x.runner.runnerInstanceId);
+    assert.equal(manifest.payload.session_binding_id, result.session_binding_id);
+    const runtimeBindingEntries = target.sessionManager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === RUNNER_BINDING_CUSTOM_TYPE);
+    assert.equal(runtimeBindingEntries.length, 1);
+    assert.equal(runtimeBindingEntries[0].data.replacement_session_id, target.sessionId);
+    const journalBinding = x.runner.storage.getRunnerSessionBinding(result.handoff_id);
+    assert.equal(journalBinding.status, "ACTIVE");
+    assert.equal(journalBinding.runner_instance_id, x.runner.runnerInstanceId);
+    assert.equal(journalBinding.session_binding_id, result.session_binding_id);
     assert.equal(manifest.payload.current_item, "ITEM-E2E-HANDOFF");
     assert.equal(manifest.payload.next_item, null);
     assert.equal(manifest.payload.next_step, "Resume the updated handoff item");
@@ -149,11 +182,68 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     assert.equal(again.state, "RESUMED");
     const reloadedStorage = new GuardianStorage(x.runner.storage.path);
     try {
-      const reloadedService = new HandoffService({ storage: reloadedStorage, artifacts: x.runner.artifacts, ledger: x.runner.ledger, observeGit: () => result.expected_git_state, safePoint: null, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off" });
+      const reloadedService = new HandoffService({ storage: reloadedStorage, artifacts: x.runner.artifacts, ledger: x.runner.ledger, observeGit: () => result.expected_git_state, safePoint: null, runnerInstanceId: x.runner.runnerInstanceId, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off" });
       const afterReload = await reloadedService.resume(result.handoff_id, { actor: "human:reload", sendResume: (prompt) => target.sendUserMessage(prompt) });
       assert.equal(afterReload.state, "RESUMED");
     } finally { reloadedStorage.close(); }
     assert.equal(x.calls, 2);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest seal", async () => {
+  const x = await makeRunner({ ownerGate: true });
+  try {
+    const blocked = x.runner.ledger.read();
+    assert.equal(blocked.status, "BLOCKED");
+    assert.equal(blocked.current_item, null);
+    assert.equal(blocked.next_item, "ITEM-H1-02");
+    assert.match(blocked.next_step, /\/eio handoff confirm/);
+    const result = await x.runner.handoffDirect({ mode: "confirm", confirm: true });
+    assert.equal(result.state, "RESUMED");
+    const advanced = x.runner.ledger.read();
+    assert.equal(advanced.plan_revision_id, "PLAN-E2E-GATE-2");
+    assert.equal(advanced.status, "IN_PROGRESS");
+    assert.equal(advanced.owner_gate.status, "SATISFIED");
+    assert.equal(advanced.current_item, "ITEM-H1-02");
+    assert.equal(advanced.next_item, "ITEM-H1-03");
+    assert.equal(advanced.task_items.find((item) => item.task_item_id === "ITEM-H1-02").status, "IN_PROGRESS");
+    assert.equal(advanced.next_step, "Validate replacement continuity and finish H1-02 metrics");
+    assert.doesNotMatch(advanced.next_step, /\/eio handoff confirm/);
+    const checkpoint = x.runner.artifacts.verify("checkpoint", result.checkpoint_id, result.checkpoint_digest);
+    const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
+    assert.equal(checkpoint.payload.plan_revision_id, "PLAN-E2E-GATE-2");
+    assert.deepEqual(checkpoint.payload.task_item_ids, ["ITEM-H1-02"]);
+    assert.equal(manifest.payload.current_item, "ITEM-H1-02");
+    assert.equal(manifest.payload.next_item, "ITEM-H1-03");
+    assert.equal(manifest.payload.next_step, advanced.next_step);
+    assert.doesNotMatch(result.resume_prompt, /next_step=.*\/eio handoff confirm/);
+    assert.equal(manifest.payload.runner_instance_id, x.runner.runnerInstanceId);
+    assert.equal(manifest.payload.session_binding_id, result.session_binding_id);
+    const binding = x.runner.storage.getRunnerSessionBinding(result.handoff_id);
+    assert.equal(binding.replacement_session_id, result.target_session_id);
+    assert.equal(binding.runner_instance_id, x.runner.runnerInstanceId);
+    assert.equal(binding.session_binding_id, result.session_binding_id);
+    const events = x.runner.storage.events(result.handoff_id);
+    assert.equal(events.filter((event) => event.event_type === "HANDOFF_STARTED").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "RUNNER_SESSION_BOUND").length, 1);
+    assert.ok(events.findIndex((event) => event.event_type === "CHECKPOINT_PERSISTED") < events.findIndex((event) => event.event_type === "RUNNER_SESSION_BOUND"));
+    assert.ok(events.findIndex((event) => event.event_type === "RUNNER_SESSION_BOUND") < events.findIndex((event) => event.event_type === "MANIFEST_PERSISTED"));
+    assert.ok(events.findIndex((event) => event.event_type === "MANIFEST_PERSISTED") < events.findIndex((event) => event.event_type === "RESUME_DISPATCHED"));
+    const duplicate = await x.runner.handoffService.resume(result.handoff_id, { actor: "human:duplicate", sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt) });
+    assert.equal(duplicate.state, "RESUMED");
+    assert.equal(x.runner.storage.events(result.handoff_id).filter((event) => event.event_type === "RESUME_ADMISSION_COMMITTED").length, 1);
+    assert.equal(x.calls, 1);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("Pi E2E fresh session outside the Guardian replacement path fails ownership attestation", async () => {
+  const x = await makeRunner();
+  try {
+    await x.runner.runtime.newSession();
+    assert.throws(() => readRuntimeRunnerBinding(x.runner.runtime.session), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+    assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });

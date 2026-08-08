@@ -1,3 +1,65 @@
+# CHECKPOINT — M1-H1 PASS; dogfood post-fix e acceptance completati
+
+## Sessione B — chiusura H1-02/H1-03
+
+- Handoff reale post-fix: `HO-27f6d0dcd68e7349bdd149de`, source `019fe1fb-d7b3-71f5-ac0e-dfd35e3f268d`, replacement `019fe1fc-aeca-76b7-99b5-c880d3b75a7d`.
+- Evidenza runtime autorizzata dall'owner: Runner ownership attestata, Continuity Check **PASS**, resume admission autorizzata una sola volta e Sessione B ripresa con `ITEM-H1-02=IN_PROGRESS`, `current_item=ITEM-H1-02`, `next_item=ITEM-H1-03`, `owner_gate=SATISFIED`.
+- History transfer: **ZERO**. Il codice esclude conversation history dal target e il manifest non contiene transcript; i sei minimal read sealed sono stati letti realmente.
+- Review statica F1: coerente con il runtime. `TaskLedger.satisfyOwnerGate()` avanza atomicamente il Ledger prima del safe point/seal; `newSession({ setup })` installa una sola CustomEntry non-context; SQLite e journal persistono `RUNNER_SESSION_BOUND`; manifest e Continuity richiedono uguaglianza runtime/journal/manifest/current Runner; admission e dispatch sono idempotenti/fail-closed.
+- Metriche post-fix Sessione A (`019fe1fb…`) e B (`019fe1fc…`): context, token, cache e costo **unknown**, perché checkpoint e runtime evidence non contengono snapshot usage. Le metriche 140.837 input / 23.074 output / 8.367 reasoning / 3.049.472 cache-read / USD 2,921141 appartengono alla sessione storica pre-fix `019fe1c2…` e non sono attribuite al nuovo dogfood.
+- Dimensioni esatte di `TASK_PLAN.md`, checkpoint, manifest e resume prompt: **unknown**; l'API file corrente non espone byte-stat e non viene sostituita con stime. Checkpoint `CP-7a6eed065a7069546349c82f` e manifest `RM-b5ec41729aab629d55ad89a4` sono disponibili come file; il resume prompt `RP-a38d491dd73939115c57fc31` è disponibile inline ma non come file standalone. Minimal reads: **6**.
+- Friction umana post-fix: comando sorgente `/eio handoff confirm` e una conferma separata per l'unica resume admission. Nessun failure riportato nel run post-fix. Restano storici il tentativo API/non-TTY fallito prima del latch e i finding A/B del primo dogfood reale.
+- Gate shell finali eseguiti manualmente dall'owner nel TUI: `npm run check` **PASS** (`syntax ok: 18 modules`); `npm test` **PASS** (**22/22**, 15 top-level, E2E 6/6, zero failure); `git diff --check` **PASS**, con solo warning informativo LF→CRLF su `TASK_PLAN.md`.
+- Stato finale: `TASK_PLAN.md` revisionato a `PLAN-M1-H1-0007`; task `DONE`, H1-02 `DONE`, H1-03 `DONE`, `current_item=null`, `next_item=null`. Owner gate `SATISFIED`; H1-01 non ripetuto, nessun nuovo handoff, Cost Guard e M1-H2 non iniziati.
+- Esito milestone: **M1-H1 PASS**.
+- `checkpoint_message`: “M1-H1 PASS: dogfood F1 reale e 22/22 test accettati”.
+
+**STOP operativo:** M1-H1 è chiusa. Non eseguire un altro handoff, non iniziare Cost Guard o M1-H2 e non creare commit senza autorizzazione separata.
+
+# CHECKPOINT — M1-H1-F1 implementato e testato offline; stato pre-dogfood superato
+
+## Issue #8 — owner gate persistito e Runner ownership attestabile
+
+- Data: 2026-08-08; sessione fix `019fe1ed-0ab4-70e1-9475-8e809324c93c`; perimetro esclusivo `M1-H1-F1`. H1-01 e SP-01…SP-04 non ripetuti; Cost Guard e integrazioni esterne non iniziati.
+- **Causa Finding A:** `/eio handoff confirm` leggeva il Ledger senza transizionare il gate canonico. I tre handoff reali precedenti hanno quindi sigillato correttamente artefatti tecnici ma con lifecycle stale (`current_item=null`, `next_item=ITEM-H1-02`, vecchio owner step).
+- **Fix Finding A:** `TaskLedger.satisfyOwnerGate()` richiede comando esatto e attore umano, valida il lifecycle bloccato e persiste atomicamente la nuova revisione Markdown prima che il piano venga usato per checkpoint/manifest. L'E2E prova `H1-01=DONE`, `H1-02=IN_PROGRESS`, `current_item=ITEM-H1-02`, `next_item=ITEM-H1-03` e un vero next step senza nuova richiesta handoff.
+- **Causa Finding B:** il solo `replacement_session_id` in projection/manifest non forniva alla sessione runtime corrente una prova Runner-owned; il fail-closed osservato era corretto.
+- **Meccanismo scelto:** il processo Runner genera `runner_instance_id`; l'handoff genera `session_binding_id` casuale. La API pubblica Pi `newSession({ setup })` installa una CustomEntry non-context `eiopago.runner-session-binding.v1` nella replacement session prima di qualsiasi conversation entry. Il binding contiene `handoff_id`, vero `replacement_session_id` del SessionManager, `runner_instance_id` e nonce.
+- **Persistenza/attestazione:** la relazione è salvata nella tabella SQLite `runner_session_bindings`, nell'evento append-only `RUNNER_SESSION_BOUND` e nel manifest sealed. Continuity richiede `runtime binding == SQLite/journal event == manifest == handoff/current Runner`; binding assente/duplicato, Runner/target/nonce/handoff diverso o stato `SUPERSEDED` produce `RUNNER_OWNERSHIP_ATTESTATION_FAILED` e nessuna admission.
+- **Test aggiunti:** attestation PASS e tutti i mismatch richiesti fail-closed; sessione Pi non Runner-owned; binding SQLite/journal active→superseded; owner gate blocked→confirm→Ledger avanzato→checkpoint/manifest→replacement Runner-owned→continuity→resume; resume prompt senza seconda richiesta; duplicate resume con una sola admission.
+- **Verifiche finali:** `npm run check` PASS, **18 moduli**; `npm test` PASS, **22/22** (**15** top-level, E2E **6/6**), zero failure e provider fake offline; `git diff --check` PASS con soli warning informativi LF→CRLF.
+- `TASK_PLAN.md` è `PLAN-M1-H1-0005`, stato `IN_PROGRESS`, `owner_gate=SATISFIED`, `current_item=ITEM-H1-02`, `next_item=ITEM-H1-03`. H1-01 non è stato ripetuto e H1-02 non è dichiarato DONE.
+- Documentazione: `docs/m1-h1-context-handoff-advisor.md`. Limite esplicito: il trust boundary è il processo/filesystem locale; nessuna firma anti-amministratore locale e nessun recovery automatico post-crash/general-purpose orchestrator.
+- Il precedente vincolo sul nuovo dogfood è stato successivamente revocato dall'owner: il run post-fix `HO-27f6d0dcd68e7349bdd149de` è riuscito ed è registrato nella sezione corrente sopra. I vecchi artefatti sealed non sono stati riscritti.
+- `checkpoint_message`: “M1-H1-F1: owner gate avanzato prima del seal e replacement ownership attestata runtime/journal/manifest”.
+
+**STOP operativo storico superato:** review e dogfood reale post-fix sono avvenuti. Non eseguire un altro handoff e non iniziare Cost Guard.
+
+# CHECKPOINT — M1-H1 PARTIAL/BLOCKED prima dell'input handoff reale
+
+## Safe point Sessione A — Context Handoff Advisor
+
+- Data: 2026-08-08; sessione Pi A `019fe1c2-19f4-7e45-88df-e89e35f4f83c`; profilo verificato `openai-codex/gpt-5.6-sol`, reasoning `high`.
+- Isolamento verificato: branch `feat/m1-h1-context-handoff-advisor`, worktree `F:/dev/eiopago-m1-h1`, HEAD baseline `84953671bc97d40efbf6f838f8ae08f3a40a4bd4`. Il worktree principale e le sue modifiche storiche non sono stati alterati, stageati o inclusi.
+- Issue #7 letta in sola lettura. Non sono stati ripetuti M0.1 o SP-01…SP-04 e non sono stati iniziati Cost Guard, hard budget, billing, supervised-auto, TokenSave o router.
+- `TASK_PLAN.md` è il Ledger M1-H1 revisionato `PLAN-M1-H1-0004`: task `BLOCKED`, `ITEM-H1-01=DONE` con evidenza, `current_item=null`, `next_item=ITEM-H1-02` bloccato; H1-03 non avviato.
+- H1-01 implementato: `ContextHandoffAdvisor` usa `ctx.getContextUsage()` quando disponibile, soglia validata configurabile tramite opzione Runner o `EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT`, default indicativo 50%, una proposta per permanenza sopra soglia e riarmo sotto soglia.
+- UX advisory: a soglia raggiunta chiede consenso; soltanto dopo risposta positiva precompila `/eio handoff confirm`. Non esegue handoff autonomo, non impegna latch, non blocca transport/richieste e non introduce hard stop.
+- Evidenza: test mirati advisor **2/2 pass**; `npm run check` **17 moduli pass**; `npm test` **12/12 pass**; `git diff --check` pass.
+- Metriche A al snapshot pre-report: 110 entry JSONL, 37 usage entry; input 140.837, output 23.074, reasoning 8.367, cache read 3.049.472, cache write 0, costo equivalente riportato USD 2,921141. Prima usage 3.569 token (1,31% derivato su 272.000); ultima usage completata 120.909 (44,45% derivato). `ctx.getContextUsage()` corrente non è esposto a questa sessione API, quindi l'occupazione finale corrente resta `unknown` e non viene inventata.
+- Gate dogfood eseguito senza harness/fake di handoff: `npm run eio` dal worktree isolato ha avviato il vero Guardian Runner e caricato `<inline:eiopago-m1-h1>`, modello/reasoning corretti. Il tool API espone però stdin/stdout non-TTY e nessun canale per inviare il comando TUI; dopo 20 secondi il tentativo è scaduto prima di poter digitare `/eio handoff confirm`.
+- Failure point esatto: **prima** di latch, safe point M1-H0, checkpoint, replacement e manifest. Stato verificato: latch `RELEASED`, generation `0`, `latestHandoff=null`; checkpoint/manifest/resume prompt/Sessione B non generati. Conversation history copiata: zero, ma non esiste un happy path completato.
+- Il processo TUI PID 22268 è rimasto attivo dopo il timeout del tool ed è stato terminato in modo mirato con `taskkill`; nessun altro processo è stato toccato. Il fallback manuale M1-H0 non esiste per questo failure pre-command, quindi non è stato inventato né sostituito con copia/incolla.
+- Intervento necessario: avviare il task fin dall'inizio dentro un TUI posseduto dal Guardian Runner M1-H0 e usare lì `/eio handoff confirm`. Collegare retroattivamente il Runner alla sessione API corrente o automatizzare `handoffDirect` sarebbe una simulazione vietata.
+- Esito milestone corrente: **PARTIAL/BLOCKED**. H1-01 funziona, ma acceptance issue #7 non passa perché Sessione A → B e Continuity Check non sono avvenuti.
+- `checkpoint_message`: “M1-H1 advisor verificato; dogfood bloccato prima dell'input /eio nel TUI”.
+
+**Nome sessione suggerito:** `eiopago-m1-h1-dogfood-resume`
+
+**Prompt minimo di ripresa:**
+
+> Avvia Pi dal worktree `F:/dev/eiopago-m1-h1` sotto il Guardian Runner M1-H0 con TUI interattivo; verifica Git e profilo high e leggi `TASK_PLAN.md` revisione `PLAN-M1-H1-0004` più la prima sezione di `CHECKPOINT.md`. H1-01 è DONE (advisor 2/2, check 17, suite 12/12): non ripeterlo. Sblocca H1-02 soltanto tramite handoff reale `/eio handoff confirm`, senza history copiata o `handoffDirect`; poi misura Sessione B e artefatti. Non iniziare Cost Guard.
+
 # CHECKPOINT — M1-H0 riaccettato sui tre finding mirati
 
 ## Ultima sessione — nuova acceptance sul diff corrente

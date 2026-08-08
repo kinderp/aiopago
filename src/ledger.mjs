@@ -1,6 +1,6 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import { sha256 } from "./canonical.mjs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { sha256, utcNow } from "./canonical.mjs";
 import { invariant } from "./errors.mjs";
 
 const BLOCK = /```json task-ledger\s*\r?\n([\s\S]*?)\r?\n```/;
@@ -27,6 +27,62 @@ export class TaskLedger {
       current_item: task.current_item,
       next_item: task.next_item,
     });
+  }
+
+  satisfyOwnerGate({ command, actor }) {
+    const bytes = readFileSync(this.path);
+    const text = bytes.toString("utf8");
+    const match = text.match(BLOCK);
+    invariant(match, "LEDGER_FORMAT_INVALID", "TASK_PLAN.md must contain one json task-ledger block");
+    let task;
+    try { task = JSON.parse(match[1]); }
+    catch (error) { invariant(false, "LEDGER_JSON_INVALID", error.message); }
+    this.validate(task);
+    const gate = task.owner_gate;
+    if (!gate || gate.status === "SATISFIED") return this.read();
+    invariant(gate.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "OWNER_GATE_INVALID");
+    invariant(command === gate.command && actor?.startsWith("human:"), "OWNER_GATE_AUTHORIZATION_REQUIRED");
+    invariant(task.current_item === null && task.next_item === gate.item_id, "OWNER_GATE_LIFECYCLE_MISMATCH");
+    const item = task.task_items.find((candidate) => candidate.task_item_id === gate.item_id);
+    invariant(item?.status === "BLOCKED", "OWNER_GATE_ITEM_NOT_BLOCKED");
+    invariant(typeof gate.satisfied_plan_revision_id === "string" && gate.satisfied_plan_revision_id !== task.plan_revision_id, "OWNER_GATE_REVISION_REQUIRED");
+    invariant(typeof gate.satisfied_next_step === "string" && gate.satisfied_next_step.length > 0 && !gate.satisfied_next_step.includes(gate.command), "OWNER_GATE_NEXT_STEP_INVALID");
+    const previousRevision = task.plan_revision_id;
+    const previousUpdatedAt = task.updated_at;
+    const now = utcNow();
+    gate.status = "SATISFIED";
+    gate.satisfied_at = now;
+    gate.satisfied_by = actor;
+    task.plan_revision_id = gate.satisfied_plan_revision_id;
+    task.status = gate.satisfied_task_status ?? "IN_PROGRESS";
+    task.updated_at = now;
+    task.current_item = gate.item_id;
+    task.next_item = gate.satisfied_next_item ?? null;
+    task.next_step = gate.satisfied_next_step;
+    item.status = "IN_PROGRESS";
+    item.last_updated_at = now;
+    item.last_updated_by = actor;
+    this.validate(task);
+    const lineEnding = text.includes("\r\n") ? "\r\n" : "\n";
+    const json = JSON.stringify(task, null, 2).replaceAll("\n", lineEnding);
+    const updated = text.replace(match[1], json)
+      .replace(`**Current revision:** \`${previousRevision}\``, `**Current revision:** \`${task.plan_revision_id}\``)
+      .replace(`**Updated:** ${previousUpdatedAt}`, `**Updated:** ${now}`);
+    const temp = `${this.path}.${process.pid}.${Date.now()}.tmp`;
+    let fd;
+    try {
+      fd = openSync(temp, "wx", 0o600);
+      writeFileSync(fd, updated, "utf8");
+      fsyncSync(fd);
+      closeSync(fd); fd = undefined;
+      renameSync(temp, this.path);
+      try { const dirFd = openSync(dirname(this.path), "r"); fsyncSync(dirFd); closeSync(dirFd); } catch {}
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      if (existsSync(temp)) unlinkSync(temp);
+      throw error;
+    }
+    return this.read();
   }
 
   validate(task) {

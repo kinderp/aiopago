@@ -5,13 +5,76 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ArtifactStore } from "../src/artifact-store.mjs";
+import { ContextHandoffAdvisor, contextHandoffThreshold } from "../src/context-advisor.mjs";
 import { GuardianError } from "../src/errors.mjs";
+import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState, sameGitState } from "../src/git-state.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
+import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "../src/safety.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
 function temp() { return mkdtempSync(join(tmpdir(), "eiopago-core-")); }
+
+test("Context Handoff Advisor validates configuration and deduplicates above-threshold events", () => {
+  assert.equal(contextHandoffThreshold(), 50);
+  assert.equal(contextHandoffThreshold("62.5"), 62.5);
+  assert.throws(() => contextHandoffThreshold(0), (error) => error.code === "CONTEXT_HANDOFF_THRESHOLD_INVALID");
+  assert.throws(() => contextHandoffThreshold(101), (error) => error.code === "CONTEXT_HANDOFF_THRESHOLD_INVALID");
+
+  const advisor = new ContextHandoffAdvisor({ thresholdPercent: 50 });
+  assert.equal(advisor.observe(undefined), null);
+  assert.equal(advisor.observe({ percent: null }), null);
+  assert.equal(advisor.observe({ percent: 49, tokens: 49, contextWindow: 100 }), null);
+  assert.equal(advisor.observe({ percent: 52, tokens: 52, contextWindow: 100 }).percent, 52);
+  assert.equal(advisor.observe({ percent: 75, tokens: 75, contextWindow: 100 }), null);
+  assert.equal(advisor.observe({ percent: 40, tokens: 40, contextWindow: 100 }), null);
+  assert.equal(advisor.observe({ percent: 51, tokens: 51, contextWindow: 100 }).percent, 51);
+});
+
+test("Context Handoff Advisor prepares the canonical command only after user consent", async () => {
+  const handlers = new Map();
+  const pi = {
+    registerCommand() {},
+    on(name, handler) { handlers.set(name, handler); },
+  };
+  let percent = 49;
+  let confirmations = 0;
+  let prepared = null;
+  let automaticHandoffs = 0;
+  const decisions = [false, true];
+  const runner = {
+    ledger: { read: () => ({ task_id: "TASK-T" }) },
+    storage: { isAdmissionOpen: () => true },
+    contextAdvisor: new ContextHandoffAdvisor({ thresholdPercent: 50 }),
+    toolTracker: { admit() {}, finish() {} },
+    async handoffFromCommand() { automaticHandoffs += 1; },
+  };
+  createGuardianExtension(runner)(pi);
+  const ctx = {
+    hasUI: true,
+    getContextUsage: () => ({ percent, tokens: percent, contextWindow: 100 }),
+    ui: {
+      async confirm(_title, proposal) { confirmations += 1; assert.match(proposal, /Context: 52%/); return decisions.shift(); },
+      setEditorText(value) { prepared = value; },
+      notify() {},
+    },
+  };
+  await handlers.get("turn_end")({}, ctx);
+  percent = 52;
+  await handlers.get("turn_end")({}, ctx);
+  assert.equal(prepared, null, "declining must not prepare or execute a handoff");
+  percent = 70;
+  await handlers.get("turn_end")({}, ctx);
+  assert.equal(confirmations, 1, "events above threshold must be deduplicated");
+  percent = 40;
+  await handlers.get("turn_end")({}, ctx);
+  percent = 52;
+  await handlers.get("turn_end")({}, ctx);
+  assert.equal(confirmations, 2);
+  assert.equal(prepared, "/eio handoff confirm");
+  assert.equal(automaticHandoffs, 0);
+});
 
 function minimalLedger(path, overrides = {}) {
   const task = {
@@ -63,6 +126,61 @@ test("Git continuity digests detect byte changes with unchanged porcelain status
   assert.deepEqual(stagedTwo.status_entries, stagedThree.status_entries);
   assert.notEqual(stagedTwo.index_digest, stagedThree.index_digest);
   assert.equal(sameGitState(stagedTwo, stagedThree), false);
+});
+
+test("Runner ownership attestation passes only when runtime, journal, manifest, and current Runner match", async (t) => {
+  const expected = {
+    schema_version: "1.0.0", handoff_id: "HO-owned", replacement_session_id: "SES-owned",
+    runner_instance_id: "RUNNER-one", session_binding_id: "BIND-one",
+  };
+  const runtimeBinding = { ...expected };
+  const manifestBinding = { ...expected };
+  const journalBinding = { ...expected, status: "ACTIVE", event_data: { handoff_id: expected.handoff_id, replacement_session_id: expected.replacement_session_id, runner_instance_id: expected.runner_instance_id, session_binding_id: expected.session_binding_id } };
+  assert.equal(verifyRunnerOwnership({ runtimeBinding, journalBinding, manifestBinding, expected }).status, "ATTESTED");
+
+  await t.test("a Pi session not created by the Runner has no runtime binding", () => {
+    const session = { sessionId: "SES-unowned", sessionManager: { getSessionId: () => "SES-unowned", getEntries: () => [] } };
+    assert.throws(() => readRuntimeRunnerBinding(session), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+  });
+  for (const [name, source, field, value] of [
+    ["runner_instance_id mismatch", "runtime", "runner_instance_id", "RUNNER-other"],
+    ["replacement_session_id mismatch", "manifest", "replacement_session_id", "SES-other"],
+    ["session binding mismatch", "journal", "session_binding_id", "BIND-other"],
+    ["handoff mismatch", "runtime", "handoff_id", "HO-stale"],
+  ]) {
+    await t.test(name, () => {
+      const values = {
+        runtimeBinding: { ...runtimeBinding },
+        journalBinding: { ...journalBinding, event_data: { ...journalBinding.event_data } },
+        manifestBinding: { ...manifestBinding },
+        expected,
+      };
+      values[`${source}Binding`][field] = value;
+      assert.throws(() => verifyRunnerOwnership(values), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+    });
+  }
+  await t.test("a superseded handoff binding fails closed", () => {
+    assert.throws(
+      () => verifyRunnerOwnership({ runtimeBinding, journalBinding: { ...journalBinding, status: "SUPERSEDED" }, manifestBinding, expected }),
+      (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED",
+    );
+  });
+  await t.test("SQLite persists and supersedes the authoritative Runner relation", () => {
+    const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+    storage.reserveHandoff({ handoff_id: expected.handoff_id, source_session_id: "SES-source", target_session_id: null, task_id: "TASK-T", state: "REPLACEMENT_SESSION_CREATING", latch_generation: 1 });
+    const handoff = storage.getHandoff(expected.handoff_id);
+    handoff.target_session_id = expected.replacement_session_id;
+    handoff.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
+    storage.saveHandoff(handoff);
+    const active = storage.bindRunnerSession(expected.handoff_id, expected);
+    assert.equal(active.status, "ACTIVE");
+    assert.deepEqual(active.event_data, journalBinding.event_data);
+    assert.equal(storage.events(expected.handoff_id).filter((event) => event.event_type === "RUNNER_SESSION_BOUND").length, 1);
+    const superseded = storage.supersedeRunnerSessionBinding(expected.handoff_id, "newer handoff");
+    assert.equal(superseded.status, "SUPERSEDED");
+    assert.throws(() => verifyRunnerOwnership({ runtimeBinding, journalBinding: superseded, manifestBinding, expected }), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+    storage.close();
+  });
 });
 
 test("sealed artifacts are immutable, indexed, and detect byte tampering", () => {

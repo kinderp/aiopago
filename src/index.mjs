@@ -1,5 +1,6 @@
 export * from "./artifact-store.mjs";
 export * from "./canonical.mjs";
+export * from "./context-advisor.mjs";
 export * from "./errors.mjs";
 export * from "./extension.mjs";
 export * from "./git-state.mjs";
@@ -7,5 +8,6 @@ export * from "./handoff.mjs";
 export * from "./ledger.mjs";
 export * from "./pi-loader.mjs";
 export * from "./runner.mjs";
+export * from "./runner-ownership.mjs";
 export * from "./safety.mjs";
 export * from "./storage.mjs";

@@ -1,24 +1,28 @@
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { sha256, stableId, utcNow } from "./canonical.mjs";
+import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
 
 export class HandoffService {
-  constructor({ storage, artifacts, ledger, observeGit, safePoint, modelPolicy = null, reasoningPolicy = null }) {
+  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null }) {
+    invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
     this.storage = storage;
     this.artifacts = artifacts;
     this.ledger = ledger;
     this.observeGit = observeGit;
     this.safePoint = safePoint;
+    this.runnerInstanceId = runnerInstanceId;
     this.modelPolicy = modelPolicy;
     this.reasoningPolicy = reasoningPolicy;
   }
 
   async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume }) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
+    if (mode === "confirm") this.ledger.satisfyOwnerGate?.({ command: "/eio handoff confirm", actor });
     const plan = this.ledger.read();
     const sourceFile = normalizePath(sourceSession.sessionFile);
     invariant(sourceFile, "PERSISTED_SOURCE_SESSION_REQUIRED");
@@ -36,6 +40,8 @@ export class HandoffService {
       source_session_file: sourceFile,
       target_session_id: null,
       target_session_file: null,
+      runner_instance_id: this.runnerInstanceId,
+      session_binding_id: opaqueId("BIND"),
       parent_session_id: sourceSessionId,
       parent_session_file: sourceFile,
       parent_checkpoint_id: parentHandoff?.checkpoint_id ?? null,
@@ -88,10 +94,17 @@ export class HandoffService {
     this.storage.saveHandoff(handoff, "REPLACEMENT_SESSION_CREATE_INTENT", { parent_session_file: sourceFile, event_key: `replacement-intent:${handoffId}` });
     let replacementResult;
     try {
-      replacementResult = await replacePaused(sourceFile, async (target) => this.finishPausedHandoff(handoffId, target, { mode, actor, confirmResume, sendResume }));
+      const expectedBinding = {
+        schema_version: "1.0.0",
+        handoff_id: handoffId,
+        runner_instance_id: handoff.runner_instance_id,
+        session_binding_id: handoff.session_binding_id,
+      };
+      replacementResult = await replacePaused(sourceFile, expectedBinding, async (target) => this.finishPausedHandoff(handoffId, target, { mode, actor, confirmResume, sendResume }));
     } catch (error) {
       handoff = this.storage.getHandoff(handoffId);
       if (handoff.target_session_id) throw error;
+      this.storage.supersedeRunnerSessionBinding(handoffId, "replacement creation failed before target registration");
       handoff.state = "HANDOFF_FAILED";
       handoff.failure = { code: "REPLACEMENT_SESSION_CREATE_UNKNOWN", message: error.message };
       handoff.manual_recovery = this.buildManualRecovery(handoff, "Replacement creation outcome is ambiguous");
@@ -116,6 +129,17 @@ export class HandoffService {
     h.target_session_file = normalizePath(session.sessionFile);
     h.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
     this.storage.saveHandoff(h, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: h.target_session_id, target_session_file: h.target_session_file, event_key: `replacement:${handoffId}` });
+
+    try {
+      const runtimeBinding = readRuntimeRunnerBinding(session);
+      invariant(runtimeBinding.handoff_id === h.handoff_id && runtimeBinding.runner_instance_id === h.runner_instance_id && runtimeBinding.session_binding_id === h.session_binding_id, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "replacement setup binding");
+      this.storage.bindRunnerSession(handoffId, runtimeBinding);
+    } catch (error) {
+      h = this.storage.getHandoff(handoffId);
+      h.state = "RUNNER_OWNERSHIP_ATTESTATION_FAILED";
+      this.storage.saveHandoff(h, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", { error: error.message });
+      throw error;
+    }
 
     h = this.storage.getHandoff(handoffId);
     h.resume_prompt_id = stableId("RP", h.handoff_id, h.checkpoint_digest, h.task_plan_revision, h.requirements_version);
@@ -165,6 +189,7 @@ export class HandoffService {
     invariant(sameGitState(checkpoint.payload.git_state, h.expected_git_state), "CHECKPOINT_MISMATCH", "git state");
     invariant(m.resume_manifest_id === h.resume_manifest_id && m.handoff_id === h.handoff_id && m.resume_prompt_id === h.resume_prompt_id, "MANIFEST_MISMATCH");
     invariant(m.source_session_id === h.source_session_id && m.replacement_session_id === h.target_session_id && m.parent_session_id === h.source_session_id, "STALE_HANDOFF");
+    this.attestRunnerOwnership(h, targetSession, m);
     invariant(m.repository === h.expected_git_state.repository_id && m.worktree === h.expected_git_state.workdir && m.branch === h.expected_git_state.branch && m.base_sha === h.expected_git_state.base_sha && m.head_sha === h.expected_git_state.head_sha && m.index_digest === h.expected_git_state.index_digest && m.worktree_digest === h.expected_git_state.worktree_digest && JSON.stringify(m.git_status_summary) === JSON.stringify(h.expected_git_state.status_entries), "MANIFEST_MISMATCH", "git state");
     invariant(targetSession.sessionId === h.target_session_id && historyEntries.length === 0 && targetSession.isIdle, "REPLACEMENT_NOT_PAUSED_NO_HISTORY");
     invariant(normalizePath(header.parentSession) === h.parent_session_file, "PARENT_LINEAGE_MISMATCH");
@@ -181,6 +206,29 @@ export class HandoffService {
     h.state = "RESUME_READY";
     this.storage.saveHandoff(h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
     return this.storage.getHandoff(handoffId);
+  }
+
+  attestRunnerOwnership(h, targetSession, manifest) {
+    invariant(h.runner_instance_id === this.runnerInstanceId, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "current Runner instance");
+    const expected = {
+      schema_version: "1.0.0",
+      handoff_id: h.handoff_id,
+      replacement_session_id: h.target_session_id,
+      runner_instance_id: this.runnerInstanceId,
+      session_binding_id: h.session_binding_id,
+    };
+    return verifyRunnerOwnership({
+      runtimeBinding: readRuntimeRunnerBinding(targetSession),
+      journalBinding: this.storage.getRunnerSessionBinding(h.handoff_id),
+      manifestBinding: {
+        schema_version: "1.0.0",
+        handoff_id: manifest.handoff_id,
+        replacement_session_id: manifest.replacement_session_id,
+        runner_instance_id: manifest.runner_instance_id,
+        session_binding_id: manifest.session_binding_id,
+      },
+      expected,
+    });
   }
 
   async resume(handoffId, { actor = "human:resume", sendResume }) {
@@ -279,6 +327,8 @@ export class HandoffService {
       checkpoint_digest: h.checkpoint_digest,
       source_session_id: h.source_session_id,
       replacement_session_id: h.target_session_id,
+      runner_instance_id: h.runner_instance_id,
+      session_binding_id: h.session_binding_id,
       parent_session_id: h.parent_session_id,
       parent_checkpoint_id: h.parent_checkpoint_id,
       session_lineage: [h.source_session_id, h.target_session_id],
