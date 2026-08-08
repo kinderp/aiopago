@@ -1,3 +1,16 @@
+# CHECKPOINT — M1-H2 H2-02A Controlled Calibration Protocol PASS
+
+- Perimetro eseguito esclusivamente: issue #9, `H2-02A`; application baseline H2-01 `930fc35d03d3f9795fa6402a047b0ded489e2817` invariata. L'experiment baseline è il commit di freeze che contiene questa sezione e il protocollo: il suo SHA va nei futuri run record, non nel manifest, evitando dipendenze circolari. Nessun RUN-40/50/60, Cost Guard, Advisor adattivo o cambio del default globale.
+- Congelato `H2-02A-PILOT-1`: i tre futuri worktree/branch devono partire identicamente dall'experiment baseline commit, con unica variabile intenzionale threshold process-local 40/50/60, modello `openai-codex/gpt-5.6-sol`, reasoning high, Pi 0.83.0, confirm, acceptance e completion identici, zero history copiata.
+- Workload scelto: `WL-HANDOFF-INCIDENT-INSPECTOR-1`, inspector locale read-only per incidenti handoff, con core, CLI, fixture/test/documentazione e cold review/fix in sessione pulita. È reale, non implementato, offline e non modifica soglie; nessun padding.
+- Non è garantibile il 60% su 272k: il protocollo richiede crossing autorevole più lifecycle completo per un run VALID; completion prima soglia è `CENSORED_EARLY_COMPLETION`, non evidenza della variante.
+- Quality baseline semplice: quattro gate PASS, nessuna regressione/finding bloccante/perdita di stato, quattro WCP accettati e rework registrato. Charged ed equivalent cost hanno aggregazioni e Cost per Accepted Checkpoint separati; token/costo puro handoff resta unknown se non attribuibile.
+- Artefatti: `docs/m1-h2-threshold-calibration.md`, `docs/m1-h2-calibration-pilot.json`; Ledger `PLAN-M1-H2-0004`, H2-02A DONE e H2-02B PLANNED. Il commit corrente effettua il freeze; prima del pilot restano run-record/extraction preflight e autorizzazione H2-02B.
+- Solo documentazione/protocollo: nessuna suite applicativa ripetuta. Validazione strutturale e `git diff --check` eseguite come gate documentali.
+- Esito: **H2-02A PASS**. `checkpoint_message`: “H2-02A PASS: protocollo pilot 40/50/60 congelato; nessun run avviato”.
+
+**STOP operativo:** non creare worktree pilot e non iniziare RUN-40 senza autorizzazione esplicita H2-02B.
+
 # CHECKPOINT — M1-H2 H2-01 Measurement Instrumentation PASS
 
 - Perimetro eseguito esclusivamente: issue #9, `H2-01`; baseline M1-H1 `b317f79c9723136203e24d216467ef80601cb64a` preservata. Nessun esperimento 40/50/60, cambio soglia, Cost Guard, auto-handoff, supervised-auto, routing o integrazione esterna.

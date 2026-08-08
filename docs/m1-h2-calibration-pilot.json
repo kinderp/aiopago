@@ -1,0 +1,75 @@
+{
+  "schema_version": "eiopago.threshold-calibration-protocol/1.0.0",
+  "protocol_id": "H2-02A-PILOT-1",
+  "issue": 9,
+  "application_baseline_commit": "930fc35d03d3f9795fa6402a047b0ded489e2817",
+  "experiment_baseline_commit": null,
+  "experiment_baseline_commit_rule": "The experiment baseline is the freeze commit containing this protocol; record its SHA in each run record after the freeze, without rewriting this manifest.",
+  "pilot_only": true,
+  "pilot_status": "PLANNED_NOT_STARTED",
+  "runs": [
+    { "run_id": "RUN-40", "status": "NOT_STARTED", "threshold_percent": 40, "branch": "calibration/h2-02b-run-40", "worktree": "F:/dev/eiopago-h2-run-40", "start_commit_role": "experiment_baseline_commit" },
+    { "run_id": "RUN-50", "status": "NOT_STARTED", "threshold_percent": 50, "branch": "calibration/h2-02b-run-50", "worktree": "F:/dev/eiopago-h2-run-50", "start_commit_role": "experiment_baseline_commit" },
+    { "run_id": "RUN-60", "status": "NOT_STARTED", "threshold_percent": 60, "branch": "calibration/h2-02b-run-60", "worktree": "F:/dev/eiopago-h2-run-60", "start_commit_role": "experiment_baseline_commit" }
+  ],
+  "controlled_environment": {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "reasoning_level": "high",
+    "pi_version": "0.83.0",
+    "node_version": "v22.19.0",
+    "confirm_mode": "advisor consent followed by /eio handoff confirm and immediate resume confirmation",
+    "compaction": "disabled by GuardianRunner",
+    "retry": "disabled by GuardianRunner",
+    "external_services": "forbidden"
+  },
+  "workload": {
+    "id": "WL-HANDOFF-INCIDENT-INSPECTOR-1",
+    "title": "Read-only Handoff Incident Inspector",
+    "purpose": "Add an offline, deterministic and privacy-safe inspector for handoff incidents without performing recovery or changing threshold logic.",
+    "deliverables": [
+      "src/handoff-inspector.mjs",
+      "bin/eio-inspect.mjs",
+      "test/handoff-inspector.test.mjs",
+      "docs/handoff-incident-inspector.md",
+      "docs/reviews/handoff-incident-inspector-review.md",
+      "package.json inspect script and src/index.mjs export"
+    ],
+    "requirements": [
+      "Open the existing Guardian SQLite database read-only and never migrate or mutate it; inspection must also leave artifact bytes unchanged.",
+      "Inspect one handoff by ID across handoff projection, latch, append-only journal ordering, runner binding, artifact index, sealed checkpoint and manifest, and only Pi session header/lineage metadata when available; never emit conversation content.",
+      "Return a versioned allowlisted report with deterministic ordering and no capture timestamp. Repeating against identical bytes must produce byte-identical JSON.",
+      "Classify the outcome as CONSISTENT_TERMINAL, PAUSED_RECOVERABLE, FAIL_CLOSED, or AMBIGUOUS and emit only predeclared action codes. Unknown schema/state is fail-closed.",
+      "RESUME_DISPATCH_UNKNOWN, digest mismatch, missing required authority, journal order violation, binding mismatch, duplicate/unknown target, or unreadable evidence must never recommend retry or automatic resume.",
+      "The CLI accepts --db, --guardian-root, --handoff and --format json; stdout is report-only, diagnostics go to stderr; exit 0 means consistent, 2 means a safety finding, and 64 means invalid invocation.",
+      "Use GuardianError/invariant conventions, export the public inspector API from src/index.mjs, add npm run inspect, and add no runtime dependency.",
+      "Tests use temporary local fixtures, block fetch, cover a healthy resumed handoff, paused recoverable handoff, ambiguous replacement creation, dispatch unknown, missing/tampered artifact, journal-order and binding mismatch, unknown state/schema, read-only byte preservation, recursive privacy allowlist, deterministic output, and CLI exit codes.",
+      "Document authority boundaries, decision table, CLI examples, privacy, exit codes, and the explicit limit that this tool diagnoses but does not repair or recover.",
+      "Do not implement Cost Guard, supervised-auto, crash recovery, provider integration, adaptive advice, or any change to context threshold behavior/default."
+    ],
+    "phases": [
+      { "checkpoint": "WCP-1", "name": "contract-and-core", "acceptance": "Inspector contract, read-only authority adapters, validations, classification, and stable report are implemented." },
+      { "checkpoint": "WCP-2", "name": "cli-and-integration", "acceptance": "CLI, exports and package integration satisfy the fixed arguments, output and exit-code contract." },
+      { "checkpoint": "WCP-3", "name": "tests-and-documentation", "acceptance": "Required offline fixture matrix and user/authority documentation are present; implementation session stops at READY_FOR_COLD_REVIEW." },
+      { "checkpoint": "WCP-4", "name": "cold-review-and-fix", "acceptance": "A fresh no-history session records requirement-by-requirement findings, fixes all blocking findings, and stops at READY_FOR_ACCEPTANCE." }
+    ],
+    "acceptance_commands": [
+      "npm run check",
+      "node --test --test-concurrency=1 test/handoff-inspector.test.mjs",
+      "npm test",
+      "git diff --check"
+    ],
+    "completion_marker": "READY_FOR_ACCEPTANCE"
+  },
+  "workload_prompt": "Execute protocol H2-02A-PILOT-1 workload WL-HANDOFF-INCIDENT-INSPECTOR-1 from the local byte-identical file .guardian/calibration/pilot-protocol.json. Read that file, TASK_PLAN.md, and only relevant repository sources. Do not change the protocol file, the handoff threshold implementation/default, model/reasoning, or scope. If TASK_PLAN.md is still the H2 calibration ledger, first convert it into a valid workload ledger with WCP-1 current, WCP-2..WCP-4 planned, this protocol file in minimal_reads, and the exact requirements and completion marker preserved; keep it current after each phase so an Eiopago handoff can resume without conversation history. Implement WCP-1 through WCP-3, using no external service and never inventing test results. Then stop with exactly READY_FOR_COLD_REVIEW. In the mandatory fresh no-history session, the same prompt applies: when TASK_PLAN.md shows WCP-4 current, independently review the diff requirement by requirement, write docs/reviews/handoff-incident-inspector-review.md with finding severity/status, fix every blocking finding, update the ledger, and stop with exactly READY_FOR_ACCEPTANCE. Do not run or simulate RUN-40/RUN-50/RUN-60 setup, do not copy conversation history, and do not claim acceptance commands passed unless their actual outputs are supplied by the operator.",
+  "workload_prompt_sha256": "d89957e5c3ccae4ad4ac57b5458fc7d45044cb1e8e22da1f4da2b7c22299af58",
+  "accepted_checkpoints": ["WCP-1", "WCP-2", "WCP-3", "WCP-4"],
+  "run_record_required_fields": {
+    "identity": ["run_id", "threshold_percent", "application_baseline_commit", "experiment_baseline_commit", "protocol_id", "protocol_file_sha256", "workload_prompt_sha256", "branch", "worktree"],
+    "environment": ["provider", "model", "reasoning_level", "pi_version", "node_version", "confirm_mode"],
+    "telemetry": ["session_ids", "context_samples", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_write_tokens", "model_calls", "charged_cost", "equivalent_cost"],
+    "handoff": ["handoff_count", "effective_handoff_contexts", "duration_ms", "artifact_bytes", "token_overhead", "cost_overhead"],
+    "quality": ["test_attempts", "test_failures", "review_findings", "rework_cycles", "regressions", "accepted_checkpoints", "final_acceptance"],
+    "outcome": ["run_started_at", "run_ended_at", "completion_time_ms", "classification", "classification_reasons", "cost_per_accepted_checkpoint"]
+  }
+}
