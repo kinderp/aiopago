@@ -1,5 +1,6 @@
 import { join, resolve } from "node:path";
 import { ArtifactStore } from "./artifact-store.mjs";
+import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
 import { ContextHandoffAdvisor } from "./context-advisor.mjs";
 import { createGuardianExtension } from "./extension.mjs";
@@ -20,6 +21,7 @@ export class GuardianRunner {
     const ledger = options.ledger ?? new TaskLedger(options.ledgerPath ?? join(cwd, "TASK_PLAN.md"));
     const plan = ledger.read();
     const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join(cwd, ".guardian", "runtime", "guardian.sqlite"));
+    if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
     storage.ensureLatch(plan.task_id);
     const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
@@ -39,7 +41,7 @@ export class GuardianRunner {
       thresholdPercent: options.contextHandoffThresholdPercent ?? process.env.EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT,
     });
     const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
-    const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
+    const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
     runner.metrics = options.metrics ?? new MeasurementInstrumentation({
       storage,
       ledger,
@@ -61,6 +63,10 @@ export class GuardianRunner {
       telemetry: runner.metrics,
     });
     await runner.createRuntime(options);
+    if (runner.calibration) {
+      runner.requireCalibrationRuntime();
+      gate.setPreflightVerifier((requestModel) => runner.requireCalibrationRuntime(requestModel));
+    }
     return runner;
   }
 
@@ -127,8 +133,14 @@ export class GuardianRunner {
     };
   }
 
+  requireCalibrationRuntime(requestModel = null) {
+    if (!this.calibration) return null;
+    return verifyCalibrationRuntimeState({ runner: this, attestationPath: this.calibration.attestationPath, requestModel });
+  }
+
   async handoffFromCommand(ctx, mode) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
+    if (this.confirmMode === "confirm") invariant(mode === "confirm", "CALIBRATION_CONFIRM_MODE_REQUIRED");
     return this.handoffService.handoff({
       sourceSession: this.runtime.session,
       mode,

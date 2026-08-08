@@ -3,28 +3,32 @@
 ## Stato e vincoli
 
 `H2-01 Measurement instrumentation` è la **application baseline** immutabile
-`930fc35d03d3f9795fa6402a047b0ded489e2817`. L'**experiment baseline H2-02A** è
-il commit di freeze che contiene questo protocollo e il relativo manifest; il
-suo SHA viene registrato dopo il commit nei run record, senza riscrivere il
-manifest e creare una dipendenza circolare. Tutti i branch pilot dovranno avere
-quell'unico commit come parent iniziale. Il pilot `H2-02B` è **PLANNED**: nessun
-RUN-40/RUN-50/RUN-60 è stato avviato e il default globale resta 50%.
+`930fc35d03d3f9795fa6402a047b0ded489e2817`. Il freeze H2-02A precedente era
+`d6a4b9cfa1e3c15cc0c9ea9ad9ead89216346254`; il futuro experiment baseline del
+pilot deve essere il commit di acceptance **H2-02A-F1** che contiene protocollo
+e launcher deterministico. Il suo SHA viene passato esplicitamente al launcher
+e registrato nei run record, senza riscrivere il manifest e creare una
+dipendenza circolare. Tutti i branch pilot dovranno avere quell'unico commit
+come parent iniziale. Il pilot `H2-02B` resta **PLANNED/BLOCKED** dall'acceptance
+F1 e il default globale resta 50%.
 
 Sono fuori scope Cost Guard, Advisor adattivo, auto-handoff, routing, provider
 esterni e qualsiasi modifica alla logica/default delle soglie.
 
 Protocollo machine-readable canonico: `docs/m1-h2-calibration-pilot.json`,
 `protocol_id=H2-02A-PILOT-1`, SHA-256 corrente
-`4706e0d9a43b34f9d6fd1524737481d62060fc5c5f384650980b13f027b00683`. Il
+`0af31e2ee41061c153d1e7c4cfaaf098db44f58ee41f15333b31b8afeb8bd2c1`. Il
 manifest dichiara separatamente `application_baseline_commit` e
 `experiment_baseline_commit=null`: quest'ultimo è intenzionalmente valorizzato
-soltanto nel run record con lo SHA del commit che congela questi byte.
+soltanto nell'attestation/run record con lo SHA del commit F1 che congela
+questi byte.
 
 ## Domanda sperimentale e pilot
 
 Il pilot confronta 40%, 50% e 60% sul medesimo workload. La sola variabile
 intenzionalmente manipolata è `EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT`, impostata
-nell'ambiente del singolo processo Runner. L'esito riguarda questo workload,
+dal launcher nell'ambiente del singolo processo Runner e duplicata come opzione
+SDK verificata. L'esito riguarda questo workload,
 questo modello e questa versione Pi; non dimostra una soglia universale.
 
 Primo ciclo, senza repliche aggiuntive preventive:
@@ -119,34 +123,43 @@ Non sono controllabili seed/temperature non esposti e latenza del provider.
 Versione, orari ed errori provider vengono registrati; un cambio di modello o
 un errore provider invalida il run.
 
-## Worktree e branch
+## Worktree, branch e bootstrap F1
 
-Da PowerShell, dopo il freeze, assegnare lo SHA completo del commit appena
-creato a `EXPERIMENT_BASELINE_COMMIT`. Non usare direttamente 930fc35 per creare
-i branch: quel commit resta la baseline applicativa contenuta nell'experiment
-baseline.
+Da PowerShell, dopo l'acceptance/commit F1, assegnare lo SHA completo del commit
+appena creato a `EXPERIMENT_BASELINE_COMMIT`. Non usare direttamente 930fc35 o
+il freeze precedente d6a4b9c: restano rispettivamente baseline applicativa e
+baseline sperimentale precedente, non eseguibile dopo il finding F1.
 
 ```powershell
-$EXPERIMENT_BASELINE_COMMIT='<SHA_DEL_COMMIT_FREEZE_H2-02A>'
+$EXPERIMENT_BASELINE_COMMIT='<SHA_DEL_COMMIT_FREEZE_H2-02A-F1>'
 git -C F:/dev/eiopago-m1-h2 worktree add -b calibration/h2-02b-run-40 F:/dev/eiopago-h2-run-40 $EXPERIMENT_BASELINE_COMMIT
 git -C F:/dev/eiopago-m1-h2 worktree add -b calibration/h2-02b-run-50 F:/dev/eiopago-h2-run-50 $EXPERIMENT_BASELINE_COMMIT
 git -C F:/dev/eiopago-m1-h2 worktree add -b calibration/h2-02b-run-60 F:/dev/eiopago-h2-run-60 $EXPERIMENT_BASELINE_COMMIT
 ```
 
-Ogni worktree deve iniziare clean, senza `.guardian/runtime`. Il protocollo
-committato viene copiato, byte per byte, nell'area ignored di ogni worktree e
-verificato prima del run:
+La copia manuale e il controllo manuale dell'assenza di SQLite sono sostituiti
+da `scripts/calibration-run.mjs`. Il launcher esegue prima del Runner processi
+Git locali, legge la versione package Pi installata, valida i byte JSON e il
+prompt, crea un `run_id` UUID, riserva atomicamente la directory ignored e
+materializza:
 
-```powershell
-New-Item -ItemType Directory -Force .guardian/calibration | Out-Null
-Copy-Item F:/dev/eiopago-m1-h2/docs/m1-h2-calibration-pilot.json .guardian/calibration/pilot-protocol.json
-(Get-FileHash .guardian/calibration/pilot-protocol.json -Algorithm SHA256).Hash.ToLower()
+```text
+.guardian/calibration/pilot-protocol.json  # copia compatibile col prompt frozen
+.guardian/calibration/<run_id>/
+  pilot-protocol.json                      # source of truth run-specific
+  preflight-attestation.json
+  run-record.json
+  runtime/guardian.sqlite                  # creato dopo il PASS dal Runner
 ```
 
-Il digest deve essere quello dichiarato sopra. La copia ignored non cambia il
-commit sorgente e fornisce la stessa specifica alle replacement session. Il
-file sorgente deve essere quello dell'experiment baseline; se branch, blob o
-digest non coincidono, stop: non rigenerarlo o editarlo nel worktree.
+`pilot-protocol.json` deve essere byte-identico sia al source sia al blob Git
+dell'experiment baseline. L'attestation usa schema
+`eiopago.calibration-preflight/1.0.0`; contiene identità run/experiment/workload,
+baseline, branch/worktree/clean status, versioni, digest protocollo/prompt,
+threshold requested/effective, provider/model/reasoning, confirm e identità/path
+dello store, senza prompt o history. Il run record nasce con
+`status=PREFLIGHT_PASSED`. Qualsiasi mismatch produce FAIL/INVALID e nessun
+Runner/provider/workload.
 
 ## Procedura esatta dei run
 
@@ -155,45 +168,50 @@ nella stessa finestra senza aggiornare Pi/Node/repository.
 
 ### Preflight comune
 
-Nel worktree selezionato:
+Il launcher verifica deterministicamente, prima del Runner: root/path worktree,
+HEAD completo passato dall'operatore, branch e path congelati nel manifest,
+`git status --porcelain` vuoto, Pi/Node, source JSON valido, identità byte del
+blob Git, digest completi di protocollo e prompt, threshold della variante e
+unicità del `run_id`. Il launcher stesso imposta
+`EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT` e passa la stessa threshold come opzione
+SDK al Runner: il testo del prompt non è autorità.
 
-1. verificare `git rev-parse HEAD` uguale all'experiment baseline registrata,
-   branch/path uguali al manifest e
-   `application_baseline_commit=930fc35d03d3f9795fa6402a047b0ded489e2817`;
-2. verificare che il diff application→experiment baseline contenga soltanto i
-   cinque file di protocollo congelati, poi `git status --porcelain` vuoto e assenza di
-   `.guardian/runtime/guardian.sqlite` prima della copia ignored;
-3. copiare/verificare il protocollo come sopra;
-4. registrare commit/digest protocollo, `node --version`, versione package Pi,
-   provider, modello e reasoning;
-5. creare il run record esterno al worktree dal template di campi del manifest,
-   senza prompt, response o history;
-6. impostare la soglia solo nel processo corrente; non modificare codice,
-   settings globali o default.
+Il criterio precedente “`.guardian/runtime/guardian.sqlite` assente dopo il
+Runner” era errato ed è rimosso. `GuardianStorage` supportava già un path
+configurabile; F1 lo usa per uno SQLite esclusivo sotto il `run_id`. Prima
+dell'apertura il path non esiste; all'apertura viene persistita una tupla
+`run_id/runtime_store_id/attestation_sha256`. Uno store preesistente,
+contaminato o con identità diversa fallisce chiuso. Nessun runtime esistente
+viene cancellato.
 
-### Comando per variante
+Pi 0.83.0 viene fissato tramite SDK pubblica: il launcher risolve il modello con
+`ModelRuntime.getModel()`, lo passa a `createAgentSessionFromServices`, passa
+`thinkingLevel`, poi verifica `AgentSession.model` e
+`AgentSession.thinkingLevel`. Il transport gate ripete il controllo prima di
+ogni provider stream; non viene parsato footer/UI. Confirm è l'opzione Runner
+esplicita `confirm`: in calibrazione il percorso `manual` è rifiutato e lo
+stato viene confrontato con l'attestation.
+
+### Comando futuro RUN-40
+
+Soltanto dopo acceptance F1 e autorizzazione H2-02B:
 
 ```powershell
-# RUN-40
 Set-Location F:/dev/eiopago-h2-run-40
-$env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT='40'
-npm run eio
-Remove-Item Env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT
-
-# RUN-50
-Set-Location F:/dev/eiopago-h2-run-50
-$env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT='50'
-npm run eio
-Remove-Item Env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT
-
-# RUN-60
-Set-Location F:/dev/eiopago-h2-run-60
-$env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT='60'
-npm run eio
-Remove-Item Env:EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT
+npm run calibration -- --variant RUN-40 --experiment-baseline $EXPERIMENT_BASELINE_COMMIT
 ```
 
-In ciascun TUI l'operatore incolla esattamente `workload_prompt` dal manifest.
+Il comando genera il `run_id`; non accetta una threshold discrezionale. Per la
+cold review si riusa esclusivamente l'identità stampata dal primo lancio:
+
+```powershell
+npm run calibration -- --resume-run <run_id>
+```
+
+La ripresa ricontrolla attestation, protocollo, HEAD/branch, store identity,
+threshold, model, reasoning e confirm, ma non pretende un worktree clean dopo
+il lavoro previsto. In ciascun TUI l'operatore incolla esattamente
+`workload_prompt` dal manifest.
 La prima attività sostanziale deve rendere `TASK_PLAN.md` un Ledger workload
 valido e aggiungere `.guardian/calibration/pilot-protocol.json` ai
 `minimal_reads`. Un handoff avvenuto prima di questa persistenza rende il run
@@ -207,8 +225,9 @@ Quando l'Advisor propone il passaggio, l'operatore esegue sempre e subito:
 4. nessun altro testo, riassunto o history incollato.
 
 Al marker `READY_FOR_COLD_REVIEW` si chiude ordinatamente il Runner, si registra
-la sessione e si riavvia `npm run eio` nello stesso worktree e con la stessa
-soglia process-local. Deve risultare un nuovo session ID senza conversation
+la sessione e si usa `npm run calibration -- --resume-run <run_id>` nello stesso
+worktree. Il launcher ripristina e verifica la stessa soglia process-local e lo
+stesso store isolato. Deve risultare un nuovo session ID senza conversation
 history; si incolla lo stesso `workload_prompt`. Anche durante la review si
 applica lo stesso comportamento Advisor/confirm.
 
@@ -227,6 +246,16 @@ l'output macchina necessario alla correzione, senza suggerimenti. Ogni ciclo
 failure→fix→rerun incrementa `rework_cycles`. Si ripete l'intero ordine dei gate.
 Il run termina alla decisione finale di acceptance e alla chiusura ordinata del
 Runner; non si crea un commit prima della cattura delle metriche.
+
+## Finding RUN-40 attempt 1
+
+`RUN-40-ATTEMPT-1 = INVALID_PREFLIGHT`. È stato fermato prima del workload:
+il protocollo ignored non era stato materializzato prima del Runner, il test di
+assenza SQLite veniva eseguito dopo che il Runner lo aveva inizializzato e
+Git/model/reasoning/confirm/digest non erano attestabili dalla sessione. Il
+fail-closed osservato è corretto. Questo tentativo **non è una replica
+sperimentale**, non va ripreso e non può essere trasformato retroattivamente in
+VALID.
 
 ## Validità
 
@@ -372,10 +401,10 @@ Il run record esterno deve però integrare deterministicamente dati che H2-01
 lascia intenzionalmente `null`: commit/versioni preflight, acceptance, review,
 rework, regressioni e charged cost.
 
-Prima di RUN-40 sono quindi obbligatori: commit del protocollo, template run
-record conforme ai campi del manifest e procedura di estrazione/validazione
-dello SQLite. Un exporter può ridurre errori manuali ma non è richiesto e non va
-trasformato in framework. Charged/provider cost resta `unknown`; non deve essere
+Prima di un nuovo RUN-40 sono quindi obbligatori: acceptance/commit F1,
+worktree creato da quel commit e PASS reale del launcher. Attestation, run
+record e isolamento/identità SQLite sono ora prodotti dal bootstrap minimo;
+non costituiscono un orchestratore generale. Charged/provider cost resta `unknown`; non deve essere
 sostituito dall'equivalent. Se non si riesce a produrre un record completo senza
 modifica telemetry, il pilot resta bloccato e si autorizza separatamente un
 collector esterno identico per tutti i run, senza cambiare application o experiment baseline.

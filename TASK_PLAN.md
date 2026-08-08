@@ -2,9 +2,9 @@
 
 **Authority:** Markdown canonico standalone
 **Schema:** `eiopago.task-ledger/0.1.0`
-**Current revision:** `PLAN-M1-H2-0004`
-**Requirements version:** `REQ-M1-H2-ISSUE-9-H2-02A-FREEZE-2026-08-08`
-**Updated:** 2026-08-08T18:26:14.192Z
+**Current revision:** `PLAN-M1-H2-0005`
+**Requirements version:** `REQ-M1-H2-ISSUE-10-H2-02A-F1-2026-08-08`
+**Updated:** 2026-08-08T20:09:22.073Z
 
 ```json task-ledger
 {
@@ -12,8 +12,8 @@
   "task_id": "TASK-EIOPAGO-M1-H2",
   "title": "Handoff Threshold Calibration",
   "objective": "Confrontare in modo riproducibile soglie handoff 40/50/60 rispetto a Cost per Accepted Checkpoint e quality baseline, separando costi charged ed equivalent e senza cambiare il default globale.",
-  "requirements_version": "REQ-M1-H2-ISSUE-9-H2-02A-FREEZE-2026-08-08",
-  "plan_revision_id": "PLAN-M1-H2-0004",
+  "requirements_version": "REQ-M1-H2-ISSUE-10-H2-02A-F1-2026-08-08",
+  "plan_revision_id": "PLAN-M1-H2-0005",
   "status": "IN_PROGRESS",
   "completion_criteria": [
     "H2-01 telemetry resta la application baseline immutabile 930fc35d03d3f9795fa6402a047b0ded489e2817",
@@ -24,16 +24,18 @@
   ],
   "risk": "HIGH",
   "created_at": "2026-08-08T16:45:00Z",
-  "updated_at": "2026-08-08T18:26:14.192Z",
+  "updated_at": "2026-08-08T20:09:22.073Z",
   "current_item": null,
   "next_item": "ITEM-H2-02B",
-  "next_step": "STOP: il commit che contiene PLAN-M1-H2-0004 è l'experiment baseline H2-02A. Registrarene lo SHA nei futuri run record; non creare worktree e non avviare RUN-40/50/60 senza autorizzazione esplicita H2-02B.",
+  "next_step": "STOP: H2-02B resta PLANNED/BLOCKED finché H2-02A-F1 non è accettato e congelato in un nuovo experiment baseline commit; non avviare RUN-40/50/60.",
   "evidence": [
     "Application baseline H2-01 930fc35d03d3f9795fa6402a047b0ded489e2817",
     "Experiment baseline definita come il freeze commit contenente questo Ledger e il protocollo, senza SHA circolare nel manifest",
     "docs/m1-h2-threshold-calibration.md",
     "docs/m1-h2-calibration-pilot.json protocol H2-02A-PILOT-1",
-    "H2-02A non ha eseguito pilot né cambiato codice/default"
+    "RUN-40-ATTEMPT-1 registrato INVALID_PREFLIGHT e non replica sperimentale",
+    "scripts/calibration-run.mjs e src/calibration-preflight.mjs",
+    "Attestation eiopago.calibration-preflight/1.0.0 e SQLite run-specific identity"
   ],
   "model_policy": "openai-codex/gpt-5.6-sol",
   "reasoning_policy": "high",
@@ -118,13 +120,48 @@
       "last_updated_by": "Pi session 019fe291-152c-7a16-9b85-7405e964709a"
     },
     {
+      "task_item_id": "ITEM-H2-02A-F1",
+      "task_id": "TASK-EIOPAGO-M1-H2",
+      "title": "Deterministic calibration bootstrap/preflight",
+      "description": "Correggere il finding reale pre-workload con launcher fail-closed, attestazione machine-readable, stato Pi autorevole e runtime store isolato per run.",
+      "status": "DONE",
+      "depends_on": [
+        "ITEM-H2-02A"
+      ],
+      "completion_criteria": [
+        "Preflight prima del Runner verifica worktree, HEAD, branch, clean status, Pi, protocollo/prompt e run_id univoco",
+        "Launcher fissa threshold e Runner fissa/verifica model, reasoning e confirm tramite API SDK pubbliche",
+        "Protocollo byte-identico, attestation e run-record PREFLIGHT_PASSED sono persisted prima del workload",
+        "SQLite usa path e identità run-specific senza cancellare runtime esistenti",
+        "Mismatch blocca input e provider stream prima del workload",
+        "RUN-40 attempt 1 resta INVALID_PREFLIGHT e non replica"
+      ],
+      "evidence": [
+        "src/calibration-preflight.mjs",
+        "scripts/calibration-run.mjs",
+        "test/calibration-preflight.test.mjs",
+        "docs/m1-h2-threshold-calibration.md",
+        "docs/m1-h2-calibration-pilot.json",
+        "Offline preflight tests 17/17 PASS",
+        "Final gates: npm run check 23 modules; npm test 46/46; E2E 6/6; git diff --check PASS"
+      ],
+      "requirements_refs": [
+        "GitHub issue #10",
+        "H2-02A-F1 Deterministic calibration bootstrap/preflight"
+      ],
+      "risk": "HIGH",
+      "milestone": "M1-H2",
+      "last_updated_at": "2026-08-08T20:09:22.073Z",
+      "last_updated_by": "Pi session 019fe2f5-14f9-7217-8f3b-7c8a3530c454"
+    },
+    {
       "task_item_id": "ITEM-H2-02B",
       "task_id": "TASK-EIOPAGO-M1-H2",
       "title": "Controlled calibration pilot",
       "description": "Eseguire RUN-40 x1, RUN-50 x1 e RUN-60 x1 secondo il protocollo congelato, classificare i run e confrontare soltanto varianti valid/accepted.",
-      "status": "PLANNED",
+      "status": "BLOCKED",
       "depends_on": [
-        "ITEM-H2-02A"
+        "ITEM-H2-02A-F1"
       ],
       "completion_criteria": [
         "Protocollo e run-record template presenti nell'experiment baseline commit prima di RUN-40",
@@ -133,15 +170,17 @@
         "Run censored/invalid esclusi correttamente dal confronto",
         "Conclusione limitata al pilot e repliche proposte solo se risultati vicini/rumorosi"
       ],
-      "evidence": [],
+      "evidence": [
+        "Blocked pending H2-02A-F1 acceptance and freeze commit"
+      ],
       "requirements_refs": [
         "GitHub issue #9",
         "H2-02B Controlled Calibration Pilot"
       ],
       "risk": "HIGH",
       "milestone": "M1-H2",
-      "last_updated_at": "2026-08-08T18:18:32.752Z",
-      "last_updated_by": "Pi session 019fe291-152c-7a16-9b85-7405e964709a"
+      "last_updated_at": "2026-08-08T20:09:22.073Z",
+      "last_updated_by": "Pi session 019fe2f5-14f9-7217-8f3b-7c8a3530c454"
     }
   ]
 }
@@ -150,8 +189,8 @@
 ## Regole di avanzamento
 
 - H2-01 resta la application baseline accettata e non viene modificata retroattivamente.
-- Il commit di freeze che contiene questo Ledger è l'experiment baseline H2-02A; il suo SHA va nei run record, non nel manifest congelato.
-- H2-02A è il protocollo corrente completato; H2-02B resta PLANNED.
+- Il futuro commit di freeze/acceptance F1 che contiene questo Ledger e il launcher sarà l'experiment baseline; il suo SHA va nelle attestation/run record, non nel manifest congelato.
+- H2-02A-F1 corregge il preflight deterministico; H2-02B resta PLANNED/BLOCKED fino ad acceptance e freeze commit F1.
 - Un completamento prima della soglia è censored, non prova una soglia.
 - La qualità è un gate; il costo più basso non basta.
 - Nessuna soglia ottimale o universalità è dichiarata dal pilot x1.

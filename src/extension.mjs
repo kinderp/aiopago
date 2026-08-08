@@ -86,6 +86,13 @@ export function createGuardianExtension(runner) {
     pi.on("session_shutdown", (event, ctx) => safeMetric(runner, "endSession", ctx, event));
 
     pi.on("input", (_event, ctx) => {
+      if (runner.calibration) {
+        try { runner.requireCalibrationRuntime(ctx.model); }
+        catch (error) {
+          ctx.ui.notify(`RUN INVALID: ${message(error)}`, "error");
+          return { action: "handled" };
+        }
+      }
       const task = runner.ledger.read();
       if (!runner.storage.isAdmissionOpen(task.task_id)) {
         ctx.ui.notify("Eiopago latch engaged: only local /eio commands are admitted", "warning");

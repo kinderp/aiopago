@@ -10,6 +10,7 @@
     "check": "node scripts/check.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs",
-    "eio": "node bin/eio.mjs"
+    "eio": "node bin/eio.mjs",
+    "calibration": "node scripts/calibration-run.mjs"
   }
 }

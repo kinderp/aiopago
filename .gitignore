@@ -3,6 +3,7 @@
 .guardian/checkpoints/
 .guardian/manifests/
 .guardian/test-runs/
+.guardian/calibration/
 
 # Node/tooling
 node_modules/

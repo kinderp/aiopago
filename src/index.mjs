@@ -1,5 +1,6 @@
 export * from "./artifact-store.mjs";
 export * from "./canonical.mjs";
+export * from "./calibration-preflight.mjs";
 export * from "./context-advisor.mjs";
 export * from "./errors.mjs";
 export * from "./extension.mjs";

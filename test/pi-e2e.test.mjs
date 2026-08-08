@@ -97,7 +97,7 @@ async function makeRunner({ ownerGate = false } = {}) {
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const sessions = mkdtempSync(join(tmpdir(), "eiopago-pi-sessions-"));
-  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off", settingsManager: settings, sessionDir: sessions, noTools: "all" });
+  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off", contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
   await runner.runtime.session.bindExtensions({
     mode: "print",
     commandContextActions: {

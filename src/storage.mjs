@@ -23,6 +23,13 @@ export class GuardianStorage {
         authority TEXT NOT NULL,
         schema_version TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS calibration_runtime_identity(
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        run_id TEXT NOT NULL UNIQUE,
+        runtime_store_id TEXT NOT NULL UNIQUE,
+        attestation_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS journal(
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id TEXT NOT NULL UNIQUE,
@@ -150,7 +157,9 @@ export class GuardianStorage {
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
+        ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Guardian SQLite canonical runtime','1.0.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
@@ -163,6 +172,28 @@ export class GuardianStorage {
         ('metric_diagnostics','Guardian SQLite bounded collection diagnostics','1.0.0'),
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
     `);
+  }
+
+  getCalibrationRuntimeIdentity() {
+    return this.db.prepare("SELECT run_id,runtime_store_id,attestation_sha256,created_at FROM calibration_runtime_identity WHERE singleton=1").get() ?? null;
+  }
+
+  bindCalibrationRuntimeIdentity(identity, { allowExisting = false } = {}) {
+    invariant(identity?.run_id && identity?.runtime_store_id && /^[a-f0-9]{64}$/.test(identity?.attestation_sha256 ?? ""), "CALIBRATION_RUNTIME_IDENTITY_INVALID");
+    return this.transaction(() => {
+      const prior = this.getCalibrationRuntimeIdentity();
+      if (prior) {
+        invariant(allowExisting, "STALE_RUNTIME_STORE", this.path);
+        invariant(prior.run_id === identity.run_id && prior.runtime_store_id === identity.runtime_store_id && prior.attestation_sha256 === identity.attestation_sha256, "RUNTIME_IDENTITY_MISMATCH");
+        return prior;
+      }
+      const domainTables = ["journal", "latches", "handoffs", "runner_session_bindings", "operations", "artifacts", "metric_sessions", "metric_samples", "metric_handoff_events", "metric_diagnostics"];
+      const contaminated = domainTables.filter((table) => this.db.prepare(`SELECT 1 AS present FROM ${table} LIMIT 1`).get());
+      invariant(contaminated.length === 0, "STALE_RUNTIME_STORE", this.path, contaminated);
+      this.db.prepare("INSERT INTO calibration_runtime_identity(singleton,run_id,runtime_store_id,attestation_sha256,created_at) VALUES(1,?,?,?,?)")
+        .run(identity.run_id, identity.runtime_store_id, identity.attestation_sha256, utcNow());
+      return this.getCalibrationRuntimeIdentity();
+    });
   }
 
   transaction(fn) {

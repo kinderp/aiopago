@@ -15,6 +15,12 @@ export class AdmissionGate {
     this.taskId = taskId;
     this.activeStreams = 0;
     this.waiters = new Set();
+    this.preflightVerifier = null;
+  }
+
+  setPreflightVerifier(verifier) {
+    invariant(typeof verifier === "function", "PREFLIGHT_VERIFIER_INVALID");
+    this.preflightVerifier = verifier;
   }
 
   guardProvider(provider) {
@@ -26,8 +32,8 @@ export class AdmissionGate {
       headers: provider.headers,
       auth: provider.auth,
       getModels: provider.getModels.bind(provider),
-      stream(model, context, options) { return gate.admit(() => provider.stream(model, context, options)); },
-      streamSimple(model, context, options) { return gate.admit(() => provider.streamSimple(model, context, options)); },
+      stream(model, context, options) { return gate.admit(() => provider.stream(model, context, options), model); },
+      streamSimple(model, context, options) { return gate.admit(() => provider.streamSimple(model, context, options), model); },
     };
     if (provider.refreshModels) guarded.refreshModels = provider.refreshModels.bind(provider);
     if (provider.filterModels) guarded.filterModels = provider.filterModels.bind(provider);
@@ -38,8 +44,9 @@ export class AdmissionGate {
     for (const provider of [...modelRuntime.getProviders()]) modelRuntime.registerNativeProvider(this.guardProvider(provider));
   }
 
-  admit(openStream) {
+  admit(openStream, requestModel = null) {
     if (!this.storage.isAdmissionOpen(this.taskId)) throw new GuardianError("LLM_ADMISSION_BLOCKED", "Guardian latch is engaged or unreadable");
+    if (this.preflightVerifier) this.preflightVerifier(requestModel);
     this.activeStreams += 1;
     let stream;
     try { stream = openStream(); }
