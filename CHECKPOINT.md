@@ -1,3 +1,18 @@
+# CHECKPOINT — M1-H2 H2-01 Measurement Instrumentation PASS
+
+- Perimetro eseguito esclusivamente: issue #9, `H2-01`; baseline M1-H1 `b317f79c9723136203e24d216467ef80601cb64a` preservata. Nessun esperimento 40/50/60, cambio soglia, Cost Guard, auto-handoff, supervised-auto, routing o integrazione esterna.
+- Implementato schema `eiopago.metrics/1.0.0`: summary sessione, sample automatico per assistant `turn_end`, eventi handoff misurati e diagnostici. Correlazione session/task/item/checkpoint/handoff quando nota; quality/rework predisposti con valori null senza score inventato.
+- Superfici Pi 0.83.0 usate: `session_start`, `session_shutdown`, `turn_end.message.usage`, `ctx.getContextUsage()` e `ctx.sessionManager.getSessionId()`. Charged/provider cost, subscription equivalent, cache-hit rate e minimal reads realmente osservate restano explicit unknown.
+- Overhead misurato da byte reali: stat di `TASK_PLAN.md`, buffer sealed checkpoint/manifest e `Buffer.byteLength` del resume prompt. Il count dichiarato nel manifest è separato dalle reads effettive unknown; nessuna conversation history/prompt/response viene salvata.
+- Persistenza: tabelle bounded nello SQLite Guardian esistente; default 100 sessioni, 2.000 sample, 1.000 eventi handoff e 100 diagnostici. Il journal resta autorità del lifecycle operativo H1; le tabelle metriche sono autorità delle sole misure.
+- Failure telemetry è non decisionale/non bloccante: nessuno zero inventato, diagnostico minimale bounded senza testo potenzialmente sensibile. Lifecycle H1 e soglia default 50% non sono stati modificati.
+- Test H2 mirati: **7/7 PASS**. Gate finali: `npm run check` **PASS** (20 moduli); `npm test` **PASS** (29 test, 22 top-level, E2E 6/6); `git diff --check` **PASS** con solo warning informativo LF→CRLF su `TASK_PLAN.md`.
+- Ledger: `PLAN-M1-H2-0002`; `ITEM-H2-01=DONE`, `ITEM-H2-02=PLANNED`, `current_item=null`, `next_item=ITEM-H2-02`. Documentazione: `docs/m1-h2-threshold-calibration.md`.
+- Esito: **H2-01 PASS**. Prima di H2-02 servono nuova autorizzazione, protocollo controllato, run comparabili e associazione acceptance/quality baseline.
+- `checkpoint_message`: “H2-01 PASS: telemetry Pi/runtime bounded, correlata e privacy-safe; 29/29 test verdi”.
+
+**STOP operativo:** non avviare H2-02 o dogfood 40/50/60 e non dichiarare una soglia ottimale senza nuova autorizzazione esplicita.
+
 # CHECKPOINT — M1-H1 PASS; dogfood post-fix e acceptance completati
 
 ## Sessione B — chiusura H1-02/H1-03

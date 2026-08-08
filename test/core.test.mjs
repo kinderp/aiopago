@@ -47,6 +47,10 @@ test("Context Handoff Advisor prepares the canonical command only after user con
     ledger: { read: () => ({ task_id: "TASK-T" }) },
     storage: { isAdmissionOpen: () => true },
     contextAdvisor: new ContextHandoffAdvisor({ thresholdPercent: 50 }),
+    metrics: {
+      captureModelCall() { throw new Error("telemetry must not alter advisor behavior"); },
+      recordHandoffEvent() { throw new Error("telemetry must not alter advisor behavior"); },
+    },
     toolTracker: { admit() {}, finish() {} },
     async handoffFromCommand() { automaticHandoffs += 1; },
   };

@@ -7,6 +7,7 @@ import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
 import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
+import { MeasurementInstrumentation } from "./metrics.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
@@ -39,6 +40,13 @@ export class GuardianRunner {
     });
     const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
     const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
+    runner.metrics = options.metrics ?? new MeasurementInstrumentation({
+      storage,
+      ledger,
+      runnerInstanceId,
+      thresholdPercent: contextAdvisor.thresholdPercent,
+      retention: options.metricsRetention,
+    });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
     runner.handoffService = new HandoffService({
@@ -50,6 +58,7 @@ export class GuardianRunner {
       runnerInstanceId,
       modelPolicy,
       reasoningPolicy,
+      telemetry: runner.metrics,
     });
     await runner.createRuntime(options);
     return runner;
@@ -63,7 +72,7 @@ export class GuardianRunner {
 
   async createRuntime(options) {
     const { coding } = this.pi;
-    const inline = { name: "eiopago-m1-h1", factory: createGuardianExtension(this) };
+    const inline = { name: "eiopago-m1-h2", factory: createGuardianExtension(this) };
     const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
       const services = await coding.createAgentSessionServices({
         cwd,

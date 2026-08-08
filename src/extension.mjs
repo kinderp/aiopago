@@ -4,6 +4,9 @@ function message(error) { return error instanceof GuardianError ? `${error.code}
 function safeNotify(ctx, text, type) {
   try { ctx.ui.notify(text, type); } catch { console.error(`[eiopago] ${text}`); }
 }
+function safeMetric(runner, method, ...args) {
+  try { return runner.metrics?.[method]?.(...args) ?? null; } catch { return null; }
+}
 
 async function adviseHandoff(runner, ctx) {
   if (!ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
@@ -11,6 +14,11 @@ async function adviseHandoff(runner, ctx) {
   if (!runner.storage.isAdmissionOpen(task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
+  safeMetric(runner, "recordHandoffEvent", "SUGGESTED", {
+    ctx,
+    threshold_percent: proposal.thresholdPercent,
+    reason: "CONTEXT_THRESHOLD_REACHED",
+  });
   const percent = Math.round(proposal.percent);
   try {
     const prepare = await ctx.ui.confirm(
@@ -18,6 +26,11 @@ async function adviseHandoff(runner, ctx) {
       `Context: ${percent}% (soglia configurata: ${proposal.thresholdPercent}%)\nHandoff consigliato.\n\nPreparare il passaggio a una nuova sessione?`,
     );
     if (!prepare) return;
+    safeMetric(runner, "recordHandoffEvent", "PREPARED", {
+      ctx,
+      threshold_percent: proposal.thresholdPercent,
+      reason: "USER_CONSENTED_TO_ADVISORY",
+    });
     ctx.ui.setEditorText("/eio handoff confirm");
     safeNotify(ctx, "Comando /eio handoff confirm preparato. Premi Invio per avviare il percorso M1-H0.", "info");
   } catch (error) {
@@ -66,7 +79,11 @@ export function createGuardianExtension(runner) {
       }
     }
 
-    pi.on("session_start", () => runner.contextAdvisor.reset());
+    pi.on("session_start", (event, ctx) => {
+      runner.contextAdvisor.reset();
+      safeMetric(runner, "startSession", ctx, event);
+    });
+    pi.on("session_shutdown", (event, ctx) => safeMetric(runner, "endSession", ctx, event));
 
     pi.on("input", (_event, ctx) => {
       const task = runner.ledger.read();
@@ -77,7 +94,10 @@ export function createGuardianExtension(runner) {
       return { action: "continue" };
     });
 
-    pi.on("turn_end", (_event, ctx) => adviseHandoff(runner, ctx));
+    pi.on("turn_end", async (event, ctx) => {
+      safeMetric(runner, "captureModelCall", event, ctx);
+      await adviseHandoff(runner, ctx);
+    });
 
     pi.on("tool_call", (event) => {
       try { runner.toolTracker.admit(event.toolCallId, event.toolName, event.input); }

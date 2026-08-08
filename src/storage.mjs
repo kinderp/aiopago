@@ -112,17 +112,55 @@ export class GuardianStorage {
         created_at TEXT NOT NULL,
         PRIMARY KEY(kind, artifact_id)
       );
+      CREATE TABLE IF NOT EXISTS metric_sessions(
+        session_id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        updated_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS metric_samples(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        sample_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL REFERENCES metric_sessions(session_id) ON DELETE CASCADE,
+        call_index INTEGER NOT NULL,
+        captured_at TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        UNIQUE(session_id, call_index)
+      );
+      CREATE TABLE IF NOT EXISTS metric_handoff_events(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric_event_id TEXT NOT NULL UNIQUE,
+        session_id TEXT,
+        handoff_id TEXT,
+        lifecycle_state TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS metric_diagnostics(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        diagnostic_id TEXT NOT NULL UNIQUE,
+        occurred_at TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS journal_handoff_seq ON journal(handoff_id, seq);
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id, state);
+      CREATE INDEX IF NOT EXISTS metric_sample_session_seq ON metric_samples(session_id, seq);
+      CREATE INDEX IF NOT EXISTS metric_handoff_id_seq ON metric_handoff_events(handoff_id, seq);
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
-        ('journal','Guardian SQLite append-only','1.0.0'),
+        ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Guardian SQLite canonical runtime','1.0.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Guardian SQLite canonical runtime','1.0.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
+        ('metric_sessions','Guardian SQLite bounded measurement summary','1.0.0'),
+        ('metric_samples','Guardian SQLite bounded per-call measurement','1.0.0'),
+        ('metric_handoff_events','Guardian SQLite bounded measurement events; journal remains operational authority','1.0.0'),
+        ('metric_diagnostics','Guardian SQLite bounded collection diagnostics','1.0.0'),
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
     `);
   }
@@ -209,6 +247,11 @@ export class GuardianStorage {
 
   findHandoffByTarget(targetSessionId) {
     const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE target_session_id=? ORDER BY created_at DESC LIMIT 1").get(targetSessionId);
+    return row ? this.getHandoff(row.handoff_id) : null;
+  }
+
+  findHandoffBySource(sourceSessionId) {
+    const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE source_session_id=? ORDER BY created_at DESC LIMIT 1").get(sourceSessionId);
     return row ? this.getHandoff(row.handoff_id) : null;
   }
 
@@ -376,6 +419,81 @@ export class GuardianStorage {
   }
 
   operationsForTask(taskId) { return this.db.prepare("SELECT * FROM operations WHERE task_id=? ORDER BY admitted_at").all(taskId); }
+
+  metricLimit(value) {
+    invariant(Number.isInteger(value) && value > 0, "METRICS_RETENTION_INVALID");
+    return value;
+  }
+
+  upsertMetricSession(record, retentionLimit) {
+    const limit = this.metricLimit(retentionLimit);
+    this.transaction(() => {
+      this.db.prepare(`INSERT INTO metric_sessions(session_id,started_at,ended_at,updated_at,record_json) VALUES(?,?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at,ended_at=excluded.ended_at,updated_at=excluded.updated_at,record_json=excluded.record_json`)
+        .run(record.session_id, record.started_at, record.ended_at, record.updated_at, JSON.stringify(record));
+      this.db.prepare("DELETE FROM metric_sessions WHERE session_id NOT IN (SELECT session_id FROM metric_sessions ORDER BY updated_at DESC, rowid DESC LIMIT ?)").run(limit);
+    });
+    return this.getMetricSession(record.session_id);
+  }
+
+  getMetricSession(sessionId) {
+    const row = this.db.prepare("SELECT record_json FROM metric_sessions WHERE session_id=?").get(sessionId);
+    return row ? JSON.parse(row.record_json) : null;
+  }
+
+  metricSessions() {
+    return this.db.prepare("SELECT record_json FROM metric_sessions ORDER BY updated_at, rowid").all().map((row) => JSON.parse(row.record_json));
+  }
+
+  appendMetricSample(record, sessionSummary, retentionLimit) {
+    const limit = this.metricLimit(retentionLimit);
+    return this.transaction(() => {
+      this.db.prepare("INSERT INTO metric_samples(sample_id,session_id,call_index,captured_at,record_json) VALUES(?,?,?,?,?)")
+        .run(record.sample_id, record.session_id, record.call_index, record.captured_at, JSON.stringify(record));
+      this.db.prepare("UPDATE metric_sessions SET started_at=?,ended_at=?,updated_at=?,record_json=? WHERE session_id=?")
+        .run(sessionSummary.started_at, sessionSummary.ended_at, sessionSummary.updated_at, JSON.stringify(sessionSummary), record.session_id);
+      this.db.prepare("DELETE FROM metric_samples WHERE seq NOT IN (SELECT seq FROM metric_samples ORDER BY seq DESC LIMIT ?)").run(limit);
+      return record;
+    });
+  }
+
+  metricSamples(sessionId = null) {
+    const rows = sessionId
+      ? this.db.prepare("SELECT record_json FROM metric_samples WHERE session_id=? ORDER BY seq").all(sessionId)
+      : this.db.prepare("SELECT record_json FROM metric_samples ORDER BY seq").all();
+    return rows.map((row) => JSON.parse(row.record_json));
+  }
+
+  appendHandoffMetricEvent(record, retentionLimit) {
+    const limit = this.metricLimit(retentionLimit);
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO metric_handoff_events(metric_event_id,session_id,handoff_id,lifecycle_state,occurred_at,record_json) VALUES(?,?,?,?,?,?)")
+        .run(record.metric_event_id, record.session_id, record.handoff_id, record.lifecycle_state, record.timestamp, JSON.stringify(record));
+      this.db.prepare("DELETE FROM metric_handoff_events WHERE seq NOT IN (SELECT seq FROM metric_handoff_events ORDER BY seq DESC LIMIT ?)").run(limit);
+    });
+    return record;
+  }
+
+  handoffMetricEvents(handoffId = null) {
+    const rows = handoffId
+      ? this.db.prepare("SELECT record_json FROM metric_handoff_events WHERE handoff_id=? ORDER BY seq").all(handoffId)
+      : this.db.prepare("SELECT record_json FROM metric_handoff_events ORDER BY seq").all();
+    return rows.map((row) => JSON.parse(row.record_json));
+  }
+
+  appendMetricDiagnostic(record, retentionLimit) {
+    const limit = this.metricLimit(retentionLimit);
+    this.transaction(() => {
+      this.db.prepare("INSERT INTO metric_diagnostics(diagnostic_id,occurred_at,record_json) VALUES(?,?,?)")
+        .run(record.diagnostic_id, record.timestamp, JSON.stringify(record));
+      this.db.prepare("DELETE FROM metric_diagnostics WHERE seq NOT IN (SELECT seq FROM metric_diagnostics ORDER BY seq DESC LIMIT ?)").run(limit);
+    });
+    return record;
+  }
+
+  metricDiagnostics() {
+    return this.db.prepare("SELECT record_json FROM metric_diagnostics ORDER BY seq").all().map((row) => JSON.parse(row.record_json));
+  }
 
   indexArtifact({ kind, id, path, digest, contentDigest }) {
     const prior = this.getArtifact(kind, id);

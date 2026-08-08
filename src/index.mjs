@@ -6,6 +6,7 @@ export * from "./extension.mjs";
 export * from "./git-state.mjs";
 export * from "./handoff.mjs";
 export * from "./ledger.mjs";
+export * from "./metrics.mjs";
 export * from "./pi-loader.mjs";
 export * from "./runner.mjs";
 export * from "./runner-ownership.mjs";

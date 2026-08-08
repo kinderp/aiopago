@@ -1,14 +1,16 @@
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import { measureHandoffArtifacts } from "./metrics.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
 
 export class HandoffService {
-  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null }) {
+  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null }) {
     invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
     this.storage = storage;
     this.artifacts = artifacts;
@@ -18,6 +20,12 @@ export class HandoffService {
     this.runnerInstanceId = runnerInstanceId;
     this.modelPolicy = modelPolicy;
     this.reasoningPolicy = reasoningPolicy;
+    this.telemetry = telemetry;
+  }
+
+  metric(lifecycleState, details) {
+    try { return this.telemetry?.recordHandoffEvent(lifecycleState, details) ?? null; }
+    catch { return null; }
   }
 
   async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume }) {
@@ -76,6 +84,15 @@ export class HandoffService {
     const reserved = this.storage.reserveHandoff(base);
     let handoff = reserved.handoff;
     if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
+    this.metric("STARTED", {
+      handoff,
+      session_id: sourceSessionId,
+      task: plan,
+      checkpoint_id: checkpointId,
+      threshold_percent: this.telemetry?.thresholdPercent,
+      reason: mode === "confirm" ? "HANDOFF_COMMAND_CONFIRMED" : "HANDOFF_COMMAND_MANUAL",
+      artifacts: measureHandoffArtifacts({ taskPlanPath: this.ledger.path }),
+    });
 
     handoff.state = "CHECKPOINT_PERSISTING";
     this.storage.saveHandoff(handoff, "STATE_TRANSITION", { from: "SAFE_TO_HANDOFF", to: handoff.state });
@@ -84,6 +101,14 @@ export class HandoffService {
       handoff.checkpoint_digest = checkpoint.digest;
       handoff.state = "CHECKPOINT_PERSISTED";
       this.storage.saveHandoff(handoff, "CHECKPOINT_PERSISTED", { checkpoint_id: checkpointId, digest: checkpoint.digest, event_key: `checkpoint:${checkpointId}` });
+      this.metric("CHECKPOINT_SEALED", {
+        handoff,
+        session_id: sourceSessionId,
+        task: plan,
+        checkpoint_id: checkpointId,
+        reason: "SEALED_ARTIFACT_PERSISTED",
+        artifacts: measureHandoffArtifacts({ taskPlanPath: this.ledger.path, checkpointBytes: checkpoint.bytes }),
+      });
     } catch (error) {
       handoff.state = "CHECKPOINT_PERSIST_FAILED";
       this.storage.saveHandoff(handoff, "CHECKPOINT_PERSIST_FAILED", { error: error.message, event_key: `checkpoint-failed:${checkpointId}` });
@@ -129,6 +154,12 @@ export class HandoffService {
     h.target_session_file = normalizePath(session.sessionFile);
     h.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
     this.storage.saveHandoff(h, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: h.target_session_id, target_session_file: h.target_session_file, event_key: `replacement:${handoffId}` });
+    this.metric("REPLACEMENT_STARTED", {
+      handoff: h,
+      session_id: h.target_session_id,
+      checkpoint_id: h.checkpoint_id,
+      reason: "PAUSED_NO_HISTORY_TARGET_CREATED",
+    });
 
     try {
       const runtimeBinding = readRuntimeRunnerBinding(session);
@@ -172,6 +203,7 @@ export class HandoffService {
   }
 
   continuity(handoffId, targetSession) {
+    const continuityStarted = performance.now();
     let h = this.storage.getHandoff(handoffId);
     invariant(["MANIFEST_PERSISTED", "RESUME_READY"].includes(h.state), "CONTINUITY_STATE_INVALID", h.state);
     const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
@@ -205,7 +237,22 @@ export class HandoffService {
     h.resume_prompt_digest = sha256(Buffer.from(h.resume_prompt, "utf8"));
     h.state = "RESUME_READY";
     this.storage.saveHandoff(h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
-    return this.storage.getHandoff(handoffId);
+    const ready = this.storage.getHandoff(handoffId);
+    this.metric("RESUME_READY", {
+      handoff: ready,
+      session_id: ready.target_session_id,
+      checkpoint_id: ready.checkpoint_id,
+      reason: "CONTINUITY_VALIDATED",
+      continuity_duration_ms: performance.now() - continuityStarted,
+      artifacts: measureHandoffArtifacts({
+        taskPlanPath: this.ledger.path,
+        checkpointBytes: checkpoint.bytes,
+        manifestBytes: manifest.bytes,
+        resumePrompt: ready.resume_prompt,
+        minimalReads: m.minimal_reads,
+      }),
+    });
+    return ready;
   }
 
   attestRunnerOwnership(h, targetSession, manifest) {
@@ -237,6 +284,13 @@ export class HandoffService {
     if (h.state === "RESUMED") return h;
     if (h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Automatic redispatch is forbidden");
     invariant(typeof sendResume === "function", "RESUME_TRANSPORT_REQUIRED");
+    const resumeStarted = performance.now();
+    this.metric("RESUME_STARTED", {
+      handoff: h,
+      session_id: h.target_session_id,
+      checkpoint_id: h.checkpoint_id,
+      reason: "HUMAN_RESUME_AUTHORIZED",
+    });
     const admissionId = stableId("ADM", h.resume_prompt_id);
     const admission = this.storage.authorizeAndAdmit(handoffId, actor, `resume:${h.resume_prompt_id}`, admissionId);
     h = admission.handoff;
@@ -250,7 +304,15 @@ export class HandoffService {
     }
     try {
       await sendResume(h.resume_prompt);
-      return this.storage.finishDispatch(handoffId, "ACKNOWLEDGED");
+      const completed = this.storage.finishDispatch(handoffId, "ACKNOWLEDGED");
+      this.metric("COMPLETED", {
+        handoff: completed,
+        session_id: completed.target_session_id,
+        checkpoint_id: completed.checkpoint_id,
+        reason: "RESUME_ACKNOWLEDGED",
+        resume_duration_ms: performance.now() - resumeStarted,
+      });
+      return completed;
     } catch (error) {
       this.storage.finishDispatch(handoffId, "UNKNOWN", error.message);
       throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Resume might have been accepted; no automatic retry", { cause: error.message });

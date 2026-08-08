@@ -171,6 +171,26 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     assert.equal(manifest.payload.worktree_digest, result.expected_git_state.worktree_digest);
     assert.equal(Object.hasOwn(manifest.payload, "transcript"), false);
     assert.equal(manifest.payload.minimal_reads.includes(`.guardian/checkpoints/${result.checkpoint_id}.json`), true);
+
+    const metricSamples = x.runner.storage.metricSamples();
+    assert.equal(metricSamples.length, 2, "one authoritative sample must be captured for each fake provider call");
+    assert.equal(metricSamples.filter((sample) => sample.session_id === sourceId).length, 1);
+    assert.equal(metricSamples.filter((sample) => sample.session_id === target.sessionId).length, 1);
+    assert.equal(x.runner.storage.getMetricSession(sourceId).lifecycle.status, "ENDED");
+    assert.equal(x.runner.storage.getMetricSession(target.sessionId).model_calls, 1);
+    const measuredLifecycle = x.runner.storage.handoffMetricEvents(result.handoff_id);
+    for (const state of ["STARTED", "CHECKPOINT_SEALED", "REPLACEMENT_STARTED", "RESUME_READY", "RESUME_STARTED", "COMPLETED"]) {
+      assert.equal(measuredLifecycle.some((event) => event.lifecycle_state === state), true, `missing measured ${state}`);
+    }
+    assert.equal(measuredLifecycle.every((event) => event.threshold_percent === 50), true);
+    const readyMeasurement = measuredLifecycle.find((event) => event.lifecycle_state === "RESUME_READY");
+    assert.equal(readyMeasurement.artifacts.checkpoint_sealed_bytes, checkpoint.bytes.length);
+    assert.equal(readyMeasurement.artifacts.manifest_bytes, manifest.bytes.length);
+    assert.equal(readyMeasurement.artifacts.resume_prompt_bytes, Buffer.byteLength(result.resume_prompt, "utf8"));
+    assert.equal(readyMeasurement.artifacts.minimal_reads_count, null);
+    assert.equal(readyMeasurement.artifacts.minimal_reads_declared_count, manifest.payload.minimal_reads.length);
+    assert.equal(JSON.stringify({ metricSamples, measuredLifecycle }).includes("SOURCE_ONLY_MARKER"), false);
+
     const handoffEvents = x.runner.storage.events(result.handoff_id);
     const admissionEvents = handoffEvents.filter((event) => event.event_type === "RESUME_ADMISSION_COMMITTED");
     assert.equal(admissionEvents.length, 1);
