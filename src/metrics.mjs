@@ -37,6 +37,14 @@ function addKnown(total, value) {
   return total + value;
 }
 
+function hasEssentialUsage(usage) {
+  return numberOrNull(usage?.input) !== null && numberOrNull(usage?.output) !== null;
+}
+
+function collectionStatus(identity) {
+  return identity.task_id === null ? "measurement_complete_correlation_partial" : "measurement_complete";
+}
+
 export function assertTelemetrySafe(record) {
   const visit = (value) => {
     if (Array.isArray(value)) return value.forEach(visit);
@@ -75,22 +83,38 @@ export class MeasurementInstrumentation {
     this.handoffStarts = new Map();
   }
 
-  diagnostic(operation, error, identity = {}) {
+  diagnostic(operation, error, identity = {}, options = {}) {
     const record = assertTelemetrySafe({
       schema_version: METRICS_SCHEMA_VERSION,
       diagnostic_id: opaqueId("MDIAG"),
       timestamp: utcNow(),
+      diagnostic_type: options.diagnostic_type ?? "measurement_missing",
       operation,
+      source: options.source ?? null,
       error_name: error?.name ?? "Error",
       error_code: typeof error?.code === "string" ? error.code : null,
       session_id: identity.session_id ?? null,
       task_id: identity.task_id ?? null,
       handoff_id: identity.handoff_id ?? null,
-      status: "collection_failed_no_metric_substitution",
+      status: options.status ?? "collection_failed_no_metric_substitution",
     });
+    if (record.diagnostic_type === "measurement_missing" && record.session_id) {
+      try {
+        const prior = this.storage.getMetricSession(record.session_id);
+        if (prior) this.storage.upsertMetricSession({ ...prior, updated_at: record.timestamp, collection_status: "measurement_missing" }, this.retention.sessions);
+      } catch {}
+    }
     try { this.storage.appendMetricDiagnostic(record, this.retention.diagnostics); }
     catch { console.error(`[eiopago] metrics diagnostic unavailable (${operation})`); }
     return null;
+  }
+
+  correlationDegraded(error, identity = {}, source = "ledger") {
+    this.diagnostic("correlation_degraded", error, identity, {
+      diagnostic_type: "correlation_degraded",
+      source,
+      status: "measurement_complete_correlation_partial",
+    });
   }
 
   safe(operation, fn, identity = {}) {
@@ -98,65 +122,101 @@ export class MeasurementInstrumentation {
     catch (error) { return this.diagnostic(operation, error, identity); }
   }
 
-  identity({ ctx = null, sessionId = null, task = null, handoff = null, checkpointId = null, itemId = undefined } = {}) {
-    const plan = task ?? this.ledger.read();
+  identity({ ctx = null, sessionId = null, task = null, handoff = null, checkpointId = null, itemId = undefined, tolerateCorrelationFailure = false } = {}) {
     const resolvedSessionId = sessionId ?? ctx?.sessionManager?.getSessionId?.() ?? null;
-    const related = handoff
-      ?? (resolvedSessionId ? this.storage.findHandoffByTarget(resolvedSessionId) : null)
-      ?? (resolvedSessionId ? this.storage.findHandoffBySource?.(resolvedSessionId) : null)
-      ?? null;
+    let plan = task;
+    if (!plan) {
+      try { plan = this.ledger.read(); }
+      catch (error) {
+        if (!tolerateCorrelationFailure) throw error;
+        const partial = {
+          session_id: resolvedSessionId,
+          runner_instance_id: this.runnerInstanceId,
+          task_id: null,
+          item_id: null,
+          checkpoint_id: null,
+          handoff_id: null,
+        };
+        this.correlationDegraded(error, partial, "ledger");
+        return partial;
+      }
+    }
+    let related = handoff;
+    try {
+      related = related
+        ?? (resolvedSessionId ? this.storage.findHandoffByTarget(resolvedSessionId) : null)
+        ?? (resolvedSessionId ? this.storage.findHandoffBySource?.(resolvedSessionId) : null)
+        ?? null;
+    } catch (error) {
+      if (!tolerateCorrelationFailure) throw error;
+      const partial = {
+        session_id: resolvedSessionId,
+        runner_instance_id: this.runnerInstanceId,
+        task_id: null,
+        item_id: null,
+        checkpoint_id: null,
+        handoff_id: null,
+      };
+      this.correlationDegraded(error, partial, "handoff_authority");
+      return partial;
+    }
     return {
       session_id: resolvedSessionId,
       runner_instance_id: this.runnerInstanceId,
-      task_id: plan.task_id,
+      task_id: plan.task_id ?? null,
       item_id: itemId === undefined ? plan.current_item ?? null : itemId,
       checkpoint_id: checkpointId ?? related?.checkpoint_id ?? null,
       handoff_id: related?.handoff_id ?? null,
     };
   }
 
-  startSession(ctx, event = {}) {
-    return this.safe("session_start", () => {
-      const identity = this.identity({ ctx });
-      if (!identity.session_id) throw new Error("METRICS_SESSION_ID_UNAVAILABLE");
-      const now = utcNow();
-      const prior = this.storage.getMetricSession(identity.session_id);
-      const record = assertTelemetrySafe(prior ? {
-        ...prior,
-        ...identity,
-        updated_at: now,
-        lifecycle: { ...prior.lifecycle, last_start_reason: event.reason ?? null },
-      } : {
-        schema_version: METRICS_SCHEMA_VERSION,
-        ...identity,
-        started_at: now,
-        ended_at: null,
-        duration_ms: null,
-        updated_at: now,
-        lifecycle: { status: "ACTIVE", start_source: "pi.session_start", last_start_reason: event.reason ?? null, end_reason: null },
-        model_calls: 0,
-        totals: {
-          input_tokens: 0,
-          output_tokens: 0,
-          reasoning_tokens: 0,
-          cache_read_tokens: 0,
-          cache_write_tokens: 0,
-          equivalent_cost_usd: 0,
-          charged_provider_cost: null,
-          subscription_cost: null,
-        },
-        latest_context: { tokens: null, context_window: null, occupancy_percent: null, status: "unknown" },
-        quality: qualityAssociations(),
-        collection_status: "ok",
-      });
-      this.storage.upsertMetricSession(record, this.retention.sessions);
-      return record;
+  persistSessionStart(identity, event = {}) {
+    const now = utcNow();
+    const prior = this.storage.getMetricSession(identity.session_id);
+    const record = assertTelemetrySafe(prior ? {
+      ...prior,
+      ...identity,
+      updated_at: now,
+      lifecycle: { ...prior.lifecycle, last_start_reason: event.reason ?? null },
+    } : {
+      schema_version: METRICS_SCHEMA_VERSION,
+      ...identity,
+      started_at: now,
+      ended_at: null,
+      duration_ms: null,
+      updated_at: now,
+      lifecycle: { status: "ACTIVE", start_source: "pi.session_start", last_start_reason: event.reason ?? null, end_reason: null },
+      model_calls: 0,
+      totals: {
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        equivalent_cost_usd: 0,
+        charged_provider_cost: null,
+        subscription_cost: null,
+      },
+      latest_context: { tokens: null, context_window: null, occupancy_percent: null, status: "unknown" },
+      quality: qualityAssociations(),
+      collection_status: identity.task_id === null ? "correlation_partial" : "ok",
     });
+    this.storage.upsertMetricSession(record, this.retention.sessions);
+    return record;
+  }
+
+  startSession(ctx, event = {}) {
+    const sessionId = ctx?.sessionManager?.getSessionId?.() ?? null;
+    return this.safe("session_start", () => {
+      const identity = this.identity({ ctx, tolerateCorrelationFailure: true });
+      if (!identity.session_id) throw Object.assign(new Error("METRICS_SESSION_ID_UNAVAILABLE"), { code: "METRICS_SESSION_ID_UNAVAILABLE" });
+      return this.persistSessionStart(identity, event);
+    }, { session_id: sessionId });
   }
 
   endSession(ctx, event = {}) {
     return this.safe("session_end", () => {
-      const identity = this.identity({ ctx });
+      const identity = this.identity({ ctx, tolerateCorrelationFailure: true });
       let prior = this.storage.getMetricSession(identity.session_id);
       if (!prior) prior = this.startSession(ctx, { reason: "observed_at_shutdown" });
       if (!prior) return null;
@@ -178,11 +238,14 @@ export class MeasurementInstrumentation {
   readContext(ctx, identity) {
     try {
       const value = typeof ctx?.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+      const tokens = numberOrNull(value?.tokens);
+      const contextWindow = numberOrNull(value?.contextWindow);
+      const percent = numberOrNull(value?.percent);
       return {
-        tokens: numberOrNull(value?.tokens),
-        context_window: numberOrNull(value?.contextWindow),
-        occupancy_percent: numberOrNull(value?.percent),
-        status: value && value.tokens !== null && value.percent !== null ? "available_runtime_estimate" : "unknown",
+        tokens,
+        context_window: contextWindow,
+        occupancy_percent: percent,
+        status: tokens !== null && percent !== null ? "available_runtime_estimate" : "unknown",
       };
     } catch (error) {
       this.diagnostic("context_usage", error, identity);
@@ -193,12 +256,14 @@ export class MeasurementInstrumentation {
   captureModelCall(event, ctx) {
     const sessionId = ctx?.sessionManager?.getSessionId?.() ?? null;
     return this.safe("model_call_sample", () => {
-      const identity = this.identity({ ctx });
-      if (!identity.session_id || event?.message?.role !== "assistant") throw new Error("METRICS_AUTHORITATIVE_ASSISTANT_USAGE_UNAVAILABLE");
+      if (!sessionId) throw Object.assign(new Error("METRICS_SESSION_ID_UNAVAILABLE"), { code: "METRICS_SESSION_ID_UNAVAILABLE" });
+      if (event?.message?.role !== "assistant" || !event.message.usage || typeof event.message.usage !== "object" || !hasEssentialUsage(event.message.usage)) {
+        throw Object.assign(new Error("METRICS_AUTHORITATIVE_ASSISTANT_USAGE_UNAVAILABLE"), { code: "METRICS_AUTHORITATIVE_ASSISTANT_USAGE_UNAVAILABLE" });
+      }
+      const identity = this.identity({ ctx, sessionId, tolerateCorrelationFailure: true });
       let session = this.storage.getMetricSession(identity.session_id);
-      if (!session) session = this.startSession(ctx, { reason: "first_observed_model_call" });
-      if (!session) return null;
-      const usage = event.message.usage ?? {};
+      if (!session) session = this.persistSessionStart(identity, { reason: "first_observed_model_call" });
+      const usage = event.message.usage;
       const capturedAt = utcNow();
       const equivalentAmount = numberOrNull(usage.cost?.total);
       const sample = assertTelemetrySafe({
@@ -209,6 +274,7 @@ export class MeasurementInstrumentation {
         captured_at: capturedAt,
         call_index: session.model_calls + 1,
         task_phase: identity.item_id,
+        collection_status: collectionStatus(identity),
         model: {
           provider: typeof event.message.provider === "string" ? event.message.provider : null,
           id: typeof event.message.model === "string" ? event.message.model : null,
@@ -248,7 +314,12 @@ export class MeasurementInstrumentation {
           equivalent_cost_usd: addKnown(totals.equivalent_cost_usd, sample.cost.equivalent.amount),
         },
         latest_context: sample.context,
-        collection_status: "ok",
+        collection_status: session.collection_status === "measurement_missing"
+          ? "measurement_missing"
+          : ["correlation_partial", "measurement_complete_correlation_partial"].includes(session.collection_status)
+            || sample.collection_status === "measurement_complete_correlation_partial"
+            ? "measurement_complete_correlation_partial"
+            : "measurement_complete",
       });
       this.storage.appendMetricSample(sample, nextSession, this.retention.samples);
       return sample;

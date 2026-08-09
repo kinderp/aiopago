@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { canonicalJson, sha256, utcNow } from "./canonical.mjs";
+import { emptyCalibrationQualityEvidence, QUALITY_EVIDENCE_FILE } from "./calibration-quality.mjs";
 import { contextHandoffThreshold, CONTEXT_HANDOFF_THRESHOLD_ENV } from "./context-advisor.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
@@ -53,6 +54,7 @@ export function calibrationPaths(cwd, runId, calibrationRoot = join(cwd, ".guard
     attestationPath: join(runRoot, "preflight-attestation.json"),
     runtimeRoot: join(runRoot, "runtime"),
     runtimeStorePath: join(runRoot, "runtime", "guardian.sqlite"),
+    qualityEvidencePath: join(runRoot, QUALITY_EVIDENCE_FILE),
     runRecordPath: join(runRoot, "run-record.json"),
   });
 }
@@ -236,6 +238,7 @@ export function runCalibrationPreflight({
     attestation_path: slash(paths.attestationPath),
   };
   writeJson(paths.attestationPath, attestation);
+  writeJson(paths.qualityEvidencePath, emptyCalibrationQualityEvidence(runId));
   writeJson(paths.runRecordPath, emptyRunRecord(attestation));
   return Object.freeze({ attestation, protocol, paths });
 }

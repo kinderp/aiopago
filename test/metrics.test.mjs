@@ -94,18 +94,18 @@ test("H2 metrics capture a complete authoritative model-call sample and correlat
   } finally { storage.close(); }
 });
 
-test("H2 metrics preserve unavailable values as explicit unknown/null", () => {
+test("H2 preserves authoritative usage when context and nonessential counters are unavailable", () => {
   const root = temp();
   const storage = new GuardianStorage(join(root, "guardian.sqlite"));
   try {
     const metrics = instrumentation(storage);
     const ctx = context("SES-unknown", undefined);
     metrics.startSession(ctx, { reason: "startup" });
-    const sample = metrics.captureModelCall(assistant({}), ctx);
+    const sample = metrics.captureModelCall(assistant({ input: 100, output: 20 }), ctx);
     assert.deepEqual(sample.context, { tokens: null, context_window: null, occupancy_percent: null, status: "unknown" });
     assert.deepEqual(sample.usage, {
-      input_tokens: null,
-      output_tokens: null,
+      input_tokens: 100,
+      output_tokens: 20,
       reasoning_tokens: null,
       cache_read_tokens: null,
       cache_write_tokens: null,
@@ -115,7 +115,7 @@ test("H2 metrics preserve unavailable values as explicit unknown/null", () => {
     });
     assert.equal(sample.cost.equivalent.status, "unknown");
     assert.equal(sample.cost.subscription.status, "unknown");
-    assert.equal(storage.getMetricSession("SES-unknown").totals.input_tokens, null);
+    assert.equal(storage.getMetricSession("SES-unknown").totals.input_tokens, 100);
   } finally { storage.close(); }
 });
 
@@ -193,6 +193,72 @@ test("H2 records contain no conversation history or full prompt/response fields"
   } finally { storage.close(); }
 });
 
+test("H2 preserves model-call usage when the Ledger is missing and marks only correlation degraded", () => {
+  const root = temp();
+  const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  try {
+    const error = Object.assign(new Error("missing ledger"), { code: "ENOENT" });
+    const metrics = new MeasurementInstrumentation({
+      storage,
+      ledger: { read: () => { throw error; } },
+      runnerInstanceId: "RUNNER-H2",
+      thresholdPercent: 50,
+    });
+    const sample = metrics.captureModelCall(assistant(completeUsage()), context("SES-ledger-missing", { tokens: 10, contextWindow: 100, percent: 10 }));
+    assert.ok(sample);
+    assert.deepEqual([sample.task_id, sample.item_id, sample.checkpoint_id, sample.handoff_id], [null, null, null, null]);
+    assert.equal(sample.collection_status, "measurement_complete_correlation_partial");
+    assert.equal(storage.getMetricSession("SES-ledger-missing").collection_status, "measurement_complete_correlation_partial");
+    assert.equal(storage.metricSamples("SES-ledger-missing").length, 1);
+    const [diagnostic] = storage.metricDiagnostics();
+    assert.equal(diagnostic.diagnostic_type, "correlation_degraded");
+    assert.equal(diagnostic.status, "measurement_complete_correlation_partial");
+    assert.equal(diagnostic.source, "ledger");
+  } finally { storage.close(); }
+});
+
+test("H2 survives a transient invalid Ledger and resumes normal correlation on the next call", () => {
+  const root = temp();
+  const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  let reads = 0;
+  try {
+    const metrics = new MeasurementInstrumentation({
+      storage,
+      ledger: { read: () => {
+        reads += 1;
+        if (reads === 1) throw Object.assign(new Error("transition"), { code: "LEDGER_FIELD_MISSING" });
+        return plan("ITEM-RECOVERED");
+      } },
+      runnerInstanceId: "RUNNER-H2",
+      thresholdPercent: 50,
+    });
+    const ctx = context("SES-ledger-transition", { tokens: 20, contextWindow: 100, percent: 20 });
+    const first = metrics.captureModelCall(assistant(completeUsage(), Date.parse("2026-08-09T00:00:01Z")), ctx);
+    const second = metrics.captureModelCall(assistant(completeUsage(), Date.parse("2026-08-09T00:00:02Z")), ctx);
+    assert.deepEqual([first.task_id, first.item_id], [null, null]);
+    assert.deepEqual([second.task_id, second.item_id], ["TASK-H2", "ITEM-RECOVERED"]);
+    assert.equal(storage.metricSamples("SES-ledger-transition").length, 2);
+    assert.equal(storage.getMetricSession("SES-ledger-transition").model_calls, 2);
+    assert.equal(storage.metricDiagnostics().length, 1);
+  } finally { storage.close(); }
+});
+
+test("H2 does not fabricate a sample when session ID or authoritative usage is missing", () => {
+  const root = temp();
+  const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  try {
+    const metrics = instrumentation(storage);
+    assert.equal(metrics.captureModelCall(assistant(completeUsage()), context(null, { tokens: 1, contextWindow: 100, percent: 1 })), null);
+    const noUsage = assistant(completeUsage());
+    delete noUsage.message.usage;
+    assert.equal(metrics.captureModelCall(noUsage, context("SES-no-usage", { tokens: 1, contextWindow: 100, percent: 1 })), null);
+    assert.equal(metrics.captureModelCall(assistant({}), context("SES-empty-usage", { tokens: 1, contextWindow: 100, percent: 1 })), null);
+    assert.equal(storage.metricSamples().length, 0);
+    assert.deepEqual(storage.metricDiagnostics().map((item) => item.diagnostic_type), ["measurement_missing", "measurement_missing", "measurement_missing"]);
+    assert.deepEqual(storage.metricDiagnostics().map((item) => item.error_code), ["METRICS_SESSION_ID_UNAVAILABLE", "METRICS_AUTHORITATIVE_ASSISTANT_USAGE_UNAVAILABLE", "METRICS_AUTHORITATIVE_ASSISTANT_USAGE_UNAVAILABLE"]);
+  } finally { storage.close(); }
+});
+
 test("H2 telemetry failure emits a bounded diagnostic and does not fabricate a sample", () => {
   let sessionRecord = null;
   const samples = [];
@@ -211,6 +277,7 @@ test("H2 telemetry failure emits a bounded diagnostic and does not fabricate a s
   assert.equal(result, null);
   assert.deepEqual(samples, []);
   assert.equal(sessionRecord.model_calls, 0, "failed persistence must not advance the authoritative summary");
+  assert.equal(sessionRecord.collection_status, "measurement_missing", "missing measurement remains sticky even if bounded diagnostics later rotate");
   assert.equal(diagnostics.length, 1);
   assert.equal(diagnostics[0].status, "collection_failed_no_metric_substitution");
   assert.equal(diagnostics[0].error_code, "SQLITE_TEST_FAILURE");

@@ -101,6 +101,9 @@ test("calibration preflight happy path persists byte-identical protocol, PASS at
   assert.equal(readFileSync(result.paths.protocolCopyPath).equals(readFileSync(join(x.root, "docs", "m1-h2-calibration-pilot.json"))), true);
   const record = JSON.parse(readFileSync(result.paths.runRecordPath, "utf8"));
   assert.equal(record.status, "PREFLIGHT_PASSED");
+  const quality = JSON.parse(readFileSync(result.paths.qualityEvidencePath, "utf8"));
+  assert.equal(quality.schema_version, "eiopago.calibration-quality-evidence/1.0.0");
+  assert.deepEqual(quality.gate_attempts, []);
 });
 
 test("calibration preflight rejects wrong HEAD", () => {

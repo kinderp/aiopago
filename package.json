@@ -11,6 +11,8 @@
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs",
     "eio": "node bin/eio.mjs",
-    "calibration": "node scripts/calibration-run.mjs"
+    "calibration": "node scripts/calibration-run.mjs",
+    "calibration:quality": "node scripts/calibration-quality-record.mjs",
+    "calibration:finalize": "node scripts/calibration-finalize.mjs"
   }
 }
