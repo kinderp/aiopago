@@ -1,5 +1,15 @@
 # M1-H2 — Controlled Handoff Threshold Calibration
 
+> **F4 feasibility update:** `6847c5cbf260ed4074e5f3846b130ed3e1ad3da3`
+> is the H2-02B F2/F3 infrastructure baseline, not a runnable experiment
+> baseline. The inspector protocol below is retained as historical design: its
+> observed workload ended below 40% and is not authorized for another pilot.
+> Issue #14 selects the frozen-ready successor proposal
+> `WL-DEVELOPMENT-CHRONICLE-1` in
+> [`m1-h2-workload-feasibility.md`](m1-h2-workload-feasibility.md). A later
+> accepted successor commit must update and freeze the machine-readable
+> protocol before any RUN-40/50/60 worktree is created.
+
 ## Stato e vincoli
 
 `H2-01 Measurement instrumentation` è la **application baseline** immutabile
