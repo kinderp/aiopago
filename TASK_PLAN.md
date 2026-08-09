@@ -1,186 +1,196 @@
-# Master Task Ledger — M1-H2 Handoff Threshold Calibration
+# Master Task Ledger — M1-P0-A Portable Bootstrap, Packaging e Config
 
 **Authority:** Markdown canonico standalone
 **Schema:** `eiopago.task-ledger/0.1.0`
-**Current revision:** `PLAN-M1-H2-0005`
-**Requirements version:** `REQ-M1-H2-ISSUE-10-H2-02A-F1-2026-08-08`
-**Updated:** 2026-08-08T20:09:22.073Z
+**Current revision:** `PLAN-M1-P0-A-0003`
+**Requirements version:** `REQ-GH-16-M1-P0-A-2026-08-09`
+**Updated:** 2026-08-09T07:44:24.045Z
 
 ```json task-ledger
 {
   "schema_version": "0.1.0",
-  "task_id": "TASK-EIOPAGO-M1-H2",
-  "title": "Handoff Threshold Calibration",
-  "objective": "Confrontare in modo riproducibile soglie handoff 40/50/60 rispetto a Cost per Accepted Checkpoint e quality baseline, separando costi charged ed equivalent e senza cambiare il default globale.",
-  "requirements_version": "REQ-M1-H2-ISSUE-10-H2-02A-F1-2026-08-08",
-  "plan_revision_id": "PLAN-M1-H2-0005",
-  "status": "IN_PROGRESS",
+  "task_id": "TASK-EIOPAGO-M1-P0-A",
+  "title": "Portable bootstrap, packaging e config",
+  "objective": "Rendere Eiopago installabile separatamente e inizializzabile in modo non distruttivo in un Git worktree esterno, con root e stato locale espliciti.",
+  "requirements_version": "REQ-GH-16-M1-P0-A-2026-08-09",
+  "plan_revision_id": "PLAN-M1-P0-A-0003",
+  "status": "DONE",
   "completion_criteria": [
-    "H2-01 telemetry resta la application baseline immutabile 930fc35d03d3f9795fa6402a047b0ded489e2817",
-    "H2-02A definisce e congela workload, controlled variables, validità, quality baseline e formule prima degli esperimenti",
-    "H2-02B esegue soltanto dopo nuova autorizzazione il pilot 40x1/50x1/60x1 da tre branch aventi lo stesso experiment baseline commit H2-02A",
-    "Nessuna soglia vincente è scelta solo per costo e nessuna conclusione x1 viene dichiarata universale",
-    "Cost Guard, Advisor adattivo e modifica del default globale restano fuori scope"
+    "Packaging e CLI alpha sono definiti e testabili da un repository esterno",
+    "eio init valida prerequisiti e Git target, crea solo stato minimo ed è idempotente",
+    "Installation root, target root, config root, runtime root e artifact root sono espliciti",
+    "TASK_PLAN.md e .gitignore sono gestiti con policy fail-closed e non distruttiva",
+    "Test P0-A, npm run check, npm test e git diff --check passano",
+    "Documentazione alpha per installazione, init, layout, re-init e cleanup è disponibile"
   ],
   "risk": "HIGH",
-  "created_at": "2026-08-08T16:45:00Z",
-  "updated_at": "2026-08-08T20:09:22.073Z",
+  "created_at": "2026-08-09T06:51:10.516Z",
+  "updated_at": "2026-08-09T07:44:24.045Z",
   "current_item": null,
-  "next_item": "ITEM-H2-02B",
-  "next_step": "STOP: H2-02B resta PLANNED/BLOCKED finché H2-02A-F1 non è accettato e congelato in un nuovo experiment baseline commit; non avviare RUN-40/50/60.",
+  "next_item": null,
+  "next_step": "STOP SESSION: P0-A chiuso; non iniziare P0-B o dogfood su repository esterni senza autorizzazione separata.",
   "evidence": [
-    "Application baseline H2-01 930fc35d03d3f9795fa6402a047b0ded489e2817",
-    "Experiment baseline definita come il freeze commit contenente questo Ledger e il protocollo, senza SHA circolare nel manifest",
-    "docs/m1-h2-threshold-calibration.md",
-    "docs/m1-h2-calibration-pilot.json protocol H2-02A-PILOT-1",
-    "RUN-40-ATTEMPT-1 registrato INVALID_PREFLIGHT e non replica sperimentale",
-    "scripts/calibration-run.mjs e src/calibration-preflight.mjs",
-    "Attestation eiopago.calibration-preflight/1.0.0 e SQLite run-specific identity"
+    "Baseline verificata: 9ed10f6148a144179cccce3c9141e4fa61c808e5",
+    "Root/config contract e redirect fail-closed: src/repository.mjs e src/runner.mjs",
+    "Bootstrap non distruttivo con Ledger ambiguo e .gitignore bounded: src/bootstrap.mjs e bin/src CLI",
+    "Package standard con bin/exports/files/engines/peer Pi e npm pack dry-run verificato",
+    "Fixture repository temporanei indipendenti in test/portable-alpha.test.mjs",
+    "Documentazione operativa: docs/portable-alpha.md",
+    "Handoff safety/latch/continuity/resume core non riscritti; soltanto root e model-policy plumbing minimo",
+    "Nessun H2 pilot, RUN-40/50/60, Cost Guard o Chronicle avviato"
   ],
   "model_policy": "openai-codex/gpt-5.6-sol",
   "reasoning_policy": "high",
-  "checkpoint_policy": "controlled_protocol_before_pilot",
+  "checkpoint_policy": "bounded_items_and_final_gates",
   "minimal_reads": [
     "TASK_PLAN.md",
-    "CHECKPOINT.md",
-    "docs/m1-h1-context-handoff-advisor.md",
-    "docs/m1-h2-threshold-calibration.md",
-    "docs/m1-h2-calibration-pilot.json"
+    "docs/portable-alpha.md"
   ],
-  "accepted_prerequisite": {
-    "milestone": "H2-01",
-    "status": "ACCEPTED_PASS",
-    "baseline": "930fc35d03d3f9795fa6402a047b0ded489e2817",
-    "note": "Measurement instrumentation accettata e invariata; H2-02A aggiunge soltanto protocollo/documentazione."
-  },
   "task_items": [
     {
-      "task_item_id": "ITEM-H2-01",
-      "task_id": "TASK-EIOPAGO-M1-H2",
-      "title": "Measurement instrumentation",
-      "description": "Raccogliere sample per model call, summary sessione ed eventi handoff correlati, versionati, bounded e privacy-safe usando soltanto superfici runtime autorevoli.",
+      "task_item_id": "P0-A1",
+      "task_id": "TASK-EIOPAGO-M1-P0-A",
+      "title": "Portability and packaging audit",
+      "description": "Inventariare entrypoint, packaging, Pi loading, root/path assumptions, config, storage e artifact boundaries sul codice reale.",
       "status": "DONE",
       "depends_on": [],
       "completion_criteria": [
-        "Metriche disponibili automatiche e unavailable esplicitamente null/unknown",
-        "Session/task/item/checkpoint/handoff correlati quando noti",
-        "Conteggio call, lifecycle, threshold e byte artefatti misurati",
-        "Charged, equivalent e subscription cost semanticamente distinti",
-        "Quality/rework predisposti senza score inventato",
-        "Retention bounded e diagnostici bounded senza dati falsi",
-        "Nessuna conversation history nei record",
-        "Test H2 e regressioni H1 verdi"
+        "I blocker per eio init/eio da repository esterno sono identificati sul codice corrente",
+        "Le invarianti handoff da non modificare sono delimitate"
       ],
       "evidence": [
-        "src/metrics.mjs",
-        "src/storage.mjs schema migration 3",
-        "test/metrics.test.mjs",
-        "Final gates H2-01: npm run check PASS; npm test 29/29 PASS; git diff --check PASS"
+        "Audit file e ricerca process.cwd/path eseguiti sulla baseline",
+        "Pi installato rilevato come @earendil-works/pi-coding-agent 0.83.0; Node v22.19.0; Git 2.51.0.windows.1"
       ],
       "requirements_refs": [
-        "GitHub issue #9",
-        "H2-01 Measurement Instrumentation"
+        "GitHub #16",
+        "FASE 0"
       ],
       "risk": "MEDIUM",
-      "milestone": "M1-H2",
-      "last_updated_at": "2026-08-08T17:50:44.192Z",
-      "last_updated_by": "Pi session 019fe274-fad4-7778-8553-8792b21f9590"
+      "milestone": "M1-P0-A",
+      "last_updated_at": "2026-08-09T07:04:19.132Z",
+      "last_updated_by": "Pi session 019fe548-2235-7018-8c05-3c0a638d01e2"
     },
     {
-      "task_item_id": "ITEM-H2-02A",
-      "task_id": "TASK-EIOPAGO-M1-H2",
-      "title": "Controlled calibration protocol",
-      "description": "Congelare prima degli esperimenti workload, variabili controllate, procedure run, classificazione valid/censored/invalid, metriche, formule e quality baseline.",
+      "task_item_id": "P0-A2",
+      "task_id": "TASK-EIOPAGO-M1-P0-A",
+      "title": "Target repository discovery and config contract",
+      "description": "Separare installation, target, config, runtime e artifact root; normalizzare e validare un Git worktree anche da path nested.",
       "status": "DONE",
       "depends_on": [
-        "ITEM-H2-01"
+        "P0-A1"
       ],
       "completion_criteria": [
-        "RUN-40/50/60 definiti da un unico experiment baseline commit H2-02A che contiene la application baseline H2-01 e i file di protocollo",
-        "Workload reale, offline, non implementato e non Cost Guard con acceptance deterministica",
-        "Prompt, modello, reasoning, Pi, confirm, completion e no-history controllati",
-        "Valid, censored e invalid run definiti incluso early completion prima soglia",
-        "Formule predefinite senza mescolare charged ed equivalent cost",
-        "Quality baseline semplice e vincolante, senza Quality Score composito",
-        "Pilot limitato a una osservazione per soglia e nessun run eseguito"
+        "Root contract esplicito e config per-repository minimo/versionato",
+        "Target mancante, non-Git o incompatibile fallisce con diagnostica utile",
+        "Path Windows, spazi e linked worktree sono coperti senza design Windows-only"
       ],
       "evidence": [
-        "docs/m1-h2-threshold-calibration.md",
-        "docs/m1-h2-calibration-pilot.json schema eiopago.threshold-calibration-protocol/1.0.0",
-        "Workload WL-HANDOFF-INCIDENT-INSPECTOR-1 e quattro accepted checkpoints predefiniti",
-        "Solo documentazione/protocollo modificati; nessun RUN-40/50/60 avviato"
+        "src/repository.mjs separa installation/target/config/runtime/artifact root e valida Git top-level reale",
+        "Config eiopago.repository/1.0.0 strict, relativa, senza campi extra/secret e senza escape dal target",
+        "Symlink/junction e tipi incompatibili sui path riservati falliscono chiuso",
+        "Test nested path, linked worktree, spazi, target errato/non-Git e config escape"
       ],
       "requirements_refs": [
-        "GitHub issue #9",
-        "H2-02A Controlled Calibration Protocol"
+        "GitHub #16",
+        "TARGET REPOSITORY CONTRACT",
+        "CONFIG"
+      ],
+      "risk": "HIGH",
+      "milestone": "M1-P0-A",
+      "last_updated_at": "2026-08-09T07:04:19.132Z",
+      "last_updated_by": "Pi session 019fe548-2235-7018-8c05-3c0a638d01e2"
+    },
+    {
+      "task_item_id": "P0-A3",
+      "task_id": "TASK-EIOPAGO-M1-P0-A",
+      "title": "Non-destructive init",
+      "description": "Implementare eio init idempotente con policy sicure per config, Ledger, runtime path e .gitignore.",
+      "status": "DONE",
+      "depends_on": [
+        "P0-A2"
+      ],
+      "completion_criteria": [
+        "Init crea gli elementi mancanti e preserva config/runtime/Ledger validi",
+        "Ledger non riconosciuto fallisce chiuso e non viene sovrascritto",
+        ".gitignore è aggiornato soltanto con blocco bounded/idempotente",
+        "Nessun file applicativo estraneo o conversation history viene creato/modificato"
+      ],
+      "evidence": [
+        "src/bootstrap.mjs implementa preflight, template Ledger, preservazione fail-closed, runtime retained e managed .gitignore block",
+        "Test init pulito, re-init, Ledger valido/estraneo, .gitignore esistente, .guardian parziale e file applicativi estranei"
+      ],
+      "requirements_refs": [
+        "GitHub #16",
+        "EIO INIT",
+        "GITIGNORE",
+        "IDEMPOTENZA E SAFETY"
+      ],
+      "risk": "HIGH",
+      "milestone": "M1-P0-A",
+      "last_updated_at": "2026-08-09T07:04:19.132Z",
+      "last_updated_by": "Pi session 019fe548-2235-7018-8c05-3c0a638d01e2"
+    },
+    {
+      "task_item_id": "P0-A4",
+      "task_id": "TASK-EIOPAGO-M1-P0-A",
+      "title": "Package and CLI entrypoint",
+      "description": "Definire bin/exports/files e un entrypoint CLI standard installabile via npm link o package path, con compatibility checks.",
+      "status": "DONE",
+      "depends_on": [
+        "P0-A2"
+      ],
+      "completion_criteria": [
+        "Package espone il bin eio e una API ESM minima",
+        "CLI supporta init, target esplicito, help/version e launch entrypoint",
+        "Node, Git e Pi mancanti/incompatibili falliscono velocemente senza auto-update"
+      ],
+      "evidence": [
+        "package.json espone bin eio, export ESM, files, Node engine e peer Pi 0.83.x",
+        "src/cli.mjs supporta init, --target, help, version e launch entrypoint",
+        "src/pi-loader.mjs risolve installazioni nested/hoisted senza adottare Pi dal target e verifica Pi 0.83.x stable",
+        "npm pack --dry-run e invocazione reale del package installato su repo temporaneo esterno con spazi verificate"
+      ],
+      "requirements_refs": [
+        "GitHub #16",
+        "PACKAGING / CLI",
+        "COMPATIBILITÀ"
+      ],
+      "risk": "HIGH",
+      "milestone": "M1-P0-A",
+      "last_updated_at": "2026-08-09T07:04:19.132Z",
+      "last_updated_by": "Pi session 019fe548-2235-7018-8c05-3c0a638d01e2"
+    },
+    {
+      "task_item_id": "P0-A5",
+      "task_id": "TASK-EIOPAGO-M1-P0-A",
+      "title": "Tests, docs and review readiness",
+      "description": "Coprire fixture repository indipendenti, documentare UX/layout/cleanup ed eseguire tutti i gate finali.",
+      "status": "DONE",
+      "depends_on": [
+        "P0-A3",
+        "P0-A4"
+      ],
+      "completion_criteria": [
+        "Casi init/re-init/Ledger/.gitignore/parziale/non-Git/path/worktree/spazi/environment sono coperti offline",
+        "Documentazione portable alpha è utilizzabile senza conoscenza degli internals",
+        "npm run check, npm test e git diff --check passano"
+      ],
+      "evidence": [
+        "test/portable-alpha.test.mjs: 15 test P0-A mirati PASS; model policy portable coperta anche E2E",
+        "docs/portable-alpha.md copre prerequisiti, install, init, layout, re-init, errori e cleanup",
+        "Gate finali cold review: npm run check PASS (32 moduli); npm test PASS (81/81); git diff --check PASS con soli warning LF/CRLF; npm pack --dry-run PASS (24 file)"
+      ],
+      "requirements_refs": [
+        "GitHub #16",
+        "DOCUMENTAZIONE",
+        "TEST",
+        "STOP CONDITION"
       ],
       "risk": "MEDIUM",
-      "milestone": "M1-H2",
-      "last_updated_at": "2026-08-08T18:26:14.192Z",
-      "last_updated_by": "Pi session 019fe291-152c-7a16-9b85-7405e964709a"
-    },
-    {
-      "task_item_id": "ITEM-H2-02A-F1",
-      "task_id": "TASK-EIOPAGO-M1-H2",
-      "title": "Deterministic calibration bootstrap/preflight",
-      "description": "Correggere il finding reale pre-workload con launcher fail-closed, attestazione machine-readable, stato Pi autorevole e runtime store isolato per run.",
-      "status": "DONE",
-      "depends_on": [
-        "ITEM-H2-02A"
-      ],
-      "completion_criteria": [
-        "Preflight prima del Runner verifica worktree, HEAD, branch, clean status, Pi, protocollo/prompt e run_id univoco",
-        "Launcher fissa threshold e Runner fissa/verifica model, reasoning e confirm tramite API SDK pubbliche",
-        "Protocollo byte-identico, attestation e run-record PREFLIGHT_PASSED sono persisted prima del workload",
-        "SQLite usa path e identità run-specific senza cancellare runtime esistenti",
-        "Mismatch blocca input e provider stream prima del workload",
-        "RUN-40 attempt 1 resta INVALID_PREFLIGHT e non replica"
-      ],
-      "evidence": [
-        "src/calibration-preflight.mjs",
-        "scripts/calibration-run.mjs",
-        "test/calibration-preflight.test.mjs",
-        "docs/m1-h2-threshold-calibration.md",
-        "docs/m1-h2-calibration-pilot.json",
-        "Offline preflight tests 17/17 PASS",
-        "Final gates: npm run check 23 modules; npm test 46/46; E2E 6/6; git diff --check PASS"
-      ],
-      "requirements_refs": [
-        "GitHub issue #10",
-        "H2-02A-F1 Deterministic calibration bootstrap/preflight"
-      ],
-      "risk": "HIGH",
-      "milestone": "M1-H2",
-      "last_updated_at": "2026-08-08T20:09:22.073Z",
-      "last_updated_by": "Pi session 019fe2f5-14f9-7217-8f3b-7c8a3530c454"
-    },
-    {
-      "task_item_id": "ITEM-H2-02B",
-      "task_id": "TASK-EIOPAGO-M1-H2",
-      "title": "Controlled calibration pilot",
-      "description": "Eseguire RUN-40 x1, RUN-50 x1 e RUN-60 x1 secondo il protocollo congelato, classificare i run e confrontare soltanto varianti valid/accepted.",
-      "status": "BLOCKED",
-      "depends_on": [
-        "ITEM-H2-02A-F1"
-      ],
-      "completion_criteria": [
-        "Protocollo e run-record template presenti nell'experiment baseline commit prima di RUN-40",
-        "Tre run avviati dallo stesso experiment baseline commit, con application baseline 930fc35d03d3f9795fa6402a047b0ded489e2817 e unica variabile intenzionale threshold",
-        "Telemetry, quality, rework e Cost per Accepted Checkpoint registrati",
-        "Run censored/invalid esclusi correttamente dal confronto",
-        "Conclusione limitata al pilot e repliche proposte solo se risultati vicini/rumorosi"
-      ],
-      "evidence": [
-        "Blocked pending H2-02A-F1 acceptance and freeze commit"
-      ],
-      "requirements_refs": [
-        "GitHub issue #9",
-        "H2-02B Controlled Calibration Pilot"
-      ],
-      "risk": "HIGH",
-      "milestone": "M1-H2",
-      "last_updated_at": "2026-08-08T20:09:22.073Z",
-      "last_updated_by": "Pi session 019fe2f5-14f9-7217-8f3b-7c8a3530c454"
+      "milestone": "M1-P0-A",
+      "last_updated_at": "2026-08-09T07:44:24.045Z",
+      "last_updated_by": "Pi session 019fe570-6705-7b74-9de5-79c62d366406"
     }
   ]
 }
@@ -188,10 +198,7 @@
 
 ## Regole di avanzamento
 
-- H2-01 resta la application baseline accettata e non viene modificata retroattivamente.
-- Il futuro commit di freeze/acceptance F1 che contiene questo Ledger e il launcher sarà l'experiment baseline; il suo SHA va nelle attestation/run record, non nel manifest congelato.
-- H2-02A-F1 corregge il preflight deterministico; H2-02B resta PLANNED/BLOCKED fino ad acceptance e freeze commit F1.
-- Un completamento prima della soglia è censored, non prova una soglia.
-- La qualità è un gate; il costo più basso non basta.
-- Nessuna soglia ottimale o universalità è dichiarata dal pilot x1.
-- Cost Guard, Advisor adattivo, auto-handoff, supervised-auto, routing e integrazioni esterne restano fuori scope.
+- Il motore handoff M1-H0/H1 resta invariato salvo plumbing minimo delle root.
+- H2 calibration resta PAUSED: nessun RUN-40/50/60 e nessuna modifica a threshold o Advisor.
+- Cost Guard, Chronicle e P0-B restano fuori scope.
+- Nessun commit viene creato in questa sessione.

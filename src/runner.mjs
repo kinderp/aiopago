@@ -16,14 +16,17 @@ import { GuardianStorage } from "./storage.mjs";
 
 export class GuardianRunner {
   static async create(options = {}) {
-    const cwd = resolve(options.cwd ?? process.cwd());
-    const pi = options.pi ?? await loadPi();
-    const ledger = options.ledger ?? new TaskLedger(options.ledgerPath ?? join(cwd, "TASK_PLAN.md"));
+    const repository = options.repository ?? null;
+    const requestedRoot = repository?.targetRoot ?? options.cwd;
+    invariant(requestedRoot, "REPOSITORY_CONTEXT_REQUIRED", "Pass a validated repository context (or an explicit cwd for internal runners)");
+    const cwd = resolve(requestedRoot);
+    const pi = options.pi ?? await loadPi({ searchRoot: cwd });
+    const ledger = options.ledger ?? new TaskLedger(options.ledgerPath ?? repository?.taskLedgerPath ?? join(cwd, "TASK_PLAN.md"));
     const plan = ledger.read();
-    const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join(cwd, ".guardian", "runtime", "guardian.sqlite"));
+    const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join(repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"), "guardian.sqlite"));
     if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
     storage.ensureLatch(plan.task_id);
-    const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? join(cwd, ".guardian"), storage);
+    const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
@@ -31,7 +34,7 @@ export class GuardianRunner {
     const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
     const model = options.model ?? (policyProvider && policyModel ? modelRuntime.getModel(policyProvider, policyModel) : undefined);
     const reasoningPolicy = options.reasoningPolicy ?? plan.reasoning_policy ?? "high";
-    if (!options.allowMissingModel) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
+    if (!options.allowMissingModel && modelPolicy) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
     const settingsManager = options.settingsManager ?? pi.coding.SettingsManager.create(cwd, options.agentDir);
     settingsManager.applyOverrides({
       compaction: { enabled: false },
@@ -41,7 +44,14 @@ export class GuardianRunner {
       thresholdPercent: options.contextHandoffThresholdPercent ?? process.env.EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT,
     });
     const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
-    const runner = new GuardianRunner({ cwd, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
+    const roots = Object.freeze({
+      installationRoot: repository?.installationRoot ?? null,
+      targetRoot: cwd,
+      configRoot: repository?.configRoot ?? join(cwd, ".guardian"),
+      runtimeRoot: repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"),
+      artifactRoot: repository?.artifactRoot ?? join(cwd, ".guardian"),
+    });
+    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
     runner.metrics = options.metrics ?? new MeasurementInstrumentation({
       storage,
       ledger,
@@ -63,6 +73,11 @@ export class GuardianRunner {
       telemetry: runner.metrics,
     });
     await runner.createRuntime(options);
+    if (!modelPolicy) {
+      const selected = runner.runtime.session.model;
+      invariant(selected?.provider && selected?.id, "MODEL_POLICY_UNAVAILABLE", "Pi did not select a model");
+      runner.handoffService.modelPolicy = `${selected.provider}/${selected.id}`;
+    }
     if (runner.calibration) {
       runner.requireCalibrationRuntime();
       gate.setPreflightVerifier((requestModel) => runner.requireCalibrationRuntime(requestModel));
@@ -78,7 +93,7 @@ export class GuardianRunner {
 
   async createRuntime(options) {
     const { coding } = this.pi;
-    const inline = { name: "eiopago-m1-h2", factory: createGuardianExtension(this) };
+    const inline = { name: "eiopago", factory: createGuardianExtension(this) };
     const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
       const services = await coding.createAgentSessionServices({
         cwd,

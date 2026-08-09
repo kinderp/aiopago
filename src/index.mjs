@@ -1,5 +1,7 @@
 export * from "./artifact-store.mjs";
+export * from "./bootstrap.mjs";
 export * from "./canonical.mjs";
+export * from "./cli.mjs";
 export * from "./calibration-preflight.mjs";
 export * from "./calibration-finalizer.mjs";
 export * from "./calibration-quality.mjs";
@@ -13,5 +15,6 @@ export * from "./metrics.mjs";
 export * from "./pi-loader.mjs";
 export * from "./runner.mjs";
 export * from "./runner-ownership.mjs";
+export * from "./repository.mjs";
 export * from "./safety.mjs";
 export * from "./storage.mjs";

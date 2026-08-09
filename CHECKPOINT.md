@@ -1,3 +1,17 @@
+# CHECKPOINT — M1-P0-A Portable Bootstrap, Packaging e Config PASS
+
+- Baseline e branch verificati: `9ed10f6148a144179cccce3c9141e4fa61c808e5`, `feat/m1-p0-portable-alpha`; nessun commit creato.
+- Audit reale chiuso: il vecchio bin usava `process.cwd()` come root unico, non esistevano `eio init`, config repository, `bin` package/exports/files o target esplicito; il loader Pi cercava soltanto env/node adiacente e il Runner creava stato direttamente sotto il cwd.
+- Contratto implementato: installation root del package separata da Git target root; config root `.guardian`, runtime root `.guardian/runtime`, artifact root `.guardian`, Ledger path e target vengono validati e passati esplicitamente al Runner.
+- `eio init [target|--target]` verifica Node >=22.19, Git worktree e Pi 0.83.x; crea config strict `eiopago.repository/1.0.0`, template Ledger solo se assente, runtime ignored e blocco `.gitignore` bounded. Re-init preserva byte Ledger/config/ignore e non cancella runtime o file estranei; Ledger non riconosciuto/ambiguo e path riservati rediretti via symlink/junction falliscono prima delle modifiche.
+- Packaging alpha Node standard: package con `bin.eio`, export ESM, files allowlist, engine e peer Pi; uso previsto `npm link` o install globale da path. Help/version, init e launch target entrypoint sono reali; il completo dogfood launcher multi-repository resta P0-B.
+- Plumbing core minimo: il Runner riceve root esplicite; se il Ledger portable lascia il model policy nullo, il modello realmente selezionato da Pi diventa la policy handoff effettiva. Safe point, latch, exactly-once admission, continuity, takeover e dispatch semantics non sono cambiati.
+- Cold review: corretti fail-open su Ledger duplicato, redirect symlink/junction, esposizione di file `.guardian` sconosciuti e selezione accidentale di Pi dal target; aggiunti test package-cwd e model policy Pi effettiva. Documentazione: `docs/portable-alpha.md`.
+- Gate finali cold review: `npm run check` PASS (32 moduli), `npm test` PASS (81/81), `git diff --check` PASS con soli warning informativi LF/CRLF, `npm pack --dry-run` PASS (24 file).
+- Nessun H2 pilot o RUN-40/50/60, nessun cambio threshold/Advisor, nessun Cost Guard, Chronicle, P0-B o dogfood Alfred/Durex/FARO.
+
+**STOP operativo:** P0-A è chiuso. Non iniziare P0-B senza autorizzazione separata.
+
 # CHECKPOINT — M1-H2 H2-02A-F1 Deterministic Calibration Bootstrap PASS
 
 - Perimetro esclusivo: issue #10, `H2-02A-F1`; nessun workload/pilot, model call reale, RUN-40/50/60, Cost Guard, Advisor adattivo, modifica workload/soglie globali o commit. HEAD di partenza/precedente experiment baseline: `d6a4b9cfa1e3c15cc0c9ea9ad9ead89216346254`; il nuovo experiment baseline sarà soltanto il futuro commit di freeze/acceptance F1.

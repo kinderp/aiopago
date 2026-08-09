@@ -12,7 +12,7 @@ import { GuardianStorage } from "../src/storage.mjs";
 
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
 
-function writeFixtureLedger(root, advanced = false) {
+function writeFixtureLedger(root, advanced = false, modelPolicy = "offline-fake/offline-fake") {
   const minimalReads = ["TASK_PLAN.md", "docs/adr.md", "docs/safe.md", "docs/resume.md"];
   const setup = {
     task_item_id: "ITEM-E2E-SETUP", task_id: "TASK-E2E", title: "Prepare source", description: "fixture setup",
@@ -34,14 +34,14 @@ function writeFixtureLedger(root, advanced = false) {
     current_item: advanced ? "ITEM-E2E-HANDOFF" : "ITEM-E2E-SETUP",
     next_item: advanced ? null : "ITEM-E2E-HANDOFF",
     next_step: advanced ? "Resume the updated handoff item" : "Complete source setup and advance the Ledger",
-    model_policy: "offline-fake/offline-fake", reasoning_policy: "off", minimal_reads: minimalReads,
+    model_policy: modelPolicy, reasoning_policy: "off", minimal_reads: minimalReads,
     task_items: [setup, handoff],
   };
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-function fixtureLedger(root) {
-  writeFixtureLedger(root);
+function fixtureLedger(root, modelPolicy = "offline-fake/offline-fake") {
+  writeFixtureLedger(root, false, modelPolicy);
   mkdirSync(join(root, "docs"));
   for (const name of ["adr.md", "safe.md", "resume.md"]) writeFileSync(join(root, "docs", name), `# ${name}\n`);
   writeFileSync(join(root, ".gitignore"), ".guardian/\n");
@@ -69,9 +69,9 @@ function writeOwnerGateLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-async function makeRunner({ ownerGate = false } = {}) {
+async function makeRunner({ ownerGate = false, portableModelPolicy = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "eiopago-pi-e2e-"));
-  fixtureLedger(root);
+  fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake");
   if (ownerGate) writeOwnerGateLedger(root);
   git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Eiopago E2E"]);
   git(root, ["add", "."]); git(root, ["commit", "-m", "fixture"]);
@@ -97,7 +97,7 @@ async function makeRunner({ ownerGate = false } = {}) {
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const sessions = mkdtempSync(join(tmpdir(), "eiopago-pi-sessions-"));
-  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off", contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
+  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy: "off", contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
   await runner.runtime.session.bindExtensions({
     mode: "print",
     commandContextActions: {
@@ -111,6 +111,19 @@ async function makeRunner({ ownerGate = false } = {}) {
   });
   return { root, runner, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
 }
+
+test("Pi E2E: a Pi-selected model becomes effective handoff policy when the Ledger leaves it null", async () => {
+  const x = await makeRunner({ portableModelPolicy: true });
+  try {
+    assert.equal(x.runner.ledger.read().model_policy, null);
+    assert.equal(x.runner.handoffService.modelPolicy, "offline-fake/offline-fake");
+    const result = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(result.state, "RESUME_READY");
+    assert.equal(result.model_policy, "offline-fake/offline-fake");
+    const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
+    assert.equal(manifest.payload.model_policy, "offline-fake/offline-fake");
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
 
 test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", async () => {
   const x = await makeRunner();
