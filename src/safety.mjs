@@ -1,3 +1,4 @@
+import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
 const TOOL_PROFILES = Object.freeze({
@@ -7,7 +8,27 @@ const TOOL_PROFILES = Object.freeze({
   ls: "READ_ONLY",
   edit: "LOCAL_ATOMIC_MUTATION",
   write: "LOCAL_ATOMIC_MUTATION",
+  bash: "SHELL_ATOMIC_OPERATION",
 });
+
+function shellEffectReference(toolCallId) {
+  return `shell:${sha256(Buffer.from(toolCallId, "utf8"))}`;
+}
+
+function bashTerminalOutcome(isError, result, interrupted) {
+  if (interrupted) return "UNKNOWN";
+  if (typeof isError !== "boolean" || !result || !Array.isArray(result.content)) return "UNKNOWN";
+  if (!isError) return "KNOWN_SUCCESS";
+  const text = result.content
+    .filter((entry) => entry?.type === "text" && typeof entry.text === "string")
+    .map((entry) => entry.text)
+    .join("\n");
+  // Pi 0.83.0's built-in bash tool throws this terminal diagnostic when its
+  // AbortSignal kills the process tree. isError alone cannot distinguish that
+  // interruption from a known command failure, so interruption stays unknown.
+  if (text === "Command aborted" || text.endsWith("\n\nCommand aborted")) return "UNKNOWN";
+  return "KNOWN_FAILURE";
+}
 
 export class AdmissionGate {
   constructor(storage, taskId) {
@@ -75,6 +96,7 @@ export class ToolOperationTracker {
   constructor(storage, taskId) {
     this.storage = storage;
     this.taskId = taskId;
+    this.admittedTools = new Map();
     this.effectReferences = new Map();
   }
   admit(toolCallId, toolName, input = {}) {
@@ -82,16 +104,25 @@ export class ToolOperationTracker {
     invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
     const latch = this.storage.ensureLatch(this.taskId);
     this.storage.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
-    if (profile !== "READ_ONLY" && typeof input.path === "string" && input.path.length > 0) {
+    this.admittedTools.set(toolCallId, toolName);
+    if (toolName === "bash") {
+      this.effectReferences.set(toolCallId, shellEffectReference(toolCallId));
+    } else if (profile !== "READ_ONLY" && typeof input.path === "string" && input.path.length > 0) {
       this.effectReferences.set(toolCallId, `file:${input.path.replaceAll("\\", "/")}`);
     }
   }
-  finish(toolCallId, isError) {
-    const effectReference = isError ? null : this.effectReferences.get(toolCallId) ?? null;
+  finish(toolCallId, isError, result = undefined, interrupted = false) {
+    const toolName = this.admittedTools.get(toolCallId);
+    const outcome = toolName === "bash"
+      ? bashTerminalOutcome(isError, result, interrupted)
+      : isError ? "KNOWN_FAILURE" : "KNOWN_SUCCESS";
+    const effectReference = outcome === "KNOWN_SUCCESS" ? this.effectReferences.get(toolCallId) ?? null : null;
+    this.admittedTools.delete(toolCallId);
     this.effectReferences.delete(toolCallId);
-    this.storage.finishOperation(toolCallId, isError ? "KNOWN_FAILURE" : "KNOWN_SUCCESS", effectReference);
+    this.storage.finishOperation(toolCallId, outcome, effectReference);
   }
   unknown(toolCallId) {
+    this.admittedTools.delete(toolCallId);
     this.effectReferences.delete(toolCallId);
     this.storage.finishOperation(toolCallId, "UNKNOWN");
   }

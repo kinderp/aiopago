@@ -165,8 +165,8 @@ export function createGuardianExtension(runner) {
       try { runner.toolTracker.admit(event.toolCallId, event.toolName, event.input); }
       catch (error) { return { block: true, reason: message(error) }; }
     });
-    pi.on("tool_execution_end", (event) => {
-      runner.toolTracker.finish(event.toolCallId, event.isError);
+    pi.on("tool_execution_end", (event, ctx) => {
+      runner.toolTracker.finish(event.toolCallId, event.isError, event.result, ctx.signal?.aborted === true);
     });
     pi.on("session_before_compact", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);

@@ -72,7 +72,7 @@ Oppure:
 eio --target F:/dev/un-altro-progetto
 ```
 
-Il comando risolve e valida il target, crea il Runner con quel repository esplicito, carica soltanto l'estensione Eiopago prevista e apre il normale TUI Pi. Il Runner possiede sessione e trasporto Pi; non esiste fallback implicito al cwd del source Eiopago.
+Il comando risolve e valida il target, crea il Runner con quel repository esplicito, carica soltanto l'estensione Eiopago prevista e apre il normale TUI Pi. Il Runner possiede sessione e trasporto Pi; non esiste fallback implicito al cwd del source Eiopago. Il Runner portable normale espone `read`, `edit`, `write`, `grep`, `find`, `ls` e il built-in Pi `bash`; ogni invocation shell è tracciata come operazione atomica non read-only e deve raggiungere un outcome terminale noto prima del safe point.
 
 Se il target non è inizializzato, l'avvio termina con `REPOSITORY_NOT_INITIALIZED` e indica di eseguire `eio init`.
 

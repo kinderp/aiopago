@@ -114,10 +114,15 @@ async function offlineRuntime(pi) {
       const resume = hasResumeContext(context);
       const phaseCalls = calls.filter((call) => call.resume === resume).length;
       calls.push({ resume, serialized: JSON.stringify(context.messages) });
-      if (phaseCalls === 0) {
-        const tool = resume
-          ? { id: "TOOL-ITEM-2", name: "write", arguments: { path: "acceptance.txt", content: "ITEM-2 accepted after continuity\n" } }
-          : { id: "TOOL-ITEM-1", name: "write", arguments: { path: "app.mjs", content: "export const greeting = 'PORTABLE';\n" } };
+      const phaseTools = resume
+        ? [{ id: "TOOL-ITEM-2", name: "write", arguments: { path: "acceptance.txt", content: "ITEM-2 accepted after continuity\n" } }]
+        : [
+            { id: "TOOL-BASH-GIT-STATUS", name: "bash", arguments: { command: "git status --short" } },
+            { id: "TOOL-BASH-LOCAL", name: "bash", arguments: { command: "node -e \"console.log('EIO_BASH_OK')\"" } },
+            { id: "TOOL-ITEM-1", name: "write", arguments: { path: "app.mjs", content: "export const greeting = 'PORTABLE';\n" } },
+          ];
+      if (phaseCalls < phaseTools.length) {
+        const tool = phaseTools[phaseCalls];
         toolCalls.push(tool);
         return streamMessage(pi, makeMessage(model, usage, [{ type: "toolCall", ...tool }], "toolUse"));
       }
@@ -165,9 +170,23 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.equal(runner.cwd, repository.targetRoot);
           assert.equal(runner.roots.targetRoot, repository.targetRoot);
           assert.equal(runner.handoffService.modelPolicy, "portable-offline/portable-offline");
+          assert.deepEqual(runner.tools, ["read", "edit", "write", "grep", "find", "ls", "bash"]);
+          assert.deepEqual(source.getActiveToolNames(), ["read", "edit", "write", "grep", "find", "ls", "bash"]);
 
           await source.prompt("Execute ITEM-1 only. SOURCE_PRIVATE_MARKER must never reach the replacement.");
           assert.equal(readFileSync(join(root, "app.mjs"), "utf8"), "export const greeting = 'PORTABLE';\n");
+          const sourceToolResults = source.sessionManager.getEntries()
+            .filter((entry) => entry.type === "message" && entry.message.role === "toolResult");
+          const bashResults = sourceToolResults.filter((entry) => entry.message.toolName === "bash");
+          assert.equal(bashResults.length, 2, "the Runner-owned Pi session must execute both real built-in bash calls");
+          assert.equal(bashResults.every((entry) => entry.message.isError === false), true);
+          assert.match(JSON.stringify(bashResults), /EIO_BASH_OK/);
+          const shellOperations = runner.storage.operationsForTask("TASK-PORTABLE-FIXTURE")
+            .filter((operation) => operation.profile === "SHELL_ATOMIC_OPERATION");
+          assert.equal(shellOperations.length, 2);
+          assert.equal(shellOperations.every((operation) => operation.outcome === "KNOWN_SUCCESS"), true);
+          assert.equal(shellOperations.every((operation) => /^shell:sha256:[a-f0-9]{64}$/.test(operation.effect_reference)), true);
+          assert.equal(JSON.stringify(shellOperations).includes("git status --short"), false, "journal must not retain raw shell commands");
           execFileSync(process.execPath, ["--test", "test/app.test.mjs"], { cwd: root, stdio: "pipe" });
           writeLedger(root, true);
           const advanced = runner.ledger.read();
@@ -253,6 +272,8 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.deepEqual(checkpoint.payload.tests, ["node --test test/app.test.mjs"]);
           assert.deepEqual(checkpoint.payload.decisions, ["docs/decision.md"]);
           assert.equal(checkpoint.payload.changes.includes("file:app.mjs"), true);
+          assert.equal(checkpoint.payload.changes.filter((reference) => /^shell:sha256:[a-f0-9]{64}$/.test(reference)).length, 2);
+          assert.equal(JSON.stringify(checkpoint.payload).includes("git status --short"), false);
           assert.deepEqual(manifest.payload.relevant_decisions, ["docs/decision.md"]);
           assert.deepEqual(manifest.payload.relevant_tests, ["node --test test/app.test.mjs"]);
           assert.deepEqual(manifest.payload.evidence_references, ["README.md"]);
@@ -298,6 +319,8 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
   }
 
   assert.ok(evidence);
+  assert.equal(offline.toolCalls.filter((call) => call.name === "bash" && call.arguments.command === "git status --short").length, 1);
+  assert.equal(offline.toolCalls.filter((call) => call.name === "bash" && call.arguments.command === "node -e \"console.log('EIO_BASH_OK')\"").length, 1);
   assert.equal(offline.toolCalls.filter((call) => call.name === "write" && call.arguments.path === "app.mjs").length, 1);
   assert.equal(offline.toolCalls.filter((call) => call.name === "write" && call.arguments.path === "acceptance.txt").length, 1);
   assert.equal(offline.calls.filter((call) => call.resume).every((call) => !call.serialized.includes("SOURCE_PRIVATE_MARKER")), true);

@@ -11,7 +11,7 @@ import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState, sameGitState } from "../src/git-state.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
-import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "../src/safety.mjs";
+import { AdmissionGate, SafePointCoordinator, TOOL_PROFILES, ToolOperationTracker } from "../src/safety.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
 function temp() { return mkdtempSync(join(tmpdir(), "eiopago-core-")); }
@@ -336,6 +336,96 @@ test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
   assert.equal(takeover.state, "ENGAGED");
   assert.equal(takeover.reason, "HUMAN_TAKEOVER");
   assert.equal(storage.events("HO-stale-confirm").some((event) => event.event_type === "LATCH_RELEASED" || event.event_type === "RESUME_ADMISSION_COMMITTED"), false);
+  storage.close();
+});
+
+test("bash safety profile tracks known outcomes without journaling raw commands", async () => {
+  const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  const taskId = "TASK-BASH"; storage.ensureLatch(taskId);
+  const tracker = new ToolOperationTracker(storage, taskId);
+  const idleSession = {
+    isIdle: true, isStreaming: false, pendingMessageCount: 0, isRetrying: false, isCompacting: false,
+    clearQueue() {}, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {},
+    async abort() {}, async waitForIdle() {},
+  };
+
+  assert.equal(TOOL_PROFILES.bash, "SHELL_ATOMIC_OPERATION");
+  assert.notEqual(TOOL_PROFILES.bash, "READ_ONLY");
+  tracker.admit("OP-bash-success", "bash", { command: "printf 'secret-value'" });
+  assert.equal(storage.operationsForTask(taskId)[0].state, "ACTIVE");
+  tracker.finish("OP-bash-success", false, { content: [{ type: "text", text: "secret-value" }] });
+  const success = storage.operationsForTask(taskId)[0];
+  assert.equal(success.outcome, "KNOWN_SUCCESS");
+  assert.match(success.effect_reference, /^shell:sha256:[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(success).includes("printf 'secret-value'"), false);
+  const safe = new SafePointCoordinator({ storage, taskId, gate: new AdmissionGate(storage, taskId) });
+  assert.equal((await safe.request(idleSession)).state, "SAFE_TO_HANDOFF", "bash success needs no input.path");
+
+  const failureTask = "TASK-BASH-FAILURE"; storage.ensureLatch(failureTask);
+  const failureTracker = new ToolOperationTracker(storage, failureTask);
+  failureTracker.admit("OP-bash-failure", "bash", { command: "exit 7" });
+  failureTracker.finish("OP-bash-failure", true, { content: [{ type: "text", text: "Command exited with code 7" }] });
+  const failure = storage.operationsForTask(failureTask)[0];
+  assert.equal(failure.outcome, "KNOWN_FAILURE");
+  assert.equal(failure.effect_reference, null);
+  assert.equal((await new SafePointCoordinator({ storage, taskId: failureTask, gate: new AdmissionGate(storage, failureTask) }).request(idleSession)).state, "SAFE_TO_HANDOFF");
+
+  for (const [task, operation, finish] of [
+    ["TASK-BASH-ABORT", "OP-bash-abort", (current) => current.finish("OP-bash-abort", true, { content: [{ type: "text", text: "partial\n\nCommand aborted" }] }, true)],
+    ["TASK-BASH-AMBIGUOUS", "OP-bash-ambiguous", (current) => current.finish("OP-bash-ambiguous", false)],
+    ["TASK-BASH-UNKNOWN", "OP-bash-unknown", (current) => current.unknown("OP-bash-unknown")],
+  ]) {
+    storage.ensureLatch(task);
+    const current = new ToolOperationTracker(storage, task);
+    current.admit(operation, "bash", { command: "opaque" });
+    finish(current);
+    assert.equal(storage.operationsForTask(task)[0].outcome, "UNKNOWN");
+    await assert.rejects(
+      () => new SafePointCoordinator({ storage, taskId: task, gate: new AdmissionGate(storage, task) }).request(idleSession),
+      (error) => error.code === "HUMAN_DECISION_REQUIRED",
+    );
+  }
+
+  const unchangedTask = "TASK-TOOLS-UNCHANGED"; storage.ensureLatch(unchangedTask);
+  const unchanged = new ToolOperationTracker(storage, unchangedTask);
+  unchanged.admit("OP-read", "read", { path: "src/read.txt" }); unchanged.finish("OP-read", false);
+  unchanged.admit("OP-edit", "edit", { path: "src\\edit.txt" }); unchanged.finish("OP-edit", false);
+  unchanged.admit("OP-write", "write", { path: "src/write.txt" }); unchanged.finish("OP-write", true);
+  const [read, edit, write] = storage.operationsForTask(unchangedTask);
+  assert.equal(read.profile, "READ_ONLY"); assert.equal(read.effect_reference, null);
+  assert.equal(edit.profile, "LOCAL_ATOMIC_MUTATION"); assert.equal(edit.effect_reference, "file:src/edit.txt");
+  assert.equal(write.profile, "LOCAL_ATOMIC_MUTATION"); assert.equal(write.outcome, "KNOWN_FAILURE");
+  assert.throws(() => unchanged.admit("OP-unknown", "custom-shell", {}), (error) => error.code === "TOOL_PROFILE_REQUIRED");
+  storage.close();
+});
+
+test("safe point waits for an active bash terminal boundary", async () => {
+  const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
+  const taskId = "TASK-BASH-DRAIN"; storage.ensureLatch(taskId);
+  const tracker = new ToolOperationTracker(storage, taskId);
+  tracker.admit("OP-bash-drain", "bash", { command: "node -e deterministic" });
+  let releaseIdle;
+  let waitStarted;
+  const started = new Promise((resolve) => { waitStarted = resolve; });
+  const idle = new Promise((resolve) => { releaseIdle = resolve; });
+  let aborts = 0;
+  const session = {
+    isIdle: false, isStreaming: false, pendingMessageCount: 0, isRetrying: false, isCompacting: false,
+    clearQueue() {}, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {},
+    async abort() { aborts += 1; },
+    async waitForIdle() { waitStarted(); await idle; this.isIdle = true; },
+  };
+  const request = new SafePointCoordinator({ storage, taskId, gate: new AdmissionGate(storage, taskId) }).request(session);
+  let settled = false;
+  request.finally(() => { settled = true; });
+  await started;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(storage.operationsForTask(taskId)[0].state, "ACTIVE");
+  tracker.finish("OP-bash-drain", false, { content: [{ type: "text", text: "done" }] });
+  releaseIdle();
+  assert.equal((await request).state, "SAFE_TO_HANDOFF");
+  assert.equal(aborts, 0, "FINISH CURRENT ATOMIC OPERATION must not abort admitted bash");
   storage.close();
 });
 

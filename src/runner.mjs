@@ -14,6 +14,8 @@ import { loadPi } from "./pi-loader.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
 
+export const DEFAULT_PORTABLE_TOOLS = Object.freeze(["read", "edit", "write", "grep", "find", "ls", "bash"]);
+
 export class GuardianRunner {
   static async create(options = {}) {
     const repository = options.repository ?? null;
@@ -51,7 +53,7 @@ export class GuardianRunner {
       runtimeRoot: repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"),
       artifactRoot: repository?.artifactRoot ?? join(cwd, ".guardian"),
     });
-    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? ["read", "edit", "write", "grep", "find", "ls"] });
+    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
     runner.metrics = options.metrics ?? new MeasurementInstrumentation({
       storage,
       ledger,
