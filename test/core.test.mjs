@@ -80,8 +80,8 @@ test("Context Handoff Advisor prepares the canonical command only after user con
   assert.equal(automaticHandoffs, 0);
 });
 
-function minimalLedger(path, overrides = {}) {
-  const task = {
+function minimalTask(overrides = {}) {
+  return {
     schema_version: "0.1.0", task_id: "TASK-T", title: "t", objective: "o",
     requirements_version: "REQ-1", plan_revision_id: "PLAN-1", status: "IN_PROGRESS",
     completion_criteria: ["tested"], risk: "HIGH", created_at: "2026-08-08T00:00:00Z",
@@ -89,8 +89,114 @@ function minimalLedger(path, overrides = {}) {
     task_items: [{ task_item_id: "ITEM-1", task_id: "TASK-T", title: "i", description: "d", status: "IN_PROGRESS", depends_on: [], completion_criteria: ["x"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "M1-H0", last_updated_at: "2026-08-08T00:00:00Z", last_updated_by: "human" }],
     ...overrides,
   };
+}
+
+function writeLedger(path, task) {
   writeFileSync(path, `# Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
+
+function minimalLedger(path, overrides = {}) {
+  writeLedger(path, minimalTask(overrides));
+}
+
+function twoItemActiveTask() {
+  const task = minimalTask({ next_item: "ITEM-2", next_step: "Complete ITEM-1, then continue ITEM-2" });
+  task.task_items.push({
+    ...task.task_items[0], task_item_id: "ITEM-2", title: "i2", description: "d2", status: "PLANNED",
+    depends_on: ["ITEM-1"], last_updated_by: "agent",
+  });
+  return task;
+}
+
+test("Ledger status vocabulary remains canonical and rejects PENDING", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const allowed = ["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"];
+  for (const status of allowed) {
+    const task = minimalTask({ status });
+    task.task_items[0].status = status;
+    task.current_item = status === "IN_PROGRESS" ? "ITEM-1" : null;
+    task.next_item = ["PLANNED", "BLOCKED"].includes(status) ? "ITEM-1" : null;
+    if (status === "DONE") {
+      task.evidence = ["task verified"];
+      task.task_items[0].evidence = ["item verified"];
+    }
+    writeLedger(path, task);
+    assert.equal(new TaskLedger(path).read().status, status);
+  }
+
+  minimalLedger(path, { status: "PENDING" });
+  assert.throws(() => new TaskLedger(path).read(), (error) => {
+    assert.equal(error.code, "LEDGER_STATUS_INVALID");
+    assert.equal(error.message, `task status must be one of ${allowed.join(", ")}`);
+    return true;
+  });
+
+  const pendingItem = twoItemActiveTask();
+  pendingItem.task_items[1].status = "PENDING";
+  writeLedger(path, pendingItem);
+  assert.throws(() => new TaskLedger(path).read(), (error) => {
+    assert.equal(error.code, "LEDGER_ITEM_STATUS_INVALID");
+    assert.equal(error.message, `item status must be one of ${allowed.join(", ")}`);
+    return true;
+  });
+});
+
+test("Ledger validates the dogfood active-to-canonical-blocked transition", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const active = twoItemActiveTask();
+  writeLedger(path, active);
+  const activeRead = new TaskLedger(path).read();
+  assert.equal(activeRead.status, "IN_PROGRESS");
+  assert.equal(activeRead.current_item, "ITEM-1");
+  assert.equal(activeRead.next_item, "ITEM-2");
+
+  const blocked = structuredClone(active);
+  blocked.status = "BLOCKED";
+  blocked.task_items[0].status = "BLOCKED";
+  blocked.current_item = null;
+  blocked.next_item = "ITEM-1";
+  blocked.next_step = "Blocker: external approval; unblock when approved; resume ITEM-1.";
+  writeLedger(path, blocked);
+  const blockedRead = new TaskLedger(path).read();
+  assert.equal(blockedRead.status, "BLOCKED");
+  assert.equal(blockedRead.current_item, null);
+  assert.equal(blockedRead.next_item, "ITEM-1");
+  assert.deepEqual(blockedRead.task_items.map((item) => item.status), ["BLOCKED", "PLANNED"]);
+});
+
+test("Ledger accepts a final active item with no future item", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const task = twoItemActiveTask();
+  task.task_items[0].status = "DONE";
+  task.task_items[0].evidence = ["ITEM-1 verified"];
+  task.task_items[1].status = "IN_PROGRESS";
+  task.current_item = "ITEM-2";
+  task.next_item = null;
+  task.next_step = "Finish ITEM-2";
+  writeLedger(path, task);
+  const read = new TaskLedger(path).read();
+  assert.equal(read.current_item, "ITEM-2");
+  assert.equal(read.next_item, null);
+});
+
+test("Ledger rejects a blocked current_item and identical current/next item", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const blockedCurrent = minimalTask({ status: "BLOCKED", current_item: "ITEM-1", next_item: null });
+  blockedCurrent.task_items[0].status = "BLOCKED";
+  writeLedger(path, blockedCurrent);
+  assert.throws(
+    () => new TaskLedger(path).read(),
+    (error) => error.code === "LEDGER_CURRENT_ITEM_MISMATCH" && error.message === "current_item must reference the sole IN_PROGRESS item",
+  );
+
+  const sameItem = twoItemActiveTask();
+  sameItem.next_item = "ITEM-1";
+  writeLedger(path, sameItem);
+  assert.throws(
+    () => new TaskLedger(path).read(),
+    (error) => error.code === "LEDGER_LIFECYCLE_INVALID" && error.message === "current_item and next_item must differ",
+  );
+});
 
 test("invalid Ledger event hooks fail closed with bounded diagnostics and recover after next_item is repaired", async () => {
   const root = temp();

@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   GITIGNORE_START,
   checkPortableEnvironment,
+  createLedgerTemplate,
   initializeRepository,
   isSupportedNodeVersion,
 } from "../src/bootstrap.mjs";
@@ -41,6 +42,21 @@ function validLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), text);
   return text;
 }
+
+test("createLedgerTemplate puts the canonical lifecycle contract before the JSON Ledger", () => {
+  const template = createLedgerTemplate("/fixture/canonical-ledger", "2026-08-09T00:00:00.000Z");
+  const contract = template.indexOf("## Ledger lifecycle contract");
+  const ledger = template.indexOf("```json task-ledger");
+  assert.ok(contract >= 0 && contract < ledger);
+  assert.match(template, /Allowed statuses: `PLANNED`, `IN_PROGRESS`, `BLOCKED`, `DONE`, `DROPPED`, `SUPERSEDED`/);
+  assert.match(template, /Future items use `PLANNED`, never `PENDING`/);
+  assert.match(template, /Active work: task and item are `IN_PROGRESS`; `current_item` references that sole item/);
+  assert.match(template, /Externally blocked work: task and item are `BLOCKED`; `current_item` is `null`; `next_item` references the blocked item/);
+  assert.match(template, /`next_step` names the blocker, unblock condition, and item to resume/);
+  assert.match(template, /`current_item` is `null` or the sole `IN_PROGRESS` item; it never references `PLANNED`, `BLOCKED`, or `DONE`/);
+  assert.match(template, /`next_item` is `null` or a `PLANNED`\/`BLOCKED` item, and must differ from `current_item`/);
+  assert.match(template, /For the final active item, `next_item` is `null`/);
+});
 
 test("portable init creates the minimal versioned contract and ignored runtime without touching application files", async () => {
   const root = repo("eiopago clean repo with spaces ");

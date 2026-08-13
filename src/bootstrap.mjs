@@ -106,7 +106,7 @@ export function createLedgerTemplate(targetRoot, now = new Date().toISOString())
       last_updated_by: "human:eio-init",
     }],
   };
-  return `# Eiopago Task Ledger\n\n**Schema:** \`eiopago.task-ledger/0.1.0\`\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`;
+  return `# Eiopago Task Ledger\n\n**Schema:** \`eiopago.task-ledger/0.1.0\`\n\n## Ledger lifecycle contract\n\n- Allowed statuses: \`PLANNED\`, \`IN_PROGRESS\`, \`BLOCKED\`, \`DONE\`, \`DROPPED\`, \`SUPERSEDED\`. Future items use \`PLANNED\`, never \`PENDING\`.\n- Active work: task and item are \`IN_PROGRESS\`; \`current_item\` references that sole item. For the final active item, \`next_item\` is \`null\`.\n- Externally blocked work: task and item are \`BLOCKED\`; \`current_item\` is \`null\`; \`next_item\` references the blocked item. \`next_step\` names the blocker, unblock condition, and item to resume.\n- \`current_item\` is \`null\` or the sole \`IN_PROGRESS\` item; it never references \`PLANNED\`, \`BLOCKED\`, or \`DONE\`.\n- \`next_item\` is \`null\` or a \`PLANNED\`/\`BLOCKED\` item, and must differ from \`current_item\`.\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`;
 }
 
 function validateExistingState(targetRoot) {

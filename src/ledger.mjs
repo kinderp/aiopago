@@ -4,7 +4,9 @@ import { sha256, utcNow } from "./canonical.mjs";
 import { invariant } from "./errors.mjs";
 
 const BLOCK = /```json task-ledger\s*\r?\n([\s\S]*?)\r?\n```/;
-const TASK_STATES = new Set(["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"]);
+const TASK_STATUS_VALUES = ["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"];
+const TASK_STATES = new Set(TASK_STATUS_VALUES);
+const TASK_STATUS_MESSAGE = `status must be one of ${TASK_STATUS_VALUES.join(", ")}`;
 
 export class TaskLedger {
   constructor(path = "TASK_PLAN.md") {
@@ -90,7 +92,7 @@ export class TaskLedger {
       invariant(Object.hasOwn(task, field), "LEDGER_FIELD_MISSING", `Ledger missing ${field}`);
     }
     invariant(task.schema_version === "0.1.0", "LEDGER_SCHEMA_UNSUPPORTED");
-    invariant(TASK_STATES.has(task.status), "LEDGER_STATUS_INVALID");
+    invariant(TASK_STATES.has(task.status), "LEDGER_STATUS_INVALID", `task ${TASK_STATUS_MESSAGE}`);
     invariant(Array.isArray(task.task_items) && task.task_items.length > 0, "LEDGER_ITEMS_INVALID");
     if (task.status === "DONE") {
       invariant(Array.isArray(task.evidence) && task.evidence.length > 0, "DONE_WITHOUT_EVIDENCE");
@@ -100,7 +102,7 @@ export class TaskLedger {
     for (const item of task.task_items) {
       invariant(item.task_id === task.task_id, "LEDGER_TASK_ID_MISMATCH");
       invariant(typeof item.task_item_id === "string" && !ids.has(item.task_item_id), "LEDGER_ITEM_ID_INVALID");
-      invariant(TASK_STATES.has(item.status), "LEDGER_ITEM_STATUS_INVALID");
+      invariant(TASK_STATES.has(item.status), "LEDGER_ITEM_STATUS_INVALID", `item ${TASK_STATUS_MESSAGE}`);
       invariant(Array.isArray(item.depends_on) && Array.isArray(item.completion_criteria) && Array.isArray(item.evidence), "LEDGER_ITEM_FIELDS_INVALID");
       if (item.status === "DONE") invariant(item.completion_criteria.length > 0 && item.evidence.length > 0, "DONE_WITHOUT_EVIDENCE");
       ids.add(item.task_item_id);
@@ -119,13 +121,13 @@ export class TaskLedger {
     };
     for (const id of ids) visit(id);
     const inProgress = task.task_items.filter((item) => item.status === "IN_PROGRESS");
-    invariant(inProgress.length <= 1, "LEDGER_MULTIPLE_CURRENT_ITEMS");
-    invariant(task.current_item === null || (typeof task.current_item === "string" && ids.has(task.current_item)), "LEDGER_CURRENT_ITEM_INVALID");
-    invariant(task.next_item === null || (typeof task.next_item === "string" && ids.has(task.next_item)), "LEDGER_NEXT_ITEM_INVALID");
+    invariant(inProgress.length <= 1, "LEDGER_MULTIPLE_CURRENT_ITEMS", "at most one item may be IN_PROGRESS");
+    invariant(task.current_item === null || (typeof task.current_item === "string" && ids.has(task.current_item)), "LEDGER_CURRENT_ITEM_INVALID", "current_item must be null or reference an existing item");
+    invariant(task.next_item === null || (typeof task.next_item === "string" && ids.has(task.next_item)), "LEDGER_NEXT_ITEM_INVALID", "next_item must be null or reference an existing item");
     invariant(task.current_item !== task.next_item || task.current_item === null, "LEDGER_LIFECYCLE_INVALID", "current_item and next_item must differ");
-    if (task.current_item === null) invariant(inProgress.length === 0, "LEDGER_CURRENT_ITEM_MISMATCH");
-    else invariant(inProgress.length === 1 && inProgress[0].task_item_id === task.current_item, "LEDGER_CURRENT_ITEM_MISMATCH");
-    if (task.next_item !== null) invariant(["PLANNED", "BLOCKED"].includes(byId.get(task.next_item).status), "LEDGER_NEXT_ITEM_INVALID", "next_item must be planned or blocked");
+    if (task.current_item === null) invariant(inProgress.length === 0, "LEDGER_CURRENT_ITEM_MISMATCH", "current_item must reference the sole IN_PROGRESS item, or be null when none is IN_PROGRESS");
+    else invariant(inProgress.length === 1 && inProgress[0].task_item_id === task.current_item, "LEDGER_CURRENT_ITEM_MISMATCH", "current_item must reference the sole IN_PROGRESS item");
+    if (task.next_item !== null) invariant(["PLANNED", "BLOCKED"].includes(byId.get(task.next_item).status), "LEDGER_NEXT_ITEM_INVALID", "next_item must reference a PLANNED or BLOCKED item");
     if (task.status === "DONE") invariant(task.current_item === null && task.next_item === null, "DONE_WITH_OPEN_LIFECYCLE");
   }
 }

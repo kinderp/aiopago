@@ -58,6 +58,12 @@ Sono accettati anche path nested, path con spazi e linked worktree. Git determin
 
 Prima del lavoro, sostituire il Ledger iniziale con un task bounded reale. Un `TASK_PLAN.md` estraneo, ambiguo o incompatibile non viene sovrascritto.
 
+### Contratto lifecycle del Ledger
+
+Gli status ammessi, sia per il task sia per gli item, sono soltanto `PLANNED`, `IN_PROGRESS`, `BLOCKED`, `DONE`, `DROPPED` e `SUPERSEDED`; un item futuro usa `PLANNED`, mai `PENDING`. Durante il lavoro normale il task e l'unico item attivo sono `IN_PROGRESS`, `current_item` identifica quell'item e `next_item` identifica un eventuale item futuro `PLANNED`/`BLOCKED`. Se l'item attivo è l'ultimo, `next_item` è `null`.
+
+Per un blocco esterno, impostare task e item a `BLOCKED`, `current_item=null` e `next_item` all'item bloccato. `next_step` deve indicare blocker, condizione di sblocco e item da riprendere. In generale `current_item` è `null` oppure identifica il solo item `IN_PROGRESS` (mai un item `PLANNED`, `BLOCKED` o `DONE`); `next_item` è `null` oppure identifica un item `PLANNED`/`BLOCKED` e deve sempre differire da `current_item`. Eiopago non converte né ripara automaticamente stati invalidi: il validator blocca il flusso finché `TASK_PLAN.md` non viene corretto esplicitamente.
+
 ## Avviare Pi sotto il Runner
 
 Dal target:
