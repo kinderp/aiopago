@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { observeGitState } from "../src/git-state.mjs";
 import { HandoffService } from "../src/handoff.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
@@ -271,12 +272,22 @@ test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest 
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
-test("Pi E2E fresh session outside the Guardian replacement path fails ownership attestation", async () => {
+test("Pi E2E direct session replacement and history fork outside the Guardian permit path are cancelled fail-closed", async () => {
   const x = await makeRunner();
   try {
-    await x.runner.runtime.newSession();
+    const source = x.runner.runtime.session;
+    const direct = await x.runner.runtime.newSession();
+    assert.equal(direct.cancelled, true);
+    assert.equal(x.runner.runtime.session.sessionId, source.sessionId);
+
+    await source.prompt("Create source history that must not be forked");
+    const userEntry = source.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message.role === "user");
+    assert.ok(userEntry);
+    const fork = await x.runner.runtime.fork(userEntry.id);
+    assert.equal(fork.cancelled, true);
+    assert.equal(x.runner.runtime.session.sessionId, source.sessionId);
     assert.throws(() => readRuntimeRunnerBinding(x.runner.runtime.session), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
-    assert.equal(x.calls, 0);
+    assert.equal(x.calls, 1);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
@@ -335,4 +346,56 @@ test("Pi E2E /eio handoff manual leaves replacement paused with zero entries", a
     assert.equal(x.calls, 1);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+async function continuityFailureScenario(code, mutate) {
+  const x = await makeRunner();
+  try {
+    const result = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(result.state, "RESUME_READY");
+    const handoff = x.runner.storage.getHandoff(result.handoff_id);
+    handoff.state = "MANIFEST_PERSISTED";
+    x.runner.storage.saveHandoff(handoff);
+    await mutate({ x, result, target: x.runner.runtime.session });
+    assert.throws(
+      () => x.runner.handoffService.continuity(result.handoff_id, x.runner.runtime.session),
+      (error) => error.code === code,
+    );
+    assert.equal(x.runner.storage.getLatch(result.task_id).state, "ENGAGED");
+    assert.equal(x.runner.storage.events(result.handoff_id).some((event) => event.event_type === "RESUME_ADMISSION_COMMITTED"), false);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+}
+
+test("P0-B continuity failure matrix remains fail-closed", async (t) => {
+  await t.test("target Git mismatch", () => continuityFailureScenario("GIT_STATE_MISMATCH", async ({ x }) => {
+    const other = mkdtempSync(join(tmpdir(), "eiopago-other-target-"));
+    git(other, ["init"]); git(other, ["config", "user.email", "other@example.invalid"]); git(other, ["config", "user.name", "Other Target"]);
+    writeFileSync(join(other, "other.txt"), "other\n"); git(other, ["add", "."]); git(other, ["commit", "-m", "other"]);
+    x.runner.handoffService.observeGit = () => observeGitState(other);
+  }));
+  await t.test("HEAD mismatch", () => continuityFailureScenario("GIT_STATE_MISMATCH", async ({ x }) => {
+    writeFileSync(join(x.root, "head-change.txt"), "new commit\n");
+    git(x.root, ["add", "head-change.txt"]); git(x.root, ["commit", "-m", "move HEAD"]);
+  }));
+  await t.test("Ledger revision mismatch", () => continuityFailureScenario("PLAN_REVISION_MISMATCH", async ({ x }) => {
+    writeFixtureLedger(x.root, true);
+  }));
+  await t.test("checkpoint digest mismatch", () => continuityFailureScenario("CHECKPOINT_MISMATCH", async ({ x, result }) => {
+    const path = x.runner.storage.getArtifact("checkpoint", result.checkpoint_id).path;
+    writeFileSync(path, `${readFileSync(path, "utf8")}tampered\n`);
+  }));
+  await t.test("manifest digest mismatch", () => continuityFailureScenario("MANIFEST_MISMATCH", async ({ x, result }) => {
+    const path = x.runner.storage.getArtifact("manifest", result.resume_manifest_id).path;
+    writeFileSync(path, `${readFileSync(path, "utf8")}tampered\n`);
+  }));
+  await t.test("model policy mismatch", () => continuityFailureScenario("MODEL_POLICY_MISMATCH", async ({ x }) => {
+    x.runner.handoffService.modelPolicy = "offline-fake/other-model";
+  }));
+  await t.test("reasoning policy mismatch", () => continuityFailureScenario("REASONING_POLICY_MISMATCH", async ({ x }) => {
+    x.runner.handoffService.reasoningPolicy = "high";
+  }));
+  await t.test("stale Runner binding", () => continuityFailureScenario("RUNNER_OWNERSHIP_ATTESTATION_FAILED", async ({ x, result }) => {
+    x.runner.storage.supersedeRunnerSessionBinding(result.handoff_id, "simulated stale Runner");
+  }));
 });

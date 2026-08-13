@@ -8,10 +8,67 @@ function safeMetric(runner, method, ...args) {
   try { return runner.metrics?.[method]?.(...args) ?? null; } catch { return null; }
 }
 
+function ledgerDiagnostic(error) {
+  const detail = error instanceof GuardianError
+    ? `${error.code} — ${String(error.message).replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "")}.`
+    : "LEDGER_READ_FAILED — TASK_PLAN.md could not be read or validated.";
+  return `Eiopago Ledger invalid:\n${detail.slice(0, 320)}\nRepair TASK_PLAN.md before continuing.`;
+}
+function isLedgerError(error, runner) {
+  if (error instanceof GuardianError && /^(LEDGER_|DONE_|OWNER_GATE_)/.test(error.code)) return true;
+  return typeof error?.path === "string" && error.path === runner.ledger.path;
+}
+function readLedgerForHook(runner, ctx, type = "error") {
+  try { return runner.ledger.read(); }
+  catch (error) {
+    safeNotify(ctx, ledgerDiagnostic(error), type);
+    return null;
+  }
+}
+
+function availableContext(ctx) {
+  try {
+    const usage = typeof ctx?.getContextUsage === "function" ? ctx.getContextUsage() : null;
+    if (!usage || !Number.isFinite(usage.percent)) return "unavailable";
+    return `${Math.round(usage.percent)}%`;
+  } catch { return "unavailable"; }
+}
+
+export function formatGuardianStatus(runner, ctx = null) {
+  const task = runner.ledger.read();
+  const latch = runner.storage.ensureLatch(task.task_id);
+  const handoff = runner.storage.latestHandoffForTask(task.task_id);
+  const session = runner.runtime?.session ?? null;
+  const git = runner.handoffService.observeGit();
+  const binding = handoff?.target_session_id === session?.sessionId
+    ? runner.storage.getRunnerSessionBinding(handoff.handoff_id)
+    : null;
+  const model = session?.model?.provider && session?.model?.id ? `${session.model.provider}/${session.model.id}` : "unavailable";
+  const ownership = binding
+    ? `Runner-owned replacement (${binding.status})`
+    : "Runner-owned source";
+  return [
+    "Eiopago status",
+    `Target repository: ${runner.roots.targetRoot}`,
+    `Git: branch=${git.branch || "detached"} HEAD=${git.head_sha ?? "unborn"}`,
+    `Worktree: ${git.workdir}`,
+    `Task: ${task.task_id} revision=${task.plan_revision_id} status=${task.status}`,
+    `Current item: ${task.current_item ?? "none"}`,
+    `Next item: ${task.next_item ?? "none"}`,
+    `Runner ownership: ${ownership}; instance=${runner.runnerInstanceId}`,
+    `Session: ${session?.sessionId ?? "unavailable"}; model=${model}; reasoning=${session?.thinkingLevel ?? "unavailable"}`,
+    `Latch: ${latch.state}; generation=${latch.generation}; reason=${latch.reason ?? "none"}`,
+    `Human takeover: ${latch.reason === "HUMAN_TAKEOVER" ? "ACTIVE" : "inactive"}`,
+    `Handoff: ${handoff?.handoff_id ?? "none"}; state=${handoff?.state ?? "none"}`,
+    `Advisor/context: ${availableContext(ctx)}; threshold=${runner.contextAdvisor?.thresholdPercent ?? "unavailable"}%`,
+    ...(handoff?.manual_recovery ?? []),
+  ].join("\n");
+}
+
 async function adviseHandoff(runner, ctx) {
   if (!ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
-  const task = runner.ledger.read();
-  if (!runner.storage.isAdmissionOpen(task.task_id)) return;
+  const task = readLedgerForHook(runner, ctx, "warning");
+  if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
   safeMetric(runner, "recordHandoffEvent", "SUGGESTED", {
@@ -53,11 +110,8 @@ export function createGuardianExtension(runner) {
       const [subcommand = "status", value] = args.trim().split(/\s+/);
       try {
         if (subcommand === "status") {
-          const task = runner.ledger.read();
-          const latch = runner.storage.ensureLatch(task.task_id);
-          const handoff = runner.storage.latestHandoffForTask(task.task_id);
-          const recovery = handoff?.manual_recovery?.length ? `\n${handoff.manual_recovery.join("\n")}` : "";
-          ctx.ui.notify(`Eiopago latch=${latch.state} generation=${latch.generation} handoff=${handoff?.handoff_id ?? "none"} state=${handoff?.state ?? "none"}${recovery}`, handoff?.state === "HANDOFF_FAILED" ? "warning" : "info");
+          const handoff = runner.storage.latestHandoffForTask(runner.ledger.read().task_id);
+          ctx.ui.notify(formatGuardianStatus(runner, ctx), handoff?.state === "HANDOFF_FAILED" ? "warning" : "info");
           return;
         }
         if (subcommand === "handoff") {
@@ -75,7 +129,7 @@ export function createGuardianExtension(runner) {
         }
         ctx.ui.notify("Usage: /eio handoff [manual|confirm] | /eio takeover | /eio resume [handoff-id] | /eio status", "warning");
       } catch (error) {
-        safeNotify(ctx, message(error), "error");
+        safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error");
       }
     }
 
@@ -93,9 +147,10 @@ export function createGuardianExtension(runner) {
           return { action: "handled" };
         }
       }
-      const task = runner.ledger.read();
+      const task = readLedgerForHook(runner, ctx);
+      if (!task) return { action: "handled" };
       if (!runner.storage.isAdmissionOpen(task.task_id)) {
-        ctx.ui.notify("Eiopago latch engaged: only local /eio commands are admitted", "warning");
+        safeNotify(ctx, "Eiopago latch engaged: only local /eio commands are admitted", "warning");
         return { action: "handled" };
       }
       return { action: "continue" };
@@ -113,17 +168,22 @@ export function createGuardianExtension(runner) {
     pi.on("tool_execution_end", (event) => {
       runner.toolTracker.finish(event.toolCallId, event.isError);
     });
-    pi.on("session_before_compact", () => {
-      const task = runner.ledger.read();
-      if (!runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+    pi.on("session_before_compact", (_event, ctx) => {
+      const task = readLedgerForHook(runner, ctx);
+      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
     });
-    pi.on("session_before_tree", () => {
-      const task = runner.ledger.read();
-      if (!runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+    pi.on("session_before_tree", (_event, ctx) => {
+      const task = readLedgerForHook(runner, ctx);
+      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
     });
-    pi.on("session_before_switch", () => {
-      const task = runner.ledger.read();
-      if (!runner.storage.isAdmissionOpen(task.task_id) && !runner.consumeReplacementPermit()) return { cancel: true };
+    pi.on("session_before_switch", (_event, ctx) => {
+      const task = readLedgerForHook(runner, ctx);
+      if (!task) return { cancel: true };
+      if (!runner.consumeReplacementPermit()) return { cancel: true };
+    });
+    pi.on("session_before_fork", (_event, ctx) => {
+      if (!readLedgerForHook(runner, ctx)) return { cancel: true };
+      return { cancel: true };
     });
   };
 }

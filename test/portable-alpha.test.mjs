@@ -244,6 +244,21 @@ test("CLI routes explicit init and launch targets through the repository contrac
   assert.equal(disposed, true);
 });
 
+test("portable launch fails fast with eio init guidance and never falls back to the installation cwd", async () => {
+  const uninitialized = repo("eiopago uninitialized launch ");
+  let createCalls = 0;
+  await assert.rejects(
+    () => runCli(["--target", uninitialized], {
+      stdout: () => {},
+      checkEnvironment: async () => ({}),
+      createRunner: async () => { createCalls += 1; },
+    }),
+    (error) => error.code === "REPOSITORY_NOT_INITIALIZED" && error.message.includes("eio init"),
+  );
+  assert.equal(createCalls, 0);
+  assert.equal(existsSync(join(uninitialized, ".guardian")), false);
+});
+
 test("package bin is invocable with an unrelated cwd and does not create target files", () => {
   const outside = temp("eiopago package invocation ");
   const output = execFileSync(process.execPath, [join(INSTALLATION_ROOT, "bin", "eio.mjs"), "--version"], {

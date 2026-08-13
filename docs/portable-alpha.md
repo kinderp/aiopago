@@ -1,79 +1,143 @@
-# Eiopago Portable Alpha — installazione, init e layout
+# Eiopago Portable Alpha — installazione, avvio e handoff
 
-Questa guida descrive **M1-P0-A**. Eiopago rimane un prodotto separato dal repository su cui lavora: `eio init` non copia il source di Eiopago, non installa dipendenze nel target e non modifica file applicativi.
+Eiopago è installato separatamente dal repository su cui lavora. Nel target non copia il proprio source, non aggiunge dipendenze applicative e non modifica `package.json`.
 
-## Prerequisiti supportati
+## Prerequisiti
 
-- Node.js **22.19.0 o successivo** (`node:sqlite` è richiesto);
-- Git disponibile su `PATH` e un normale Git worktree, inclusi i linked worktree;
-- `@earendil-works/pi-coding-agent` **0.83.x**;
-- una configurazione Pi/provider utilizzabile per l'avvio interattivo.
+- Node.js **22.19.0 o successivo**;
+- Git su `PATH` e un normale Git worktree, inclusi linked worktree;
+- `@earendil-works/pi-coding-agent` **0.83.x** accanto all'installazione Eiopago;
+- un provider Pi configurato e utilizzabile.
 
-Eiopago rileva questi prerequisiti e fallisce prima del bootstrap se mancano. Non aggiorna e non installa automaticamente Node, Git o Pi. Pi viene risolto accanto all'installazione Eiopago (nested/hoisted o installazione globale), non dal `node_modules` arbitrario del repository target. Per una installazione Pi non risolvibile automaticamente si può impostare `PI_CODING_AGENT_ROOT` alla directory del package `@earendil-works/pi-coding-agent`; l'override è autorevole e un path errato fallisce chiuso senza fallback.
+Eiopago verifica i prerequisiti prima di init e launch. Non installa e non aggiorna automaticamente Node, Git o Pi. Se Pi è installato in una posizione non risolvibile, impostare `PI_CODING_AGENT_ROOT` alla directory del package Pi. Un override errato fallisce senza fallback al `node_modules` del target.
 
 ## Installazione locale alpha
 
-Il metodo preferito per l'alpha personale è il linking npm standard, eseguito nel repository Eiopago:
+Dal repository/package Eiopago:
 
 ```text
-cd F:/dev/eiopago-m1-p0
 npm link
 ```
 
-Questo registra il bin `eio` senza copiare Eiopago nei repository target. In alternativa è possibile installare globalmente dal path locale:
+In alternativa:
 
 ```text
 npm install --global F:/dev/eiopago-m1-p0
 ```
 
-Non è richiesta né prevista in P0-A una pubblicazione npm pubblica. Il package dichiara un vero `bin`, l'entrypoint ESM e il peer Pi supportato; `npm pack --dry-run` consente di ispezionare il contenuto del package.
+Per provare esattamente il contenuto impacchettato senza pubblicarlo:
 
-## Root contract
+```text
+npm pack
+npm install --global ./eiopago-0.1.0.tgz
+```
 
-Le root non vengono più dedotte come se fossero una sola directory:
+La Portable Alpha non viene pubblicata su npm.
 
-- **installation root**: directory del package Eiopago; contiene `bin/` e `src/`;
-- **target root**: top-level reale restituito da Git per il worktree selezionato;
-- **config root**: `<target>/.guardian`;
-- **runtime root**: `<target>/.guardian/runtime`, separata dal config persistente;
-- **artifact root**: `<target>/.guardian`, con artifact sealed nelle sottodirectory `checkpoints/` e `manifests/` quando un handoff le crea.
+## Inizializzare un target
 
-Tutte sono risolte e passate esplicitamente al Runner. Un path nested viene ricondotto al relativo top-level Git. Path con spazi e linked worktree sono supportati; il design usa API Node/Git portabili e non richiede una lettera drive Windows.
-
-## Inizializzazione
-
-Dentro una qualsiasi directory del worktree:
+Dentro il worktree target:
 
 ```text
 eio init
 ```
 
-Oppure indicando il target:
+Oppure da qualsiasi directory:
 
 ```text
-eio init F:/dev/un-altro-progetto
-eio init --target "F:/dev/progetto con spazi"
+eio init --target F:/dev/un-altro-progetto
 ```
 
-`eio init`:
+Sono accettati anche path nested, path con spazi e linked worktree. Git determina sempre il top-level reale. `eio init`:
 
-1. verifica Node, Git, Pi e il worktree target;
-2. valida prima qualsiasi config o `TASK_PLAN.md` preesistente;
-3. crea solo gli elementi Eiopago mancanti;
-4. aggiunge a `.gitignore` un solo blocco delimitato e idempotente;
-5. stampa root, versioni e liste `Created`, `Updated`, `Preserved`.
+1. verifica Node, Git, Pi e target;
+2. preserva config e Ledger compatibili;
+3. crea solo lo stato Eiopago mancante;
+4. aggiunge un blocco delimitato e idempotente a `.gitignore`;
+5. stampa root, versioni e file creati/preservati.
 
-Terminato init, rivedere il Ledger e poi avviare:
+Prima del lavoro, sostituire il Ledger iniziale con un task bounded reale. Un `TASK_PLAN.md` estraneo, ambiguo o incompatibile non viene sovrascritto.
+
+## Avviare Pi sotto il Runner
+
+Dal target:
 
 ```text
 eio
-# oppure
+```
+
+Oppure:
+
+```text
 eio --target F:/dev/un-altro-progetto
 ```
 
-Il normale entrypoint avvia Pi con l'estensione Eiopago inline. Non scrive configurazioni extension in `.pi`, non modifica la configurazione Pi globale e disabilita il caricamento accidentale di altre extension/skill/prompt template nel Runner. Il completo launcher acceptance/dogfood multi-repository appartiene a P0-B.
+Il comando risolve e valida il target, crea il Runner con quel repository esplicito, carica soltanto l'estensione Eiopago prevista e apre il normale TUI Pi. Il Runner possiede sessione e trasporto Pi; non esiste fallback implicito al cwd del source Eiopago.
 
-## Layout creato
+Se il target non è inizializzato, l'avvio termina con `REPOSITORY_NOT_INITIALIZED` e indica di eseguire `eio init`.
+
+## Comandi nel TUI
+
+### Stato
+
+```text
+/eio status
+```
+
+Mostra in forma bounded:
+
+- target repository e worktree;
+- branch e HEAD;
+- task, revisione Ledger, current item e next item;
+- ownership Runner e sessione corrente;
+- modello/reasoning effettivi;
+- latch, takeover e handoff corrente;
+- stato context/Advisor quando disponibile.
+
+Non mostra conversation history, credenziali o secret.
+
+### Handoff con conferma
+
+Prima aggiornare `TASK_PLAN.md`: l'item concluso deve avere stato/evidence corretti e `current_item`, `next_item`, `next_step` devono descrivere il lavoro da riprendere. Poi:
+
+```text
+/eio handoff confirm
+```
+
+Eiopago attende un safe point, salva gli artifact del target, crea una nuova sessione Pi vuota e verifica repository, Git, Ledger, modello, reasoning e ownership. Solo dopo un Continuity Check positivo chiede il consenso per una singola resume admission.
+
+Accettando la conferma, la nuova sessione riceve il solo contesto minimo autorevole e prosegue dal `current_item`/`next_step` del Ledger. Non occorre conoscere o copiare ID, database, prompt o artifact.
+
+Invii duplicati e conferme duplicate non producono una seconda admission locale. Questo non equivale a dichiarare exactly-once presso il provider.
+
+### Handoff manuale
+
+```text
+/eio handoff manual
+```
+
+La replacement resta in pausa dopo il Continuity Check. Per autorizzare in seguito:
+
+```text
+/eio resume
+```
+
+Anche `/eio resume` richiede consenso umano. Non incollare manualmente checkpoint, manifest o chat nel nuovo editor.
+
+### Pause e takeover
+
+I due nomi correnti sono alias:
+
+```text
+/eio pause
+/eio takeover
+```
+
+Entrambi richiedono un safe point e attivano `HUMAN_TAKEOVER`. Il takeover umano ha precedenza assoluta: una conferma handoff pendente non può rilasciarlo e nuovi prompt/provider call restano bloccati.
+
+La alpha non offre un force-resume del takeover. Dopo un takeover, conservare lo stato, terminare il Runner e riconciliare esplicitamente il lavoro prima di qualsiasi cleanup o nuova inizializzazione.
+
+## Cosa viene salvato nel target
 
 ```text
 <target>/
@@ -81,64 +145,121 @@ Il normale entrypoint avvia Pi con l'estensione Eiopago inline. Non scrive confi
 ├── TASK_PLAN.md
 └── .guardian/
     ├── config.json
-    └── runtime/
+    ├── runtime/
+    ├── checkpoints/    # creato al primo handoff
+    └── manifests/      # creato al primo handoff
 ```
 
-Config iniziale:
+Da versionare:
 
-```json
-{
-  "schema_version": "eiopago.repository/1.0.0",
-  "task_ledger": "TASK_PLAN.md",
-  "runtime_root": ".guardian/runtime",
-  "artifact_root": ".guardian"
-}
+- `.guardian/config.json`;
+- `TASK_PLAN.md`;
+- il blocco Eiopago in `.gitignore`.
+
+Resta locale e ignorato:
+
+- `.guardian/runtime/`;
+- `.guardian/checkpoints/`;
+- `.guardian/manifests/`;
+- `.guardian/test-runs/` e `.guardian/calibration/`.
+
+Checkpoint e manifest descrivono il task target: Git root, branch, HEAD, stato worktree, revisione Ledger, item corrente/successivo, test/decisioni/evidence dichiarati dal Ledger, policy modello e lineage della replacement.
+
+## Cosa non viene trasferito
+
+La replacement non è un clone/fork della chat. Non riceve:
+
+- transcript;
+- precedenti messaggi user/assistant;
+- summary o compaction della conversazione;
+- prompt copiati dalla sessione precedente;
+- secret o credenziali.
+
+La continuity usa soltanto la revisione di `TASK_PLAN.md`, checkpoint, Resume Context Manifest, stato Git e i `minimal_reads` dichiarati. La relazione parent della sessione serve a verificare la lineage, non a importare history.
+
+## Failure recovery
+
+I controlli safety-critical falliscono chiuso.
+
+- `GIT_STATE_MISMATCH`, `PLAN_REVISION_MISMATCH`, `CHECKPOINT_MISMATCH`, `MANIFEST_MISMATCH`: non confermare e non ritentare alla cieca. Ripristinare o riconciliare esplicitamente Git/Ledger/artifact, quindi avviare un nuovo percorso solo quando lo stato è noto.
+- `MODEL_POLICY_MISMATCH` o `REASONING_POLICY_MISMATCH`: selezionare la policy dichiarata nel Ledger/manifest; Eiopago non cambia modello automaticamente.
+- `RUNNER_OWNERSHIP_ATTESTATION_FAILED`: non usare una sessione Pi creata fuori dal percorso Runner-owned.
+- replacement creation fallita/ambigua: il checkpoint resta conservato, ma Eiopago non crea automaticamente un secondo target. Usare `/eio status` e seguire le istruzioni mostrate.
+- `RESUME_DISPATCH_UNKNOWN`: il prompt potrebbe essere stato accettato; il redispatch automatico è vietato. Verificare umanamente la sessione prima di ogni azione.
+- `HUMAN_TAKEOVER_ACTIVE`: il takeover prevale; una vecchia conferma non può riprendere il lavoro.
+
+Non cancellare `.guardian/runtime` per aggirare un errore: eliminerebbe lo stato che consente la riconciliazione.
+
+## Procedura manuale di acceptance su fixture esterna
+
+Creare un repository temporaneo, mai un repository di dogfood reale:
+
+```text
+mkdir eio-portable-fixture
+cd eio-portable-fixture
+git init
+git config user.email portable@example.invalid
+git config user.name "Portable Fixture"
+echo portable > app.txt
+git add app.txt
+git commit -m "initial fixture"
+eio init
 ```
 
-La config non contiene root assolute ricavabili da Git, secret, credenziali o conversation history.
+Modificare `TASK_PLAN.md` con due item bounded, per esempio:
 
-### File da versionare
+1. `ITEM-1`: cambiare `app.txt` in `PORTABLE` e verificarlo;
+2. `ITEM-2`: creare `acceptance.txt` senza ripetere `ITEM-1`.
 
-- `.guardian/config.json` — piccolo contratto repository Eiopago;
-- `TASK_PLAN.md` — Ledger canonico;
-- `.gitignore` — se il blocco è stato creato o aggiunto.
+Impostare inizialmente `current_item=ITEM-1`, `next_item=ITEM-2` e `model_policy=null` (oppure una policy Pi esplicita disponibile). Poi:
 
-### Stato locale ignorato
+```text
+eio
+```
 
-- `.guardian/runtime/` — SQLite, WAL e stato operativo;
-- `.guardian/checkpoints/` — checkpoint sealed locali;
-- `.guardian/manifests/` — Resume Context Manifest locali;
-- `.guardian/test-runs/` e `.guardian/calibration/` — aree locali già riservate.
+Nel TUI:
 
-Il blocco `.gitignore` contiene eccezioni esplicite per rendere versionabili config e Ledger anche se una regola precedente ignorava `.guardian/`. Il contenuto preesistente non viene sostituito. Se esiste un blocco managed parziale o alterato, init fallisce chiuso e richiede una revisione umana.
+```text
+/eio status
+```
 
-## Policy per `TASK_PLAN.md`
+Chiedere a Pi:
 
-- assente: viene creato un template Ledger `0.1.0` minimo e valido;
-- Ledger Eiopago valido: viene preservato byte-per-byte;
-- file non riconosciuto, JSON invalido o schema incompatibile: `TASK_PLAN_NOT_EIOPAGO_LEDGER`, senza sovrascrittura e prima di creare stato Eiopago.
+```text
+Completa soltanto ITEM-1, verifica il risultato e aggiorna TASK_PLAN.md: ITEM-1 DONE con evidence, ITEM-2 IN_PROGRESS, current_item ITEM-2, next_item null e next_step "Create acceptance.txt for ITEM-2; do not repeat ITEM-1.". Non eseguire ITEM-2.
+```
 
-Il template è intenzionalmente generico: prima di un task reale occorre sostituire objective, criteri e item con un piano bounded. Non contiene conversation history.
+Dopo `ITEM-1`, il Ledger deve riportare esplicitamente:
 
-## Re-init e safety
+```text
+ITEM-1 = DONE
+ITEM-2 = IN_PROGRESS
+current_item = ITEM-2
+next_item = null
+next_step = "Create acceptance.txt for ITEM-2; do not repeat ITEM-1."
+```
 
-`eio init` è re-runnable. Config, Ledger, blocco ignore e runtime esistenti vengono preservati; database, artifact e file sconosciuti sotto `.guardian` non vengono cancellati. Una directory `.guardian` parziale viene completata soltanto con gli elementi mancanti. Path Eiopago riservati che sono symlink/junction o hanno un tipo incompatibile vengono rifiutati prima di scrivere, così config, runtime e artifact non possono essere rediretti fuori dal target.
+`next_item` rappresenta un futuro item `PLANNED`/`BLOCKED`, non l'item corrente.
 
-Init modifica al massimo i file infrastrutturali dichiarati sopra. Non modifica `package.json`, source, test o altri file applicativi del target.
+Verificare il diff, quindi:
 
-## Errori comuni
+```text
+/eio handoff confirm
+```
 
-- `TARGET_PATH_NOT_FOUND`: il path non esiste;
-- `TARGET_NOT_GIT_WORKTREE`: il path non appartiene a un worktree Git supportato;
-- `REPOSITORY_NOT_INITIALIZED`: eseguire prima `eio init` nel target corretto;
-- `TASK_PLAN_NOT_EIOPAGO_LEDGER`: decidere esplicitamente come rinominare/migrare il piano esistente; Eiopago non lo sovrascrive;
-- `REPOSITORY_CONFIG_*`: config JSON invalida, schema non supportato o path che esce dal target;
-- `GITIGNORE_EIO_BLOCK_INVALID`: ripristinare o rimuovere consapevolmente il blocco managed prima del re-init;
-- `NODE_VERSION_UNSUPPORTED`, `GIT_UNAVAILABLE`, `PI_UNAVAILABLE`, `PI_VERSION_UNSUPPORTED`: installare/selezionare manualmente una versione supportata.
+Accettare l'unica conferma mostrata dopo `Continuity passed`. La sessione B deve continuare `ITEM-2`, senza richiedere copie manuali. Infine controllare:
 
-## Disinstallazione e cleanup manuale
+```text
+/eio status
+```
 
-Rimuovere il link/package CLI con uno dei comandi npm appropriati all'installazione:
+Atteso: target fixture corretto, sessione replacement Runner-owned, latch rilasciato, handoff `RESUMED`, modello/reasoning invariati, `acceptance.txt` creato e `ITEM-1` non ripetuto.
+
+## Re-init, uninstall e cleanup
+
+`eio init` è re-runnable e preserva config, Ledger, blocco ignore, runtime e artifact esistenti. Path riservati rediretti con symlink/junction o di tipo incompatibile vengono rifiutati.
+
+Rimuovere CLI/link con:
 
 ```text
 npm unlink --global eiopago
@@ -146,11 +267,11 @@ npm unlink --global eiopago
 npm uninstall --global eiopago
 ```
 
-Nel target, prima di eliminare `.guardian`, fermare ogni Runner e conservare gli artifact necessari. La rimozione è intenzionalmente manuale:
+Nel target, fermare prima ogni Runner e archiviare gli artifact necessari. Poi, soltanto con stato riconciliato:
 
-1. archiviare o eliminare consapevolmente `.guardian/runtime`, `checkpoints` e `manifests`;
-2. rimuovere `.guardian/config.json` e la directory solo se non serve più;
-3. rimuovere esattamente il blocco `.gitignore` delimitato dai commenti Eiopago;
-4. conservare `TASK_PLAN.md` se è diventato documentazione di progetto; non eliminarlo automaticamente.
+1. rimuovere consapevolmente `.guardian/runtime`, `checkpoints` e `manifests`;
+2. rimuovere `.guardian/config.json` e la directory se non servono più;
+3. rimuovere esattamente il blocco managed Eiopago da `.gitignore`;
+4. conservare `TASK_PLAN.md` se è documentazione utile.
 
-Eiopago non offre un comando distruttivo `uninit` in P0-A.
+Non esiste un comando distruttivo `uninit` nella Portable Alpha.

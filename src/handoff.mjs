@@ -342,6 +342,11 @@ export class HandoffService {
   }
 
   buildCheckpoint(h, plan, operations) {
+    const relevantTests = Array.isArray(plan.relevant_tests) ? plan.relevant_tests : [];
+    const relevantDecisions = Array.isArray(plan.relevant_decisions) ? plan.relevant_decisions : [];
+    const changes = operations
+      .filter((operation) => operation.effect_reference)
+      .map((operation) => operation.effect_reference);
     return {
       schema_version: "0.1.0",
       checkpoint_id: h.checkpoint_id,
@@ -353,7 +358,7 @@ export class HandoffService {
       run_lineage: [],
       plan_revision_id: h.task_plan_revision,
       requirements_version: h.requirements_version,
-      checkpoint_message: "M1-H0 handoff sealed at a Runner-owned safe point",
+      checkpoint_message: `Eiopago handoff for ${plan.task_id} sealed at a Runner-owned safe point`,
       created_at: h.created_at,
       producer: { component: "eiopago-runner", version: "0.1.0", actor_type: "guardian" },
       git_state: h.expected_git_state,
@@ -365,20 +370,24 @@ export class HandoffService {
       next_step: h.next_step,
       status: "PARTIAL",
       checkpoint_spec_id: null,
-      changes: [],
-      tests: ["npm test", "npm run test:e2e"],
-      decisions: ["ADR-0015", "SP-01 REQUIRES_RUNNER", "SP-03 FINISH CURRENT ATOMIC OPERATION", "SP-04 dispatch unknown fail-closed"],
+      changes,
+      tests: relevantTests,
+      decisions: relevantDecisions,
       idempotency_key: `checkpoint:${h.checkpoint_id}`,
     };
   }
 
   buildManifest(h) {
+    const plan = this.ledger.read();
+    const relevantDecisions = Array.isArray(plan.relevant_decisions) ? plan.relevant_decisions : [];
+    const relevantTests = Array.isArray(plan.relevant_tests) ? plan.relevant_tests : [];
+    const evidenceReferences = Array.isArray(plan.evidence_references) ? plan.evidence_references : [];
     return {
       manifest_version: "1.0.0",
       resume_manifest_id: h.resume_manifest_id,
       created_at: h.created_at,
       task_id: h.task_id,
-      objective: this.ledger.read().objective,
+      objective: plan.objective,
       current_item: h.current_item,
       next_item: h.next_item,
       next_step: h.next_step,
@@ -402,13 +411,13 @@ export class HandoffService {
       index_digest: h.expected_git_state.index_digest,
       worktree_digest: h.expected_git_state.worktree_digest,
       git_status_summary: h.expected_git_state.status_entries,
-      relevant_decisions: ["docs/adr/0015-m0-boundaries-and-contract-freeze.md"],
-      relevant_tests: ["npm test", "npm run test:e2e"],
-      evidence_references: ["docs/m1-h0-handoff-mvp.md"],
+      relevant_decisions: relevantDecisions,
+      relevant_tests: relevantTests,
+      evidence_references: evidenceReferences,
       risks: ["Provider execution is not exactly-once", "Session create to journal remains a saga boundary"],
       blocks: [],
       minimal_reads: [
-        ...this.ledger.read().minimal_reads,
+        ...plan.minimal_reads,
         `.guardian/checkpoints/${h.checkpoint_id}.json`,
         `.guardian/manifests/${h.resume_manifest_id}.json`,
       ],

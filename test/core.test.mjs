@@ -92,6 +92,98 @@ function minimalLedger(path, overrides = {}) {
   writeFileSync(path, `# Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
+test("invalid Ledger event hooks fail closed with bounded diagnostics and recover after next_item is repaired", async () => {
+  const root = temp();
+  const path = join(root, "TASK_PLAN.md");
+  minimalLedger(path, { next_item: "ITEM-1" });
+
+  const handlers = new Map();
+  const commands = new Map();
+  const pi = {
+    registerCommand(name, command) { commands.set(name, command); },
+    on(name, handler) { handlers.set(name, handler); },
+  };
+  const notifications = [];
+  let admissionChecks = 0;
+  let advisorObservations = 0;
+  let contextReads = 0;
+  let confirmations = 0;
+  let handoffStarts = 0;
+  let replacementPermitConsumes = 0;
+  const runner = {
+    calibration: null,
+    ledger: new TaskLedger(path),
+    storage: {
+      isAdmissionOpen() { admissionChecks += 1; return true; },
+      latestHandoffForTask() { throw new Error("invalid status must not inspect handoffs"); },
+    },
+    contextAdvisor: {
+      thresholdPercent: 50,
+      reset() {},
+      observe(usage) {
+        advisorObservations += 1;
+        return { percent: usage.percent, thresholdPercent: 50 };
+      },
+    },
+    metrics: { captureModelCall() {} },
+    toolTracker: { admit() {}, finish() {} },
+    consumeReplacementPermit() { replacementPermitConsumes += 1; return true; },
+    async handoffFromCommand() {
+      runner.ledger.read();
+      handoffStarts += 1;
+    },
+  };
+  createGuardianExtension(runner)(pi);
+  const ctx = {
+    hasUI: true,
+    getContextUsage() { contextReads += 1; return { percent: 60, tokens: 60, contextWindow: 100 }; },
+    ui: {
+      notify(text, type) { notifications.push({ text, type }); },
+      async confirm() { confirmations += 1; return false; },
+      setEditorText() {},
+    },
+  };
+
+  await assert.doesNotReject(() => handlers.get("turn_end")({}, ctx));
+  assert.equal(advisorObservations, 0);
+  assert.equal(contextReads, 0);
+  assert.deepEqual(handlers.get("input")({}, ctx), { action: "handled" });
+  assert.equal(admissionChecks, 0);
+  for (const hook of ["session_before_compact", "session_before_tree", "session_before_switch", "session_before_fork"]) {
+    assert.deepEqual(handlers.get(hook)({}, ctx), { cancel: true });
+  }
+  assert.equal(replacementPermitConsumes, 0);
+  await assert.doesNotReject(() => commands.get("eio").handler("status", ctx));
+  await assert.doesNotReject(() => commands.get("eio").handler("handoff confirm", ctx));
+  assert.equal(handoffStarts, 0);
+  assert.equal(notifications.length, 8);
+  for (const notification of notifications) {
+    assert.match(notification.text, /^Eiopago Ledger invalid:\nLEDGER_LIFECYCLE_INVALID — current_item and next_item must differ\.\nRepair TASK_PLAN\.md before continuing\.$/);
+    assert.doesNotMatch(notification.text, /\n\s+at |Extension \"inline:eiopago\" error/);
+    assert.ok(notification.text.length < 500);
+  }
+
+  const item2 = {
+    task_item_id: "ITEM-2", task_id: "TASK-T", title: "i2", description: "d2", status: "IN_PROGRESS",
+    depends_on: [], completion_criteria: ["x"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "M1-H0",
+    last_updated_at: "2026-08-08T00:01:00Z", last_updated_by: "human",
+  };
+  minimalLedger(path, {
+    plan_revision_id: "PLAN-2", updated_at: "2026-08-08T00:01:00Z", current_item: "ITEM-2", next_item: null,
+    next_step: "Create acceptance.txt for ITEM-2; do not repeat ITEM-1.", task_items: [item2],
+  });
+  const repaired = runner.ledger.read();
+  assert.equal(repaired.current_item, "ITEM-2");
+  assert.equal(repaired.next_item, null);
+  assert.equal(repaired.task_items[0].status, "IN_PROGRESS");
+  assert.deepEqual(handlers.get("input")({}, ctx), { action: "continue" });
+  await handlers.get("turn_end")({}, ctx);
+  assert.equal(admissionChecks, 2);
+  assert.equal(advisorObservations, 1);
+  assert.equal(contextReads, 1);
+  assert.equal(confirmations, 1);
+});
+
 test("Ledger computes a byte digest and rejects DONE without evidence", () => {
   const root = temp(); const path = join(root, "TASK_PLAN.md");
   minimalLedger(path);
