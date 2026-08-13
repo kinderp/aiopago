@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,7 +10,7 @@ import {
   initializeRepository,
   isSupportedNodeVersion,
 } from "../src/bootstrap.mjs";
-import { runCli } from "../src/cli.mjs";
+import { formatCliError, runCli } from "../src/cli.mjs";
 import { GuardianError } from "../src/errors.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { isSupportedPiVersion, resolvePiRoot } from "../src/pi-loader.mjs";
@@ -158,6 +158,83 @@ test("wrong and non-Git targets fail with stable diagnostics", async () => {
   await assert.rejects(() => init(missing), (error) => error.code === "TARGET_PATH_NOT_FOUND");
   const plain = temp("eiopago not git ");
   await assert.rejects(() => init(plain), (error) => error.code === "TARGET_NOT_GIT_WORKTREE");
+});
+
+test("init surfaces dubious ownership with exact manual remediation and never changes Git trust", async () => {
+  const root = temp("eiopago dubious ownership ");
+  const target = realpathSync(root);
+  const requested = join(target, "nested", "deeper");
+  mkdirSync(requested, { recursive: true });
+  const gitTarget = process.platform === "win32" ? target.replaceAll("\\", "/") : target;
+  const commandTarget = /^[A-Za-z0-9_./:+-]+$/.test(gitTarget) ? gitTarget : JSON.stringify(gitTarget);
+  const calls = [];
+  const execFile = (file, args) => {
+    calls.push([file, ...args]);
+    if (args[0] === "--version") return "git version 2.50.1";
+    const error = new Error("Command failed: git rev-parse --is-inside-work-tree");
+    error.status = 128;
+    error.stderr = Buffer.from(`fatal: detected dubious ownership in repository at '${gitTarget}'\n'${gitTarget}/.git' is on a file system that does not record ownership\nTo add an exception for this directory, call:\n\ngit config --global --add safe.directory ${gitTarget}\n`);
+    throw error;
+  };
+
+  let received;
+  await assert.rejects(() => init(requested, { execFile }), (error) => {
+    received = error;
+    return error.code === "GIT_SAFE_DIRECTORY_REQUIRED";
+  });
+  const expectedMessage = `Git requires explicit trust for this worktree:\n${gitTarget}\n\nIf you trust this repository, run manually:\n\ngit config --global --add safe.directory ${commandTarget}\n\nEiopago does not modify Git global configuration automatically.`;
+  assert.equal(received.message, expectedMessage);
+  assert.equal(formatCliError(received), `eio: GIT_SAFE_DIRECTORY_REQUIRED: ${expectedMessage}`);
+  assert.equal(calls.some((call) => call.slice(1, 5).join(" ") === "config --global --add safe.directory"), false);
+  assert.deepEqual(readdirSync(root), ["nested"]);
+  assert.equal(existsSync(join(root, ".guardian")), false);
+});
+
+test("repository Git failure classification remains conservative", () => {
+  const root = temp("eiopago classified Git failures ");
+  const gitTarget = process.platform === "win32" ? realpathSync(root).replaceAll("\\", "/") : realpathSync(root);
+  const dubious = `fatal: detected dubious ownership in repository at '${gitTarget}'\nTo add an exception for this directory, call:\n\ngit config --global --add safe.directory ${gitTarget}\n`;
+  const failingExec = (stderr, properties = {}) => () => {
+    const error = new Error("simulated Git failure");
+    error.status = 128;
+    error.stderr = Buffer.from(stderr);
+    Object.assign(error, properties);
+    throw error;
+  };
+
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("fatal: not a git repository (or any of the parent directories): .git\n") }),
+    (error) => error.code === "TARGET_NOT_GIT_WORKTREE",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("", { code: "ENOENT" }) }),
+    (error) => error.code === "GIT_UNAVAILABLE",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("fatal: invalid value for safe.directory\ngit config --global --add safe.directory /somewhere\n") }),
+    (error) => error.code === "TARGET_NOT_GIT_WORKTREE",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec(`fatal: detected dubious ownership in repository at '${gitTarget}'\n`) }),
+    (error) => error.code === "TARGET_NOT_GIT_WORKTREE",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec(dubious, { status: 1 }) }),
+    (error) => error.code === "TARGET_NOT_GIT_WORKTREE",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("", { stderr: dubious }) }),
+    (error) => error.code === "GIT_SAFE_DIRECTORY_REQUIRED",
+  );
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("", { stderr: "", message: dubious }) }),
+    (error) => error.code === "GIT_SAFE_DIRECTORY_REQUIRED",
+  );
+  const outsideInspectionBound = `${"x".repeat(64 * 1024)}${dubious}`;
+  assert.throws(
+    () => discoverTargetRepository(root, { execFile: failingExec("", { stderr: outsideInspectionBound, message: outsideInspectionBound }) }),
+    (error) => error.code === "TARGET_NOT_GIT_WORKTREE",
+  );
 });
 
 test("repository config paths are explicit, normalized, and cannot escape the target", async () => {

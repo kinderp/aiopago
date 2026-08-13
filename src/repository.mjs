@@ -15,11 +15,41 @@ export const DEFAULT_REPOSITORY_CONFIG = Object.freeze({
   artifact_root: ".guardian",
 });
 
+const GIT_FAILURE_INSPECTION_LIMIT = 64 * 1024;
+
+function boundedErrorText(value) {
+  if (typeof value === "string") return value.slice(0, GIT_FAILURE_INSPECTION_LIMIT);
+  if (Buffer.isBuffer(value)) return value.subarray(0, GIT_FAILURE_INSPECTION_LIMIT).toString("utf8");
+  return "";
+}
+
+function dubiousOwnershipTarget(error) {
+  if (error?.status !== 128) return null;
+  const diagnostic = [boundedErrorText(error?.stderr), boundedErrorText(error?.message)].filter(Boolean).join("\n");
+  const ownership = /^fatal:\s*detected dubious ownership in repository at '(.+)'\r?$/im.exec(diagnostic);
+  if (!ownership || !/^[ \t]*git config --global --add safe\.directory[ \t]+\S.*\r?$/im.test(diagnostic)) return null;
+  return ownership[1];
+}
+
+function gitCompatiblePath(path) {
+  return process.platform === "win32" ? path.replaceAll("\\", "/") : path;
+}
+
+function commandArgument(path) {
+  return /^[A-Za-z0-9_./:+-]+$/.test(path) ? path : JSON.stringify(path);
+}
+
 function runGit(cwd, args, execFile = execFileSync) {
   try {
     return execFile("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   } catch (error) {
     if (error?.code === "ENOENT") invariant(false, "GIT_UNAVAILABLE", "Git is required but was not found on PATH");
+    const ownershipTarget = dubiousOwnershipTarget(error);
+    if (ownershipTarget) {
+      const target = gitCompatiblePath(ownershipTarget);
+      const command = `git config --global --add safe.directory ${commandArgument(target)}`;
+      invariant(false, "GIT_SAFE_DIRECTORY_REQUIRED", `Git requires explicit trust for this worktree:\n${target}\n\nIf you trust this repository, run manually:\n\n${command}\n\nEiopago does not modify Git global configuration automatically.`);
+    }
     invariant(false, "TARGET_NOT_GIT_WORKTREE", `Target is not a supported Git worktree: ${cwd}`);
   }
 }

@@ -177,6 +177,12 @@ La replacement non è un clone/fork della chat. Non riceve:
 
 La continuity usa soltanto la revisione di `TASK_PLAN.md`, checkpoint, Resume Context Manifest, stato Git e i `minimal_reads` dichiarati. La relazione parent della sessione serve a verificare la lineage, non a importare history.
 
+## Troubleshooting: Git dubious ownership / `safe.directory`
+
+Git può rifiutare un worktree reale quando il filesystem non registra ownership, oppure quando l'ownership osservata non consente di considerarlo trusted. In questo caso Eiopago fallisce chiuso con `GIT_SAFE_DIRECTORY_REQUIRED`, mostra il repository esatto e il comando manuale corrispondente; non modifica automaticamente la configurazione Git globale.
+
+Eseguire il comando mostrato soltanto se si riconosce e si considera trusted quello specifico repository. Aggiungere esclusivamente il path esatto, non una directory parent più ampia, e non usare `safe.directory=*`, che disabiliterebbe il controllo per tutti i repository.
+
 ## Failure recovery
 
 I controlli safety-critical falliscono chiuso.
