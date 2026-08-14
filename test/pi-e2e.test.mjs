@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { canonicalJson, digestObject, sha256 } from "../src/canonical.mjs";
 import { observeGitState } from "../src/git-state.mjs";
 import { HandoffService } from "../src/handoff.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
@@ -13,8 +14,16 @@ import { GuardianStorage } from "../src/storage.mjs";
 
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
 
-function writeFixtureLedger(root, advanced = false, modelPolicy = "offline-fake/offline-fake") {
-  const minimalReads = ["TASK_PLAN.md", "docs/adr.md", "docs/safe.md", "docs/resume.md"];
+const REAL_MINIMAL_READS = [
+  "AGENTS.md section 18",
+  "CHECKPOINT.md",
+  "TASK_PLAN.md",
+  "Complete PR #679 diff against its current base",
+  "Current PR #679 status, checks, reviews, and discussions",
+];
+
+function writeFixtureLedger(root, advanced = false, modelPolicy = "offline-fake/offline-fake", requiredLocalPaths = undefined) {
+  const minimalReads = REAL_MINIMAL_READS;
   const setup = {
     task_item_id: "ITEM-E2E-SETUP", task_id: "TASK-E2E", title: "Prepare source", description: "fixture setup",
     status: advanced ? "DONE" : "IN_PROGRESS", depends_on: [], completion_criteria: ["source response observed"],
@@ -36,13 +45,15 @@ function writeFixtureLedger(root, advanced = false, modelPolicy = "offline-fake/
     next_item: advanced ? null : "ITEM-E2E-HANDOFF",
     next_step: advanced ? "Resume the updated handoff item" : "Complete source setup and advance the Ledger",
     model_policy: modelPolicy, reasoning_policy: "off", minimal_reads: minimalReads,
+    ...(requiredLocalPaths ? { required_local_paths: requiredLocalPaths } : {}),
     task_items: [setup, handoff],
   };
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-function fixtureLedger(root, modelPolicy = "offline-fake/offline-fake") {
-  writeFixtureLedger(root, false, modelPolicy);
+function fixtureLedger(root, modelPolicy = "offline-fake/offline-fake", requiredLocalPaths = undefined) {
+  writeFixtureLedger(root, false, modelPolicy, requiredLocalPaths);
+  writeFileSync(join(root, "CHECKPOINT.md"), "# Project checkpoint\n");
   mkdirSync(join(root, "docs"));
   for (const name of ["adr.md", "safe.md", "resume.md"]) writeFileSync(join(root, "docs", name), `# ${name}\n`);
   writeFileSync(join(root, ".gitignore"), ".guardian/\n");
@@ -70,12 +81,14 @@ function writeOwnerGateLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-async function makeRunner({ ownerGate = false, portableModelPolicy = false } = {}) {
-  const root = mkdtempSync(join(tmpdir(), "eiopago-pi-e2e-"));
-  fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake");
-  if (ownerGate) writeOwnerGateLedger(root);
-  git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Eiopago E2E"]);
-  git(root, ["add", "."]); git(root, ["commit", "-m", "fixture"]);
+async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null } = {}) {
+  const root = existingRoot ?? mkdtempSync(join(tmpdir(), "eiopago-pi-e2e-"));
+  if (!existingRoot) {
+    fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake", requiredLocalPaths);
+    if (ownerGate) writeOwnerGateLedger(root);
+    git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Eiopago E2E"]);
+    git(root, ["add", "."]); git(root, ["commit", "-m", "fixture"]);
+  }
   const pi = await loadPi();
   const credentials = new pi.ai.InMemoryCredentialStore();
   const modelRuntime = await pi.coding.ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
@@ -111,6 +124,29 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false } = {
     },
   });
   return { root, runner, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
+}
+
+function convertFailedManifestToLegacyV1(runner, failed) {
+  const index = runner.storage.getArtifact("manifest", failed.resume_manifest_id);
+  const envelope = JSON.parse(readFileSync(index.path, "utf8"));
+  envelope.payload.manifest_version = "1.0.0";
+  delete envelope.payload.required_local_paths;
+  envelope.payload.minimal_reads = [
+    ...REAL_MINIMAL_READS,
+    `.guardian/checkpoints/${failed.checkpoint_id}.json`,
+    `.guardian/manifests/${failed.resume_manifest_id}.json`,
+  ];
+  envelope.payload.content_digest = null;
+  envelope.payload.content_digest = digestObject(envelope.payload);
+  const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
+  const digest = sha256(bytes);
+  writeFileSync(index.path, bytes);
+  runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind='manifest' AND artifact_id=?")
+    .run(digest, envelope.payload.content_digest, failed.resume_manifest_id);
+  failed.resume_manifest_digest = digest;
+  delete failed.failure;
+  runner.storage.saveHandoff(failed);
+  return { bytes, digest };
 }
 
 test("Pi E2E: a Pi-selected model becomes effective handoff policy when the Ledger leaves it null", async () => {
@@ -184,7 +220,9 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     assert.equal(manifest.payload.index_digest, result.expected_git_state.index_digest);
     assert.equal(manifest.payload.worktree_digest, result.expected_git_state.worktree_digest);
     assert.equal(Object.hasOwn(manifest.payload, "transcript"), false);
-    assert.equal(manifest.payload.minimal_reads.includes(`.guardian/checkpoints/${result.checkpoint_id}.json`), true);
+    assert.deepEqual(manifest.payload.minimal_reads, REAL_MINIMAL_READS);
+    assert.deepEqual(manifest.payload.required_local_paths, ["TASK_PLAN.md"]);
+    assert.equal(result.resume_prompt.includes(`semantic_minimal_reads_json=${JSON.stringify(REAL_MINIMAL_READS)}`), true);
 
     const metricSamples = x.runner.storage.metricSamples();
     assert.equal(metricSamples.length, 2, "one authoritative sample must be captured for each fake provider call");
@@ -346,6 +384,172 @@ test("Pi E2E /eio handoff manual leaves replacement paused with zero entries", a
     assert.equal(x.calls, 1);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("semantic minimal_reads preserve the real five directives and do not require prose to exist as files", async () => {
+  const x = await makeRunner();
+  try {
+    assert.equal(existsSync(join(x.root, "AGENTS.md section 18")), false);
+    assert.equal(existsSync(join(x.root, "Complete PR #679 diff against its current base")), false);
+    const result = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(result.state, "RESUME_READY");
+    const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
+    assert.deepEqual(manifest.payload.minimal_reads, REAL_MINIMAL_READS);
+    assert.deepEqual(manifest.payload.required_local_paths, ["TASK_PLAN.md"]);
+    assert.equal(result.resume_prompt.includes(`semantic_minimal_reads_json=${JSON.stringify(REAL_MINIMAL_READS)}`), true);
+    assert.equal(x.runner.storage.events(result.handoff_id).some((event) => event.event_type === "CONTINUITY_FAILED"), false);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("an explicitly required missing local path fails continuity closed without reclassifying semantic directives", async () => {
+  const x = await makeRunner({ requiredLocalPaths: ["docs/machine-required.md"] });
+  try {
+    await assert.rejects(
+      () => x.runner.handoffDirect({ mode: "manual", confirm: false }),
+      (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING" && error.message === "required local path unavailable: docs/machine-required.md",
+    );
+    const failed = x.runner.storage.latestHandoffForTask("TASK-E2E");
+    assert.equal(failed.state, "CONTINUITY_FAILED");
+    assert.equal(failed.failure.code, "REQUIRED_LOCAL_PATH_MISSING");
+    assert.deepEqual(x.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest).payload.minimal_reads, REAL_MINIMAL_READS);
+    assert.equal(x.runner.storage.getLatch(failed.task_id).state, "ENGAGED");
+    assert.equal(x.runner.storage.events(failed.handoff_id).some((event) => event.event_type === "RESUME_AUTHORIZED"), false);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("CONTINUITY_FAILED recovery crosses a process restart and accepts sealed legacy 1.0.0 evidence", async () => {
+  let runnerA = await makeRunner();
+  let runnerB = null;
+  try {
+    const continuity = runnerA.runner.handoffService.continuity.bind(runnerA.runner.handoffService);
+    runnerA.runner.handoffService.continuity = () => { const error = new Error("minimal reads unavailable"); error.code = "CONTINUITY_FAILED"; throw error; };
+    await assert.rejects(() => runnerA.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "CONTINUITY_FAILED" && error.message === "minimal reads unavailable");
+    runnerA.runner.handoffService.continuity = continuity;
+    let failed = runnerA.runner.storage.latestHandoffForTask("TASK-E2E");
+    const failedTargetId = failed.target_session_id;
+    const oldRunnerInstanceId = failed.runner_instance_id;
+    const legacy = convertFailedManifestToLegacyV1(runnerA.runner, failed);
+    failed = runnerA.runner.storage.getHandoff(failed.handoff_id);
+    const failedSnapshot = structuredClone(failed);
+    assert.equal(runnerA.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest).payload.manifest_version, "1.0.0");
+    assert.equal(failed.state, "CONTINUITY_FAILED");
+    assert.equal(failed.authorization_state, "NOT_AUTHORIZED");
+    assert.equal(failed.admission_state, "NOT_COMMITTED");
+    assert.equal(failed.dispatch_state, "NOT_STARTED");
+
+    await assert.rejects(
+      () => runnerA.runner.handoffDirect({ mode: "confirm", confirm: true }),
+      (error) => error.code === "CONTINUITY_RECOVERY_REQUIRED",
+      "normal handoff confirm must not hide a retry of the failed target",
+    );
+    let oldDispatchCalled = false;
+    await assert.rejects(
+      () => runnerA.runner.handoffService.resume(failed.handoff_id, { actor: "human:implicit-retry", sendResume: async () => { oldDispatchCalled = true; } }),
+      (error) => error.code === "CONTINUITY_RECOVERY_REQUIRED",
+    );
+    assert.equal(oldDispatchCalled, false);
+
+    const root = runnerA.root;
+    await runnerA.runner.dispose(); runnerA.restoreFetch(); runnerA = null;
+    runnerB = await makeRunner({ existingRoot: root });
+    const freshSourceId = runnerB.runner.runtime.session.sessionId;
+    assert.notEqual(runnerB.runner.runnerInstanceId, oldRunnerInstanceId);
+    assert.notEqual(freshSourceId, failedTargetId);
+    assert.equal(runnerB.runner.runtime.session.sessionManager.getEntries().filter((entry) => ["message", "custom_message", "compaction", "branch_summary"].includes(entry.type)).length, 0);
+    await assert.rejects(
+      () => runnerB.runner.handoffDirect({ mode: "confirm", confirm: true }),
+      (error) => error.code === "CONTINUITY_RECOVERY_REQUIRED",
+      "a fresh Runner source must still use the explicit recover command",
+    );
+
+    let pausedEvidence;
+    const recovered = await runnerB.runner.recoverHandoffDirect(failed.handoff_id, {
+      confirm: async (handoff, session) => {
+        const history = session.sessionManager.getEntries().filter((entry) => ["message", "custom_message", "compaction", "branch_summary"].includes(entry.type));
+        pausedEvidence = { state: handoff.state, history: history.length, latch: runnerB.runner.storage.getLatch(handoff.task_id) };
+        return true;
+      },
+    });
+
+    assert.equal(recovered.state, "RESUMED");
+    assert.notEqual(recovered.handoff_id, failed.handoff_id);
+    assert.equal(recovered.recovery_of_handoff_id, failed.handoff_id);
+    assert.equal(recovered.source_session_id, freshSourceId);
+    assert.notEqual(recovered.target_session_id, failedTargetId);
+    assert.equal(recovered.parent_checkpoint_id, failed.checkpoint_id);
+    assert.equal(pausedEvidence.state, "RESUME_READY");
+    assert.equal(pausedEvidence.history, 0);
+    assert.equal(pausedEvidence.latch.state, "ENGAGED");
+    assert.equal(pausedEvidence.latch.generation, failed.latch_generation);
+    assert.deepEqual(runnerB.runner.storage.getHandoff(failed.handoff_id), failedSnapshot, "the terminal failed projection must remain immutable evidence");
+    assert.deepEqual(readFileSync(runnerB.runner.storage.getArtifact("manifest", failed.resume_manifest_id).path), legacy.bytes, "legacy sealed evidence must not be migrated or rewritten");
+    const newManifest = runnerB.runner.artifacts.verify("manifest", recovered.resume_manifest_id, recovered.resume_manifest_digest);
+    assert.equal(newManifest.payload.manifest_version, "1.1.0");
+    const oldBinding = runnerB.runner.storage.getRunnerSessionBinding(failed.handoff_id);
+    assert.equal(oldBinding.status, "SUPERSEDED");
+    assert.equal(oldBinding.replacement_session_id, failedTargetId);
+    assert.equal(oldBinding.runner_instance_id, oldRunnerInstanceId);
+    const oldEvents = runnerB.runner.storage.events(failed.handoff_id);
+    assert.equal(oldEvents.filter((event) => event.event_type === "CONTINUITY_RECOVERY_STARTED").length, 1);
+    assert.equal(oldEvents.some((event) => ["RESUME_AUTHORIZED", "RESUME_ADMISSION_COMMITTED", "RESUME_DISPATCH_INTENT"].includes(event.event_type)), false);
+    const events = runnerB.runner.storage.events(recovered.handoff_id);
+    assert.equal(events.filter((event) => event.event_type === "HANDOFF_STARTED").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "RESUME_AUTHORIZED").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "RESUME_ADMISSION_COMMITTED").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "RESUME_DISPATCH_INTENT").length, 1);
+    assert.equal(events.filter((event) => event.event_type === "RESUME_ACKNOWLEDGED").length, 1);
+    assert.ok(events.findIndex((event) => event.event_type === "CONTINUITY_VALIDATED") < events.findIndex((event) => event.event_type === "RESUME_AUTHORIZED"));
+    assert.equal(runnerB.calls, 1);
+    assert.equal(runnerB.networkAttempts, 0);
+  } finally {
+    if (runnerA) { await runnerA.runner.dispose(); runnerA.restoreFetch(); }
+    if (runnerB) { await runnerB.runner.dispose(); runnerB.restoreFetch(); }
+  }
+});
+
+test("CONTINUITY_FAILED recovery rejects unknown or durable resume effects and unsupported states", async (t) => {
+  await t.test("UNKNOWN dispatch projection", async () => {
+    const x = await makeRunner({ requiredLocalPaths: ["docs/missing-unknown.md"] });
+    try {
+      await assert.rejects(() => x.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING");
+      const failed = x.runner.storage.latestHandoffForTask("TASK-E2E");
+      failed.dispatch_state = "UNKNOWN";
+      x.runner.storage.saveHandoff(failed);
+      writeFileSync(join(x.root, "docs", "missing-unknown.md"), "fixed\n");
+      assert.throws(
+        () => x.runner.storage.prepareContinuityRecovery(failed.handoff_id, { sourceSessionId: "SES-fresh-unknown", runnerInstanceId: "RUNNER-fresh-unknown", actor: "human:test-recovery" }),
+        (error) => error.code === "CONTINUITY_RECOVERY_UNSAFE",
+      );
+      assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+      assert.equal(x.runner.storage.getLatch(failed.task_id).state, "ENGAGED");
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
+  await t.test("durable authorization/admission/dispatch evidence", async () => {
+    const x = await makeRunner({ requiredLocalPaths: ["docs/missing-durable.md"] });
+    try {
+      await assert.rejects(() => x.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING");
+      const failed = x.runner.storage.latestHandoffForTask("TASK-E2E");
+      x.runner.storage.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+        .run(failed.resume_prompt_id, failed.handoff_id, "human:simulated", failed.latch_generation, "2026-08-08T00:00:00Z");
+      x.runner.storage.db.prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+        .run("ADM-simulated", failed.resume_prompt_id, "resume:simulated", failed.handoff_id, "2026-08-08T00:00:00Z");
+      x.runner.storage.db.prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
+        .run("DSP-simulated", "ADM-simulated", failed.handoff_id, 1, "DISPATCHING", "2026-08-08T00:00:00Z");
+      writeFileSync(join(x.root, "docs", "missing-durable.md"), "fixed\n");
+      assert.throws(
+        () => x.runner.storage.prepareContinuityRecovery(failed.handoff_id, { sourceSessionId: "SES-fresh-durable", runnerInstanceId: "RUNNER-fresh-durable", actor: "human:test-recovery" }),
+        (error) => error.code === "CONTINUITY_RECOVERY_UNSAFE",
+      );
+      assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
+  await t.test("unsupported non-failed state", async () => {
+    const x = await makeRunner();
+    try {
+      const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+      await assert.rejects(() => x.runner.handoffService.recoverContinuityFailure({ failedHandoffId: ready.handoff_id }), (error) => error.code === "CONTINUITY_RECOVERY_NOT_ALLOWED");
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
 });
 
 async function continuityFailureScenario(code, mutate) {

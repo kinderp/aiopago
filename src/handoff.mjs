@@ -1,13 +1,31 @@
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import { canonicalRequiredLocalPaths, validateRequiredLocalPaths } from "./ledger.mjs";
 import { measureHandoffArtifacts } from "./metrics.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
+
+const HISTORY_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+
+function conversationHistory(session) {
+  return session.sessionManager.getEntries().filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
+}
+
+export function verifyRequiredLocalPaths(repositoryRoot, paths) {
+  const root = realpathSync(repositoryRoot);
+  for (const path of paths) {
+    const candidate = resolve(root, path);
+    if (!existsSync(candidate)) throw new GuardianError("REQUIRED_LOCAL_PATH_MISSING", `required local path unavailable: ${path}`);
+    const actual = realpathSync(candidate);
+    const fromRoot = relative(root, actual);
+    invariant(fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot), "REQUIRED_LOCAL_PATH_INVALID", `required local path resolves outside repository: ${path}`);
+  }
+}
 
 export class HandoffService {
   constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null }) {
@@ -28,19 +46,30 @@ export class HandoffService {
     catch { return null; }
   }
 
-  async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume }) {
+  async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null }) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
-    if (mode === "confirm") this.ledger.satisfyOwnerGate?.({ command: "/eio handoff confirm", actor });
-    const plan = this.ledger.read();
     const sourceFile = normalizePath(sourceSession.sessionFile);
     invariant(sourceFile, "PERSISTED_SOURCE_SESSION_REQUIRED");
     const sourceSessionId = sourceSession.sessionId;
+    let plan = this.ledger.read();
+    const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
+    const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
+    if (recoveryOf === null) {
+      const pending = this.storage.pendingContinuityFailureForTask(plan.task_id);
+      invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /eio handoff recover ${pending.handoff_id}` : undefined);
+      invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /eio handoff recover ${parentHandoff.handoff_id}` : undefined);
+    } else {
+      this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
+    }
+    if (mode === "confirm" && recoveryOf === null) {
+      this.ledger.satisfyOwnerGate?.({ command: "/eio handoff confirm", actor });
+      plan = this.ledger.read();
+    }
     this.assertModelPolicy(plan, sourceSession);
     const safe = await this.safePoint.request(sourceSession, actor);
     const git = this.observeGit();
     const handoffId = stableId("HO", sourceSessionId, plan.plan_revision_id, String(safe.latch_generation));
     const checkpointId = stableId("CP", handoffId, plan.content_digest);
-    const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
     const createdAt = utcNow();
     const base = {
       handoff_id: handoffId,
@@ -52,7 +81,8 @@ export class HandoffService {
       session_binding_id: opaqueId("BIND"),
       parent_session_id: sourceSessionId,
       parent_session_file: sourceFile,
-      parent_checkpoint_id: parentHandoff?.checkpoint_id ?? null,
+      parent_checkpoint_id: recoveryParent?.checkpoint_id ?? parentHandoff?.checkpoint_id ?? null,
+      recovery_of_handoff_id: recoveryOf,
       task_id: plan.task_id,
       current_item: plan.current_item,
       next_item: plan.next_item,
@@ -190,8 +220,9 @@ export class HandoffService {
     try { h = this.continuity(handoffId, session); }
     catch (error) {
       h = this.storage.getHandoff(handoffId);
-      h.state = error.code && error.code !== "ILLEGAL_TRANSITION" ? error.code : "CONTINUITY_FAILED";
-      this.storage.saveHandoff(h, "CONTINUITY_FAILED", { code: h.state, error: error.message });
+      h.state = "CONTINUITY_FAILED";
+      h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
+      this.storage.saveHandoff(h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
       throw error;
     }
     target.setEditor?.(h.resume_prompt);
@@ -200,6 +231,50 @@ export class HandoffService {
       if (confirmed) return this.resume(handoffId, { actor: options.actor, sendResume: options.sendResume ?? target.sendResume });
     }
     return h;
+  }
+
+  async recoverContinuityFailure({ failedHandoffId, sourceSession, sourceAttestation, replacePaused, actor = "human:/eio-handoff-recover", confirmResume = async () => false, sendResume }) {
+    const failed = this.storage.getHandoff(failedHandoffId);
+    invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
+    invariant(sourceAttestation?.session_id === sourceSession?.sessionId && sourceAttestation?.runner_instance_id === this.runnerInstanceId, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The recovery source must be the fresh session owned by the current Runner");
+    invariant(sourceSession.sessionId !== failed.source_session_id && sourceSession.sessionId !== failed.target_session_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The failed handoff sessions are evidence, not the fresh recovery source");
+    invariant(conversationHistory(sourceSession).length === 0 && sourceSession.isIdle, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The current Runner source must remain idle with zero conversation history");
+    const plan = this.ledger.read();
+    invariant(plan.task_id === failed.task_id && plan.plan_revision_id === failed.task_plan_revision && plan.content_digest === failed.task_plan_digest && plan.requirements_version === failed.requirements_version, "CONTINUITY_RECOVERY_SOURCE_INVALID", "current Ledger does not match failed handoff provenance");
+    invariant(plan.current_item === failed.current_item && plan.next_item === failed.next_item && plan.next_step === failed.next_step, "CONTINUITY_RECOVERY_SOURCE_INVALID", "current Ledger task position differs from failed handoff");
+    const actualModel = sourceSession.model ? `${sourceSession.model.provider}/${sourceSession.model.id}` : null;
+    invariant(actualModel === failed.model_policy && sourceSession.thinkingLevel === failed.reasoning_policy, "CONTINUITY_RECOVERY_SOURCE_INVALID", "current model/reasoning policy differs from failed handoff");
+    const checkpoint = this.artifacts.verify("checkpoint", failed.checkpoint_id, failed.checkpoint_digest);
+    const manifest = this.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest);
+    this.verifyRecoveryEvidence(failed, checkpoint.payload, manifest.payload);
+    invariant(sameGitState(failed.expected_git_state, this.observeGit()), "GIT_STATE_MISMATCH", "recovery source differs from failed handoff Git state");
+    const latch = this.storage.getLatch(failed.task_id);
+    invariant(latch?.state === "ENGAGED" && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
+    await this.safePoint.request(sourceSession, actor);
+    this.storage.prepareContinuityRecovery(failedHandoffId, {
+      sourceSessionId: sourceSession.sessionId,
+      runnerInstanceId: this.runnerInstanceId,
+      actor,
+    });
+    return this.handoff({
+      sourceSession,
+      replacePaused,
+      mode: "confirm",
+      actor,
+      confirmResume,
+      sendResume,
+      recoveryOf: failedHandoffId,
+    });
+  }
+
+  verifyRecoveryEvidence(failed, checkpoint, manifest) {
+    invariant(["1.0.0", "1.1.0"].includes(manifest.manifest_version), "MANIFEST_MISMATCH", "unsupported recovery evidence manifest version");
+    invariant(checkpoint.checkpoint_id === failed.checkpoint_id && checkpoint.task_id === failed.task_id && checkpoint.plan_revision_id === failed.task_plan_revision && checkpoint.requirements_version === failed.requirements_version, "CHECKPOINT_MISMATCH", "recovery provenance");
+    invariant(manifest.resume_manifest_id === failed.resume_manifest_id && manifest.handoff_id === failed.handoff_id && manifest.resume_prompt_id === failed.resume_prompt_id, "MANIFEST_MISMATCH", "recovery identity");
+    invariant(manifest.checkpoint_id === failed.checkpoint_id && manifest.checkpoint_digest === failed.checkpoint_digest && manifest.task_id === failed.task_id, "MANIFEST_MISMATCH", "recovery checkpoint/task provenance");
+    invariant(manifest.source_session_id === failed.source_session_id && manifest.replacement_session_id === failed.target_session_id && manifest.parent_session_id === failed.source_session_id, "MANIFEST_MISMATCH", "recovery session provenance");
+    invariant(manifest.runner_instance_id === failed.runner_instance_id && manifest.session_binding_id === failed.session_binding_id, "MANIFEST_MISMATCH", "recovery binding provenance");
+    invariant(manifest.task_plan_revision === failed.task_plan_revision && manifest.task_plan_digest === failed.task_plan_digest && manifest.requirements_version === failed.requirements_version, "MANIFEST_MISMATCH", "recovery plan provenance");
   }
 
   continuity(handoffId, targetSession) {
@@ -211,9 +286,10 @@ export class HandoffService {
     const plan = this.ledger.read();
     const currentGit = this.observeGit();
     const m = manifest.payload;
+    invariant(m.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
     const header = targetSession.sessionManager.getHeader();
     const entries = targetSession.sessionManager.getEntries();
-    const historyEntries = entries.filter((entry) => ["message", "custom_message", "compaction", "branch_summary"].includes(entry.type));
+    const historyEntries = entries.filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
     invariant(plan.task_id === h.task_id && m.task_id === h.task_id, "CONTINUITY_FAILED", "task_id");
     invariant(plan.plan_revision_id === h.task_plan_revision && plan.content_digest === h.task_plan_digest && m.task_plan_revision === h.task_plan_revision && m.task_plan_digest === h.task_plan_digest, "PLAN_REVISION_MISMATCH");
     invariant(plan.requirements_version === h.requirements_version && m.requirements_version === h.requirements_version, "REQUIREMENTS_VERSION_MISMATCH");
@@ -228,8 +304,12 @@ export class HandoffService {
     invariant(sameGitState(h.expected_git_state, currentGit), "GIT_STATE_MISMATCH");
     invariant(m.current_item === plan.current_item && m.next_item === plan.next_item && m.next_step === plan.next_step, "CONTINUITY_FAILED", "current item/next item/next step");
     invariant(m.model_policy === h.model_policy && m.reasoning_policy === h.reasoning_policy, "CONTINUITY_FAILED", "model/reasoning policy");
-    const repositoryRoot = dirname(this.ledger.path);
-    invariant(m.minimal_reads.every((path) => typeof path === "string" && path.length > 0 && existsSync(resolve(repositoryRoot, path))), "CONTINUITY_FAILED", "minimal reads unavailable");
+    const semanticMinimalReads = plan.minimal_reads ?? [];
+    invariant(Array.isArray(m.minimal_reads) && JSON.stringify(m.minimal_reads) === JSON.stringify(semanticMinimalReads), "MANIFEST_MISMATCH", "semantic minimal reads");
+    validateRequiredLocalPaths(m.required_local_paths, "REQUIRED_LOCAL_PATH_INVALID");
+    const expectedLocalPaths = canonicalRequiredLocalPaths(plan.required_local_paths ?? [], "REQUIRED_LOCAL_PATH_INVALID");
+    invariant(JSON.stringify(m.required_local_paths) === JSON.stringify(expectedLocalPaths), "MANIFEST_MISMATCH", "required local paths");
+    verifyRequiredLocalPaths(dirname(this.ledger.path), m.required_local_paths);
     const latch = this.storage.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
     this.assertModelPolicy(plan, targetSession);
@@ -282,6 +362,7 @@ export class HandoffService {
     let h = this.storage.getHandoff(handoffId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUMED") return h;
+    if (h.state === "CONTINUITY_FAILED") throw new GuardianError("CONTINUITY_RECOVERY_REQUIRED", `Use /eio handoff recover ${h.handoff_id}`);
     if (h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Automatic redispatch is forbidden");
     invariant(typeof sendResume === "function", "RESUME_TRANSPORT_REQUIRED");
     const resumeStarted = performance.now();
@@ -383,7 +464,7 @@ export class HandoffService {
     const relevantTests = Array.isArray(plan.relevant_tests) ? plan.relevant_tests : [];
     const evidenceReferences = Array.isArray(plan.evidence_references) ? plan.evidence_references : [];
     return {
-      manifest_version: "1.0.0",
+      manifest_version: "1.1.0",
       resume_manifest_id: h.resume_manifest_id,
       created_at: h.created_at,
       task_id: h.task_id,
@@ -416,11 +497,8 @@ export class HandoffService {
       evidence_references: evidenceReferences,
       risks: ["Provider execution is not exactly-once", "Session create to journal remains a saga boundary"],
       blocks: [],
-      minimal_reads: [
-        ...plan.minimal_reads,
-        `.guardian/checkpoints/${h.checkpoint_id}.json`,
-        `.guardian/manifests/${h.resume_manifest_id}.json`,
-      ],
+      minimal_reads: [...(plan.minimal_reads ?? [])],
+      required_local_paths: canonicalRequiredLocalPaths(plan.required_local_paths ?? []),
       model_policy: h.model_policy,
       reasoning_policy: h.reasoning_policy,
       remaining_budget: null,
@@ -445,8 +523,9 @@ export class HandoffService {
       `current_item=${manifest.current_item}`,
       `next_item=${manifest.next_item}`,
       `next_step=${manifest.next_step}`,
-      `minimal_reads=${manifest.minimal_reads.join("|")}`,
-      "Read only the listed authoritative artifacts. Do not reconstruct state from previous conversation history.",
+      `semantic_minimal_reads_json=${JSON.stringify(manifest.minimal_reads)}`,
+      `required_local_paths_json=${JSON.stringify(manifest.required_local_paths)}`,
+      "Follow the semantic minimal-read directives exactly. Required local paths are machine-verified dependencies; checkpoint and manifest integrity are sealed separately. Do not reconstruct state from previous conversation history.",
     ].join("\n");
   }
 

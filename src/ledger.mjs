@@ -7,6 +7,30 @@ const BLOCK = /```json task-ledger\s*\r?\n([\s\S]*?)\r?\n```/;
 const TASK_STATUS_VALUES = ["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"];
 const TASK_STATES = new Set(TASK_STATUS_VALUES);
 const TASK_STATUS_MESSAGE = `status must be one of ${TASK_STATUS_VALUES.join(", ")}`;
+const MAX_RESUME_LIST_ENTRIES = 64;
+const MAX_RESUME_ENTRY_LENGTH = 2048;
+
+function validateBoundedStringList(value, field, code = "LEDGER_RESUME_CONTEXT_INVALID") {
+  invariant(Array.isArray(value) && value.length <= MAX_RESUME_LIST_ENTRIES, code, `${field} must be an array with at most ${MAX_RESUME_LIST_ENTRIES} entries`);
+  for (const entry of value) invariant(typeof entry === "string" && entry.length > 0 && entry.length <= MAX_RESUME_ENTRY_LENGTH, code, `${field} entries must be non-empty bounded strings`);
+  return value;
+}
+
+export function validateRequiredLocalPaths(value, code = "LEDGER_REQUIRED_LOCAL_PATH_INVALID") {
+  validateBoundedStringList(value, "required_local_paths", code);
+  for (const path of value) {
+    const components = path.split("/");
+    invariant(!path.includes("\\") && !path.includes("\0") && !path.startsWith("/") && !/^[A-Za-z]:/.test(path) && components.every((component) => component.length > 0 && component !== "." && component !== ".."), code, `required_local_paths entries must be normalized repo-relative paths: ${path}`);
+  }
+  return value;
+}
+
+export function canonicalRequiredLocalPaths(value = [], code = "LEDGER_REQUIRED_LOCAL_PATH_INVALID") {
+  validateRequiredLocalPaths(value, code);
+  const canonical = [...new Set(["TASK_PLAN.md", ...value])];
+  invariant(canonical.length <= MAX_RESUME_LIST_ENTRIES, code, `required_local_paths including TASK_PLAN.md must have at most ${MAX_RESUME_LIST_ENTRIES} entries`);
+  return canonical;
+}
 
 export class TaskLedger {
   constructor(path = "TASK_PLAN.md") {
@@ -93,6 +117,8 @@ export class TaskLedger {
     }
     invariant(task.schema_version === "0.1.0", "LEDGER_SCHEMA_UNSUPPORTED");
     invariant(TASK_STATES.has(task.status), "LEDGER_STATUS_INVALID", `task ${TASK_STATUS_MESSAGE}`);
+    if (Object.hasOwn(task, "minimal_reads")) validateBoundedStringList(task.minimal_reads, "minimal_reads");
+    canonicalRequiredLocalPaths(Object.hasOwn(task, "required_local_paths") ? task.required_local_paths : []);
     invariant(Array.isArray(task.task_items) && task.task_items.length > 0, "LEDGER_ITEMS_INVALID");
     if (task.status === "DONE") {
       invariant(Array.isArray(task.evidence) && task.evidence.length > 0, "DONE_WITHOUT_EVIDENCE");

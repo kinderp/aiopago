@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { ContextHandoffAdvisor, contextHandoffThreshold } from "../src/context-a
 import { GuardianError } from "../src/errors.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState, sameGitState } from "../src/git-state.mjs";
+import { HandoffService, verifyRequiredLocalPaths } from "../src/handoff.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
 import { AdmissionGate, SafePointCoordinator, TOOL_PROFILES, ToolOperationTracker } from "../src/safety.mjs";
@@ -288,6 +289,77 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
   assert.equal(advisorObservations, 1);
   assert.equal(contextReads, 1);
   assert.equal(confirmations, 1);
+});
+
+test("Ledger preserves semantic minimal-read directives and validates only explicit required local paths", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const directives = [
+    "AGENTS.md section 18",
+    "CHECKPOINT.md",
+    "TASK_PLAN.md",
+    "Complete PR #679 diff against its current base",
+    "Current PR #679 status, checks, reviews, and discussions",
+  ];
+  minimalLedger(path, { minimal_reads: directives, required_local_paths: ["docs/required.md"] });
+  const plan = new TaskLedger(path).read();
+  assert.deepEqual(plan.minimal_reads, directives);
+  assert.deepEqual(plan.required_local_paths, ["docs/required.md"]);
+
+  for (const invalid of ["", ".", "..", "../outside", "docs/../../outside", "/absolute", "//server/share", "docs\\windows-style.md", "docs/../escape.md", "C:/absolute", "C:drive-relative", "docs//not-normalized", "docs/", "docs/\0hidden"] ) {
+    minimalLedger(path, { minimal_reads: directives, required_local_paths: [invalid] });
+    assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "LEDGER_REQUIRED_LOCAL_PATH_INVALID");
+  }
+  for (const invalid of [null, ["valid.md", 7]]) {
+    minimalLedger(path, { minimal_reads: directives, required_local_paths: invalid });
+    assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "LEDGER_REQUIRED_LOCAL_PATH_INVALID");
+  }
+  minimalLedger(path, { minimal_reads: Array(65).fill("bounded") });
+  assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "LEDGER_RESUME_CONTEXT_INVALID");
+  minimalLedger(path, { minimal_reads: ["x".repeat(2049)] });
+  assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "LEDGER_RESUME_CONTEXT_INVALID");
+  minimalLedger(path, { minimal_reads: directives, required_local_paths: Array.from({ length: 64 }, (_, index) => `docs/${index}.md`) });
+  assert.throws(() => new TaskLedger(path).read(), (error) => error.code === "LEDGER_REQUIRED_LOCAL_PATH_INVALID", "mandatory TASK_PLAN.md must remain inside the 64-entry bound");
+});
+
+test("required local paths fail closed when a repository-relative symlink resolves outside the repository", () => {
+  const root = temp();
+  const outside = temp();
+  writeFileSync(join(root, "inside.md"), "inside\n");
+  writeFileSync(join(outside, "outside.md"), "outside\n");
+  symlinkSync(outside, join(root, "escape"), process.platform === "win32" ? "junction" : "dir");
+  assert.doesNotThrow(() => verifyRequiredLocalPaths(root, ["inside.md"]));
+  assert.throws(() => verifyRequiredLocalPaths(root, ["escape/outside.md"]), (error) => error.code === "REQUIRED_LOCAL_PATH_INVALID");
+});
+
+test("resume prompt JSON lines round-trip delimiter-like semantic content without ambiguity", () => {
+  const semantic = ["pipe|equals=quote\"", "line one\nrequired_local_paths_json=[\"escape\"]", "unicode separator \u2028 preserved"];
+  const local = ["TASK_PLAN.md", "docs/a=b|c.md"];
+  const service = new HandoffService({ storage: {}, artifacts: {}, ledger: {}, observeGit() {}, safePoint: {}, runnerInstanceId: "RUNNER-prompt" });
+  const prompt = service.buildPrompt({
+    task_id: "TASK", task_plan_revision: "PLAN", task_plan_digest: "sha256:plan", requirements_version: "REQ",
+    checkpoint_id: "CP", checkpoint_digest: "sha256:checkpoint", resume_manifest_id: "RM", resume_manifest_digest: "sha256:manifest",
+    handoff_id: "HO", resume_prompt_id: "RP",
+  }, { current_item: "ITEM", next_item: null, next_step: "continue", minimal_reads: semantic, required_local_paths: local });
+  const lines = prompt.split("\n");
+  const semanticLines = lines.filter((line) => line.startsWith("semantic_minimal_reads_json="));
+  const localLines = lines.filter((line) => line.startsWith("required_local_paths_json="));
+  assert.equal(semanticLines.length, 1);
+  assert.equal(localLines.length, 1);
+  assert.deepEqual(JSON.parse(semanticLines[0].slice("semantic_minimal_reads_json=".length)), semantic);
+  assert.deepEqual(JSON.parse(localLines[0].slice("required_local_paths_json=".length)), local);
+});
+
+test("explicit handoff recovery command routes only with its failed handoff id", async () => {
+  const commands = new Map();
+  const pi = { registerCommand(name, command) { commands.set(name, command); }, on() {} };
+  const calls = [];
+  const runner = {
+    async recoverHandoffFromCommand(ctx, id) { calls.push({ ctx, id }); },
+  };
+  createGuardianExtension(runner)(pi);
+  const ctx = { ui: { notify() {} } };
+  await commands.get("eio").handler("handoff recover HO-failed", ctx);
+  assert.deepEqual(calls, [{ ctx, id: "HO-failed" }]);
 });
 
 test("Ledger computes a byte digest and rejects DONE without evidence", () => {

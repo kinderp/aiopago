@@ -35,7 +35,14 @@ function taskLedger(advanced = false) {
     evidence: [],
     model_policy: null,
     reasoning_policy: "off",
-    minimal_reads: ["TASK_PLAN.md", "docs/decision.md"],
+    minimal_reads: [
+      "AGENTS.md section 18",
+      "CHECKPOINT.md",
+      "TASK_PLAN.md",
+      "Complete PR #679 diff against its current base",
+      "Current PR #679 status, checks, reviews, and discussions",
+    ],
+    required_local_paths: ["docs/decision.md"],
     relevant_decisions: ["docs/decision.md"],
     relevant_tests: ["node --test test/app.test.mjs"],
     evidence_references: ["README.md"],
@@ -67,6 +74,7 @@ function createExternalFixture() {
   mkdirSync(join(root, "test"));
   writeFileSync(join(root, "app.mjs"), "export const greeting = 'portable';\n");
   writeFileSync(join(root, "README.md"), "# Independent portable fixture\n");
+  writeFileSync(join(root, "CHECKPOINT.md"), "# Project checkpoint\n");
   writeFileSync(join(root, "docs", "decision.md"), "# Decision\n\nUse an uppercase greeting and separate acceptance evidence.\n");
   writeFileSync(join(root, "test", "app.test.mjs"), "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { greeting } from '../app.mjs';\ntest('normalized greeting', () => assert.equal(greeting, 'PORTABLE'));\n");
   git(root, ["init"]);
@@ -264,6 +272,9 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.equal(targetEntries.includes("EIOPAGO_RESUME_V1"), true);
           assert.equal(targetEntries.includes("current_item=ITEM-2"), true);
           assert.equal(targetEntries.includes("do not repeat ITEM-1"), true);
+          assert.equal(targetEntries.includes("AGENTS.md section 18"), true);
+          assert.equal(targetEntries.includes("Complete PR #679 diff against its current base"), true);
+          assert.equal(targetEntries.includes("Current PR #679 status, checks, reviews, and discussions"), true);
 
           const checkpoint = runner.artifacts.verify("checkpoint", result.checkpoint_id, result.checkpoint_digest);
           const manifest = runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
@@ -277,6 +288,8 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.deepEqual(manifest.payload.relevant_decisions, ["docs/decision.md"]);
           assert.deepEqual(manifest.payload.relevant_tests, ["node --test test/app.test.mjs"]);
           assert.deepEqual(manifest.payload.evidence_references, ["README.md"]);
+          assert.deepEqual(manifest.payload.minimal_reads, taskLedger(true).minimal_reads);
+          assert.deepEqual(manifest.payload.required_local_paths, ["TASK_PLAN.md", "docs/decision.md"]);
           assert.equal(manifest.payload.worktree, normalized(repository.targetRoot));
           assert.equal(manifest.payload.branch, git(root, ["branch", "--show-current"]));
           assert.equal(manifest.payload.head_sha, initialHead);

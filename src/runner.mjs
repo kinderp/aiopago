@@ -129,6 +129,13 @@ export class GuardianRunner {
       agentDir: options.agentDir ?? coding.getAgentDir(),
       sessionManager,
     });
+    this.recoverySourceSession = this.runtime.session;
+  }
+
+  currentRecoverySourceAttestation() {
+    const session = this.runtime?.session;
+    invariant(session && session === this.recoverySourceSession, "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery must start from the fresh session created by the current Runner");
+    return Object.freeze({ session_id: session.sessionId, runner_instance_id: this.runnerInstanceId });
   }
 
   permitReplacement() { this.replacementPermit += 1; }
@@ -182,6 +189,33 @@ export class GuardianRunner {
     });
   }
 
+  async recoverHandoffFromCommand(ctx, failedHandoffId) {
+    invariant(typeof failedHandoffId === "string" && failedHandoffId.length > 0, "CONTINUITY_RECOVERY_HANDOFF_ID_REQUIRED");
+    return this.handoffService.recoverContinuityFailure({
+      failedHandoffId,
+      sourceSession: this.runtime.session,
+      sourceAttestation: this.currentRecoverySourceAttestation(),
+      actor: "human:/eio-handoff-recover",
+      replacePaused: async (parentSession, ownership, onPaused) => {
+        this.permitReplacement();
+        let pausedResult;
+        try {
+          const result = await ctx.newSession({
+            parentSession,
+            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
+            withSession: async (replacementCtx) => {
+              const target = this.commandTarget(replacementCtx);
+              pausedResult = await onPaused(target);
+              target.notify(pausedResult.state === "RESUMED" ? "Eiopago recovered handoff resumed" : `Eiopago recovered target paused: ${pausedResult.handoff_id}`);
+            },
+          });
+          return { ...result, pausedResult };
+        } finally { this.revokeReplacementPermit(); }
+      },
+      confirmResume: async (target, h) => target.confirm(h),
+    });
+  }
+
   async takeoverFromCommand(ctx) {
     const result = await this.safePoint.request(this.runtime.session, "human:/eio-takeover", "HUMAN_TAKEOVER");
     ctx.ui.notify(`Eiopago paused at ${result.state}; latch generation=${result.latch_generation}`, "warning");
@@ -217,6 +251,34 @@ export class GuardianRunner {
             session: this.runtime.session,
             setEditor: () => {},
             confirm: async () => confirm,
+            sendResume: (prompt) => this.runtime.session.sendUserMessage(prompt),
+          };
+          const pausedResult = await onPaused(target);
+          return { ...result, pausedResult };
+        } finally { this.revokeReplacementPermit(); }
+      },
+      confirmResume: (target, h) => target.confirm(h),
+    });
+  }
+
+  async recoverHandoffDirect(failedHandoffId, { confirm = true } = {}) {
+    return this.handoffService.recoverContinuityFailure({
+      failedHandoffId,
+      sourceSession: this.runtime.session,
+      sourceAttestation: this.currentRecoverySourceAttestation(),
+      actor: "human:test-or-host-recovery",
+      replacePaused: async (parentSession, ownership, onPaused) => {
+        this.permitReplacement();
+        try {
+          const result = await this.runtime.newSession({
+            parentSession,
+            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
+          });
+          if (result.cancelled) return result;
+          const target = {
+            session: this.runtime.session,
+            setEditor: () => {},
+            confirm: async (handoff) => typeof confirm === "function" ? confirm(handoff, this.runtime.session) : confirm,
             sendResume: (prompt) => this.runtime.session.sendUserMessage(prompt),
           };
           const pausedResult = await onPaused(target);

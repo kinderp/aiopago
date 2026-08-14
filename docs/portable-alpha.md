@@ -114,6 +114,10 @@ Eiopago attende un safe point, salva gli artifact del target, crea una nuova ses
 
 Accettando la conferma, la nuova sessione riceve il solo contesto minimo autorevole e prosegue dal `current_item`/`next_step` del Ledger. Non occorre conoscere o copiare ID, database, prompt o artifact.
 
+Nel Ledger, `minimal_reads` contiene esclusivamente direttive semantiche bounded per l'agente. Ogni stringa viene conservata letteralmente nel manifest e nel resume prompt: per esempio `AGENTS.md section 18` o `Complete PR #679 diff against its current base` non viene interpretata come path. Eiopago non usa split, regex o test filesystem su queste direttive.
+
+Le dipendenze locali verificabili sono separate in `required_local_paths`. Il campo Ledger è opzionale, backward-compatible, bounded e accetta solo path repo-relative normalizzati con `/`, senza path assoluti o traversal. Il manifest aggiunge sempre `TASK_PLAN.md`; Continuity verifica l'esistenza di questi soli path e fallisce chiuso se ne manca uno. Checkpoint e Resume Context Manifest non dipendono da questo test generico: `ArtifactStore.verify` ne verifica byte, digest, identità e content digest sealed.
+
 Invii duplicati e conferme duplicate non producono una seconda admission locale. Questo non equivale a dichiarare exactly-once presso il provider.
 
 ### Handoff manuale
@@ -181,7 +185,7 @@ La replacement non è un clone/fork della chat. Non riceve:
 - prompt copiati dalla sessione precedente;
 - secret o credenziali.
 
-La continuity usa soltanto la revisione di `TASK_PLAN.md`, checkpoint, Resume Context Manifest, stato Git e i `minimal_reads` dichiarati. La relazione parent della sessione serve a verificare la lineage, non a importare history.
+La continuity usa la revisione autorevole di `TASK_PLAN.md`, checkpoint e Resume Context Manifest sealed, stato Git, ownership Runner e `required_local_paths` espliciti. I `minimal_reads` dichiarati sono direttive semantiche trasmesse all'agente, non dipendenze filesystem. La relazione parent della sessione serve a verificare la lineage, non a importare history.
 
 ## Troubleshooting: Git dubious ownership / `safe.directory`
 
@@ -196,9 +200,18 @@ I controlli safety-critical falliscono chiuso.
 - `GIT_STATE_MISMATCH`, `PLAN_REVISION_MISMATCH`, `CHECKPOINT_MISMATCH`, `MANIFEST_MISMATCH`: non confermare e non ritentare alla cieca. Ripristinare o riconciliare esplicitamente Git/Ledger/artifact, quindi avviare un nuovo percorso solo quando lo stato è noto.
 - `MODEL_POLICY_MISMATCH` o `REASONING_POLICY_MISMATCH`: selezionare la policy dichiarata nel Ledger/manifest; Eiopago non cambia modello automaticamente.
 - `RUNNER_OWNERSHIP_ATTESTATION_FAILED`: non usare una sessione Pi creata fuori dal percorso Runner-owned.
+- `REQUIRED_LOCAL_PATH_MISSING`: correggere la dipendenza locale esplicitamente dichiarata; una direttiva semantica che non corrisponde a un file non produce questo errore.
 - replacement creation fallita/ambigua: il checkpoint resta conservato, ma Eiopago non crea automaticamente un secondo target. Usare `/eio status` e seguire le istruzioni mostrate.
 - `RESUME_DISPATCH_UNKNOWN`: il prompt potrebbe essere stato accettato; il redispatch automatico è vietato. Verificare umanamente la sessione prima di ogni azione.
 - `HUMAN_TAKEOVER_ACTIVE`: il takeover prevale; una vecchia conferma non può riprendere il lavoro.
+
+Un handoff terminale `CONTINUITY_FAILED` senza alcuna authorization, admission o dispatch può essere riconciliato, anche dopo il riavvio del processo, soltanto da una fresh source session history-zero creata e posseduta dal Runner corrente:
+
+```text
+/eio handoff recover <handoff-id>
+```
+
+Il comando è una volontà umana distinta da `handoff confirm`: verifica digest, identità e provenance degli artifact sealed del failed handoff (inclusi i manifest legacy `1.0.0`, senza migrarli né rieseguirne la vecchia Continuity), verifica il binding storico del failed target, richiede stato durable `NOT_AUTHORIZED` / `NOT_COMMITTED` / `NOT_STARTED`, Ledger e Git invariati, mantiene il latch `ENGAGED`, supersede esplicitamente il vecchio binding e crea dalla fresh source un nuovo handoff `1.1.0` con nuovo target. Il failed target non viene riattivato e il failed handoff resta immutato e terminale come evidence. Solo dopo la nuova Continuity positiva viene chiesta una nuova singola autorizzazione. Stato mancante, `UNKNOWN`, authorization/admission/dispatch già presente, source non fresh/Runner-owned, source già coinvolta in un handoff o binding storico non dimostrabile falliscono chiuso; non esiste retry automatico del vecchio handoff.
 
 Non cancellare `.guardian/runtime` per aggirare un errore: eliminerebbe lo stato che consente la riconciliazione.
 

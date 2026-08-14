@@ -98,7 +98,7 @@ async function adviseHandoff(runner, ctx) {
 export function createGuardianExtension(runner) {
   return function guardianExtension(pi) {
     pi.registerCommand("eio", {
-      description: "Eiopago: /eio handoff [manual|confirm] | takeover | resume [handoff-id] | status",
+      description: "Eiopago: /eio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status",
       handler: async (args, ctx) => runCommand(args, ctx),
     });
     pi.registerCommand("eiopago", {
@@ -107,16 +107,16 @@ export function createGuardianExtension(runner) {
     });
 
     async function runCommand(args, ctx) {
-      const [subcommand = "status", value] = args.trim().split(/\s+/);
+      const [subcommand = "status", value, identifier] = args.trim().split(/\s+/);
       try {
         if (subcommand === "status") {
           const handoff = runner.storage.latestHandoffForTask(runner.ledger.read().task_id);
-          ctx.ui.notify(formatGuardianStatus(runner, ctx), handoff?.state === "HANDOFF_FAILED" ? "warning" : "info");
+          ctx.ui.notify(formatGuardianStatus(runner, ctx), ["HANDOFF_FAILED", "CONTINUITY_FAILED"].includes(handoff?.state) ? "warning" : "info");
           return;
         }
         if (subcommand === "handoff") {
-          const mode = value ?? "confirm";
-          await runner.handoffFromCommand(ctx, mode);
+          if (value === "recover") await runner.recoverHandoffFromCommand(ctx, identifier);
+          else await runner.handoffFromCommand(ctx, value ?? "confirm");
           return;
         }
         if (subcommand === "takeover" || subcommand === "pause") {
@@ -127,7 +127,7 @@ export function createGuardianExtension(runner) {
           await runner.resumeFromCommand(ctx, value);
           return;
         }
-        ctx.ui.notify("Usage: /eio handoff [manual|confirm] | /eio takeover | /eio resume [handoff-id] | /eio status", "warning");
+        ctx.ui.notify("Usage: /eio handoff [manual|confirm] | /eio handoff recover <handoff-id> | /eio takeover | /eio resume [handoff-id] | /eio status", "warning");
       } catch (error) {
         safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error");
       }

@@ -266,7 +266,7 @@ export class GuardianStorage {
       this.db.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
         .run(projection.handoff_id, projection.source_session_id, null, projection.task_id, projection.state, projection.latch_generation, JSON.stringify(projection), now, now);
       this.db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
-      this.appendEvent("HANDOFF_STARTED", { source_session_id: projection.source_session_id, latch_generation: projection.latch_generation }, { handoffId: projection.handoff_id, eventKey: `handoff:${projection.handoff_id}` });
+      this.appendEvent("HANDOFF_STARTED", { source_session_id: projection.source_session_id, latch_generation: projection.latch_generation, recovery_of_handoff_id: projection.recovery_of_handoff_id ?? null }, { handoffId: projection.handoff_id, eventKey: `handoff:${projection.handoff_id}` });
       return { created: true, handoff: this.getHandoff(projection.handoff_id) };
     });
   }
@@ -284,6 +284,20 @@ export class GuardianStorage {
   findHandoffBySource(sourceSessionId) {
     const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE source_session_id=? ORDER BY created_at DESC LIMIT 1").get(sourceSessionId);
     return row ? this.getHandoff(row.handoff_id) : null;
+  }
+
+  pendingContinuityFailureForTask(taskId) {
+    const row = this.db.prepare("SELECT h.handoff_id FROM handoffs h JOIN runner_session_bindings b ON b.handoff_id=h.handoff_id WHERE h.task_id=? AND h.state='CONTINUITY_FAILED' AND b.status='ACTIVE' ORDER BY h.created_at DESC LIMIT 1").get(taskId);
+    return row ? this.getHandoff(row.handoff_id) : null;
+  }
+
+  assertContinuityRecoveryPrepared(handoffId, { sourceSessionId, runnerInstanceId }) {
+    const binding = this.getRunnerSessionBinding(handoffId);
+    invariant(binding?.status === "SUPERSEDED", "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed target binding was not superseded");
+    const event = this.db.prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_key=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(handoffId, `continuity-recovery:${handoffId}`);
+    const data = event ? JSON.parse(event.data_json) : null;
+    invariant(data?.current_source_session_id === sourceSessionId && data?.current_runner_instance_id === runnerInstanceId, "CONTINUITY_RECOVERY_SOURCE_INVALID", "recovery preparation does not belong to the current Runner source");
+    return data;
   }
 
   bindRunnerSession(handoffId, binding) {
@@ -325,6 +339,43 @@ export class GuardianStorage {
         .run(now, reason, handoffId);
       this.appendEvent("RUNNER_SESSION_BINDING_SUPERSEDED", { reason }, { handoffId, eventKey: `runner-binding-superseded:${handoffId}` });
       return this.getRunnerSessionBinding(handoffId);
+    });
+  }
+
+  prepareContinuityRecovery(handoffId, { sourceSessionId, runnerInstanceId, actor }) {
+    invariant(typeof sourceSessionId === "string" && typeof runnerInstanceId === "string" && actor?.startsWith("human:"), "CONTINUITY_RECOVERY_AUTHORITY_INVALID");
+    return this.transaction(() => {
+      const handoff = this.getHandoff(handoffId);
+      invariant(handoff?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", handoff?.state ?? "HANDOFF_NOT_FOUND");
+      invariant(sourceSessionId !== handoff.source_session_id && sourceSessionId !== handoff.target_session_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "recovery requires a distinct fresh source session");
+      invariant(handoff.authorization_state === "NOT_AUTHORIZED" && handoff.admission_state === "NOT_COMMITTED" && handoff.dispatch_state === "NOT_STARTED", "CONTINUITY_RECOVERY_UNSAFE", "authorization/admission/dispatch state is not provably empty");
+      const authorization = this.db.prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? LIMIT 1").get(handoffId);
+      const admission = this.db.prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? LIMIT 1").get(handoffId);
+      const dispatch = this.db.prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(handoffId);
+      invariant(!authorization && !admission && !dispatch, "CONTINUITY_RECOVERY_UNSAFE", "durable authorization/admission/dispatch evidence exists");
+      const continuityFailure = this.db.prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_FAILED' LIMIT 1").get(handoffId);
+      invariant(continuityFailure, "CONTINUITY_RECOVERY_UNSAFE", "terminal continuity failure journal evidence is missing");
+      const latch = this.getLatch(handoff.task_id);
+      invariant(latch?.state === "ENGAGED" && latch.generation === handoff.latch_generation, "LATCH_GENERATION_MISMATCH");
+      const binding = this.getRunnerSessionBinding(handoffId);
+      invariant(binding?.status === "ACTIVE" && binding.replacement_session_id === handoff.target_session_id && binding.runner_instance_id === handoff.runner_instance_id && binding.session_binding_id === handoff.session_binding_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed target binding is not active and coherent");
+      const currentUse = this.db.prepare("SELECT handoff_id,state FROM handoffs WHERE source_session_id=? OR target_session_id=? LIMIT 1").get(sourceSessionId, sourceSessionId);
+      const activeSource = this.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=? LIMIT 1").get(sourceSessionId);
+      invariant(!currentUse && !activeSource, "CONTINUITY_RECOVERY_SOURCE_INVALID", "current recovery source already participates in a handoff");
+      const reason = `explicit continuity recovery by ${actor}`;
+      const now = utcNow();
+      const changed = this.db.prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
+        .run(now, reason, handoffId);
+      invariant(changed.changes === 1, "CONTINUITY_RECOVERY_UNSAFE", "failed target binding reconciliation raced");
+      this.appendEvent("RUNNER_SESSION_BINDING_SUPERSEDED", { reason }, { handoffId, eventKey: `runner-binding-superseded:${handoffId}` });
+      this.appendEvent("CONTINUITY_RECOVERY_STARTED", {
+        failed_target_session_id: handoff.target_session_id,
+        failed_runner_instance_id: handoff.runner_instance_id,
+        current_source_session_id: sourceSessionId,
+        current_runner_instance_id: runnerInstanceId,
+        actor,
+      }, { handoffId, eventKey: `continuity-recovery:${handoffId}` });
+      return { handoff: this.getHandoff(handoffId), binding: this.getRunnerSessionBinding(handoffId), latch: this.getLatch(handoff.task_id) };
     });
   }
 
