@@ -8,8 +8,8 @@
 | Slice | Scope | Gate |
 |---|---|---|
 | **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
-| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | Prossimo slice dopo il rename completo; non iniziato nella migration |
-| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | Dopo 0.2-B |
+| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **CLOSED**; foundation interna, nessun intent adapter pubblico |
+| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **NEXT**; dopo la chiusura 0.2-B |
 | **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | Nessun issue adapter |
 | **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | Invarianti core preservate |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
@@ -21,9 +21,10 @@
 Gate vincolante dopo 0.2-A:
 
 1. **Dedicated rename migration: COMPLETE**;
-2. **0.2-B Plan Proposal Foundation: NEXT, non iniziata**.
+2. **0.2-B Plan Proposal Foundation: CLOSED**;
+3. **0.2-C Intent Adapter minimo: NEXT**.
 
-La migrazione di nome è una modifica dedicata separata da 0.2-A. Non include alcun lavoro 0.2-B.
+La migration di nome e 0.2-A restano chiuse. La foundation 0.2-B non espone ancora l'adapter/intent surface di 0.2-C.
 
 ## Fondazione M0/M1
 
