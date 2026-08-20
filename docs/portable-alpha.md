@@ -64,6 +64,44 @@ Gli status ammessi, sia per il task sia per gli item, sono soltanto `PLANNED`, `
 
 Per un blocco esterno, impostare task e item a `BLOCKED`, `current_item=null` e `next_item` all'item bloccato. `next_step` deve indicare blocker, condizione di sblocco e item da riprendere. In generale `current_item` è `null` oppure identifica il solo item `IN_PROGRESS` (mai un item `PLANNED`, `BLOCKED` o `DONE`); `next_item` è `null` oppure identifica un item `PLANNED`/`BLOCKED` e deve sempre differire da `current_item`. Eiopago non converte né ripara automaticamente stati invalidi: il validator blocca il flusso finché `TASK_PLAN.md` non viene corretto esplicitamente.
 
+## Workflow umano read-only (0.2-A)
+
+Senza avviare Pi, selezionare un modello o effettuare provider call, la CLI può mostrare il piano autorevole e il limite corrente dell’osservazione runtime:
+
+```text
+eio status
+eio why
+eio next
+```
+
+- `eio status` riassume obiettivo e attività del piano e segnala se l’autorità runtime non è verificabile;
+- `eio why` spiega il boundary fail-closed corrente;
+- `eio next` non suggerisce avvio o retry senza una verifica runtime canonica e non modifica lo stato.
+
+I comandi accettano `--target <path>` e funzionano anche in un repository Git non ancora inizializzato, senza crearvi file. Non migrano né modificano il runtime SQLite e non creano sessioni, checkpoint o manifest.
+
+`TASK_PLAN.md` resta il piano operativo autorevole, ispezionabile e modificabile direttamente. Le superfici read-only sono:
+
+```text
+eio plan
+eio plan --raw
+eio plan --check
+eio plan --technical
+```
+
+- `eio plan` mostra una vista leggibile del piano e il path dell'artifact autorevole;
+- `eio plan --raw` stampa il testo corrente senza validarlo o rigenerarlo, quindi resta utilizzabile anche durante la riparazione di un Ledger invalido;
+- `eio plan --check` esegue il validator canonico senza scritture;
+- `eio plan --technical` espone ID, revisione, digest e campi lifecycle come escape hatch esperto.
+
+Una modifica manuale diventa la nuova autorità alla lettura successiva. Nessuno di questi comandi corregge, rigenera o sovrascrive `TASK_PLAN.md`.
+
+Portable Alpha 0.1 applica le invarianti runtime nei percorsi live di safe point, handoff, continuity, admission, dispatch e ownership, ma non espone un verifier read-only complessivo riutilizzabile senza ridefinire quel protocollo. 0.2-A non ricostruisce quindi una seconda state machine da SQLite: il reader osserva soltanto presenza, stabilità dei byte e sidecar del runtime e non interpreta row, journal o projection. Un runtime presente, non osservato, concorrente o comunque privo di un risultato canonico produce sempre “richiede attenzione”; stati o condition futuri non possono produrre “pronto”. `next` non suggerisce avvio o retry.
+
+Una projection runtime completa richiede un futuro **Core Observation Port** posseduto dal core e condiviso con i percorsi live. Tale port, così come un control channel read-only posseduto dal Runner, non fa parte di 0.2-A.
+
+Le proposal conversazionali, `eio start`, `eio stop`, Intent Adapter e modalità di autonomia non fanno parte di questo slice.
+
 ## Avviare Pi sotto il Runner
 
 Dal target:

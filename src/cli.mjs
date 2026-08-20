@@ -10,18 +10,30 @@ Usage:
   eio init [target]
   eio init --target <path>
   eio [--target <path>]
+  eio status [--target <path>]
+  eio why [--target <path>]
+  eio next [--target <path>]
+  eio plan [--raw | --check | --technical] [--target <path>]
   eio --help | --version
 
 Commands:
   init    Initialize Eiopago state non-destructively in a Git worktree
+  status  Show plan context and the runtime observation boundary without starting Pi
+  why     Explain the current plan/runtime observation boundary
+  next    Show bounded guidance without changing or launching runtime state
+  plan    Inspect or validate the authoritative TASK_PLAN.md read-only
 
 Without a command, eio starts Pi under the Eiopago Runner. Run init first.`;
+
+const COMMANDS = new Set(["init", "status", "why", "next", "plan"]);
+const READ_ONLY_COMMANDS = new Set(["status", "why", "next", "plan"]);
+const PLAN_OPTIONS = new Set(["--raw", "--check", "--technical"]);
 
 function parse(argv) {
   if (argv.includes("--help") || argv.includes("-h")) return { help: true };
   if (argv.includes("--version") || argv.includes("-v")) return { version: true };
   const values = [...argv];
-  const command = values[0] === "init" ? values.shift() : null;
+  const command = COMMANDS.has(values[0]) ? values.shift() : null;
   let target = null;
   const targetIndex = values.indexOf("--target");
   if (targetIndex >= 0) {
@@ -30,8 +42,17 @@ function parse(argv) {
     values.splice(targetIndex, 2);
   }
   if (command === "init" && values.length === 1 && target === null) target = values.shift();
+  let planOption = null;
+  if (command === "plan") {
+    const options = values.filter((value) => PLAN_OPTIONS.has(value));
+    if (options.length > 1) throw new GuardianError("CLI_ARGUMENT_INVALID", "eio plan accepts only one of --raw, --check, or --technical");
+    if (options.length === 1) {
+      planOption = options[0].slice(2);
+      values.splice(values.indexOf(options[0]), 1);
+    }
+  }
   if (values.length > 0) throw new GuardianError("CLI_ARGUMENT_INVALID", `Unexpected argument: ${values[0]}`);
-  return { command, target: target ?? process.cwd() };
+  return { command, planOption, target: target ?? process.cwd() };
 }
 
 function lineList(label, values) {
@@ -56,6 +77,7 @@ export function formatInitSummary(result) {
 
 export async function runCli(argv = process.argv.slice(2), options = {}) {
   const stdout = options.stdout ?? ((text) => console.log(text));
+  const rawStdout = options.rawStdout ?? (options.stdout ? options.stdout : ((text) => process.stdout.write(text)));
   const parsed = parse(argv);
   if (parsed.help) { stdout(HELP); return { action: "help" }; }
   if (parsed.version) { stdout(EIO_VERSION); return { action: "version" }; }
@@ -63,6 +85,30 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     const result = await (options.initializeRepository ?? initializeRepository)(parsed.target, options.bootstrapOptions);
     stdout(formatInitSummary(result));
     return { action: "init", result };
+  }
+  if (READ_ONLY_COMMANDS.has(parsed.command)) {
+    const workflow = await import("./human-workflow.mjs");
+    const observation = await (options.observeHumanWorkflow ?? workflow.observeHumanWorkflow)(parsed.target, {
+      ...options.workflowOptions,
+      includeRuntime: parsed.command !== "plan",
+      planMode: parsed.command === "plan" && parsed.planOption === "raw" ? "raw" : "validated",
+    });
+    if (parsed.command === "plan") {
+      if (!observation.initialized) throw new GuardianError("REPOSITORY_NOT_INITIALIZED", `Eiopago is not initialized in ${observation.targetRoot}; run 'eio init' first`);
+      if (parsed.planOption === "raw") {
+        if (!observation.plan?.exists || observation.plan?.error || typeof observation.plan?.text !== "string") throw observation.plan?.error?.source ?? new GuardianError("LEDGER_NOT_FOUND", "Authoritative TASK_PLAN.md is unavailable");
+        rawStdout(observation.plan.text);
+      } else if (parsed.planOption === "check") {
+        if (!observation.plan?.valid) throw observation.plan?.error?.source ?? new GuardianError("LEDGER_READ_FAILED", "TASK_PLAN.md is invalid");
+        stdout(`TASK_PLAN.md valido — revisione ${observation.plan.plan.plan_revision_id}`);
+      } else if (parsed.planOption === "technical") stdout(workflow.formatPlanTechnical(observation));
+      else stdout(workflow.formatPlan(observation));
+      return { action: "plan", mode: parsed.planOption ?? "summary", observation };
+    }
+    const view = workflow.projectHumanWorkflow(observation);
+    const format = parsed.command === "status" ? workflow.formatHumanStatus : parsed.command === "why" ? workflow.formatHumanWhy : workflow.formatHumanNext;
+    stdout(format(view));
+    return { action: parsed.command, observation, view };
   }
 
   await (options.checkEnvironment ?? checkPortableEnvironment)({ searchRoot: parsed.target });

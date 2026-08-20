@@ -1,9 +1,31 @@
-# Eiopago/Guardian — roadmap congelata dopo M0.1
+# Eiopago/Guardian — roadmap di prodotto
 
-**Versione:** 0.1 — 2026-08-05  
+**Versione:** 0.2 — 2026-08-20
 **Fonte autorevole:** questo file governa scope e ordine delle milestone; lo stato runtime dei task appartiene al Master Task Ledger e non viene dedotto da questa roadmap.
 
-## Gate corrente
+## Sequenza Eiopago 0.2
+
+| Slice | Scope | Gate |
+|---|---|---|
+| **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
+| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | Solo dopo la migrazione di nome dedicata |
+| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | Dopo 0.2-B |
+| **0.2-D — Start da obiettivo** | `eio start <obiettivo>` con planning agent-driven e autorizzazione | Nessun issue adapter |
+| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | Invarianti core preservate |
+| **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
+| **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
+| **0.2-H — Completamento guidato** | Verifica criteria/evidence e chiusura confermata | `DONE` non implica acceptance esterna |
+| **0.2-I — Authority routing** | `PROPOSE`, `ESCALATE`, `DEFER` e boundary FARO | Nessuna decisione strategica automatica |
+| **0.2-J — Autonomy modes** | Introduzione progressiva di `MANUAL`, `GUIDED`, `AUTO` | Solo con authority e safety invariants verificati |
+
+Gate vincolante dopo 0.2-A:
+
+1. **Dedicated rename migration: Eiopago -> Aiopago**;
+2. **0.2-B Plan Proposal Foundation**.
+
+La migrazione di nome non appartiene a 0.2-A e non è iniziata in questo slice. 0.2-B non può iniziare prima della sua chiusura.
+
+## Fondazione M0/M1
 
 ### M0.1 — Contract and Boundary Freeze
 

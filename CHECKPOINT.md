@@ -1,3 +1,22 @@
+# CHECKPOINT — Eiopago 0.2-A Safe Read Side Foundation pronta al commit
+
+- Worktree/branch verificati: `F:/dev/eiopago-ux-0.2`, `feat/human-workflow-ux-0.2`, HEAD baseline `72461f653d217e8f18b3cba2c1b7ed46220cee4e`; il workspace storico `F:/dev/eiopago` non è stato modificato. Nessun commit, push o merge eseguito.
+- Recuperata la review `REQUEST CHANGES` persistita: tre finding HIGH su operation futura ignorata, mismatch latch/journal capace di occultare `HUMAN_TAKEOVER` e authorization/admission/journal incompleti; un finding MEDIUM sulla projection pubblica fail-open per `includeRuntime:false` e condition futura/sconosciuta.
+- Causa radice confermata: il precedente reader SQLite ricostruiva una seconda semantica delle authority safety-critical senza un verifier canonico complessivo nel core 0.1. Il puro refactor non era possibile senza introdurre il futuro Core Observation Port.
+- Boundary corretto già persistito e riaccettato: `runtime-reader.mjs` osserva soltanto presenza, sidecar e stabilità dei byte; non apre/interpreta SQLite e non contiene lifecycle state machine. Runtime assente, presente, concorrente, non osservato o non verificabile resta `NEEDS_ATTENTION`/`RUNTIME_NOT_VERIFIED`; nessun percorso pubblico costruisce `READY` o `SUSPENDED`.
+- I quattro finding sono chiusi senza whitelist/query/branch presenter specifici: tutti gli scenari runtime corrotti o futuri restano non verificati; `includeRuntime:false`, workflow futuro e condition sconosciuta falliscono chiusi. `plan --raw` resta separato dal validator; `plan --check` usa `TaskLedger` canonico.
+- Invarianti core preservate: `runner.mjs`, `handoff.mjs`, `safety.mjs`, `storage.mjs` e `runner-ownership.mjs` hanno diff nullo rispetto alla baseline. Nessun Plan Proposal, Intent Adapter, start/stop, Human Action Broker, control channel o altro scope 0.2-B implementato.
+- Verifiche della sessione: test mirati `test/human-workflow.test.mjs` **34/34 PASS**; `npm test` **147/147 PASS**; `npm run check` **PASS, 36 moduli**; `git diff --check` **PASS**. Warning SQLite experimental e LF→CRLF dei fixture sono informativi.
+- Nuova review completa: **APPROVE**, zero finding HIGH/MEDIUM aperti. 0.2-A è pronta per essere committata, ma il commit resta fermo in attesa della decisione dell'owner.
+
+**STOP operativo:** non iniziare 0.2-B e non creare commit senza autorizzazione esplicita.
+
+**Nome sessione suggerito:** `eiopago-0.2-a-commit-decision`
+
+**Prompt minimo di ripresa:**
+
+> Lavora soltanto in `F:/dev/eiopago-ux-0.2` sul branch `feat/human-workflow-ux-0.2`; non toccare `F:/dev/eiopago`. Leggi la prima sezione di `CHECKPOINT.md`, verifica HEAD/status e il diff 0.2-A. I quattro finding runtime/projection sono chiusi con boundary fail-closed; test 147/147, check 36 moduli, diff-check PASS e review APPROVE. Non iniziare 0.2-B. Crea il commit soltanto se l'owner lo autorizza esplicitamente.
+
 # CHECKPOINT — M1-P0-A Portable Bootstrap, Packaging e Config PASS
 
 - Baseline e branch verificati: `9ed10f6148a144179cccce3c9141e4fa61c808e5`, `feat/m1-p0-portable-alpha`; nessun commit creato.
