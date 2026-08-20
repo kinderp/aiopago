@@ -91,6 +91,7 @@ export function validateRepositoryStateBoundaries(targetRoot) {
     [".guardian/checkpoints", "directory"],
     [".guardian/manifests", "directory"],
     [".guardian/plan-proposals", "directory"],
+    [".guardian/plan-history", "directory"],
     [".guardian/plan-write.lock", "file"],
     [".guardian/test-runs", "directory"],
     [".guardian/calibration", "directory"],

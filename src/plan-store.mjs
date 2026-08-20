@@ -1,18 +1,22 @@
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
@@ -21,17 +25,22 @@ export const LEGACY_TASK_LEDGER_SCHEMA = "eiopago.task-ledger/0.1.0";
 
 const LEDGER_BLOCK = /```json task-ledger[^\S\r\n]*(\r?\n)([\s\S]*?)(\r?\n)```/;
 const SCHEMA_HEADER = /^\*\*Schema:\*\*[ \t]*`([^`]+)`[ \t]*$/gm;
-let temporarySequence = 0;
+const MAX_PLAN_BYTES = 32 * 1024 * 1024;
+const MAX_STATE_BYTES = 32 * 1024 * 1024;
+const LOCK_SCHEMA = "aiopago.plan-write-lock/0.2.0";
 
 const DEFAULT_IO = Object.freeze({
   closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -75,10 +84,6 @@ function closeQuietly(io, fd) {
   try { io.closeSync(fd); } catch {}
 }
 
-function unlinkQuietly(io, path) {
-  try { if (io.existsSync(path)) io.unlinkSync(path); } catch {}
-}
-
 function syncDirectory(io, path) {
   let fd;
   try {
@@ -91,74 +96,194 @@ function syncDirectory(io, path) {
   }
 }
 
-function temporaryPath(path, label) {
-  temporarySequence += 1;
-  return `${path}.${process.pid}.${Date.now()}.${temporarySequence}.${label}.tmp`;
-}
-
 function samePath(left, right) {
   const a = resolve(left);
   const b = resolve(right);
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
+function statValue(stat, field) {
+  return typeof stat[field] === "bigint" ? stat[field].toString() : String(stat[field]);
+}
+
+function fileIdentity(stat) {
+  return Object.freeze({ device: statValue(stat, "dev"), inode: statValue(stat, "ino") });
+}
+
+export function sameFilesystemIdentity(left, right) {
+  return Boolean(left && right && left.device === right.device && left.inode === right.inode);
+}
+
+function randomToken() {
+  return randomBytes(32).toString("hex");
+}
+
+function temporaryPath(path, label) {
+  return `${path}.${process.pid}.${randomBytes(16).toString("hex")}.${label}.tmp`;
+}
+
 export class PlanRevisionWriter {
+  #io;
+  #testHooks;
+
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
-    this.io = Object.freeze({ ...DEFAULT_IO, ...(options.io ?? {}) });
     this.guardianRoot = resolve(options.guardianRoot ?? join(dirname(this.path), ".guardian"));
     this.lockPath = resolve(options.lockPath ?? join(this.guardianRoot, "plan-write.lock"));
-  }
-
-  #assertRealFile(path) {
-    const stat = this.io.lstatSync(path);
-    invariant(stat.isFile() && !stat.isSymbolicLink() && samePath(this.io.realpathSync(path), path), "PLAN_PATH_REDIRECTED", `Refusing redirected or non-file authoritative plan path: ${path}`);
+    this.#io = Object.freeze({ ...DEFAULT_IO, ...(options.io ?? {}) });
+    this.#testHooks = options.testHooks ?? null;
   }
 
   #ensureRealDirectory(path) {
-    this.io.mkdirSync(path, { recursive: true });
-    const stat = this.io.lstatSync(path);
-    invariant(stat.isDirectory() && !stat.isSymbolicLink() && samePath(this.io.realpathSync(path), path), "PLAN_STATE_PATH_REDIRECTED", `Refusing redirected plan state directory: ${path}`);
+    this.#io.mkdirSync(path, { recursive: true });
+    const stat = this.#io.lstatSync(path, { bigint: true });
+    invariant(stat.isDirectory() && !stat.isSymbolicLink() && samePath(this.#io.realpathSync(path), path), "PLAN_STATE_PATH_REDIRECTED", `Refusing redirected plan state directory: ${path}`);
   }
 
-  #ensureGuardianRoot() {
-    this.#ensureRealDirectory(this.guardianRoot);
+  #pathExists(path) {
+    try { this.#io.lstatSync(path, { bigint: true }); return true; }
+    catch (error) { if (error?.code === "ENOENT") return false; throw error; }
+  }
+
+  #readRegular(path, { maximum = MAX_STATE_BYTES, code = "PLAN_PROVENANCE_INVALID", allowHardlinks = false } = {}) {
+    const absolute = resolve(path);
+    let fd;
+    try {
+      const before = this.#io.lstatSync(absolute, { bigint: true });
+      invariant(before.isFile() && !before.isSymbolicLink(), code, `Expected a regular non-symlink file: ${absolute}`);
+      invariant(allowHardlinks || statValue(before, "nlink") === "1", code, `Unexpected hardlink count for ${absolute}`);
+      invariant(samePath(this.#io.realpathSync(absolute), absolute), code, `Refusing redirected file: ${absolute}`);
+      fd = this.#io.openSync(absolute, "r");
+      const opened = this.#io.fstatSync(fd, { bigint: true });
+      invariant(opened.isFile() && sameFilesystemIdentity(fileIdentity(before), fileIdentity(opened)), code, `File identity changed while opening ${absolute}`);
+      invariant(Number(opened.size) <= maximum, code, `File exceeds ${maximum} bytes: ${absolute}`);
+      const bytes = this.#io.readFileSync(fd);
+      invariant(bytes.length <= maximum && statValue(this.#io.fstatSync(fd, { bigint: true }), "size") === statValue(opened, "size"), code, `File changed while reading ${absolute}`);
+      this.#io.closeSync(fd);
+      fd = undefined;
+      return Object.freeze({ bytes, identity: fileIdentity(opened), mode: Number(opened.mode) & 0o777 });
+    } finally {
+      closeQuietly(this.#io, fd);
+    }
   }
 
   #acquireLock() {
-    this.#ensureGuardianRoot();
+    this.#ensureRealDirectory(this.guardianRoot);
     let fd;
-    let ownsLock = false;
+    let identity;
+    const token = randomToken();
+    const bytes = Buffer.from(`${JSON.stringify({ schema: LOCK_SCHEMA, ownership_token: token, pid: process.pid, created_at: new Date().toISOString() })}\n`, "utf8");
     try {
-      fd = this.io.openSync(this.lockPath, "wx", 0o600);
-      ownsLock = true;
-      const record = `${JSON.stringify({ schema: "aiopago.plan-write-lock/0.1.0", pid: process.pid, created_at: new Date().toISOString() })}\n`;
-      this.io.writeFileSync(fd, record, "utf8");
-      this.io.fsyncSync(fd);
-      this.io.closeSync(fd);
-      return undefined;
+      fd = this.#io.openSync(this.lockPath, "wx", 0o600);
+      identity = fileIdentity(this.#io.fstatSync(fd, { bigint: true }));
+      this.#io.writeFileSync(fd, bytes);
+      this.#io.fsyncSync(fd);
+      return Object.freeze({ fd, identity, token, bytes });
     } catch (error) {
-      closeQuietly(this.io, fd);
+      closeQuietly(this.#io, fd);
       if (error?.code === "EEXIST") {
         throw new GuardianError("PLAN_WRITE_LOCKED", `Aiopago plan mutation is already locked: ${this.lockPath}. Stale or corrupt locks require explicit human inspection and removal.`);
       }
-      if (ownsLock) unlinkQuietly(this.io, this.lockPath);
+      if (identity && this.#pathExists(this.lockPath)) {
+        try {
+          const current = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_OWNERSHIP_LOST" });
+          if (sameFilesystemIdentity(current.identity, identity)) this.#io.unlinkSync(this.lockPath);
+        } catch {}
+      }
       throw error;
     }
   }
 
-  #releaseLock() {
-    try { this.io.unlinkSync(this.lockPath); }
+  #attestLock(lock) {
+    let current;
+    try { current = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_OWNERSHIP_LOST" }); }
     catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      if (error?.code === "ENOENT") throw new GuardianError("PLAN_LOCK_OWNERSHIP_LOST", "The acquired plan lock path no longer exists");
+      throw error;
     }
-    syncDirectory(this.io, dirname(this.lockPath));
+    invariant(sameFilesystemIdentity(current.identity, lock.identity) && current.bytes.equals(lock.bytes), "PLAN_LOCK_OWNERSHIP_LOST", "The plan write lock was removed, replaced, or its ownership token changed");
+  }
+
+  #releaseLock(lock) {
+    let releaseError;
+    try {
+      this.#attestLock(lock);
+      this.#io.unlinkSync(this.lockPath);
+      syncDirectory(this.#io, dirname(this.lockPath));
+    } catch (error) {
+      releaseError = error?.code === "PLAN_LOCK_OWNERSHIP_LOST" ? error : new GuardianError("PLAN_LOCK_RELEASE_FAILED", error.message);
+    } finally {
+      closeQuietly(this.#io, lock.fd);
+    }
+    if (releaseError) throw releaseError;
   }
 
   readCurrent({ requireSingleBlock = false, validate } = {}) {
-    const observed = parseTaskPlanBytes(this.io.readFileSync(this.path), { requireSingleBlock });
+    const file = this.#readRegular(this.path, { maximum: MAX_PLAN_BYTES, code: "PLAN_PATH_REDIRECTED" });
+    const observed = parseTaskPlanBytes(file.bytes, { requireSingleBlock });
     validate?.(observed.task);
-    return observed;
+    return Object.freeze({ ...observed, fileIdentity: file.identity, mode: file.mode });
+  }
+
+  readPlanBytes() {
+    return Buffer.from(this.#readRegular(this.path, { maximum: MAX_PLAN_BYTES, code: "PLAN_PATH_REDIRECTED" }).bytes);
+  }
+
+  stateExists(path) {
+    return this.#pathExists(resolve(path));
+  }
+
+  assertStateDirectory(path) {
+    const absolute = resolve(path);
+    const stat = this.#io.lstatSync(absolute, { bigint: true });
+    invariant(stat.isDirectory() && !stat.isSymbolicLink() && samePath(this.#io.realpathSync(absolute), absolute), "PLAN_STATE_PATH_REDIRECTED", `Refusing redirected plan state directory: ${absolute}`);
+    return absolute;
+  }
+
+  stateDirectoryEntries(path) {
+    const absolute = this.assertStateDirectory(path);
+    return this.#io.readdirSync(absolute, { withFileTypes: true });
+  }
+
+  readImmutable(path, maximum = MAX_STATE_BYTES) {
+    return Buffer.from(this.#readRegular(resolve(path), { maximum, code: "PLAN_PROVENANCE_INVALID" }).bytes);
+  }
+
+  writeImmutable(path, bytes, { conflictCode = "PLAN_PROVENANCE_CONFLICT" } = {}) {
+    const destination = resolve(path);
+    const parent = dirname(destination);
+    this.#ensureRealDirectory(parent);
+    const value = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+    invariant(value.length <= MAX_STATE_BYTES, "PLAN_PROVENANCE_INVALID", `Immutable record exceeds ${MAX_STATE_BYTES} bytes`);
+    if (this.#pathExists(destination)) {
+      const existing = this.#readRegular(destination, { maximum: MAX_STATE_BYTES, code: "PLAN_PROVENANCE_INVALID" });
+      if (existing.bytes.equals(value)) return;
+      throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+    }
+    const temp = temporaryPath(destination, "immutable");
+    let fd;
+    let ownsTemp = false;
+    try {
+      fd = this.#io.openSync(temp, "wx", 0o600);
+      ownsTemp = true;
+      this.#io.writeFileSync(fd, value);
+      this.#io.fsyncSync(fd);
+      this.#io.closeSync(fd);
+      fd = undefined;
+      this.#io.linkSync(temp, destination);
+      this.#io.unlinkSync(temp);
+      ownsTemp = false;
+      syncDirectory(this.#io, parent);
+    } catch (error) {
+      closeQuietly(this.#io, fd);
+      if (ownsTemp) { try { this.#io.unlinkSync(temp); } catch {} }
+      if (error?.code === "EEXIST") {
+        const existing = this.#readRegular(destination, { maximum: MAX_STATE_BYTES, code: "PLAN_PROVENANCE_INVALID" });
+        if (existing.bytes.equals(value)) return;
+        throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+      }
+      throw error;
+    }
   }
 
   #casConflict(expected, observed, phase) {
@@ -177,50 +302,44 @@ export class PlanRevisionWriter {
     }
   }
 
-  atomicReplace(bytes) {
-    const candidate = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  #prepareCandidateTemp(bytes, mode, baseIdentity) {
     const temp = temporaryPath(this.path, "replace");
     let fd;
     let ownsTemp = false;
     try {
-      fd = this.io.openSync(temp, "wx", 0o600);
+      fd = this.#io.openSync(temp, "wx", mode || 0o600);
       ownsTemp = true;
-      this.io.writeFileSync(fd, candidate);
-      this.io.fsyncSync(fd);
-      this.io.closeSync(fd);
+      if (process.platform !== "win32") this.#io.fchmodSync(fd, mode || 0o600);
+      this.#io.writeFileSync(fd, bytes);
+      this.#io.fsyncSync(fd);
+      const identity = fileIdentity(this.#io.fstatSync(fd, { bigint: true }));
+      invariant(!sameFilesystemIdentity(identity, baseIdentity), "PLAN_COMMIT_WITNESS_INVALID", "Candidate temp must have a distinct filesystem identity from the base authority");
+      this.#io.closeSync(fd);
       fd = undefined;
-      this.io.renameSync(temp, this.path);
-      syncDirectory(this.io, dirname(this.path));
+      return { path: temp, identity, reference: relative(dirname(this.path), temp).replaceAll("\\", "/"), ownsTemp };
     } catch (error) {
-      closeQuietly(this.io, fd);
-      if (ownsTemp) unlinkQuietly(this.io, temp);
+      closeQuietly(this.#io, fd);
+      if (ownsTemp) { try { this.#io.unlinkSync(temp); } catch {} }
       throw error;
     }
   }
 
-  writeImmutable(path, bytes) {
-    const destination = resolve(path);
-    const parent = dirname(destination);
-    this.#ensureRealDirectory(parent);
-    const temp = temporaryPath(destination, "immutable");
-    let fd;
-    let ownsTemp = false;
-    try {
-      fd = this.io.openSync(temp, "wx", 0o600);
-      ownsTemp = true;
-      this.io.writeFileSync(fd, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
-      this.io.fsyncSync(fd);
-      this.io.closeSync(fd);
-      fd = undefined;
-      this.io.linkSync(temp, destination);
-      syncDirectory(this.io, parent);
-      this.io.unlinkSync(temp);
-    } catch (error) {
-      closeQuietly(this.io, fd);
-      if (ownsTemp) unlinkQuietly(this.io, temp);
-      if (error?.code === "EEXIST") throw new GuardianError("PLAN_PROVENANCE_CONFLICT", `Immutable plan provenance already exists: ${destination}`);
+  #historyReference(contentDigest) {
+    invariant(/^sha256:[a-f0-9]{64}$/.test(contentDigest), "PLAN_HISTORY_INVALID", "History digest is invalid");
+    return `.guardian/plan-history/sha256-${contentDigest.slice("sha256:".length)}.md`;
+  }
+
+  #persistHistory(current) {
+    const reference = this.#historyReference(current.contentDigest);
+    const path = resolve(dirname(this.path), reference);
+    try { this.writeImmutable(path, current.bytes, { conflictCode: "PLAN_HISTORY_CORRUPT" }); }
+    catch (error) {
+      if (error?.code === "PLAN_PROVENANCE_INVALID" || error?.code === "PLAN_STATE_PATH_REDIRECTED") throw new GuardianError("PLAN_HISTORY_CORRUPT", `Previous plan history is not trustworthy: ${path}`);
       throw error;
     }
+    const stored = this.readImmutable(path, MAX_PLAN_BYTES);
+    invariant(sha256(stored) === current.contentDigest && stored.equals(current.bytes), "PLAN_HISTORY_CORRUPT", "Previous plan history does not contain the exact base bytes");
+    return reference;
   }
 
   commit({
@@ -229,37 +348,64 @@ export class PlanRevisionWriter {
     validate,
     inspectExisting,
     prepare,
-    beforeFinalAttestation,
   }) {
-    this.#assertRealFile(this.path);
-    this.#acquireLock();
+    invariant(typeof validate === "function", "PLAN_VALIDATOR_REQUIRED", "Every plan mutation must provide the canonical semantic validator");
+    invariant(typeof prepare === "function", "PLAN_PREPARE_REQUIRED", "Every plan mutation must provide a deterministic candidate preparation");
+    const lock = this.#acquireLock();
     let operationError;
+    let temp;
+    let committed = false;
     try {
       const current = this.readCurrent({ requireSingleBlock, validate });
       const existing = inspectExisting?.(current);
       if (existing !== undefined && existing !== null) return existing;
       if (expected) this.#casConflict(expected, current, "initial attestation");
-      const prepared = prepare(current);
+      const previousSnapshotReference = this.#historyReference(current.contentDigest);
+      const prepared = prepare(current, Object.freeze({ previousSnapshotReference }));
       if (prepared?.noWrite) return prepared.result;
       invariant(prepared && Buffer.isBuffer(prepared.bytes), "PLAN_MATERIALIZATION_INVALID", "Plan mutation must materialize candidate bytes");
       const candidate = parseTaskPlanBytes(prepared.bytes, { requireSingleBlock });
       validate?.(candidate.task);
-      beforeFinalAttestation?.(Object.freeze({ current, candidate }));
+
+      temp = this.#prepareCandidateTemp(prepared.bytes, current.mode, current.fileIdentity);
+      const persistedSnapshotReference = this.#persistHistory(current);
+      invariant(persistedSnapshotReference === previousSnapshotReference, "PLAN_HISTORY_INVALID");
+      prepared.beforeFinalAttestation?.(Object.freeze({
+        current,
+        candidate,
+        candidateTempIdentity: temp.identity,
+        candidateTempReference: temp.reference,
+        previousSnapshotReference,
+      }));
+      this.#testHooks?.afterPreparation?.(Object.freeze({ current, candidate }));
+
       const finalObservation = this.readCurrent({ requireSingleBlock, validate });
       const attestation = expected ?? { planRevisionId: current.task.plan_revision_id, contentDigest: current.contentDigest };
       this.#casConflict(attestation, finalObservation, "final attestation");
       invariant(finalObservation.contentDigest === current.contentDigest, "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed while the mutation was being prepared");
-      this.atomicReplace(prepared.bytes);
-      try { prepared.afterCommit?.(); }
-      catch (error) {
+      this.#attestLock(lock);
+      this.#io.renameSync(temp.path, this.path);
+      temp.ownsTemp = false;
+      committed = true;
+
+      syncDirectory(this.#io, dirname(this.path));
+      const committedFile = this.readCurrent({ requireSingleBlock, validate });
+      invariant(committedFile.contentDigest === candidate.contentDigest && sameFilesystemIdentity(committedFile.fileIdentity, temp.identity), "PLAN_COMMIT_WITNESS_INVALID", "Committed TASK_PLAN.md does not match the prepared candidate identity and digest");
+      try {
+        const result = prepared.afterCommit?.(Object.freeze({ committed: committedFile, candidateTempIdentity: temp.identity, previousSnapshotReference }));
+        return result ?? prepared.result;
+      } catch (error) {
         throw new GuardianError("PLAN_APPLY_COMMITTED_PROVENANCE_PENDING", "TASK_PLAN.md was replaced, but immutable applied provenance is incomplete; retry only the same proposal_id and payload to recover", { cause_code: error?.code ?? null });
       }
-      return prepared.result;
     } catch (error) {
       operationError = error;
-      throw error;
+      if (committed && error?.code !== "PLAN_APPLY_COMMITTED_PROVENANCE_PENDING" && error?.code !== "PLAN_COMMIT_WITNESS_INVALID") {
+        operationError = new GuardianError("PLAN_APPLY_COMMITTED_PROVENANCE_PENDING", "TASK_PLAN.md may have been replaced but post-commit bookkeeping failed", { cause_code: error?.code ?? null });
+      }
+      throw operationError;
     } finally {
-      try { this.#releaseLock(); }
+      if (temp?.ownsTemp) { try { this.#io.unlinkSync(temp.path); } catch {} }
+      try { this.#releaseLock(lock); }
       catch (releaseError) { if (!operationError) throw releaseError; }
     }
   }
