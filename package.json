@@ -30,6 +30,7 @@
     "bin/",
     "src/",
     "README.md",
+    "docs/0.2-b-plan-proposal-foundation.md",
     "docs/portable-alpha.md",
     "docs/rename-aiopago-migration.md"
   ],

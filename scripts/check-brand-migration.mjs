@@ -12,6 +12,7 @@ const shortPattern = new RegExp(`(?<![A-Za-z0-9])${legacyShort}(?![A-Za-z0-9])`,
 const fullAllowlist = new Map(Object.entries({
   "CHECKPOINT.md": [75, "rename closure allowlist and immutable session history"],
   "TASK_PLAN.md": [11, "closed Ledger provenance and stable IDs"],
+  "docs/0.2-b-plan-proposal-foundation.md": [1, "explicit legacy Ledger mutation policy"],
   "docs/audit/guardian-requirements-coverage.md": [15, "historical audit record"],
   "docs/m1-h1-context-handoff-advisor.md": [1, "persisted runner-binding compatibility"],
   "docs/m1-h2-calibration-pilot.json": [7, "frozen digest-bound protocol"],
@@ -26,11 +27,13 @@ const fullAllowlist = new Map(Object.entries({
   "src/calibration-quality.mjs": [1, "legacy quality-evidence reader"],
   "src/extension.mjs": [1, "deprecated TUI alias"],
   "src/ledger.mjs": [1, "legacy command normalization"],
+  "src/plan-store.mjs": [1, "legacy Ledger schema reader and mutation rejection"],
   "src/repository.mjs": [1, "legacy repository-config reader"],
   "src/runner-ownership.mjs": [1, "legacy session-binding reader"],
   "test/calibration-finalizer.test.mjs": [1, "legacy protocol compatibility test"],
   "test/calibration-preflight.test.mjs": [1, "legacy protocol compatibility test"],
   "test/core.test.mjs": [4, "legacy Ledger, command and binding tests"],
+  "test/plan-proposal.test.mjs": [1, "legacy Ledger read and mutation-policy test"],
 }));
 
 const shortAllowlist = new Map(Object.entries({

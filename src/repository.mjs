@@ -90,6 +90,8 @@ export function validateRepositoryStateBoundaries(targetRoot) {
     [".guardian/runtime/guardian.sqlite-shm", "file"],
     [".guardian/checkpoints", "directory"],
     [".guardian/manifests", "directory"],
+    [".guardian/plan-proposals", "directory"],
+    [".guardian/plan-write.lock", "file"],
     [".guardian/test-runs", "directory"],
     [".guardian/calibration", "directory"],
     ["TASK_PLAN.md", "file"],
