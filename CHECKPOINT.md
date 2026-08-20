@@ -1,21 +1,27 @@
-# CHECKPOINT — Eiopago 0.2-A Safe Read Side Foundation pronta al commit
+# CHECKPOINT — Eiopago 0.2-A CLOSED
 
-- Worktree/branch verificati: `F:/dev/eiopago-ux-0.2`, `feat/human-workflow-ux-0.2`, HEAD baseline `72461f653d217e8f18b3cba2c1b7ed46220cee4e`; il workspace storico `F:/dev/eiopago` non è stato modificato. Nessun commit, push o merge eseguito.
-- Recuperata la review `REQUEST CHANGES` persistita: tre finding HIGH su operation futura ignorata, mismatch latch/journal capace di occultare `HUMAN_TAKEOVER` e authorization/admission/journal incompleti; un finding MEDIUM sulla projection pubblica fail-open per `includeRuntime:false` e condition futura/sconosciuta.
-- Causa radice confermata: il precedente reader SQLite ricostruiva una seconda semantica delle authority safety-critical senza un verifier canonico complessivo nel core 0.1. Il puro refactor non era possibile senza introdurre il futuro Core Observation Port.
-- Boundary corretto già persistito e riaccettato: `runtime-reader.mjs` osserva soltanto presenza, sidecar e stabilità dei byte; non apre/interpreta SQLite e non contiene lifecycle state machine. Runtime assente, presente, concorrente, non osservato o non verificabile resta `NEEDS_ATTENTION`/`RUNTIME_NOT_VERIFIED`; nessun percorso pubblico costruisce `READY` o `SUSPENDED`.
-- I quattro finding sono chiusi senza whitelist/query/branch presenter specifici: tutti gli scenari runtime corrotti o futuri restano non verificati; `includeRuntime:false`, workflow futuro e condition sconosciuta falliscono chiusi. `plan --raw` resta separato dal validator; `plan --check` usa `TaskLedger` canonico.
-- Invarianti core preservate: `runner.mjs`, `handoff.mjs`, `safety.mjs`, `storage.mjs` e `runner-ownership.mjs` hanno diff nullo rispetto alla baseline. Nessun Plan Proposal, Intent Adapter, start/stop, Human Action Broker, control channel o altro scope 0.2-B implementato.
-- Verifiche della sessione: test mirati `test/human-workflow.test.mjs` **34/34 PASS**; `npm test` **147/147 PASS**; `npm run check` **PASS, 36 moduli**; `git diff --check` **PASS**. Warning SQLite experimental e LF→CRLF dei fixture sono informativi.
-- Nuova review completa: **APPROVE**, zero finding HIGH/MEDIUM aperti. 0.2-A è pronta per essere committata, ma il commit resta fermo in attesa della decisione dell'owner.
+- Worktree/branch: `F:/dev/eiopago-ux-0.2`, `feat/human-workflow-ux-0.2`; baseline `72461f653d217e8f18b3cba2c1b7ed46220cee4e`; **HEAD finale applicativo 0.2-A** `f0faab642c4a2ed52b40417aab577e74fcd253ba`. Il commit documentale che contiene questa sezione formalizza la chiusura senza cambiare il codice applicativo.
+- **Status: 0.2-A CLOSED.** La Human Workflow UX read-only espone `status`, `why`, `next`, `plan`, `plan --raw`, `plan --check` e `plan --technical` senza avviare Pi, selezionare modelli, effettuare provider call o acquisire ownership runtime.
+- Finding chiusi: tre HIGH su operation futura ignorata, mismatch latch/journal capace di occultare `HUMAN_TAKEOVER` e authorization/admission/journal incompleti; un MEDIUM sulla projection pubblica fail-open per `includeRuntime:false` e condition futura/sconosciuta.
+- Boundary accettato: il core 0.1 non possiede un verifier read-only complessivo estraibile con puro refactor. `runtime-reader.mjs` osserva soltanto presenza, sidecar e stabilità dei byte, non apre/interpreta SQLite e non contiene una lifecycle state machine. Runtime assente, presente, concorrente, non osservato o non verificabile resta `NEEDS_ATTENTION`/`RUNTIME_NOT_VERIFIED`; nessun percorso pubblico costruisce `READY` o `SUSPENDED`.
+- Acceptance: piano Markdown autorevole e modifiche umane preservati; `plan --raw` indipendente dal validator; `plan --check` usa `TaskLedger`; output normale bounded e senza dati runtime privati; repository non inizializzati, directory nested e linked worktree coperti; byte/hash/mtime di piano e runtime invariati; nessuna mutation o migrazione.
+- Invarianti core preservate: `runner.mjs`, `handoff.mjs`, `safety.mjs`, `storage.mjs` e `runner-ownership.mjs` hanno diff nullo dalla baseline. Nessun Plan Proposal, Intent Adapter, start/stop, Human Action Broker, control channel o altro scope 0.2-B è stato introdotto.
+- Gate finali: test mirati `test/human-workflow.test.mjs` **34/34 PASS**; `npm test` **147/147 PASS**; `npm run check` **PASS, 36 moduli**; `npm pack --dry-run` **PASS, 26 file**; `git diff --check` **PASS**. Warning SQLite experimental e LF→CRLF dei fixture sono informativi.
+- Review finale: **APPROVE**, zero finding HIGH/MEDIUM/LOW bloccanti, nessun TODO/FIXME bloccante. Residual non bloccante e deliberatamente futuro: una runtime projection positiva richiede un Core Observation Port condiviso col core.
+- Roadmap persistita in `docs/roadmap.md`. Il repository remoto resta `kinderp/eiopago`; il default branch remoto resta `feat/pi-usage-guardian-foundation`. Nessun rename è stato iniziato in 0.2-A.
 
-**STOP operativo:** non iniziare 0.2-B e non creare commit senza autorizzazione esplicita.
+**STOP operativo:** dopo la chiusura di 0.2-A non iniziare il rename né 0.2-B in questa sessione.
 
-**Nome sessione suggerito:** `eiopago-0.2-a-commit-decision`
+**Prossimo passo ESATTO:**
+
+1. **Dedicated rename migration: Eiopago -> Aiopago**
+2. dopo il rename: **0.2-B Plan Proposal Foundation**
+
+**Nome sessione suggerito:** `eiopago-aiopago-dedicated-rename`
 
 **Prompt minimo di ripresa:**
 
-> Lavora soltanto in `F:/dev/eiopago-ux-0.2` sul branch `feat/human-workflow-ux-0.2`; non toccare `F:/dev/eiopago`. Leggi la prima sezione di `CHECKPOINT.md`, verifica HEAD/status e il diff 0.2-A. I quattro finding runtime/projection sono chiusi con boundary fail-closed; test 147/147, check 36 moduli, diff-check PASS e review APPROVE. Non iniziare 0.2-B. Crea il commit soltanto se l'owner lo autorizza esplicitamente.
+> Leggi integralmente `AGENTS.md` se presente, la prima sezione di `CHECKPOINT.md`, `docs/roadmap.md` e la documentazione di migrazione che verrà autorizzata. Verifica worktree, branch, HEAD, remotes, upstream e default branch. 0.2-A è CLOSED a `f0faab642c4a2ed52b40417aab577e74fcd253ba`; non riaprirla salvo regressione dimostrata. Esegui in una sessione dedicata soltanto il rename completo Eiopago -> Aiopago, con inventario, piano atomico, test e remote strategy esplicita. Non iniziare 0.2-B durante il rename. Dopo acceptance del rename, il passo successivo è 0.2-B Plan Proposal Foundation.
 
 # CHECKPOINT — M1-P0-A Portable Bootstrap, Packaging e Config PASS
 
