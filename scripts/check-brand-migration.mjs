@@ -10,7 +10,7 @@ const shortPattern = new RegExp(`(?<![A-Za-z0-9])${legacyShort}(?![A-Za-z0-9])`,
 
 // Exact path/count allowlist. A count change requires an explicit migration review.
 const fullAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [61, "immutable session history"],
+  "CHECKPOINT.md": [75, "rename closure allowlist and immutable session history"],
   "TASK_PLAN.md": [11, "closed Ledger provenance and stable IDs"],
   "docs/audit/guardian-requirements-coverage.md": [15, "historical audit record"],
   "docs/m1-h1-context-handoff-advisor.md": [1, "persisted runner-binding compatibility"],
@@ -34,7 +34,7 @@ const fullAllowlist = new Map(Object.entries({
 }));
 
 const shortAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [20, "immutable session history"],
+  "CHECKPOINT.md": [26, "rename closure compatibility summary and immutable session history"],
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
   [["bin", `${legacyShort}.mjs`].join("/")]: [1, "deprecated thin CLI wrapper"],

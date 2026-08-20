@@ -1,3 +1,31 @@
+# CHECKPOINT — AIOPAGO RENAME COMPLETE
+
+- **Brand:** Aiopago. **Repository:** `kinderp/aiopago` (`https://github.com/kinderp/aiopago`). **Default branch:** `main`. **CLI canonical:** `aio`. **Legacy CLI:** `eio` (deprecated, thin wrapper, warning soltanto su stderr). **0.2-A:** CLOSED. **Rename:** COMPLETE. **Next:** 0.2-B Plan Proposal Foundation.
+- Baseline canonica: `ab5100207f7714852b121352d8f389dfe92133a4`; HEAD applicativo 0.2-A: `f0faab642c4a2ed52b40417aab577e74fcd253ba`; implementation commit del rename: `3c7a786444c51931ef6cdb31d3e5945e03e9cf5d`. Il commit documentale che contiene questa sezione chiude il checkpoint; nessuna feature 0.2-B è stata iniziata.
+- Worktree/branch dedicati: `F:/dev/aiopago-rename`, `chore/rename-aiopago`. Il worktree storico `F:/dev/eiopago-ux-0.2` è rimasto intatto a `ab5100207f7714852b121352d8f389dfe92133a4`.
+- Remote rename eseguito sullo stesso repository GitHub, non tramite copia: repository ID prima/dopo `1324222061`, node ID `R_kgDOTu4GbQ`; `kinderp/eiopago` → `kinderp/aiopago`. `default_branch=main` è rimasto invariato. `origin` finale è `https://github.com/kinderp/aiopago.git`; fetch, `ls-remote` e dry-run push autenticato PASS.
+- Package: nome `aiopago`, metadata repository/homepage/bugs canonici e npm registry check del vecchio nome = `E404`, quindi nessun compatibility package e nessuna pubblicazione. Non esisteva un package/module tree interno `eiopago`: nessun namespace o implementation duplicata è stato inventato.
+- CLI/TUI: `bin/aio.mjs` è l'entrypoint canonico; `bin/eio.mjs` delega alla stessa `src/cli-entry.mjs`. `/aio` è canonico; `/eio` e `/eiopago` sono alias deprecati dello stesso handler. Help, version, status e `plan --raw` hanno stdout ed exit code equivalenti; i warning legacy non contaminano stdout.
+- Environment: canonica `AIOPAGO_CONTEXT_HANDOFF_THRESHOLD_PERCENT`; fallback deprecato `EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT`; valori duali diversi falliscono con conflitto esplicito. Non esisteva alcuna variabile pubblica `EIOPAGO_*`, quindi nessuna layer artificiale è stata aggiunta.
+- Persistent state: nessun path `~/.eiopago`, `.eiopago`, database/config brandizzato o directory equivalente esisteva. `.guardian/`, config, runtime SQLite e artifact restano nello stesso path e non vengono spostati, uniti o sovrascritti. `aio init` preserva byte per byte config, Ledger, runtime e managed `.gitignore` legacy validi; la presenza simultanea dei due blocchi managed fallisce esplicitamente.
+- Schemi/protocolli: nuovi writer usano `aiopago.repository/1.0.0`, `aiopago.task-ledger/0.1.0`, `aiopago.runner-session-binding.v1`, schemi calibration `aiopago.*`, producer `aiopago-runner` e marker `AIOPAGO_RESUME_V1`. I reader accettano gli identificatori pre-rename esatti necessari (`eiopago.repository/1.0.0`, `eiopago.runner-session-binding.v1` e schemi calibration `eiopago.*`); Ledger/owner command pre-rename restano leggibili. Nessun dato persistito è stato riscritto retroattivamente.
+- Provenance immutabile: `TASK_PLAN.md` e `docs/m1-h2-calibration-pilot.json` hanno diff byte nullo da `origin/main`; `TASK-EIOPAGO-*`, i record `PLAN-EIOPAGO-*`, il marker storico `EIOPAGO_RESUME_V1`, worktree/remotes realmente usati e le sezioni checkpoint precedenti restano invariati. Audit e documenti calibration chiusi sono marcati esplicitamente come historical pre-rename records.
+- Legacy allowlist finale: (1) storia immutabile in `CHECKPOINT.md`, `TASK_PLAN.md`, protocollo pilot, audit e documenti H2 storici; (2) reader/fallback precisi per config, managed ignore, Ledger command, runner binding, calibration ed environment; (3) alias CLI/TUI deprecati; (4) migration note e test di compatibilità. Nessun uso legacy corrente fuori da queste categorie è autorizzato.
+- Brand guard: `scripts/check-brand-migration.mjs`, integrato in `npm run check`, scansiona file tracked/untracked pertinenti, nomi path e token brevi separatamente, con path/count/rationale esatti; nuove occurrence o variazioni della allowlist falliscono.
+- Gate pre e post GitHub rename: `npm test` **156/156 PASS**; `npm run check` **PASS, brand guard + 39 moduli**; `npm pack --dry-run` **PASS, 30 file**; `git diff --check` **PASS**. Warning SQLite experimental e LF→CRLF dei fixture sono informativi. Review `origin/main...HEAD`: zero finding HIGH/MEDIUM noti, nessun URL corrente stale, nessuna perdita di compatibilità/schema, nessun lavoro accidentale 0.2-B.
+- Residual non bloccanti e intenzionali: alias `eio`/`/eio`/`/eiopago`, env fallback, reader legacy e provenance storica sopra; rimozione futura richiede una migration separata. Nessuna CI configurata da osservare. Nessun blocker aperto.
+- `checkpoint_message`: “Aiopago rename completo: repository, package, CLI e compatibilità legacy verificati”.
+
+**STOP operativo:** Dedicated Rename Migration chiusa. Non iniziare 0.2-B, Core Observation Port o nuove feature in questa sessione.
+
+**Prossimo passo ESATTO:** `0.2-B Plan Proposal Foundation` in una nuova sessione e branch dedicati, partendo dalla `main` Aiopago canonica.
+
+**Nome sessione suggerito:** `aiopago-0.2-b-plan-proposal-foundation`
+
+**Prompt minimo di ripresa:**
+
+> Lavora su `kinderp/aiopago`. Leggi `AGENTS.md` se presente, la prima sezione di `CHECKPOINT.md`, `docs/roadmap.md` e `docs/rename-aiopago-migration.md`; verifica repository, `origin`, default `main`, HEAD e status. Il rename Aiopago è COMPLETE e 0.2-A è CLOSED: non riaprire il rename o rimuovere compatibility legacy senza finding dimostrato. Crea branch/worktree dedicati da `main` e avvia esclusivamente 0.2-B Plan Proposal Foundation, preservando le invarianti safety-critical e senza anticipare 0.2-C o il Core Observation Port.
+
 # CHECKPOINT — Eiopago 0.2-A CLOSED
 
 - Worktree/branch: `F:/dev/eiopago-ux-0.2`, `feat/human-workflow-ux-0.2`; baseline `72461f653d217e8f18b3cba2c1b7ed46220cee4e`; **HEAD finale applicativo 0.2-A** `f0faab642c4a2ed52b40417aab577e74fcd253ba`. Il commit documentale che contiene questa sezione formalizza la chiusura senza cambiare il codice applicativo.
