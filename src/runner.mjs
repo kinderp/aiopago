@@ -2,7 +2,7 @@ import { join, resolve } from "node:path";
 import { ArtifactStore } from "./artifact-store.mjs";
 import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
-import { ContextHandoffAdvisor } from "./context-advisor.mjs";
+import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./context-advisor.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
@@ -42,8 +42,9 @@ export class GuardianRunner {
       compaction: { enabled: false },
       retry: { enabled: false },
     });
+    const environmentThreshold = contextHandoffThresholdEnvironment(options.processEnv ?? process.env, { warn: options.environmentWarning });
     const contextAdvisor = options.contextAdvisor ?? new ContextHandoffAdvisor({
-      thresholdPercent: options.contextHandoffThresholdPercent ?? process.env.EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT,
+      thresholdPercent: options.contextHandoffThresholdPercent ?? environmentThreshold,
     });
     const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
     const roots = Object.freeze({
@@ -95,7 +96,7 @@ export class GuardianRunner {
 
   async createRuntime(options) {
     const { coding } = this.pi;
-    const inline = { name: "eiopago", factory: createGuardianExtension(this) };
+    const inline = { name: "aiopago", factory: createGuardianExtension(this) };
     const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
       const services = await coding.createAgentSessionServices({
         cwd,
@@ -151,7 +152,7 @@ export class GuardianRunner {
     return {
       session,
       setEditor: (text) => replacementCtx.ui.setEditorText(text),
-      confirm: (h) => replacementCtx.ui.confirm("Eiopago resume", `Continuity passed for ${h.handoff_id}. Authorize the single resume admission?`),
+      confirm: (h) => replacementCtx.ui.confirm("Aiopago resume", `Continuity passed for ${h.handoff_id}. Authorize the single resume admission?`),
       sendResume: (prompt) => replacementCtx.sendUserMessage(prompt),
       notify: (text, type = "info") => replacementCtx.ui.notify(text, type),
     };
@@ -168,7 +169,7 @@ export class GuardianRunner {
     return this.handoffService.handoff({
       sourceSession: this.runtime.session,
       mode,
-      actor: "human:/eio-handoff",
+      actor: "human:/aio-handoff",
       replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         let pausedResult;
@@ -179,7 +180,7 @@ export class GuardianRunner {
             withSession: async (replacementCtx) => {
               const target = this.commandTarget(replacementCtx);
               pausedResult = await onPaused(target);
-              target.notify(pausedResult.state === "RESUMED" ? "Eiopago handoff resumed" : `Eiopago target paused: ${pausedResult.handoff_id}`);
+              target.notify(pausedResult.state === "RESUMED" ? "Aiopago handoff resumed" : `Aiopago target paused: ${pausedResult.handoff_id}`);
             },
           });
           return { ...result, pausedResult };
@@ -195,7 +196,7 @@ export class GuardianRunner {
       failedHandoffId,
       sourceSession: this.runtime.session,
       sourceAttestation: this.currentRecoverySourceAttestation(),
-      actor: "human:/eio-handoff-recover",
+      actor: "human:/aio-handoff-recover",
       replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         let pausedResult;
@@ -206,7 +207,7 @@ export class GuardianRunner {
             withSession: async (replacementCtx) => {
               const target = this.commandTarget(replacementCtx);
               pausedResult = await onPaused(target);
-              target.notify(pausedResult.state === "RESUMED" ? "Eiopago recovered handoff resumed" : `Eiopago recovered target paused: ${pausedResult.handoff_id}`);
+              target.notify(pausedResult.state === "RESUMED" ? "Aiopago recovered handoff resumed" : `Aiopago recovered target paused: ${pausedResult.handoff_id}`);
             },
           });
           return { ...result, pausedResult };
@@ -217,8 +218,8 @@ export class GuardianRunner {
   }
 
   async takeoverFromCommand(ctx) {
-    const result = await this.safePoint.request(this.runtime.session, "human:/eio-takeover", "HUMAN_TAKEOVER");
-    ctx.ui.notify(`Eiopago paused at ${result.state}; latch generation=${result.latch_generation}`, "warning");
+    const result = await this.safePoint.request(this.runtime.session, "human:/aio-takeover", "HUMAN_TAKEOVER");
+    ctx.ui.notify(`Aiopago paused at ${result.state}; latch generation=${result.latch_generation}`, "warning");
     return result;
   }
 
@@ -227,10 +228,10 @@ export class GuardianRunner {
     const h = handoffId ? this.storage.getHandoff(handoffId) : this.storage.findHandoffByTarget(current.sessionId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUME_READY") this.handoffService.continuity(h.handoff_id, current);
-    const confirmed = await ctx.ui.confirm("Eiopago resume", `Authorize resume for ${h.handoff_id}?`);
+    const confirmed = await ctx.ui.confirm("Aiopago resume", `Authorize resume for ${h.handoff_id}?`);
     if (!confirmed) return h;
-    const result = await this.handoffService.resume(h.handoff_id, { actor: "human:/eio-resume", sendResume: (prompt) => current.sendUserMessage(prompt) });
-    ctx.ui.notify(`Eiopago ${result.state}`, "info");
+    const result = await this.handoffService.resume(h.handoff_id, { actor: "human:/aio-resume", sendResume: (prompt) => current.sendUserMessage(prompt) });
+    ctx.ui.notify(`Aiopago ${result.state}`, "info");
     return result;
   }
 

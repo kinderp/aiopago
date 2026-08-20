@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   GITIGNORE_START,
+  LEGACY_GITIGNORE_END,
+  LEGACY_GITIGNORE_START,
   checkPortableEnvironment,
   createLedgerTemplate,
   initializeRepository,
@@ -18,13 +20,14 @@ import { isSupportedPiVersion, resolvePiRoot } from "../src/pi-loader.mjs";
 import {
   DEFAULT_REPOSITORY_CONFIG,
   INSTALLATION_ROOT,
+  LEGACY_REPOSITORY_CONFIG_SCHEMA,
   discoverTargetRepository,
   loadRepositoryContext,
   validateRepositoryConfig,
 } from "../src/repository.mjs";
 
 const fakePi = async () => ({ root: "/fake/pi", version: "0.83.0", name: "@earendil-works/pi-coding-agent" });
-function temp(prefix = "eiopago portable ") { return mkdtempSync(join(tmpdir(), prefix)); }
+function temp(prefix = "aiopago portable ") { return mkdtempSync(join(tmpdir(), prefix)); }
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
 function repo(prefix) { const root = temp(prefix); git(root, ["init"]); return root; }
 function init(root, options = {}) { return initializeRepository(root, { piInspector: fakePi, now: "2026-08-09T00:00:00.000Z", ...options }); }
@@ -59,7 +62,7 @@ test("createLedgerTemplate puts the canonical lifecycle contract before the JSON
 });
 
 test("portable init creates the minimal versioned contract and ignored runtime without touching application files", async () => {
-  const root = repo("eiopago clean repo with spaces ");
+  const root = repo("aiopago clean repo with spaces ");
   writeFileSync(join(root, "application.txt"), "do not change\n");
   const result = await init(root);
   assert.equal(result.installationRoot, INSTALLATION_ROOT);
@@ -79,7 +82,7 @@ test("portable init creates the minimal versioned contract and ignored runtime w
 });
 
 test("re-init is idempotent and preserves a valid Ledger, config, gitignore, and runtime state", async () => {
-  const root = repo("eiopago reinit ");
+  const root = repo("aiopago reinit ");
   const first = await init(root);
   writeFileSync(join(root, ".guardian", "runtime", "existing.db"), "state");
   const snapshots = ["TASK_PLAN.md", ".guardian/config.json", ".gitignore"].map((path) => readFileSync(join(root, path)));
@@ -91,38 +94,77 @@ test("re-init is idempotent and preserves a valid Ledger, config, gitignore, and
   assert.equal(readFileSync(join(root, ".gitignore"), "utf8").split(GITIGNORE_START).length - 1, 1);
 });
 
+test("init preserves legacy repository config, managed ignore block, Ledger, and runtime bytes", async () => {
+  const root = repo("aiopago legacy repository state ");
+  const ledger = validLedger(root);
+  mkdirSync(join(root, ".guardian", "runtime"), { recursive: true });
+  const legacyConfig = `${JSON.stringify({ ...DEFAULT_REPOSITORY_CONFIG, schema_version: LEGACY_REPOSITORY_CONFIG_SCHEMA }, null, 2)}\n`;
+  const legacyIgnore = [
+    LEGACY_GITIGNORE_START,
+    "!.guardian/",
+    ".guardian/*",
+    ".guardian/runtime/",
+    ".guardian/checkpoints/",
+    ".guardian/manifests/",
+    ".guardian/test-runs/",
+    ".guardian/calibration/",
+    "!.guardian/config.json",
+    "!TASK_PLAN.md",
+    LEGACY_GITIGNORE_END,
+    "",
+  ].join("\n");
+  writeFileSync(join(root, ".guardian", "config.json"), legacyConfig);
+  writeFileSync(join(root, ".guardian", "runtime", "legacy.db"), "legacy-runtime-bytes");
+  writeFileSync(join(root, ".gitignore"), legacyIgnore);
+  const result = await init(root);
+  assert.equal(result.config.schema_version, LEGACY_REPOSITORY_CONFIG_SCHEMA);
+  assert.equal(readFileSync(join(root, ".guardian", "config.json"), "utf8"), legacyConfig);
+  assert.equal(readFileSync(join(root, ".gitignore"), "utf8"), legacyIgnore);
+  assert.equal(readFileSync(join(root, "TASK_PLAN.md"), "utf8"), ledger);
+  assert.equal(readFileSync(join(root, ".guardian", "runtime", "legacy.db"), "utf8"), "legacy-runtime-bytes");
+  assert.equal(result.actions.updated.length, 0);
+});
+
+test("init rejects simultaneous canonical and legacy managed ignore blocks", async () => {
+  const root = repo("aiopago managed block conflict ");
+  const body = ["!.guardian/", ".guardian/*", ".guardian/runtime/", ".guardian/checkpoints/", ".guardian/manifests/", ".guardian/test-runs/", ".guardian/calibration/", "!.guardian/config.json", "!TASK_PLAN.md"];
+  writeFileSync(join(root, ".gitignore"), [GITIGNORE_START, ...body, "# End Aiopago local state", LEGACY_GITIGNORE_START, ...body, LEGACY_GITIGNORE_END, ""].join("\n"));
+  await assert.rejects(() => init(root), (error) => error.code === "GITIGNORE_AIO_BLOCK_CONFLICT");
+  assert.equal(existsSync(join(root, ".guardian")), false);
+});
+
 test("init preserves an existing compatible Ledger byte-for-byte", async () => {
-  const root = repo("eiopago valid ledger ");
+  const root = repo("aiopago valid ledger ");
   const ledger = validLedger(root);
   const result = await init(root);
   assert.equal(readFileSync(join(root, "TASK_PLAN.md"), "utf8"), ledger);
   assert.equal(result.actions.preserved.some((value) => value.startsWith("TASK_PLAN.md")), true);
 });
 
-test("init fails closed on an unrecognized TASK_PLAN.md before creating Eiopago state", async () => {
-  const root = repo("eiopago foreign plan ");
-  writeFileSync(join(root, "TASK_PLAN.md"), "# Application task plan\n\nNot an Eiopago Ledger.\n");
-  await assert.rejects(() => init(root), (error) => error.code === "TASK_PLAN_NOT_EIOPAGO_LEDGER");
+test("init fails closed on an unrecognized TASK_PLAN.md before creating Aiopago state", async () => {
+  const root = repo("aiopago foreign plan ");
+  writeFileSync(join(root, "TASK_PLAN.md"), "# Application task plan\n\nNot an Aiopago Ledger.\n");
+  await assert.rejects(() => init(root), (error) => error.code === "TASK_PLAN_NOT_AIOPAGO_LEDGER");
   assert.equal(existsSync(join(root, ".guardian")), false);
   assert.equal(existsSync(join(root, ".gitignore")), false);
   assert.match(readFileSync(join(root, "TASK_PLAN.md"), "utf8"), /Application task plan/);
 });
 
 test("init fails closed on an ambiguous Ledger with multiple task-ledger blocks", async () => {
-  const root = repo("eiopago ambiguous ledger ");
+  const root = repo("aiopago ambiguous ledger ");
   const ledger = validLedger(root);
   writeFileSync(join(root, "TASK_PLAN.md"), `${ledger}\n${ledger}`);
-  await assert.rejects(() => init(root), (error) => error.code === "TASK_PLAN_NOT_EIOPAGO_LEDGER");
+  await assert.rejects(() => init(root), (error) => error.code === "TASK_PLAN_NOT_AIOPAGO_LEDGER");
   assert.equal(existsSync(join(root, ".guardian")), false);
   assert.equal(existsSync(join(root, ".gitignore")), false);
 });
 
 test("init appends one bounded block to an existing .gitignore and can expose versioned config under a prior .guardian ignore", async () => {
-  const root = repo("eiopago gitignore ");
+  const root = repo("aiopago gitignore ");
   writeFileSync(join(root, ".gitignore"), "dist/\n.guardian/\n");
   await init(root);
   const text = readFileSync(join(root, ".gitignore"), "utf8");
-  assert.match(text, /^dist\/\n\.guardian\/\n\n# Eiopago/m);
+  assert.match(text, /^dist\/\n\.guardian\/\n\n# Aiopago/m);
   assert.equal(text.split(GITIGNORE_START).length - 1, 1);
   assert.throws(() => git(root, ["check-ignore", ".guardian/config.json"]));
   assert.equal(git(root, ["check-ignore", ".guardian/runtime/probe"]), ".guardian/runtime/probe");
@@ -131,7 +173,7 @@ test("init appends one bounded block to an existing .gitignore and can expose ve
 });
 
 test("init handles a partial .guardian directory without deleting existing content", async () => {
-  const root = repo("eiopago partial guardian ");
+  const root = repo("aiopago partial guardian ");
   mkdirSync(join(root, ".guardian"));
   writeFileSync(join(root, ".guardian", "owner-note.txt"), "preserve");
   await init(root);
@@ -142,8 +184,8 @@ test("init handles a partial .guardian directory without deleting existing conte
 });
 
 test("init rejects redirected reserved state before writing target files", async () => {
-  const root = repo("eiopago redirected state ");
-  const outside = temp("eiopago outside state ");
+  const root = repo("aiopago redirected state ");
+  const outside = temp("aiopago outside state ");
   symlinkSync(outside, join(root, ".guardian"), process.platform === "win32" ? "junction" : "dir");
   await assert.rejects(() => init(root), (error) => error.code === "REPOSITORY_STATE_PATH_REDIRECTED");
   assert.equal(existsSync(join(root, "TASK_PLAN.md")), false);
@@ -152,12 +194,12 @@ test("init rejects redirected reserved state before writing target files", async
 });
 
 test("target discovery accepts nested paths and linked Git worktrees", async () => {
-  const main = repo("eiopago main worktree ");
+  const main = repo("aiopago main worktree ");
   git(main, ["config", "user.email", "portable@example.invalid"]);
   git(main, ["config", "user.name", "Portable Test"]);
   writeFileSync(join(main, "seed.txt"), "seed\n");
   git(main, ["add", "seed.txt"]); git(main, ["commit", "-m", "seed"]);
-  const linked = temp("eiopago linked worktree ");
+  const linked = temp("aiopago linked worktree ");
   // git worktree requires the destination not to exist.
   const { rmSync } = await import("node:fs");
   rmSync(linked, { recursive: true });
@@ -170,14 +212,14 @@ test("target discovery accepts nested paths and linked Git worktrees", async () 
 });
 
 test("wrong and non-Git targets fail with stable diagnostics", async () => {
-  const missing = join(temp("eiopago missing parent "), "does-not-exist");
+  const missing = join(temp("aiopago missing parent "), "does-not-exist");
   await assert.rejects(() => init(missing), (error) => error.code === "TARGET_PATH_NOT_FOUND");
-  const plain = temp("eiopago not git ");
+  const plain = temp("aiopago not git ");
   await assert.rejects(() => init(plain), (error) => error.code === "TARGET_NOT_GIT_WORKTREE");
 });
 
 test("init surfaces dubious ownership with exact manual remediation and never changes Git trust", async () => {
-  const root = temp("eiopago dubious ownership ");
+  const root = temp("aiopago dubious ownership ");
   const target = realpathSync(root);
   const requested = join(target, "nested", "deeper");
   mkdirSync(requested, { recursive: true });
@@ -198,16 +240,16 @@ test("init surfaces dubious ownership with exact manual remediation and never ch
     received = error;
     return error.code === "GIT_SAFE_DIRECTORY_REQUIRED";
   });
-  const expectedMessage = `Git requires explicit trust for this worktree:\n${gitTarget}\n\nIf you trust this repository, run manually:\n\ngit config --global --add safe.directory ${commandTarget}\n\nEiopago does not modify Git global configuration automatically.`;
+  const expectedMessage = `Git requires explicit trust for this worktree:\n${gitTarget}\n\nIf you trust this repository, run manually:\n\ngit config --global --add safe.directory ${commandTarget}\n\nAiopago does not modify Git global configuration automatically.`;
   assert.equal(received.message, expectedMessage);
-  assert.equal(formatCliError(received), `eio: GIT_SAFE_DIRECTORY_REQUIRED: ${expectedMessage}`);
+  assert.equal(formatCliError(received), `aio: GIT_SAFE_DIRECTORY_REQUIRED: ${expectedMessage}`);
   assert.equal(calls.some((call) => call.slice(1, 5).join(" ") === "config --global --add safe.directory"), false);
   assert.deepEqual(readdirSync(root), ["nested"]);
   assert.equal(existsSync(join(root, ".guardian")), false);
 });
 
 test("repository Git failure classification remains conservative", () => {
-  const root = temp("eiopago classified Git failures ");
+  const root = temp("aiopago classified Git failures ");
   const gitTarget = process.platform === "win32" ? realpathSync(root).replaceAll("\\", "/") : realpathSync(root);
   const dubious = `fatal: detected dubious ownership in repository at '${gitTarget}'\nTo add an exception for this directory, call:\n\ngit config --global --add safe.directory ${gitTarget}\n`;
   const failingExec = (stderr, properties = {}) => () => {
@@ -254,7 +296,7 @@ test("repository Git failure classification remains conservative", () => {
 });
 
 test("repository config paths are explicit, normalized, and cannot escape the target", async () => {
-  const root = repo("eiopago context ");
+  const root = repo("aiopago context ");
   await init(root);
   const context = loadRepositoryContext(join(root, ".guardian"));
   assert.equal(context.configRoot, join(context.targetRoot, ".guardian"));
@@ -290,10 +332,10 @@ test("environment checks reject incompatible Node, missing Git, and unavailable 
     (error) => error.code === "PI_UNAVAILABLE",
   );
   await assert.rejects(
-    () => resolvePiRoot({ root: join(temp("eiopago missing pi root "), "missing") }),
+    () => resolvePiRoot({ root: join(temp("aiopago missing pi root "), "missing") }),
     (error) => error.code === "PI_UNAVAILABLE",
   );
-  const unrelated = temp("eiopago unrelated project pi ");
+  const unrelated = temp("aiopago unrelated project pi ");
   const unrelatedPi = join(unrelated, "node_modules", "@earendil-works", "pi-coding-agent");
   mkdirSync(join(unrelatedPi, "dist"), { recursive: true });
   writeFileSync(join(unrelatedPi, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.83.0", main: "dist/index.js" }));
@@ -302,14 +344,14 @@ test("environment checks reject incompatible Node, missing Git, and unavailable 
 });
 
 test("CLI routes explicit init and launch targets through the repository contract", async () => {
-  const root = repo("eiopago cli target ");
+  const root = repo("aiopago cli target ");
   const output = [];
   const initialized = await runCli(["init", "--target", root], {
     stdout: (text) => output.push(text),
     bootstrapOptions: { piInspector: fakePi, now: "2026-08-09T00:00:00.000Z" },
   });
   assert.equal(initialized.action, "init");
-  assert.match(output[0], /Eiopago init complete/);
+  assert.match(output[0], /Aiopago init complete/);
   const priorCwd = process.cwd();
   try {
     process.chdir(root);
@@ -337,8 +379,8 @@ test("CLI routes explicit init and launch targets through the repository contrac
   assert.equal(disposed, true);
 });
 
-test("portable launch fails fast with eio init guidance and never falls back to the installation cwd", async () => {
-  const uninitialized = repo("eiopago uninitialized launch ");
+test("portable launch fails fast with aio init guidance and never falls back to the installation cwd", async () => {
+  const uninitialized = repo("aiopago uninitialized launch ");
   let createCalls = 0;
   await assert.rejects(
     () => runCli(["--target", uninitialized], {
@@ -346,15 +388,32 @@ test("portable launch fails fast with eio init guidance and never falls back to 
       checkEnvironment: async () => ({}),
       createRunner: async () => { createCalls += 1; },
     }),
-    (error) => error.code === "REPOSITORY_NOT_INITIALIZED" && error.message.includes("eio init"),
+    (error) => error.code === "REPOSITORY_NOT_INITIALIZED" && error.message.includes("aio init"),
   );
   assert.equal(createCalls, 0);
   assert.equal(existsSync(join(uninitialized, ".guardian")), false);
 });
 
+test("canonical aio and deprecated eio executables have equivalent stdout and exit status", async () => {
+  const root = repo("aiopago cli aliases ");
+  await init(root);
+  const execute = (name, args) => spawnSync(process.execPath, [join(INSTALLATION_ROOT, "bin", `${name}.mjs`), ...args], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  for (const args of [["--help"], ["--version"], ["status"], ["plan", "--raw"]]) {
+    const canonical = execute("aio", args);
+    const legacy = execute("eio", args);
+    assert.equal(canonical.status, legacy.status);
+    assert.equal(canonical.stdout, legacy.stdout);
+    assert.equal(canonical.stderr, "");
+    assert.match(legacy.stderr, /^eio is deprecated; use aio instead\.\r?\n$/);
+  }
+});
+
 test("package bin is invocable with an unrelated cwd and does not create target files", () => {
-  const outside = temp("eiopago package invocation ");
-  const output = execFileSync(process.execPath, [join(INSTALLATION_ROOT, "bin", "eio.mjs"), "--version"], {
+  const outside = temp("aiopago package invocation ");
+  const output = execFileSync(process.execPath, [join(INSTALLATION_ROOT, "bin", "aio.mjs"), "--version"], {
     cwd: outside,
     encoding: "utf8",
   });
@@ -364,7 +423,10 @@ test("package bin is invocable with an unrelated cwd and does not create target 
 
 test("package declares a real CLI bin, ESM export, engine, and supported Pi peer", () => {
   const manifest = JSON.parse(readFileSync(join(INSTALLATION_ROOT, "package.json"), "utf8"));
+  assert.equal(manifest.name, "aiopago");
+  assert.equal(manifest.bin.aio, "bin/aio.mjs");
   assert.equal(manifest.bin.eio, "bin/eio.mjs");
+  assert.equal(manifest.repository.url, "git+https://github.com/kinderp/aiopago.git");
   assert.equal(manifest.exports["."], "./src/index.mjs");
   assert.equal(manifest.engines.node, ">=22.19.0");
   assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.83.0 <0.84.0");

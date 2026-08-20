@@ -7,7 +7,7 @@ import { loadCalibrationQualityEvidence, QUALITY_EVIDENCE_FILE } from "./calibra
 import { GuardianError, invariant } from "./errors.mjs";
 import { TaskLedger } from "./ledger.mjs";
 
-export const CALIBRATION_FINALIZER_SCHEMA = "eiopago.calibration-finalizer/1.0.0";
+export const CALIBRATION_FINALIZER_SCHEMA = "aiopago.calibration-finalizer/1.0.0";
 
 const REQUIRED_HANDOFF_STATES = ["SUGGESTED", "PREPARED", "STARTED", "COMPLETED"];
 const REQUIRED_ACCEPTANCE_COMMANDS = [
@@ -16,7 +16,10 @@ const REQUIRED_ACCEPTANCE_COMMANDS = [
   "npm test",
   "git diff --check",
 ];
-const PROTOCOL_SCHEMA = "eiopago.threshold-calibration-protocol/1.0.0";
+const PROTOCOL_SCHEMAS = new Set([
+  "aiopago.threshold-calibration-protocol/1.0.0",
+  "eiopago.threshold-calibration-protocol/1.0.0",
+]);
 const BLOCKING_DIAGNOSTIC_STATUSES = new Set(["collection_failed_no_metric_substitution", "measurement_missing"]);
 
 function digestHex(bytes) { return sha256(bytes).slice("sha256:".length); }
@@ -183,7 +186,7 @@ export function finalizeCalibrationRun({ runRoot, runId = null } = {}) {
   const sourceFailures = [];
   if (attestation.preflight_result !== "PASS" || attestation.failure_reasons.length) sourceFailures.push("INVALID_PREFLIGHT");
   if (digestHex(protocolBytes) !== attestation.protocol_digest) sourceFailures.push("PROTOCOL_DIGEST_MISMATCH");
-  if (protocol.schema_version !== PROTOCOL_SCHEMA
+  if (!PROTOCOL_SCHEMAS.has(protocol.schema_version)
     || protocol.protocol_id !== attestation.experiment_id
     || protocol.workload?.id !== attestation.workload_id) sourceFailures.push("PROTOCOL_IDENTITY_MISMATCH");
   const variant = protocol.runs?.find((item) => (item.variant_id ?? item.run_id) === attestation.variant_id) ?? null;

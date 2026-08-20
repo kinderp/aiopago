@@ -56,13 +56,13 @@ export class HandoffService {
     const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
     if (recoveryOf === null) {
       const pending = this.storage.pendingContinuityFailureForTask(plan.task_id);
-      invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /eio handoff recover ${pending.handoff_id}` : undefined);
-      invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /eio handoff recover ${parentHandoff.handoff_id}` : undefined);
+      invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : undefined);
+      invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /aio handoff recover ${parentHandoff.handoff_id}` : undefined);
     } else {
       this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
     }
     if (mode === "confirm" && recoveryOf === null) {
-      this.ledger.satisfyOwnerGate?.({ command: "/eio handoff confirm", actor });
+      this.ledger.satisfyOwnerGate?.({ command: "/aio handoff confirm", actor });
       plan = this.ledger.read();
     }
     this.assertModelPolicy(plan, sourceSession);
@@ -233,7 +233,7 @@ export class HandoffService {
     return h;
   }
 
-  async recoverContinuityFailure({ failedHandoffId, sourceSession, sourceAttestation, replacePaused, actor = "human:/eio-handoff-recover", confirmResume = async () => false, sendResume }) {
+  async recoverContinuityFailure({ failedHandoffId, sourceSession, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume }) {
     const failed = this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
     invariant(sourceAttestation?.session_id === sourceSession?.sessionId && sourceAttestation?.runner_instance_id === this.runnerInstanceId, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The recovery source must be the fresh session owned by the current Runner");
@@ -362,7 +362,7 @@ export class HandoffService {
     let h = this.storage.getHandoff(handoffId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUMED") return h;
-    if (h.state === "CONTINUITY_FAILED") throw new GuardianError("CONTINUITY_RECOVERY_REQUIRED", `Use /eio handoff recover ${h.handoff_id}`);
+    if (h.state === "CONTINUITY_FAILED") throw new GuardianError("CONTINUITY_RECOVERY_REQUIRED", `Use /aio handoff recover ${h.handoff_id}`);
     if (h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Automatic redispatch is forbidden");
     invariant(typeof sendResume === "function", "RESUME_TRANSPORT_REQUIRED");
     const resumeStarted = performance.now();
@@ -412,12 +412,12 @@ export class HandoffService {
   buildManualRecovery(h, cause) {
     const checkpointPath = this.storage.getArtifact("checkpoint", h.checkpoint_id)?.path ?? `.guardian/checkpoints/${h.checkpoint_id}.json`;
     return [
-      `${cause}; Eiopago will not create or prompt a second target automatically.`,
+      `${cause}; Aiopago will not create or prompt a second target automatically.`,
       `1. Preserve checkpoint ${h.checkpoint_id} (${h.checkpoint_digest}) at ${checkpointPath}.`,
       `2. Do not retry handoff ${h.handoff_id} until the Pi session effect has been reconciled by a human.`,
       "3. Inspect Pi sessions for a child whose parentSession equals the recorded source_session_file.",
-      "4. If no child exists, start a fresh Eiopago session manually and keep the latch engaged; if one exists, keep it paused and verify lineage before any resume.",
-      `5. Use /eio status and retain handoff_id=${h.handoff_id}; RESUME_DISPATCH_UNKNOWN or an unknown target must never be retried blindly.`,
+      "4. If no child exists, start a fresh Aiopago session manually and keep the latch engaged; if one exists, keep it paused and verify lineage before any resume.",
+      `5. Use /aio status and retain handoff_id=${h.handoff_id}; RESUME_DISPATCH_UNKNOWN or an unknown target must never be retried blindly.`,
       "The final Resume Context Manifest cannot be sealed until the real replacement_session_id is known.",
     ];
   }
@@ -439,9 +439,9 @@ export class HandoffService {
       run_lineage: [],
       plan_revision_id: h.task_plan_revision,
       requirements_version: h.requirements_version,
-      checkpoint_message: `Eiopago handoff for ${plan.task_id} sealed at a Runner-owned safe point`,
+      checkpoint_message: `Aiopago handoff for ${plan.task_id} sealed at a Runner-owned safe point`,
       created_at: h.created_at,
-      producer: { component: "eiopago-runner", version: "0.1.0", actor_type: "guardian" },
+      producer: { component: "aiopago-runner", version: "0.1.0", actor_type: "guardian" },
       git_state: h.expected_git_state,
       completion_criteria: plan.completion_criteria.map((criterion) => ({ criterion, status: "IN_PROGRESS" })),
       evidence: operations.filter((operation) => operation.effect_reference).map((operation) => ({ kind: "operation_effect", locator: operation.effect_reference, verification_status: "VERIFIED" })),
@@ -509,7 +509,7 @@ export class HandoffService {
 
   buildPrompt(h, manifest) {
     return [
-      "EIOPAGO_RESUME_V1",
+      "AIOPAGO_RESUME_V1",
       `task_id=${h.task_id}`,
       `task_plan_revision=${h.task_plan_revision}`,
       `task_plan_digest=${h.task_plan_digest}`,

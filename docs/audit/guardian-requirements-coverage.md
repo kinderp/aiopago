@@ -1,3 +1,5 @@
+> **Historical pre-rename record.** Names, identifiers, commands, repository/worktree paths and measured protocol references below are retained as immutable provenance. The current product is Aiopago; use `docs/portable-alpha.md` for canonical `aio` usage and `docs/rename-aiopago-migration.md` for compatibility.
+
 # Guardian — audit di copertura dei requisiti
 
 **Data audit:** 2026-08-05  

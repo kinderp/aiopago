@@ -1,3 +1,5 @@
+> **Historical pre-rename record.** Names, identifiers, commands, repository/worktree paths and measured protocol references below are retained as immutable provenance. The current product is Aiopago; use `docs/portable-alpha.md` for canonical `aio` usage and `docs/rename-aiopago-migration.md` for compatibility.
+
 # M1-H2 — Controlled Handoff Threshold Calibration
 
 > **F4 feasibility update:** `6847c5cbf260ed4074e5f3846b130ed3e1ad3da3`

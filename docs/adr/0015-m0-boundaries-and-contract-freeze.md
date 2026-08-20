@@ -10,7 +10,7 @@
 
 ## 1. Contesto e vincoli
 
-Eiopago/Guardian deve rendere implementabile M1 senza diventare un orchestratore durevole o un control plane globale. Il report di copertura ha rilevato fonti concorrenti potenziali, assenza di un checkpoint model atomico, confini esterni non congelati e API Pi non verificate al livello necessario.
+Aiopago/Guardian deve rendere implementabile M1 senza diventare un orchestratore durevole o un control plane globale. Il report di copertura ha rilevato fonti concorrenti potenziali, assenza di un checkpoint model atomico, confini esterni non congelati e API Pi non verificate al livello necessario.
 
 Questo ADR non rende alcuna funzionalità runtime `COMPLETE`. Congela confini e contratti; codice, migrazioni e test restano M1 o milestone successive.
 
@@ -174,15 +174,15 @@ Se lo spike fallisce, il vero gate deve stare nel `streamFn`/request admission d
 
 ### D6 — Confini dell'ecosistema e standalone (DECIDED come ipotesi architetturale)
 
-| Componente | Possiede | Non possiede in Eiopago |
+| Componente | Possiede | Non possiede in Aiopago |
 |---|---|---|
-| Eiopago/Guardian | sessioni Pi, contesto, token/costi locali, Cost Guard, handoff, takeover, Ledger locale, `CandidateCheckpoint`, roadmap/report locali, modalità standalone | queue durevole generale, lease worker, backlog globale, GitHub write, metodologia globale, acceptance globale, evidence repository generale |
+| Aiopago/Guardian | sessioni Pi, contesto, token/costi locali, Cost Guard, handoff, takeover, Ledger locale, `CandidateCheckpoint`, roadmap/report locali, modalità standalone | queue durevole generale, lease worker, backlog globale, GitHub write, metodologia globale, acceptance globale, evidence repository generale |
 | Durex | queue, task/run durevoli, worker, claim, lease/fencing, heartbeat, retry/resume, cancellazione, process ownership, output persistente | contesto LLM, policy di fase, acceptance |
 | FARO Governance | backlog globale, metodologia/policy progetto, task/checkpoint graph globale, priorità, assegnazione, acceptance, GitHub synchronization, project babysitting | esecuzione di sessione e worker lease |
 | Raiatea | evidence bundle, provenance, risoluzione e verifica delle evidenze | scheduling e session control |
 | Alfred | osservazione di eventi e segnali | task scheduling, session management, acceptance |
 
-Eiopago standalone segue `Pi → Guardian → checkpoint locale`. Le integrazioni sono adapter opzionali, provider-neutral, senza database condiviso o import di moduli interni. In assenza di consumer esterni, gli ID `project_id`, `run_id` ed external decision possono essere null secondo contratto; Cost Guard, handoff manual/confirm, takeover, Ledger e roadmap locale restano utilizzabili.
+Aiopago standalone segue `Pi → Guardian → checkpoint locale`. Le integrazioni sono adapter opzionali, provider-neutral, senza database condiviso o import di moduli interni. In assenza di consumer esterni, gli ID `project_id`, `run_id` ed external decision possono essere null secondo contratto; Cost Guard, handoff manual/confirm, takeover, Ledger e roadmap locale restano utilizzabili.
 
 `CheckpointDecision` è un contratto futuro: Guardian lo consuma ma non produce acceptance globale. `EvidenceReference` è prodotto localmente per evidenze del repository; Raiatea può risolverlo/arricchirlo in futuro senza diventare dipendenza dell'MVP.
 

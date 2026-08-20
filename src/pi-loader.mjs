@@ -47,7 +47,7 @@ export async function resolvePiRoot(options = {}) {
     catch { invariant(false, "PI_UNAVAILABLE", `Configured Pi root is unavailable: ${root}`); }
   }
 
-  // Resolve from Eiopago's own installation, not from the selected target
+  // Resolve from Aiopago's own installation, not from the selected target
   // repository: an unrelated project's Pi copy must not become authoritative.
   const candidates = [
     resolutionCandidate(dirname(fileURLToPath(import.meta.url))),
@@ -61,7 +61,7 @@ export async function resolvePiRoot(options = {}) {
     visited.add(key);
     try { await access(join(root, "package.json")); return root; } catch {}
   }
-  invariant(false, "PI_UNAVAILABLE", "Cannot locate @earendil-works/pi-coding-agent beside Eiopago; install Pi 0.83.x or set PI_CODING_AGENT_ROOT");
+  invariant(false, "PI_UNAVAILABLE", "Cannot locate @earendil-works/pi-coding-agent beside Aiopago; install Pi 0.83.x or set PI_CODING_AGENT_ROOT");
 }
 
 export async function inspectPi(options = {}) {

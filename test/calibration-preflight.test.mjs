@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  LEGACY_CALIBRATION_ATTESTATION_SCHEMA,
   loadCalibrationAttestation,
   runCalibrationPreflight,
   verifyCalibrationRuntimeState,
@@ -17,10 +18,10 @@ import { GuardianStorage } from "../src/storage.mjs";
 
 const piRoot = await resolvePiRoot();
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
-function protocol(root, branch = "calibration/test") {
+function protocol(root, branch = "calibration/test", schemaVersion = "aiopago.threshold-calibration-protocol/1.0.0") {
   const prompt = "Implement the frozen offline fixture workload.";
   return {
-    schema_version: "eiopago.threshold-calibration-protocol/1.0.0",
+    schema_version: schemaVersion,
     protocol_id: "TEST-PILOT-1",
     application_baseline_commit: "a".repeat(40),
     controlled_environment: {
@@ -38,11 +39,11 @@ function protocol(root, branch = "calibration/test") {
   };
 }
 
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "eiopago-calibration-"));
+function fixture({ protocolSchema = "aiopago.threshold-calibration-protocol/1.0.0" } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "aiopago-calibration-"));
   mkdirSync(join(root, "docs"));
   writeFileSync(join(root, ".gitignore"), ".guardian/calibration/\n");
-  writeFileSync(join(root, "docs", "m1-h2-calibration-pilot.json"), `${JSON.stringify(protocol(root), null, 2)}\n`);
+  writeFileSync(join(root, "docs", "m1-h2-calibration-pilot.json"), `${JSON.stringify(protocol(root, "calibration/test", protocolSchema), null, 2)}\n`);
   git(root, ["init", "-b", "calibration/test"]);
   git(root, ["config", "user.email", "test@example.invalid"]);
   git(root, ["config", "user.name", "Calibration Test"]);
@@ -83,7 +84,7 @@ function runtimeFixture() {
     confirmMode: "confirm",
     pi: { root: piRoot },
   };
-  const processEnv = { EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT: "40" };
+  const processEnv = { AIOPAGO_CONTEXT_HANDOFF_THRESHOLD_PERCENT: "40" };
   return { x, prepared, runner, processEnv, close: () => storage.close() };
 }
 
@@ -102,8 +103,17 @@ test("calibration preflight happy path persists byte-identical protocol, PASS at
   const record = JSON.parse(readFileSync(result.paths.runRecordPath, "utf8"));
   assert.equal(record.status, "PREFLIGHT_PASSED");
   const quality = JSON.parse(readFileSync(result.paths.qualityEvidencePath, "utf8"));
-  assert.equal(quality.schema_version, "eiopago.calibration-quality-evidence/1.0.0");
+  assert.equal(quality.schema_version, "aiopago.calibration-quality-evidence/1.0.0");
   assert.deepEqual(quality.gate_attempts, []);
+});
+
+test("calibration preflight and attestation reader accept exact pre-rename schemas", () => {
+  const x = fixture({ protocolSchema: "eiopago.threshold-calibration-protocol/1.0.0" });
+  const result = preflight(x);
+  assert.equal(result.attestation.preflight_result, "PASS");
+  const legacy = { ...result.attestation, schema_version: LEGACY_CALIBRATION_ATTESTATION_SCHEMA };
+  writeFileSync(result.paths.attestationPath, `${JSON.stringify(legacy)}\n`);
+  assert.equal(loadCalibrationAttestation(result.paths.attestationPath).attestation.schema_version, LEGACY_CALIBRATION_ATTESTATION_SCHEMA);
 });
 
 test("calibration preflight rejects wrong HEAD", () => {

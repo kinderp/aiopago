@@ -95,14 +95,14 @@ function view(state, observation, fields) {
 export function projectHumanWorkflow(observation) {
   if (!observation.initialized) {
     return view("NOT_CONFIGURED", observation, {
-      reason: "Questo repository non è ancora inizializzato per Eiopago.",
-      next: "esegui “eio init”, poi ispeziona il piano autorevole con “eio plan”.",
+      reason: "Questo repository non è ancora inizializzato per Aiopago.",
+      next: "esegui “aio init”, poi ispeziona il piano autorevole con “aio plan”.",
       technical: null,
     });
   }
   if (observation.configError) {
     return view("NEEDS_ATTENTION", observation, {
-      reason: "La configurazione Eiopago non può essere letta o validata.",
+      reason: "La configurazione Aiopago non può essere letta o validata.",
       next: "ispeziona la diagnostica tecnica e correggi la configurazione; non continuare il lavoro alla cieca.",
       technical: observation.configError,
     });
@@ -110,7 +110,7 @@ export function projectHumanWorkflow(observation) {
   if (!observation.plan?.valid) {
     return view("NEEDS_ATTENTION", observation, {
       reason: "TASK_PLAN.md non è valido e non può essere usato come piano autorevole.",
-      next: "esegui “eio plan --check”, ispeziona “eio plan --raw” e correggi manualmente il piano.",
+      next: "esegui “aio plan --check”, ispeziona “aio plan --raw” e correggi manualmente il piano.",
       technical: observation.plan?.error ?? null,
     });
   }
@@ -121,7 +121,7 @@ export function projectHumanWorkflow(observation) {
       ? "Lo stato runtime è concorrente o in transizione e non può essere verificato in sicurezza dall’osservatore esterno."
       : "Il core Portable Alpha 0.1 non espone ancora una verifica read-only canonica dell’autorità runtime.",
     next: live
-      ? "non avviare né riprovare eio; attendi che il Runner sia chiuso e il runtime sia quiescente, quindi osserva di nuovo lo stato."
+      ? "non avviare né riprovare aio; attendi che il Runner sia chiuso e il runtime sia quiescente, quindi osserva di nuovo lo stato."
       : "usa il piano autorevole per orientarti, ma non dedurre avvio o retry da questa projection; serve un futuro Core Observation Port.",
     technical: error,
   });
@@ -133,7 +133,7 @@ const STATE_LABELS = Object.freeze({
 });
 
 export function formatHumanStatus(view) {
-  const lines = [`Eiopago — ${STATE_LABELS[view.state]}`];
+  const lines = [`Aiopago — ${STATE_LABELS[view.state]}`];
   if (view.objective) lines.push(`Obiettivo: ${view.objective}`);
   if (view.currentActivity) lines.push(`Attività corrente: ${view.currentActivity}`);
   if (view.progress) lines.push(`Progresso: ${view.progress.completed}/${view.progress.total} attività concluse`);
@@ -165,7 +165,7 @@ export function formatPlan(observation) {
   if (!observation.plan?.valid) {
     const code = observation.plan?.error?.code ?? observation.configError?.code ?? "PLAN_UNAVAILABLE";
     const message = observation.plan?.error?.message ?? observation.configError?.message ?? "Piano autorevole non disponibile";
-    return [`Piano autorevole non valido`, `Artifact: ${observation.plan?.path ?? observation.repository?.taskLedgerPath ?? "non disponibile"}`, `Diagnostica: ${code}: ${message}`, "Verifica: eio plan --check", "Ispezione: eio plan --raw"].join("\n");
+    return [`Piano autorevole non valido`, `Artifact: ${observation.plan?.path ?? observation.repository?.taskLedgerPath ?? "non disponibile"}`, `Diagnostica: ${code}: ${message}`, "Verifica: aio plan --check", "Ispezione: aio plan --raw"].join("\n");
   }
   const plan = observation.plan.plan;
   const completed = progress(plan);
@@ -185,7 +185,7 @@ export function formatPlanTechnical(observation) {
   if (!observation.plan?.valid) return formatPlan(observation);
   const plan = observation.plan.plan;
   return [
-    "Eiopago plan — technical",
+    "Aiopago plan — technical",
     `Artifact: ${observation.plan.path}`,
     `Task ID: ${plan.task_id}`,
     `Revisione: ${plan.plan_revision_id}`,

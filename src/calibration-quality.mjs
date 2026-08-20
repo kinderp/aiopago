@@ -3,7 +3,8 @@ import { dirname, resolve } from "node:path";
 import { canonicalJson } from "./canonical.mjs";
 import { invariant } from "./errors.mjs";
 
-export const CALIBRATION_QUALITY_SCHEMA = "eiopago.calibration-quality-evidence/1.0.0";
+export const CALIBRATION_QUALITY_SCHEMA = "aiopago.calibration-quality-evidence/1.0.0";
+export const LEGACY_CALIBRATION_QUALITY_SCHEMA = "eiopago.calibration-quality-evidence/1.0.0";
 export const QUALITY_EVIDENCE_FILE = "quality-evidence.json";
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
@@ -50,7 +51,7 @@ export function emptyCalibrationQualityEvidence(runId) {
 
 export function validateCalibrationQualityEvidence(evidence, { runId = evidence?.run_id, expectedCommands = [] } = {}) {
   exactKeys(evidence, ["schema_version", "run_id", "accepted_checkpoints", "completion_marker_observed", "controls", "gate_attempts", "review_findings", "rework_cycles", "regressions", "final_acceptance"], "QUALITY_EVIDENCE_FIELDS_INVALID");
-  invariant(evidence.schema_version === CALIBRATION_QUALITY_SCHEMA, "QUALITY_EVIDENCE_SCHEMA_MISMATCH");
+  invariant([CALIBRATION_QUALITY_SCHEMA, LEGACY_CALIBRATION_QUALITY_SCHEMA].includes(evidence.schema_version), "QUALITY_EVIDENCE_SCHEMA_MISMATCH");
   invariant(evidence.run_id === runId, "QUALITY_RUN_ID_MISMATCH");
   boundedArray(expectedCommands, "QUALITY_EXPECTED_COMMANDS_INVALID", 16);
   unique(expectedCommands, "QUALITY_EXPECTED_COMMANDS_DUPLICATE");

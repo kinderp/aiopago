@@ -1,16 +1,16 @@
-# Eiopago/Guardian — roadmap di prodotto
+# Aiopago/Guardian — roadmap di prodotto
 
 **Versione:** 0.2 — 2026-08-20
 **Fonte autorevole:** questo file governa scope e ordine delle milestone; lo stato runtime dei task appartiene al Master Task Ledger e non viene dedotto da questa roadmap.
 
-## Sequenza Eiopago 0.2
+## Sequenza Aiopago 0.2
 
 | Slice | Scope | Gate |
 |---|---|---|
 | **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
-| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | Solo dopo la migrazione di nome dedicata |
+| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | Prossimo slice dopo il rename completo; non iniziato nella migration |
 | **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | Dopo 0.2-B |
-| **0.2-D — Start da obiettivo** | `eio start <obiettivo>` con planning agent-driven e autorizzazione | Nessun issue adapter |
+| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | Nessun issue adapter |
 | **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | Invarianti core preservate |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
 | **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
@@ -20,10 +20,10 @@
 
 Gate vincolante dopo 0.2-A:
 
-1. **Dedicated rename migration: Eiopago -> Aiopago**;
-2. **0.2-B Plan Proposal Foundation**.
+1. **Dedicated rename migration: COMPLETE**;
+2. **0.2-B Plan Proposal Foundation: NEXT, non iniziata**.
 
-La migrazione di nome non appartiene a 0.2-A e non è iniziata in questo slice. 0.2-B non può iniziare prima della sua chiusura.
+La migrazione di nome è una modifica dedicata separata da 0.2-A. Non include alcun lavoro 0.2-B.
 
 ## Fondazione M0/M1
 
@@ -36,7 +36,7 @@ Consegne documentali:
 - handoff/human latch state machine;
 - matrice API Pi e spike necessari;
 - contratti minimi provider-neutral;
-- confini Eiopago/Durex/FARO Governance/Raiatea/Alfred;
+- confini Aiopago/Durex/FARO Governance/Raiatea/Alfred;
 - modalità standalone.
 
 M0.1 non contiene codice applicativo e non rende COMPLETE le funzionalità M1.

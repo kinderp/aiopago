@@ -1,4 +1,4 @@
-# Piano maestro dell’ecosistema FARO–Durex–Eiopago
+# Piano maestro dell’ecosistema FARO–Durex–Aiopago
 
 **Versione:** 0.1  
 **Data:** 2026-08-06  
@@ -16,7 +16,7 @@ Questo file serve per:
 
 - non perdere le decisioni prese nelle chat;
 - capire quale progetto deve fare cosa;
-- evitare duplicazioni fra Eiopago, Durex, FARO, Raiatea e Alfred;
+- evitare duplicazioni fra Aiopago, Durex, FARO, Raiatea e Alfred;
 - mantenere una roadmap comune;
 - aprire issue padre e issue figlie nei repository corretti;
 - sapere quali contratti devono essere condivisi;
@@ -69,7 +69,7 @@ L’obiettivo è costruire un sistema federato in cui agenti AI possano svolgere
 ```text
 FARO Governance decide cosa fare e governa il progetto
 Durex garantisce l’esecuzione durevole dei job e dei run
-Eiopago/Guardian controlla come lavora l’agente dentro Pi
+Aiopago/Guardian controlla come lavora l’agente dentro Pi
 Raiatea conserva evidenze e provenienza
 Alfred osserva segnali ed eventi
 GitHub rappresenta backlog, issue, PR, roadmap e collaborazione umana
@@ -174,16 +174,16 @@ Un agente non può dichiarare completato un checkpoint senza:
 
 # 3. Stato attuale noto
 
-## 3.1 Eiopago/Guardian
+## 3.1 Aiopago/Guardian
 
-**Repository locale:** `E:/dev/eiopago`  
-**Repository GitHub:** `kinderp/eiopago`  
+**Repository locale canonico:** `F:/dev/aiopago`
+**Repository GitHub:** `kinderp/aiopago`
 **Branch locale noto:** `feat/pi-usage-guardian-foundation`
 
 Stato rilevato dal report di copertura:
 
 - esistono documentazione, regole operative e checkpoint;
-- non esistono ancora sorgenti o test propri di Eiopago;
+- non esistono ancora sorgenti o test propri di Aiopago;
 - nessuna funzionalità è ancora `COMPLETE`;
 - gran parte dei requisiti è `PARTIAL` documentale;
 - il modello checkpoint e i contratti futuri sono in larga parte `MISSING`;
@@ -273,12 +273,12 @@ Ruolo previsto:
 
 | Funzione | Owner principale | Note |
 |---|---|---|
-| Cost Guard e cache accounting | Eiopago | locale alla sessione Pi |
-| Session handoff | Eiopago | manual/confirm/supervised-auto/auto |
-| Human takeover | Eiopago | latch persistente |
-| Master Task Ledger locale | Eiopago | per il task in esecuzione |
-| CandidateCheckpoint | Eiopago | output pubblico principale |
-| Queue, job e run | Durex | non duplicare in Eiopago |
+| Cost Guard e cache accounting | Aiopago | locale alla sessione Pi |
+| Session handoff | Aiopago | manual/confirm/supervised-auto/auto |
+| Human takeover | Aiopago | latch persistente |
+| Master Task Ledger locale | Aiopago | per il task in esecuzione |
+| CandidateCheckpoint | Aiopago | output pubblico principale |
+| Queue, job e run | Durex | non duplicare in Aiopago |
 | Lease, heartbeat, retry | Durex | execution lifecycle |
 | Process control e PTY | Durex | execution transport |
 | Project backlog globale | FARO Governance | control plane |
@@ -296,7 +296,7 @@ Ruolo previsto:
 
 ## 5.1 Repository esistenti da mantenere
 
-- [ ] `kinderp/eiopago`
+- [ ] `kinderp/aiopago`
 - [ ] `kinderp/durex`
 - [ ] `kinderp/faro`
 - [ ] `kinderp/raiatea`
@@ -306,7 +306,7 @@ Ruolo previsto:
 
 ### `faro-governance`
 
-`DECIDED COME DIREZIONE, CREAZIONE DA ESEGUIRE DOPO M0.1 EIOPAGO`
+`DECIDED COME DIREZIONE, CREAZIONE DA ESEGUIRE DOPO M0.1 AIOPAGO`
 
 Scopo iniziale docs-first:
 
@@ -354,10 +354,10 @@ Motivo: evitare frammentazione prematura. Inizialmente possono essere directory 
 
 ## 5.4 Possibile rinomina
 
-Eiopago è il nome scelto per Guardian. Nei documenti comuni usare:
+Aiopago è il nome scelto per Guardian. Nei documenti comuni usare:
 
 ```text
-Eiopago (Guardian)
+Aiopago (Guardian)
 ```
 
 finché il nome pubblico definitivo non viene ratificato.
@@ -366,10 +366,10 @@ finché il nome pubblico definitivo non viene ratificato.
 
 # 6. Modalità standalone obbligatorie
 
-## 6.1 Eiopago standalone
+## 6.1 Aiopago standalone
 
 ```text
-Pi → Eiopago → checkpoint locale
+Pi → Aiopago → checkpoint locale
 ```
 
 Deve funzionare senza:
@@ -386,7 +386,7 @@ Deve funzionare senza:
 Durex → runner → Codex/Pi/altro agente
 ```
 
-Deve continuare a funzionare senza Eiopago.
+Deve continuare a funzionare senza Aiopago.
 
 ## 6.3 FARO Governance standalone
 
@@ -414,9 +414,9 @@ FARO Project
     └── CheckpointSpec
         └── Durex Task
             └── Durex Run
-                ├── Eiopago Session 1
-                ├── Eiopago Handoff
-                └── Eiopago Session 2
+                ├── Aiopago Session 1
+                ├── Aiopago Handoff
+                └── Aiopago Session 2
                     └── CandidateCheckpoint
                         └── CheckpointDecision
 ```
@@ -452,11 +452,11 @@ Tentativo concreto con:
 - cancellation;
 - stato terminale.
 
-## 7.4 Eiopago Session
+## 7.4 Aiopago Session
 
 Segmento di contesto LLM.
 
-Uno stesso run può usare più sessioni Eiopago.
+Uno stesso run può usare più sessioni Aiopago.
 
 ## 7.5 CandidateCheckpoint
 
@@ -488,7 +488,7 @@ CANCELLED
 
 `COMPLETED` indica che il processo è terminato, non che il risultato è stato accettato.
 
-## 8.2 Eiopago Checkpoint
+## 8.2 Aiopago Checkpoint
 
 Lifecycle proposto da ratificare in M0.1:
 
@@ -517,7 +517,7 @@ SUPERSEDED
 
 # 9. Fonti di verità
 
-`DECIDED IN E-M0.1 — ADR Eiopago 0015`
+`DECIDED IN E-M0.1 — ADR Aiopago 0015`
 
 È ratificata una strategia ibrida con ownership distinta per categoria, non una sincronizzazione bidirezionale:
 
@@ -526,14 +526,14 @@ SUPERSEDED
 | file, commit e worktree | Git/repository |
 | Master Task Ledger locale MVP | Markdown canonico versionato; indice SQLite solo derivato |
 | CandidateCheckpoint | artefatto JSON immutabile/versionato; indice SQLite derivato |
-| telemetria, stato handoff e human latch | database Eiopago; raw e normalizzati separati |
+| telemetria, stato handoff e human latch | database Aiopago; raw e normalizzati separati |
 | roadmap di prodotto | Markdown; roadmap runtime come projection non mutante |
 | costo fatturato | provider billing; stime/Pi/provider response restano fonti distinte |
 | task/run lifecycle durevole | Durex |
 | project graph, policy e acceptance | FARO Governance |
 | issue/PR pubbliche | GitHub |
 | evidenze | artefatto originario/repository; Raiatea per provenance futura |
-| sessione corrente | Eiopago/Pi |
+| sessione corrente | Aiopago/Pi |
 
 Principio:
 
@@ -685,7 +685,7 @@ Esempio:
 contracts: 0.1
 
 components:
-  eiopago:
+  aiopago:
     versions: ">=0.1 <0.3"
     checkpoint_contract: "0.1"
 
@@ -696,7 +696,7 @@ components:
 
 ---
 
-# 12. Eiopago: roadmap completa
+# 12. Aiopago: roadmap completa
 
 ## E-M0.1 — Contract and Boundary Freeze
 
@@ -737,10 +737,10 @@ Priorità assoluta.
 - [ ] Master Task Ledger minimo;
 - [ ] checkpoint model minimo;
 - [ ] human-control latch;
-- [ ] `/eiopago pause`;
-- [ ] `/eiopago takeover`;
-- [ ] `/eiopago resume`;
-- [ ] `/eiopago handoff cancel`;
+- [ ] `/aiopago pause`;
+- [ ] `/aiopago takeover`;
+- [ ] `/aiopago resume`;
+- [ ] `/aiopago handoff cancel`;
 - [ ] handoff `manual`;
 - [ ] handoff `confirm`;
 - [ ] nuova sessione pulita;
@@ -770,7 +770,7 @@ Priorità assoluta.
 
 **Gate:** handoff ordinario automatico, escalation umana per cambi critici.
 
-## E-M1.2 — Guardian/Eiopago Runner opzionale
+## E-M1.2 — Guardian/Aiopago Runner opzionale
 
 Solo se l’Extension API non è sufficiente.
 
@@ -866,17 +866,17 @@ Durex resta un prodotto autonomo.
 - [ ] decidere ownership del runner;
 - [ ] definire mapping EventEnvelope.
 
-## D-M1 — PiEiopagoRunner
+## D-M1 — PiAiopagoRunner
 
 Nome da ratificare:
 
 - `PiGuardianRunner`;
-- `PiEiopagoRunner`;
-- `EiopagoExecutor`.
+- `PiAiopagoRunner`;
+- `AiopagoExecutor`.
 
 Funzioni:
 
-- [ ] avviare Pi con Eiopago;
+- [ ] avviare Pi con Aiopago;
 - [ ] passare RunContext;
 - [ ] ricevere RunEvent;
 - [ ] inoltrare cancellation;
@@ -1084,7 +1084,7 @@ Possibile integrazione futura:
 Gate scientifico FARO Research
 → CheckpointSpec
 → Durex Run
-→ Eiopago Session(s)
+→ Aiopago Session(s)
 → EvidenceReference
 → GO/PIVOT/STOP
 ```
@@ -1209,7 +1209,7 @@ Creare nel repository `faro-governance`.
 Esempio:
 
 ```text
-Epic: Session handoff durevole Eiopago–Durex
+Epic: Session handoff durevole Aiopago–Durex
 ```
 
 ## 20.2 Issue figlie nei repository owner
@@ -1217,8 +1217,8 @@ Epic: Session handoff durevole Eiopago–Durex
 Esempio:
 
 ```text
-eiopago#...  CandidateCheckpoint
-durex#...    PiEiopagoRunner
+aiopago#...  CandidateCheckpoint
+durex#...    PiAiopagoRunner
 faro-governance#... CheckpointSpec
 raiatea#...  EvidenceReference
 ```
@@ -1250,7 +1250,7 @@ faro-governance/docs/ecosystem/COMMON_ROADMAP.md
 Roadmap locali:
 
 ```text
-eiopago/docs/ROADMAP.md
+aiopago/docs/ROADMAP.md
 durex/docs/ROADMAP.md
 faro/docs/research/RESEARCH_ROADMAP.md
 raiatea/docs/ROADMAP.md
@@ -1294,7 +1294,7 @@ invalid-secret-leak.json
 
 Test per repository:
 
-## Eiopago
+## Aiopago
 
 - produce CandidateCheckpoint valido;
 - produce RunEvent usage valido;
@@ -1322,7 +1322,7 @@ Test per repository:
 ```text
 CheckpointSpec
 → Durex fake task/run
-→ Eiopago fixture
+→ Aiopago fixture
 → CandidateCheckpoint
 → evidence
 → FARO decision
@@ -1355,7 +1355,7 @@ Se il provider non è OpenAI:
 
 # 24. Priorità globale dell’ecosistema
 
-## P0 — Chiudere Eiopago M0.1
+## P0 — Chiudere Aiopago M0.1
 
 Nessun altro fronte di implementazione deve precederlo.
 
@@ -1367,7 +1367,7 @@ Primo valore economico reale.
 
 Ridurre lavoro manuale mantenendo controllo.
 
-## P3 — Durex + Eiopago end-to-end
+## P3 — Durex + Aiopago end-to-end
 
 Rendere il task durevole oltre processo, crash e quota.
 
@@ -1403,7 +1403,7 @@ Soltanto dopo stabilità single-agent.
 
 # 25. Passaggi immediati
 
-## Step 1 — Eiopago M0.1
+## Step 1 — Aiopago M0.1
 
 `DONE DOCUMENTALE — evidenze in ADR-0015, contratti M0, roadmap, coverage e CHECKPOINT.md`
 
@@ -1416,12 +1416,12 @@ Soltanto dopo stabilità single-agent.
 
 ## Step 2 — Rendere persistente la fondazione
 
-- [ ] creare almeno un commit nel branch Eiopago;
+- [ ] creare almeno un commit nel branch Aiopago;
 - [ ] pubblicare branch remoto;
 - [ ] aprire PR M0.1 oppure issue padre M1;
 - [ ] evitare che tutto resti soltanto nel worktree.
 
-## Step 3 — Aprire Eiopago M1
+## Step 3 — Aprire Aiopago M1
 
 Issue padre suggerita:
 
@@ -1451,7 +1451,7 @@ Da fare solo dopo M0.1 ratificata.
 
 ## Step 5 — Prima integrazione Durex
 
-Da iniziare dopo il primo handoff end-to-end di Eiopago.
+Da iniziare dopo il primo handoff end-to-end di Aiopago.
 
 ---
 
@@ -1463,7 +1463,7 @@ Da iniziare dopo il primo handoff end-to-end di Eiopago.
 - [ ] non automatizzare merge critici;
 - [ ] non acquistare crediti automaticamente;
 - [ ] non integrare provider prima del Cost Guard;
-- [ ] non duplicare queue/lease/heartbeat dentro Eiopago;
+- [ ] non duplicare queue/lease/heartbeat dentro Aiopago;
 - [ ] non spostare FARO Research nel control plane;
 - [ ] non creare un policy engine arbitrario basato solo su LLM;
 - [ ] non marcare complete funzionalità solo documentate.
@@ -1472,7 +1472,7 @@ Da iniziare dopo il primo handoff end-to-end di Eiopago.
 
 # 27. Open questions da risolvere
 
-## Eiopago
+## Aiopago
 
 - [ ] `NEEDS_SPIKE SP-01`: l'Extension non espone un hook block diretto; provare il fallback prima di richiedere Runner.
 - [ ] `NEEDS_SPIKE SP-08`: `newSession()` esiste, ma failure dopo teardown e recovery journal vanno provati.
@@ -1512,11 +1512,11 @@ Da iniziare dopo il primo handoff end-to-end di Eiopago.
 
 Il primo ciclo dell’ecosistema è completato quando:
 
-1. Eiopago misura e blocca il consumo;
-2. Eiopago crea una nuova sessione con conferma;
+1. Aiopago misura e blocca il consumo;
+2. Aiopago crea una nuova sessione con conferma;
 3. il takeover umano funziona;
 4. il task riprende dal checkpoint;
-5. Durex esegue Eiopago come runner durevole;
+5. Durex esegue Aiopago come runner durevole;
 6. CandidateCheckpoint viene prodotto;
 7. FARO Governance lo valuta con regole minime;
 8. un’evidenza viene referenziata;
@@ -1530,14 +1530,14 @@ Il primo ciclo dell’ecosistema è completato quando:
 ## 2026-08-06 — v0.1
 
 - adottata architettura federata;
-- Eiopago è il nome del progetto Guardian;
+- Aiopago è il nome del progetto Guardian;
 - FARO Research resta separato;
 - proposto nuovo repository `faro-governance`;
 - Durex mantiene execution lifecycle;
 - checkpoint definito come commit operativo;
 - acceptance separata dall’esecuzione;
 - roadmap comune localizzata in FARO Governance;
-- priorità immediata: Eiopago M0.1 e poi M1.
+- priorità immediata: Aiopago M0.1 e poi M1.
 
 ---
 
@@ -1546,7 +1546,7 @@ Il primo ciclo dell’ecosistema è completato quando:
 Quando questo documento viene passato in una nuova chat o a un nuovo agente, allegare anche:
 
 1. questo file;
-2. ultimo `CHECKPOINT.md` di Eiopago;
+2. ultimo `CHECKPOINT.md` di Aiopago;
 3. `guardian-requirements-coverage.md`;
 4. ultimo report M0.1;
 5. branch e SHA correnti;

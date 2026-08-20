@@ -5,17 +5,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ArtifactStore } from "../src/artifact-store.mjs";
-import { ContextHandoffAdvisor, contextHandoffThreshold } from "../src/context-advisor.mjs";
+import {
+  CONTEXT_HANDOFF_THRESHOLD_ENV,
+  LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV,
+  ContextHandoffAdvisor,
+  contextHandoffThreshold,
+  contextHandoffThresholdEnvironment,
+} from "../src/context-advisor.mjs";
 import { GuardianError } from "../src/errors.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState, sameGitState } from "../src/git-state.mjs";
 import { HandoffService, verifyRequiredLocalPaths } from "../src/handoff.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
-import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
+import { LEGACY_RUNNER_BINDING_CUSTOM_TYPE, readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
 import { AdmissionGate, SafePointCoordinator, TOOL_PROFILES, ToolOperationTracker } from "../src/safety.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
-function temp() { return mkdtempSync(join(tmpdir(), "eiopago-core-")); }
+function temp() { return mkdtempSync(join(tmpdir(), "aiopago-core-")); }
 
 test("Context Handoff Advisor validates configuration and deduplicates above-threshold events", () => {
   assert.equal(contextHandoffThreshold(), 50);
@@ -31,6 +37,19 @@ test("Context Handoff Advisor validates configuration and deduplicates above-thr
   assert.equal(advisor.observe({ percent: 75, tokens: 75, contextWindow: 100 }), null);
   assert.equal(advisor.observe({ percent: 40, tokens: 40, contextWindow: 100 }), null);
   assert.equal(advisor.observe({ percent: 51, tokens: 51, contextWindow: 100 }).percent, 51);
+});
+
+test("context threshold environment uses Aiopago canonically and fails on incompatible legacy values", () => {
+  const warnings = [];
+  const options = { warn: (message) => warnings.push(message) };
+  assert.equal(contextHandoffThresholdEnvironment({ [CONTEXT_HANDOFF_THRESHOLD_ENV]: "40" }, options), "40");
+  assert.equal(contextHandoffThresholdEnvironment({ [LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV]: "45" }, options), "45");
+  assert.equal(contextHandoffThresholdEnvironment({ [CONTEXT_HANDOFF_THRESHOLD_ENV]: "50", [LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV]: "50" }, options), "50");
+  assert.equal(warnings.length, 2);
+  assert.throws(
+    () => contextHandoffThresholdEnvironment({ [CONTEXT_HANDOFF_THRESHOLD_ENV]: "40", [LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV]: "60" }, options),
+    (error) => error.code === "CONTEXT_HANDOFF_THRESHOLD_ENV_CONFLICT",
+  );
 });
 
 test("Context Handoff Advisor prepares the canonical command only after user consent", async () => {
@@ -77,7 +96,7 @@ test("Context Handoff Advisor prepares the canonical command only after user con
   percent = 52;
   await handlers.get("turn_end")({}, ctx);
   assert.equal(confirmations, 2);
-  assert.equal(prepared, "/eio handoff confirm");
+  assert.equal(prepared, "/aio handoff confirm");
   assert.equal(automaticHandoffs, 0);
 });
 
@@ -260,13 +279,13 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
     assert.deepEqual(handlers.get(hook)({}, ctx), { cancel: true });
   }
   assert.equal(replacementPermitConsumes, 0);
-  await assert.doesNotReject(() => commands.get("eio").handler("status", ctx));
-  await assert.doesNotReject(() => commands.get("eio").handler("handoff confirm", ctx));
+  await assert.doesNotReject(() => commands.get("aio").handler("status", ctx));
+  await assert.doesNotReject(() => commands.get("aio").handler("handoff confirm", ctx));
   assert.equal(handoffStarts, 0);
   assert.equal(notifications.length, 8);
   for (const notification of notifications) {
-    assert.match(notification.text, /^Eiopago Ledger invalid:\nLEDGER_LIFECYCLE_INVALID — current_item and next_item must differ\.\nRepair TASK_PLAN\.md before continuing\.$/);
-    assert.doesNotMatch(notification.text, /\n\s+at |Extension \"inline:eiopago\" error/);
+    assert.match(notification.text, /^Aiopago Ledger invalid:\nLEDGER_LIFECYCLE_INVALID — current_item and next_item must differ\.\nRepair TASK_PLAN\.md before continuing\.$/);
+    assert.doesNotMatch(notification.text, /\n\s+at |Extension \"inline:aiopago\" error/);
     assert.ok(notification.text.length < 500);
   }
 
@@ -289,6 +308,33 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
   assert.equal(advisorObservations, 1);
   assert.equal(contextReads, 1);
   assert.equal(confirmations, 1);
+});
+
+test("a pre-rename Ledger heading and owner command remain readable and advance through canonical aio", () => {
+  const root = temp(); const path = join(root, "TASK_PLAN.md");
+  const task = minimalTask({
+    status: "BLOCKED",
+    current_item: null,
+    next_item: "ITEM-1",
+    next_step: "Owner gate: execute /eio handoff confirm",
+    owner_gate: {
+      kind: "HANDOFF_CONFIRM",
+      status: "BLOCKED",
+      command: "/eio handoff confirm",
+      item_id: "ITEM-1",
+      satisfied_plan_revision_id: "PLAN-2",
+      satisfied_task_status: "IN_PROGRESS",
+      satisfied_next_item: null,
+      satisfied_next_step: "Continue the bounded item",
+    },
+  });
+  task.task_items[0].status = "BLOCKED";
+  writeFileSync(path, `# Eiopago Task Ledger\n\n**Schema:** \`eiopago.task-ledger/0.1.0\`\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
+  const ledger = new TaskLedger(path);
+  assert.equal(ledger.read().owner_gate.command, "/eio handoff confirm");
+  const advanced = ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:/aio-handoff" });
+  assert.equal(advanced.owner_gate.status, "SATISFIED");
+  assert.equal(advanced.current_item, "ITEM-1");
 });
 
 test("Ledger preserves semantic minimal-read directives and validates only explicit required local paths", () => {
@@ -349,6 +395,19 @@ test("resume prompt JSON lines round-trip delimiter-like semantic content withou
   assert.deepEqual(JSON.parse(localLines[0].slice("required_local_paths_json=".length)), local);
 });
 
+test("canonical and deprecated TUI commands delegate to one handler", async () => {
+  const commands = new Map();
+  const pi = { registerCommand(name, command) { commands.set(name, command); }, on() {} };
+  const calls = [];
+  const notifications = [];
+  const runner = { async recoverHandoffFromCommand(_ctx, id) { calls.push(id); } };
+  createGuardianExtension(runner)(pi);
+  const ctx = { ui: { notify(text, type) { notifications.push({ text, type }); } } };
+  for (const name of ["aio", "eio", "eiopago"]) await commands.get(name).handler("handoff recover HO-legacy", ctx);
+  assert.deepEqual(calls, ["HO-legacy", "HO-legacy", "HO-legacy"]);
+  assert.deepEqual(notifications.map((item) => item.text), ["/eio is deprecated; use /aio", "/eiopago is deprecated; use /aio"]);
+});
+
 test("explicit handoff recovery command routes only with its failed handoff id", async () => {
   const commands = new Map();
   const pi = { registerCommand(name, command) { commands.set(name, command); }, on() {} };
@@ -358,7 +417,7 @@ test("explicit handoff recovery command routes only with its failed handoff id",
   };
   createGuardianExtension(runner)(pi);
   const ctx = { ui: { notify() {} } };
-  await commands.get("eio").handler("handoff recover HO-failed", ctx);
+  await commands.get("aio").handler("handoff recover HO-failed", ctx);
   assert.deepEqual(calls, [{ ctx, id: "HO-failed" }]);
 });
 
@@ -378,7 +437,7 @@ test("Git continuity digests detect byte changes with unchanged porcelain status
   const root = temp();
   execFileSync("git", ["init"], { cwd: root });
   execFileSync("git", ["config", "user.email", "core@example.invalid"], { cwd: root });
-  execFileSync("git", ["config", "user.name", "Eiopago Core"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Aiopago Core"], { cwd: root });
   writeFileSync(join(root, "tracked.txt"), "committed\n");
   execFileSync("git", ["add", "tracked.txt"], { cwd: root });
   execFileSync("git", ["commit", "-m", "fixture"], { cwd: root });
@@ -415,6 +474,11 @@ test("Runner ownership attestation passes only when runtime, journal, manifest, 
   await t.test("a Pi session not created by the Runner has no runtime binding", () => {
     const session = { sessionId: "SES-unowned", sessionManager: { getSessionId: () => "SES-unowned", getEntries: () => [] } };
     assert.throws(() => readRuntimeRunnerBinding(session), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+  });
+  await t.test("a pre-rename custom entry remains readable", () => {
+    const entry = { type: "custom", customType: LEGACY_RUNNER_BINDING_CUSTOM_TYPE, data: runtimeBinding };
+    const session = { sessionId: expected.replacement_session_id, sessionManager: { getSessionId: () => expected.replacement_session_id, getEntries: () => [entry] } };
+    assert.deepEqual(readRuntimeRunnerBinding(session), runtimeBinding);
   });
   for (const [name, source, field, value] of [
     ["runner_instance_id mismatch", "runtime", "runner_instance_id", "RUNNER-other"],
@@ -502,7 +566,7 @@ test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
     task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
     resume_prompt_id: "RP-stale-confirm", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
   });
-  storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/eio-takeover");
+  storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
   assert.throws(
     () => storage.authorizeAndAdmit("HO-stale-confirm", "human:stale-confirm", "resume:RP-stale-confirm", "ADM-stale-confirm"),
     (error) => error.code === "HUMAN_TAKEOVER_ACTIVE",
@@ -620,7 +684,7 @@ test("safe point closes transport, clears queue, and fails closed on unknown mut
   const result = await safe.request(session);
   assert.equal(result.state, "SAFE_TO_HANDOFF");
   assert.throws(() => gate.admit(() => null), (error) => error.code === "LLM_ADMISSION_BLOCKED");
-  const escalated = storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/eio-takeover");
+  const escalated = storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
   assert.equal(escalated.generation, result.latch_generation);
   assert.equal(escalated.reason, "HUMAN_TAKEOVER");
   const drainTask = "TASK-V"; storage.ensureLatch(drainTask);

@@ -6,7 +6,7 @@ H1-01 resta invariato. Questo documento registra soltanto `M1-H1-F1` (issue #8):
 
 ## Finding A — owner gate stale
 
-**Causa:** `/eio handoff confirm` importava il Ledger senza applicare una transizione canonica del gate. Checkpoint e manifest venivano quindi sigillati con `current_item=null`, `next_item=ITEM-H1-02` e il vecchio `next_step` che richiedeva ancora lo stesso comando.
+**Causa:** `/aio handoff confirm` importava il Ledger senza applicare una transizione canonica del gate. Checkpoint e manifest venivano quindi sigillati con `current_item=null`, `next_item=ITEM-H1-02` e il vecchio `next_step` che richiedeva ancora lo stesso comando.
 
 **Fix:** in modalità `confirm`, prima di leggere il piano usato per safe point e sealing, `TaskLedger.satisfyOwnerGate()` applica una scrittura atomica temp+fsync+rename della nuova revisione Markdown. La transizione richiede attore `human:*`, comando esatto, lifecycle bloccato coerente e un vero `satisfied_next_step`. L'E2E verifica prima del seal:
 
@@ -14,13 +14,13 @@ H1-01 resta invariato. Questo documento registra soltanto `M1-H1-F1` (issue #8):
 - `ITEM-H1-02 = IN_PROGRESS`;
 - `current_item = ITEM-H1-02`;
 - `next_item = ITEM-H1-03`;
-- `next_step` privo di una nuova richiesta `/eio handoff confirm`.
+- `next_step` privo di una nuova richiesta `/aio handoff confirm`.
 
 ## Finding B — Runner ownership non verificabile
 
 **Causa:** `replacement_session_id` era presente nel journal/projection e nel manifest, ma la sessione Pi corrente non possedeva una credenziale di binding installata dal Runner. Il solo manifest non poteva attestare l'identità runtime e il fail-closed era quindi corretto.
 
-**Fix minimale:** ogni processo `GuardianRunner` genera un `runner_instance_id`; ogni handoff genera un nonce `session_binding_id`. Il Runner usa la API pubblica Pi `newSession({ setup(sessionManager) })` per aggiungere alla replacement session una `CustomEntry` non inclusa nel contesto LLM (`eiopago.runner-session-binding.v1`) durante il setup, prima di qualsiasi conversation entry. La entry contiene:
+**Fix minimale:** ogni processo `GuardianRunner` genera un `runner_instance_id`; ogni handoff genera un nonce `session_binding_id`. Il Runner usa la API pubblica Pi `newSession({ setup(sessionManager) })` per aggiungere alla replacement session una `CustomEntry` non inclusa nel contesto LLM durante il setup, prima di qualsiasi conversation entry. I record pre-rename usano il tipo legacy `eiopago.runner-session-binding.v1`, ancora leggibile; i nuovi record usano `aiopago.runner-session-binding.v1`. La entry contiene:
 
 - `handoff_id`;
 - `replacement_session_id` ottenuto dal `SessionManager` reale;

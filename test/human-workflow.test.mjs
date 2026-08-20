@@ -14,14 +14,14 @@ import { GuardianStorage } from "../src/storage.mjs";
 
 const fakePi = async () => ({ root: "/fake/pi", version: "0.83.0", name: "@earendil-works/pi-coding-agent" });
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
-function temp() { return mkdtempSync(join(tmpdir(), "eiopago-human-workflow-")); }
+function temp() { return mkdtempSync(join(tmpdir(), "aiopago-human-workflow-")); }
 
 function task(overrides = {}) {
   return {
     schema_version: "0.1.0",
     task_id: "TASK-HUMAN",
     title: "Human workflow fixture",
-    objective: "Make the current Eiopago task understandable without opening Pi.",
+    objective: "Make the current Aiopago task understandable without opening Pi.",
     requirements_version: "REQ-HUMAN-1",
     plan_revision_id: "PLAN-HUMAN-1",
     status: "IN_PROGRESS",
@@ -166,8 +166,8 @@ test("0.2-A CLI status, why, next and plan are human-readable and leave plan/run
 
   const status = await command(["status", "--target", root]);
   assert.equal(status.result.action, "status");
-  assert.match(status.output, /Eiopago — richiede attenzione/);
-  assert.match(status.output, /Obiettivo: Make the current Eiopago task understandable/);
+  assert.match(status.output, /Aiopago — richiede attenzione/);
+  assert.match(status.output, /Obiettivo: Make the current Aiopago task understandable/);
   assert.match(status.output, /Attività corrente: Build read-only projection/);
   assert.doesNotMatch(status.output, /TASK-HUMAN|ITEM-HUMAN|PLAN-HUMAN|latch|handoff/i);
 
@@ -176,7 +176,7 @@ test("0.2-A CLI status, why, next and plan are human-readable and leave plan/run
 
   const next = await command(["next", "--target", root]);
   assert.match(next.output, /non dedurre avvio o retry/);
-  assert.doesNotMatch(next.output, /esegui “eio”|\/eio resume/i);
+  assert.doesNotMatch(next.output, /esegui “aio”|\/aio resume/i);
 
   const plan = await command(["plan", "--target", root]);
   assert.match(plan.output, /Piano autorevole: Human workflow fixture/);
@@ -207,16 +207,16 @@ test("a live WAL runtime fails closed without changing database or sidecar bytes
     assert.equal(before.runtimeEntries.includes("guardian.sqlite-shm"), true);
 
     const status = await command(["status", "--target", root]);
-    assert.match(status.output, /Eiopago — richiede attenzione/);
+    assert.match(status.output, /Aiopago — richiede attenzione/);
     assert.match(status.output, /non può essere verificato in sicurezza dall’osservatore esterno/);
     const next = await command(["next", "--target", root]);
-    assert.match(next.output, /non avviare né riprovare eio/);
-    assert.doesNotMatch(next.output, /esegui “eio”|avvia eio/i);
+    assert.match(next.output, /non avviare né riprovare aio/);
+    assert.doesNotMatch(next.output, /esegui “aio”|avvia aio/i);
     assertUnchanged(before, capture(root));
   } finally { storage.close(); }
 });
 
-test("eio plan --raw returns the authoritative text even when Ledger validation fails", async () => {
+test("aio plan --raw returns the authoritative text even when Ledger validation fails", async () => {
   const root = await fixture({ runtime: true });
   const invalid = "# Human-owned plan\n\nThis is intentionally invalid while being repaired.\n";
   writeFileSync(join(root, "TASK_PLAN.md"), invalid);
@@ -231,9 +231,9 @@ test("eio plan --raw returns the authoritative text even when Ledger validation 
     (error) => error.code === "LEDGER_FORMAT_INVALID",
   );
   const status = await command(["status", "--target", root]);
-  assert.match(status.output, /Eiopago — richiede attenzione/);
+  assert.match(status.output, /Aiopago — richiede attenzione/);
   assert.match(status.output, /TASK_PLAN\.md non è valido/);
-  assert.match(status.output, /eio plan --check/);
+  assert.match(status.output, /aio plan --check/);
 
   assertUnchanged(before, capture(root));
 });
@@ -241,7 +241,7 @@ test("eio plan --raw returns the authoritative text even when Ledger validation 
 test("a direct human edit becomes the next observed authority and is never overwritten", async () => {
   const root = await fixture();
   const first = await command(["plan", "--target", root]);
-  assert.match(first.output, /Make the current Eiopago task understandable/);
+  assert.match(first.output, /Make the current Aiopago task understandable/);
 
   const edited = task({
     objective: "Honor a direct human edit as the canonical plan.",
@@ -267,7 +267,7 @@ test("public workflow projection never constructs READY without a canonical core
     const projected = projectHumanWorkflow({ initialized: true, plan: activePlan, runtime });
     assert.equal(projected.state, "NEEDS_ATTENTION");
     assert.equal(projected.technical.code, "RUNTIME_NOT_VERIFIED");
-    assert.doesNotMatch(projected.next, /esegui “eio”|\/eio resume/i);
+    assert.doesNotMatch(projected.next, /esegui “aio”|\/aio resume/i);
   }
 
   const root = await fixture();
@@ -277,17 +277,17 @@ test("public workflow projection never constructs READY without a canonical core
   assert.equal(projected.technical.code, "RUNTIME_NOT_VERIFIED");
 });
 
-test("read-only workflow commands describe an uninitialized Git repository without creating Eiopago state", async () => {
+test("read-only workflow commands describe an uninitialized Git repository without creating Aiopago state", async () => {
   const root = temp();
   git(root, ["init"]);
   const before = readdirSync(root).sort();
 
   const status = await command(["status", "--target", root]);
-  assert.match(status.output, /Eiopago — da configurare/);
+  assert.match(status.output, /Aiopago — da configurare/);
   const why = await command(["why", "--target", root]);
   assert.match(why.output, /non è ancora inizializzato/);
   const next = await command(["next", "--target", root]);
-  assert.match(next.output, /eio init/);
+  assert.match(next.output, /aio init/);
 
   assert.deepEqual(readdirSync(root).sort(), before);
   assert.equal(existsSync(join(root, ".guardian")), false);
@@ -367,7 +367,7 @@ test("review regressions fail closed at the architectural boundary without prese
       assert.equal(observed.error.code, "RUNTIME_NOT_VERIFIED");
       const projected = projectHumanWorkflow({ initialized: true, targetRoot: root, plan: { valid: true, plan, path: join(root, "TASK_PLAN.md") }, runtime: observed });
       assert.equal(projected.state, "NEEDS_ATTENTION");
-      assert.doesNotMatch(projected.next, /esegui “eio”|\/eio resume/i);
+      assert.doesNotMatch(projected.next, /esegui “aio”|\/aio resume/i);
     });
   }
 });
@@ -516,7 +516,7 @@ test("runtime reader performs acquisition only and never opens or interprets SQL
   assert.equal(observed.workflow, "NEEDS_ATTENTION");
   assert.equal(observed.error.code, "RUNTIME_NOT_VERIFIED");
   assert.equal(databaseFactoryCalls, 0);
-  assert.equal(readdirSync(tmpdir()).some((name) => name.startsWith("eiopago-runtime-read-")), false);
+  assert.equal(readdirSync(tmpdir()).some((name) => name.startsWith("aiopago-runtime-read-")), false);
 });
 
 test("public runtime observation and output omit projection_json private fields", async () => {

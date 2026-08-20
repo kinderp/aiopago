@@ -105,7 +105,7 @@ export class MeasurementInstrumentation {
       } catch {}
     }
     try { this.storage.appendMetricDiagnostic(record, this.retention.diagnostics); }
-    catch { console.error(`[eiopago] metrics diagnostic unavailable (${operation})`); }
+    catch { console.error(`[aiopago] metrics diagnostic unavailable (${operation})`); }
     return null;
   }
 

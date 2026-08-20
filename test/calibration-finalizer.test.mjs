@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { finalizeCalibrationRun } from "../src/calibration-finalizer.mjs";
 import { CALIBRATION_ATTESTATION_SCHEMA } from "../src/calibration-preflight.mjs";
-import { emptyCalibrationQualityEvidence, writeCalibrationQualityEvidence } from "../src/calibration-quality.mjs";
+import { LEGACY_CALIBRATION_QUALITY_SCHEMA, emptyCalibrationQualityEvidence, writeCalibrationQualityEvidence } from "../src/calibration-quality.mjs";
 import { sha256 } from "../src/canonical.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
@@ -157,13 +157,13 @@ function handoffEvent(state, index) {
   };
 }
 
-function fixture({ percent = 41, samplePercents = null, withHandoff = true, diagnostics = [], qualityEvidence = quality(), sampleOverrides = {} } = {}) {
-  const root = mkdtempSync(join(tmpdir(), "eiopago-finalizer-"));
+function fixture({ percent = 41, samplePercents = null, withHandoff = true, diagnostics = [], qualityEvidence = quality(), sampleOverrides = {}, protocolSchema = "aiopago.threshold-calibration-protocol/1.0.0" } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "aiopago-finalizer-"));
   const runRoot = join(root, ".guardian", "calibration", RUN_ID);
   const runtimeRoot = join(runRoot, "runtime");
   mkdirSync(runtimeRoot, { recursive: true });
   const protocol = {
-    schema_version: "eiopago.threshold-calibration-protocol/1.0.0",
+    schema_version: protocolSchema,
     protocol_id: "TEST-PILOT",
     application_baseline_commit: "a".repeat(40),
     runs: [{ variant_id: "RUN-40", threshold_percent: 40, branch: "calibration/test", worktree: root.replaceAll("\\", "/") }],
@@ -259,6 +259,17 @@ test("calibration finalizer produces VALID from an actual MetricSample crossing 
   assert.equal(record.telemetry.charged_cost.status, "unknown");
   assert.equal(record.outcome.cost_per_accepted_checkpoint.equivalent.amount, 1);
   assert.equal(record.outcome.cost_per_accepted_checkpoint.charged.status, "unknown");
+});
+
+test("calibration finalizer accepts frozen pre-rename protocol and quality schemas without rewriting the protocol", () => {
+  const x = fixture({
+    protocolSchema: "eiopago.threshold-calibration-protocol/1.0.0",
+    qualityEvidence: quality({ schema_version: LEGACY_CALIBRATION_QUALITY_SCHEMA }),
+  });
+  const before = readFileSync(join(x.runRoot, "pilot-protocol.json"));
+  const { record } = finalizeCalibrationRun({ runRoot: x.runRoot, runId: RUN_ID });
+  assert.equal(record.classification, "VALID");
+  assert.deepEqual(readFileSync(join(x.runRoot, "pilot-protocol.json")), before);
 });
 
 test("calibration finalizer produces CENSORED when quality passes before any measured crossing", () => {

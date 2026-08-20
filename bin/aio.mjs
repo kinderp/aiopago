@@ -2,4 +2,4 @@
 
 import { runCliEntrypoint } from "../src/cli-entry.mjs";
 
-await runCliEntrypoint({ commandName: "eio", deprecated: true });
+await runCliEntrypoint();

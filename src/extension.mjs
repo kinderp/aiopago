@@ -2,7 +2,7 @@ import { GuardianError } from "./errors.mjs";
 
 function message(error) { return error instanceof GuardianError ? `${error.code}: ${error.message}` : error?.message ?? String(error); }
 function safeNotify(ctx, text, type) {
-  try { ctx.ui.notify(text, type); } catch { console.error(`[eiopago] ${text}`); }
+  try { ctx.ui.notify(text, type); } catch { console.error(`[aiopago] ${text}`); }
 }
 function safeMetric(runner, method, ...args) {
   try { return runner.metrics?.[method]?.(...args) ?? null; } catch { return null; }
@@ -12,7 +12,7 @@ function ledgerDiagnostic(error) {
   const detail = error instanceof GuardianError
     ? `${error.code} — ${String(error.message).replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "")}.`
     : "LEDGER_READ_FAILED — TASK_PLAN.md could not be read or validated.";
-  return `Eiopago Ledger invalid:\n${detail.slice(0, 320)}\nRepair TASK_PLAN.md before continuing.`;
+  return `Aiopago Ledger invalid:\n${detail.slice(0, 320)}\nRepair TASK_PLAN.md before continuing.`;
 }
 function isLedgerError(error, runner) {
   if (error instanceof GuardianError && /^(LEDGER_|DONE_|OWNER_GATE_)/.test(error.code)) return true;
@@ -48,7 +48,7 @@ export function formatGuardianStatus(runner, ctx = null) {
     ? `Runner-owned replacement (${binding.status})`
     : "Runner-owned source";
   return [
-    "Eiopago status",
+    "Aiopago status",
     `Target repository: ${runner.roots.targetRoot}`,
     `Git: branch=${git.branch || "detached"} HEAD=${git.head_sha ?? "unborn"}`,
     `Worktree: ${git.workdir}`,
@@ -79,7 +79,7 @@ async function adviseHandoff(runner, ctx) {
   const percent = Math.round(proposal.percent);
   try {
     const prepare = await ctx.ui.confirm(
-      "Eiopago",
+      "Aiopago",
       `Context: ${percent}% (soglia configurata: ${proposal.thresholdPercent}%)\nHandoff consigliato.\n\nPreparare il passaggio a una nuova sessione?`,
     );
     if (!prepare) return;
@@ -88,8 +88,8 @@ async function adviseHandoff(runner, ctx) {
       threshold_percent: proposal.thresholdPercent,
       reason: "USER_CONSENTED_TO_ADVISORY",
     });
-    ctx.ui.setEditorText("/eio handoff confirm");
-    safeNotify(ctx, "Comando /eio handoff confirm preparato. Premi Invio per avviare il percorso M1-H0.", "info");
+    ctx.ui.setEditorText("/aio handoff confirm");
+    safeNotify(ctx, "Comando /aio handoff confirm preparato. Premi Invio per avviare il percorso M1-H0.", "info");
   } catch (error) {
     safeNotify(ctx, `Context Handoff Advisor non disponibile: ${message(error)}`, "warning");
   }
@@ -97,14 +97,23 @@ async function adviseHandoff(runner, ctx) {
 
 export function createGuardianExtension(runner) {
   return function guardianExtension(pi) {
-    pi.registerCommand("eio", {
-      description: "Eiopago: /eio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status",
+    pi.registerCommand("aio", {
+      description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status",
       handler: async (args, ctx) => runCommand(args, ctx),
     });
-    pi.registerCommand("eiopago", {
-      description: "Alias of /eio",
+    pi.registerCommand("aiopago", {
+      description: "Alias of /aio",
       handler: async (args, ctx) => runCommand(args, ctx),
     });
+    for (const legacyName of ["eio", "eiopago"]) {
+      pi.registerCommand(legacyName, {
+        description: `Deprecated alias of /aio`,
+        handler: async (args, ctx) => {
+          safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning");
+          return runCommand(args, ctx);
+        },
+      });
+    }
 
     async function runCommand(args, ctx) {
       const [subcommand = "status", value, identifier] = args.trim().split(/\s+/);
@@ -127,7 +136,7 @@ export function createGuardianExtension(runner) {
           await runner.resumeFromCommand(ctx, value);
           return;
         }
-        ctx.ui.notify("Usage: /eio handoff [manual|confirm] | /eio handoff recover <handoff-id> | /eio takeover | /eio resume [handoff-id] | /eio status", "warning");
+        ctx.ui.notify("Usage: /aio handoff [manual|confirm] | /aio handoff recover <handoff-id> | /aio takeover | /aio resume [handoff-id] | /aio status", "warning");
       } catch (error) {
         safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error");
       }
@@ -150,7 +159,7 @@ export function createGuardianExtension(runner) {
       const task = readLedgerForHook(runner, ctx);
       if (!task) return { action: "handled" };
       if (!runner.storage.isAdmissionOpen(task.task_id)) {
-        safeNotify(ctx, "Eiopago latch engaged: only local /eio commands are admitted", "warning");
+        safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning");
         return { action: "handled" };
       }
       return { action: "continue" };

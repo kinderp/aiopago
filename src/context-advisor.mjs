@@ -1,7 +1,18 @@
 import { invariant } from "./errors.mjs";
 
 export const DEFAULT_CONTEXT_HANDOFF_THRESHOLD_PERCENT = 50;
-export const CONTEXT_HANDOFF_THRESHOLD_ENV = "EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT";
+export const CONTEXT_HANDOFF_THRESHOLD_ENV = "AIOPAGO_CONTEXT_HANDOFF_THRESHOLD_PERCENT";
+export const LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV = "EIO_CONTEXT_HANDOFF_THRESHOLD_PERCENT";
+
+export function contextHandoffThresholdEnvironment(env = process.env, { warn = (message) => console.error(message) } = {}) {
+  const canonical = env[CONTEXT_HANDOFF_THRESHOLD_ENV];
+  const legacy = env[LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV];
+  if (canonical !== undefined && legacy !== undefined) {
+    invariant(String(canonical) === String(legacy), "CONTEXT_HANDOFF_THRESHOLD_ENV_CONFLICT", `${CONTEXT_HANDOFF_THRESHOLD_ENV} conflicts with deprecated ${LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV}`);
+  }
+  if (legacy !== undefined) warn(`${LEGACY_CONTEXT_HANDOFF_THRESHOLD_ENV} is deprecated; use ${CONTEXT_HANDOFF_THRESHOLD_ENV}`);
+  return canonical ?? legacy;
+}
 
 export function contextHandoffThreshold(value = undefined) {
   if (value === undefined || value === null || value === "") return DEFAULT_CONTEXT_HANDOFF_THRESHOLD_PERCENT;

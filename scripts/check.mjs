@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+execFileSync(process.execPath, ["scripts/check-brand-migration.mjs"], { stdio: "inherit" });
+
 const roots = ["src", "bin", "scripts", "test"];
 const files = [];
 function walk(path) {

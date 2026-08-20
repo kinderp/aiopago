@@ -15,10 +15,11 @@ import {
 } from "./repository.mjs";
 
 export const MINIMUM_NODE_VERSION = "22.19.0";
-export const GITIGNORE_START = "# Eiopago local state (managed by eio init)";
-export const GITIGNORE_END = "# End Eiopago local state";
-const GITIGNORE_LINES = [
-  GITIGNORE_START,
+export const GITIGNORE_START = "# Aiopago local state (managed by aio init)";
+export const GITIGNORE_END = "# End Aiopago local state";
+export const LEGACY_GITIGNORE_START = "# Eiopago local state (managed by eio init)";
+export const LEGACY_GITIGNORE_END = "# End Eiopago local state";
+const MANAGED_GITIGNORE_BODY = [
   "!.guardian/",
   ".guardian/*",
   ".guardian/runtime/",
@@ -28,8 +29,9 @@ const GITIGNORE_LINES = [
   ".guardian/calibration/",
   "!.guardian/config.json",
   "!TASK_PLAN.md",
-  GITIGNORE_END,
 ];
+const GITIGNORE_LINES = [GITIGNORE_START, ...MANAGED_GITIGNORE_BODY, GITIGNORE_END];
+const LEGACY_GITIGNORE_LINES = [LEGACY_GITIGNORE_START, ...MANAGED_GITIGNORE_BODY, LEGACY_GITIGNORE_END];
 
 function parseVersion(version) {
   const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version ?? "");
@@ -74,8 +76,8 @@ export function createLedgerTemplate(targetRoot, now = new Date().toISOString())
   const task = {
     schema_version: "0.1.0",
     task_id: id,
-    title: `Eiopago task ledger — ${basename(targetRoot)}`,
-    objective: "Describe the current repository task and preserve bounded evidence across Eiopago handoffs.",
+    title: `Aiopago task ledger — ${basename(targetRoot)}`,
+    objective: "Describe the current repository task and preserve bounded evidence across Aiopago handoffs.",
     requirements_version: "REQ-INITIAL-1",
     plan_revision_id: "PLAN-INITIAL-1",
     status: "IN_PROGRESS",
@@ -86,7 +88,7 @@ export function createLedgerTemplate(targetRoot, now = new Date().toISOString())
     current_item: itemId,
     next_item: null,
     next_step: "Edit this Ledger with the bounded current task before starting work.",
-    evidence: ["Created non-destructively by eio init"],
+    evidence: ["Created non-destructively by aio init"],
     model_policy: null,
     reasoning_policy: "high",
     minimal_reads: ["TASK_PLAN.md"],
@@ -103,10 +105,10 @@ export function createLedgerTemplate(targetRoot, now = new Date().toISOString())
       risk: "MEDIUM",
       milestone: "LOCAL",
       last_updated_at: now,
-      last_updated_by: "human:eio-init",
+      last_updated_by: "human:aio-init",
     }],
   };
-  return `# Eiopago Task Ledger\n\n**Schema:** \`eiopago.task-ledger/0.1.0\`\n\n## Ledger lifecycle contract\n\n- Allowed statuses: \`PLANNED\`, \`IN_PROGRESS\`, \`BLOCKED\`, \`DONE\`, \`DROPPED\`, \`SUPERSEDED\`. Future items use \`PLANNED\`, never \`PENDING\`.\n- Active work: task and item are \`IN_PROGRESS\`; \`current_item\` references that sole item. For the final active item, \`next_item\` is \`null\`.\n- Externally blocked work: task and item are \`BLOCKED\`; \`current_item\` is \`null\`; \`next_item\` references the blocked item. \`next_step\` names the blocker, unblock condition, and item to resume.\n- \`current_item\` is \`null\` or the sole \`IN_PROGRESS\` item; it never references \`PLANNED\`, \`BLOCKED\`, or \`DONE\`.\n- \`next_item\` is \`null\` or a \`PLANNED\`/\`BLOCKED\` item, and must differ from \`current_item\`.\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`;
+  return `# Aiopago Task Ledger\n\n**Schema:** \`aiopago.task-ledger/0.1.0\`\n\n## Ledger lifecycle contract\n\n- Allowed statuses: \`PLANNED\`, \`IN_PROGRESS\`, \`BLOCKED\`, \`DONE\`, \`DROPPED\`, \`SUPERSEDED\`. Future items use \`PLANNED\`, never \`PENDING\`.\n- Active work: task and item are \`IN_PROGRESS\`; \`current_item\` references that sole item. For the final active item, \`next_item\` is \`null\`.\n- Externally blocked work: task and item are \`BLOCKED\`; \`current_item\` is \`null\`; \`next_item\` references the blocked item. \`next_step\` names the blocker, unblock condition, and item to resume.\n- \`current_item\` is \`null\` or the sole \`IN_PROGRESS\` item; it never references \`PLANNED\`, \`BLOCKED\`, or \`DONE\`.\n- \`next_item\` is \`null\` or a \`PLANNED\`/\`BLOCKED\` item, and must differ from \`current_item\`.\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`;
 }
 
 function validateExistingState(targetRoot) {
@@ -120,14 +122,26 @@ function validateExistingState(targetRoot) {
       const text = readFileSync(ledgerPath, "utf8");
       invariant(text.split("```json task-ledger").length - 1 === 1, "LEDGER_FORMAT_AMBIGUOUS", "TASK_PLAN.md must contain exactly one json task-ledger block");
       new TaskLedger(ledgerPath).read();
-    } catch (error) { throw new GuardianError("TASK_PLAN_NOT_EIOPAGO_LEDGER", `Existing TASK_PLAN.md is not a compatible Eiopago Ledger; preserved without changes (${error.code ?? error.message})`); }
+    } catch (error) { throw new GuardianError("TASK_PLAN_NOT_AIOPAGO_LEDGER", `Existing TASK_PLAN.md is not a compatible Aiopago Ledger; preserved without changes (${error.code ?? error.message})`); }
   }
   if (existsSync(gitignorePath)) {
     const text = readFileSync(gitignorePath, "utf8");
-    const startCount = text.split(GITIGNORE_START).length - 1;
-    const endCount = text.split(GITIGNORE_END).length - 1;
-    invariant(startCount === endCount && startCount <= 1, "GITIGNORE_EIO_BLOCK_INVALID", "Existing .gitignore contains partial or duplicate Eiopago managed blocks; repair it explicitly before re-running init");
-    if (startCount === 1) invariant(text.includes(GITIGNORE_LINES.join(text.includes("\r\n") ? "\r\n" : "\n")), "GITIGNORE_EIO_BLOCK_INVALID", "Existing Eiopago .gitignore block differs from the supported block; review it explicitly");
+    const eol = text.includes("\r\n") ? "\r\n" : "\n";
+    const blocks = [
+      { start: GITIGNORE_START, end: GITIGNORE_END, lines: GITIGNORE_LINES },
+      { start: LEGACY_GITIGNORE_START, end: LEGACY_GITIGNORE_END, lines: LEGACY_GITIGNORE_LINES },
+    ];
+    let present = 0;
+    for (const block of blocks) {
+      const startCount = text.split(block.start).length - 1;
+      const endCount = text.split(block.end).length - 1;
+      invariant(startCount === endCount && startCount <= 1, "GITIGNORE_AIO_BLOCK_INVALID", "Existing .gitignore contains partial or duplicate Aiopago managed blocks; repair it explicitly before re-running init");
+      if (startCount === 1) {
+        present += 1;
+        invariant(text.includes(block.lines.join(eol)), "GITIGNORE_AIO_BLOCK_INVALID", "Existing Aiopago .gitignore block differs from a supported canonical or legacy block; review it explicitly");
+      }
+    }
+    invariant(present <= 1, "GITIGNORE_AIO_BLOCK_CONFLICT", "Existing .gitignore contains both Aiopago and legacy Eiopago managed blocks; resolve the conflict explicitly");
   }
 }
 
@@ -136,7 +150,11 @@ function ensureGitignore(targetRoot, actions) {
   const existed = existsSync(path);
   const prior = existed ? readFileSync(path, "utf8") : "";
   if (prior.includes(GITIGNORE_START)) {
-    actions.preserved.push(".gitignore (Eiopago block already present)");
+    actions.preserved.push(".gitignore (Aiopago block already present)");
+    return;
+  }
+  if (prior.includes(LEGACY_GITIGNORE_START)) {
+    actions.preserved.push(".gitignore (legacy Eiopago block retained compatibly)");
     return;
   }
   const eol = prior.includes("\r\n") ? "\r\n" : "\n";
@@ -144,7 +162,7 @@ function ensureGitignore(targetRoot, actions) {
   const block = `${prefix}${prior.length > 0 ? eol : ""}${GITIGNORE_LINES.join(eol)}${eol}`;
   if (existed) {
     appendFileSync(path, block, "utf8");
-    actions.updated.push(".gitignore (appended bounded Eiopago block)");
+    actions.updated.push(".gitignore (appended bounded Aiopago block)");
   } else {
     writeFileSync(path, block, { encoding: "utf8", flag: "wx" });
     actions.created.push(".gitignore");
@@ -179,7 +197,7 @@ export async function initializeRepository(input = process.cwd(), options = {}) 
     writeFileSync(ledgerPath, createLedgerTemplate(targetRoot, options.now), { encoding: "utf8", flag: "wx" });
     new TaskLedger(ledgerPath).read();
     actions.created.push("TASK_PLAN.md");
-  } else actions.preserved.push("TASK_PLAN.md (valid Eiopago Ledger)");
+  } else actions.preserved.push("TASK_PLAN.md (valid Aiopago Ledger)");
 
   if (!existsSync(runtimeRoot)) { mkdirSync(runtimeRoot, { recursive: true }); actions.created.push(".guardian/runtime/"); }
   else actions.preserved.push(".guardian/runtime/ (existing state retained)");

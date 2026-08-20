@@ -1,6 +1,6 @@
-# M0 contracts — Eiopago/Guardian
+# M0 contracts — Aiopago/Guardian
 
-- **Contract set:** `eiopago.m0`
+- **Contract set:** `aiopago.m0`
 - **Schema version:** `0.1.0`
 - **Status:** DECIDED for field semantics; serialization schemas and fixtures DEFERRED to M1
 - **ADR:** [`../adr/0015-m0-boundaries-and-contract-freeze.md`](../adr/0015-m0-boundaries-and-contract-freeze.md)
@@ -131,7 +131,7 @@ Il checkpoint riferisce una revisione esatta; un update compare-and-swap usa `pr
 ### 3.1 Concetti
 
 - `DraftCheckpoint`: workspace mutabile e non riprendibile garantito.
-- `CandidateCheckpoint`: snapshot pubblico immutabile prodotto da Eiopago.
+- `CandidateCheckpoint`: snapshot pubblico immutabile prodotto da Aiopago.
 - `VerifiedCheckpoint`: lo stesso candidato con evento Guardian `VERIFIED`; il payload non cambia.
 - `ExternalDecision`: valutazione separata, futura, che non modifica il candidato.
 
@@ -260,7 +260,7 @@ Le transizioni sono eventi append-only. Il campo `status` nella projection è l'
 
 ### 4.1 `CheckpointDecision`
 
-Produttore previsto: FARO Governance o umano/governance adapter autorizzato. Eiopago può consumarlo e visualizzarlo, non produrre acceptance globale.
+Produttore previsto: FARO Governance o umano/governance adapter autorizzato. Aiopago può consumarlo e visualizzarlo, non produrre acceptance globale.
 
 ```text
 checkpoint_decision_id
@@ -368,7 +368,7 @@ resume_checkpoint_id?
 
 - `cancellation_channel`: endpoint/capability opaca con semantics idempotenti; non contiene segreto persistito nel checkpoint.
 - `event_sink`: endpoint/callback descriptor e versione envelope.
-- In standalone Eiopago crea un run locale effimero o lascia `run_id` null nei soli contratti che lo consentono; non implementa queue/lease.
+- In standalone Aiopago crea un run locale effimero o lascia `run_id` null nei soli contratti che lo consentono; non implementa queue/lease.
 
 ### 5.4 `RunEvent`
 
@@ -384,11 +384,11 @@ failure       # code, category, retryable, diagnostics/evidence refs
 cancellation  # requested, acknowledged, completed, actor/reason
 ```
 
-Eiopago può produrre eventi session/usage/checkpoint; Durex possiede heartbeat/lease e durable run lifecycle. Un `completed` non equivale a checkpoint `VERIFIED` o decisione `ACCEPTED`.
+Aiopago può produrre eventi session/usage/checkpoint; Durex possiede heartbeat/lease e durable run lifecycle. Un `completed` non equivale a checkpoint `VERIFIED` o decisione `ACCEPTED`.
 
 ### 5.5 `CandidateCheckpoint`
 
-Output pubblico principale di Eiopago. Include:
+Output pubblico principale di Aiopago. Include:
 
 ```text
 checkpoint identity e digest
@@ -493,14 +493,14 @@ Invarianti:
 | Contratto | Producer principale | Consumer | Owner semantico |
 |---|---|---|---|
 | EventEnvelope | Tutti | Tutti | Contratti comuni futuri; copia locale congelata M0.1 |
-| CheckpointSpec | FARO/utente standalone | Durex/Guardian | FARO Governance futuro; subset standalone Eiopago |
+| CheckpointSpec | FARO/utente standalone | Durex/Guardian | FARO Governance futuro; subset standalone Aiopago |
 | RunContext | Durex/runner | Guardian | Durex |
 | RunEvent | Durex/Guardian | FARO/Alfred | Producer per payload, envelope comune |
-| CandidateCheckpoint | Guardian | FARO/Durex/utente | Eiopago |
+| CandidateCheckpoint | Guardian | FARO/Durex/utente | Aiopago |
 | CheckpointDecision | FARO/umano | Guardian/Durex/GitHub adapter | FARO Governance |
 | EvidenceReference | Producer/Raiatea | Guardian/FARO | Raiatea per provenance generale; producer per artefatto |
 
-Nessun contratto autorizza Eiopago a implementare queue durevole, worker lease, backlog globale, GitHub writes, metodologia, acceptance globale o repository generale delle evidenze.
+Nessun contratto autorizza Aiopago a implementare queue durevole, worker lease, backlog globale, GitHub writes, metodologia, acceptance globale o repository generale delle evidenze.
 
 ## 8. Conformance rinviata a M1
 

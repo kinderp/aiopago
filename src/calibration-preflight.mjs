@@ -9,11 +9,12 @@ import {
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { canonicalJson, sha256, utcNow } from "./canonical.mjs";
 import { emptyCalibrationQualityEvidence, QUALITY_EVIDENCE_FILE } from "./calibration-quality.mjs";
-import { contextHandoffThreshold, CONTEXT_HANDOFF_THRESHOLD_ENV } from "./context-advisor.mjs";
+import { contextHandoffThreshold, contextHandoffThresholdEnvironment, CONTEXT_HANDOFF_THRESHOLD_ENV } from "./context-advisor.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
-export const CALIBRATION_ATTESTATION_SCHEMA = "eiopago.calibration-preflight/1.0.0";
-export const CALIBRATION_RUN_RECORD_SCHEMA = "eiopago.calibration-run-record/1.0.0";
+export const CALIBRATION_ATTESTATION_SCHEMA = "aiopago.calibration-preflight/1.0.0";
+export const LEGACY_CALIBRATION_ATTESTATION_SCHEMA = "eiopago.calibration-preflight/1.0.0";
+export const CALIBRATION_RUN_RECORD_SCHEMA = "aiopago.calibration-run-record/1.0.0";
 export const DEFAULT_CALIBRATION_PROTOCOL = "docs/m1-h2-calibration-pilot.json";
 
 function digestHex(bytes) { return sha256(bytes).slice("sha256:".length); }
@@ -250,7 +251,7 @@ export function loadCalibrationAttestation(attestationPath) {
   let attestation;
   try { attestation = JSON.parse(bytes.toString("utf8")); }
   catch { throw new GuardianError("CALIBRATION_ATTESTATION_INVALID"); }
-  invariant(attestation.schema_version === CALIBRATION_ATTESTATION_SCHEMA, "CALIBRATION_ATTESTATION_SCHEMA_MISMATCH");
+  invariant([CALIBRATION_ATTESTATION_SCHEMA, LEGACY_CALIBRATION_ATTESTATION_SCHEMA].includes(attestation.schema_version), "CALIBRATION_ATTESTATION_SCHEMA_MISMATCH");
   return { attestation, bytes, digest: digestHex(bytes), path: resolve(attestationPath) };
 }
 
@@ -325,7 +326,10 @@ export function verifyCalibrationRuntimeState({ runner, attestationPath, process
     }
   }
   if (runner.contextAdvisor?.thresholdPercent !== attestation.effective_threshold) mismatch("EFFECTIVE_THRESHOLD_MISMATCH", attestation.effective_threshold, runner.contextAdvisor?.thresholdPercent);
-  if (String(processEnv[CONTEXT_HANDOFF_THRESHOLD_ENV] ?? "") !== String(attestation.requested_threshold)) mismatch("PROCESS_THRESHOLD_MISMATCH", String(attestation.requested_threshold), processEnv[CONTEXT_HANDOFF_THRESHOLD_ENV] ?? null);
+  let processThreshold = null;
+  try { processThreshold = contextHandoffThresholdEnvironment(processEnv, { warn: () => {} }); }
+  catch (error) { failures.push(reason(error.code ?? "PROCESS_THRESHOLD_ENV_CONFLICT")); }
+  if (String(processThreshold ?? "") !== String(attestation.requested_threshold)) mismatch("PROCESS_THRESHOLD_MISMATCH", String(attestation.requested_threshold), processThreshold ?? null);
   const sessionModel = requestModel ?? runner.runtime?.session?.model;
   if (sessionModel?.provider !== attestation.provider || sessionModel?.id !== attestation.model) mismatch("MODEL_MISMATCH", `${attestation.provider}/${attestation.model}`, sessionModel ? `${sessionModel.provider}/${sessionModel.id}` : null);
   const thinking = runner.runtime?.session?.thinkingLevel;

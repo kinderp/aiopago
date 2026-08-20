@@ -69,7 +69,7 @@ function writeLedger(root, advanced = false) {
 }
 
 function createExternalFixture() {
-  const root = mkdtempSync(join(tmpdir(), "eiopago-p0-b-external-"));
+  const root = mkdtempSync(join(tmpdir(), "aiopago-p0-b-external-"));
   mkdirSync(join(root, "docs"));
   mkdirSync(join(root, "test"));
   writeFileSync(join(root, "app.mjs"), "export const greeting = 'portable';\n");
@@ -102,7 +102,7 @@ function streamMessage(pi, message) {
 }
 
 function hasResumeContext(context) {
-  return JSON.stringify(context.messages).includes("EIOPAGO_RESUME_V1");
+  return JSON.stringify(context.messages).includes("AIOPAGO_RESUME_V1");
 }
 
 async function offlineRuntime(pi) {
@@ -126,7 +126,7 @@ async function offlineRuntime(pi) {
         ? [{ id: "TOOL-ITEM-2", name: "write", arguments: { path: "acceptance.txt", content: "ITEM-2 accepted after continuity\n" } }]
         : [
             { id: "TOOL-BASH-GIT-STATUS", name: "bash", arguments: { command: "git status --short" } },
-            { id: "TOOL-BASH-LOCAL", name: "bash", arguments: { command: "node -e \"console.log('EIO_BASH_OK')\"" } },
+            { id: "TOOL-BASH-LOCAL", name: "bash", arguments: { command: "node -e \"console.log('AIO_BASH_OK')\"" } },
             { id: "TOOL-ITEM-1", name: "write", arguments: { path: "app.mjs", content: "export const greeting = 'PORTABLE';\n" } },
           ];
       if (phaseCalls < phaseTools.length) {
@@ -143,7 +143,7 @@ async function offlineRuntime(pi) {
 
 const HISTORY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
 
-test("P0-B external repo: eio launch owns Pi and completes portable A-to-B handoff with zero history", async (t) => {
+test("P0-B external repo: aio launch owns Pi and completes portable A-to-B handoff with zero history", async (t) => {
   const root = createExternalFixture();
   const initResult = await runCli(["init", "--target", root], { stdout: () => {} });
   assert.equal(normalized(initResult.result.targetRoot), normalized(root));
@@ -155,7 +155,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
   const pi = await loadPi();
   const offline = await offlineRuntime(pi);
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-  const sessions = mkdtempSync(join(tmpdir(), "eiopago-p0-b-sessions-"));
+  const sessions = mkdtempSync(join(tmpdir(), "aiopago-p0-b-sessions-"));
   const priorFetch = globalThis.fetch;
   let networkAttempts = 0;
   globalThis.fetch = async () => { networkAttempts += 1; throw new Error("network forbidden"); };
@@ -188,7 +188,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           const bashResults = sourceToolResults.filter((entry) => entry.message.toolName === "bash");
           assert.equal(bashResults.length, 2, "the Runner-owned Pi session must execute both real built-in bash calls");
           assert.equal(bashResults.every((entry) => entry.message.isError === false), true);
-          assert.match(JSON.stringify(bashResults), /EIO_BASH_OK/);
+          assert.match(JSON.stringify(bashResults), /AIO_BASH_OK/);
           const shellOperations = runner.storage.operationsForTask("TASK-PORTABLE-FIXTURE")
             .filter((operation) => operation.profile === "SHELL_ATOMIC_OPERATION");
           assert.equal(shellOperations.length, 2);
@@ -213,7 +213,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           let confirmations = 0;
           const uiContext = {
             async confirm(title) {
-              assert.equal(title, "Eiopago resume");
+              assert.equal(title, "Aiopago resume");
               confirmations += 1;
               const session = runner.runtime.session;
               const handoff = runner.storage.findHandoffByTarget(session.sessionId);
@@ -249,8 +249,8 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           };
           await source.bindExtensions({ mode: "print", uiContext, commandContextActions });
           await Promise.all([
-            source.prompt("/eio handoff confirm"),
-            source.prompt("/eio handoff confirm"),
+            source.prompt("/aio handoff confirm"),
+            source.prompt("/aio handoff confirm"),
           ]);
           const result = runner.storage.latestHandoffForTask("TASK-PORTABLE-FIXTURE");
           assert.equal(confirmations, 1);
@@ -258,7 +258,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.equal(pausedEvidence.state, "RESUME_READY");
           assert.equal(pausedEvidence.history_count, 0);
           assert.equal(pausedEvidence.serialized_entries.includes("SOURCE_PRIVATE_MARKER"), false);
-          assert.equal(pausedEvidence.serialized_entries.includes("EIOPAGO_RESUME_V1"), false);
+          assert.equal(pausedEvidence.serialized_entries.includes("AIOPAGO_RESUME_V1"), false);
           assert.equal(pausedEvidence.binding_count, 1);
           assert.equal(pausedEvidence.model, "portable-offline/portable-offline");
           assert.equal(pausedEvidence.reasoning, "off");
@@ -269,7 +269,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
           assert.equal(readFileSync(join(root, "acceptance.txt"), "utf8"), "ITEM-2 accepted after continuity\n");
           const targetEntries = JSON.stringify(target.sessionManager.getEntries());
           assert.equal(targetEntries.includes("SOURCE_PRIVATE_MARKER"), false);
-          assert.equal(targetEntries.includes("EIOPAGO_RESUME_V1"), true);
+          assert.equal(targetEntries.includes("AIOPAGO_RESUME_V1"), true);
           assert.equal(targetEntries.includes("current_item=ITEM-2"), true);
           assert.equal(targetEntries.includes("do not repeat ITEM-1"), true);
           assert.equal(targetEntries.includes("AGENTS.md section 18"), true);
@@ -333,7 +333,7 @@ test("P0-B external repo: eio launch owns Pi and completes portable A-to-B hando
 
   assert.ok(evidence);
   assert.equal(offline.toolCalls.filter((call) => call.name === "bash" && call.arguments.command === "git status --short").length, 1);
-  assert.equal(offline.toolCalls.filter((call) => call.name === "bash" && call.arguments.command === "node -e \"console.log('EIO_BASH_OK')\"").length, 1);
+  assert.equal(offline.toolCalls.filter((call) => call.name === "bash" && call.arguments.command === "node -e \"console.log('AIO_BASH_OK')\"").length, 1);
   assert.equal(offline.toolCalls.filter((call) => call.name === "write" && call.arguments.path === "app.mjs").length, 1);
   assert.equal(offline.toolCalls.filter((call) => call.name === "write" && call.arguments.path === "acceptance.txt").length, 1);
   assert.equal(offline.calls.filter((call) => call.resume).every((call) => !call.serialized.includes("SOURCE_PRIVATE_MARKER")), true);

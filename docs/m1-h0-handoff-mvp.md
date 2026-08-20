@@ -9,7 +9,7 @@ Il vertical slice standalone implementa esclusivamente:
 - checkpoint JSON e Resume Context Manifest sealed con scrittura temp+fsync+rename, digest dei byte e indice SQLite;
 - Guardian Runner con provider transport admission fail-closed e allowlist di tool profilati;
 - safe point SP-03 **FINISH CURRENT ATOMIC OPERATION**;
-- `/eio handoff manual`, `/eio handoff confirm`, `/eio takeover`, `/eio resume` e `/eio status` (alias `/eiopago`);
+- `/aio handoff manual`, `/aio handoff confirm`, `/aio takeover`, `/aio resume` e `/aio status` (alias `/aiopago`);
 - replacement Pi con parent, inizialmente paused e senza history;
 - Continuity Check e resume prompt deterministico senza call dedicata;
 - authorization/admission idempotente e dispatch intent persistito prima dell'invio;
@@ -24,17 +24,17 @@ Requisiti: Node.js 22.19+ e Pi installato. Il Runner usa il provider/model del L
 ```text
 npm test
 npm run test:e2e
-npm run eio
+npm run aio
 ```
 
 In Pi gestito dal Runner:
 
 ```text
-/eio handoff manual
-/eio handoff confirm
-/eio takeover
-/eio resume [handoff-id]
-/eio status
+/aio handoff manual
+/aio handoff confirm
+/aio takeover
+/aio resume [handoff-id]
+/aio status
 ```
 
 `manual` crea e valida il target, precompila il prompt ma mantiene latch e target in pausa. `confirm` chiede l'autorizzazione nella replacement session dopo continuity; solo allora rilascia il latch, committa admission e invia il prompt. `takeover` persiste o scala il latch a `HUMAN_TAKEOVER`, chiude queue/retry/compaction e raggiunge lo stesso safe point tool-aware senza avviare un handoff.
@@ -51,10 +51,10 @@ In Pi gestito dal Runner:
 - Il lifecycle canonico del Ledger espone `current_item` e `next_item`; ogni update resta una nuova revisione della fonte Markdown, mai una reverse sync silenziosa dal DB.
 - `resume_prompt_id` ha una authorization e una admission; l'idempotency key è unica.
 - Qualsiasi errore dopo il dispatch intent viene classificato `RESUME_DISPATCH_UNKNOWN`; il Runner non ritenta automaticamente.
-- La creazione Pi e il journal SQLite non sono una singola transazione ACID: outcome ambiguo/cancellato della create resta `HANDOFF_FAILED` senza secondo target automatico. Checkpoint e istruzioni numerate di riconciliazione manuale restano visibili in `/eio status`; il manifest finale non viene falsamente sigillato finché manca il vero target ID.
+- La creazione Pi e il journal SQLite non sono una singola transazione ACID: outcome ambiguo/cancellato della create resta `HANDOFF_FAILED` senza secondo target automatico. Checkpoint e istruzioni numerate di riconciliazione manuale restano visibili in `/aio status`; il manifest finale non viene falsamente sigillato finché manca il vero target ID.
 
 Non viene dichiarata exactly-once provider execution.
 
 ## Verifica M1-H0
 
-`npm run check` valida i 16 moduli. `npm test` esegue 6 test core offline e 4 E2E con Pi/SessionManager reali e provider fake. I core riproducono anche stale confirm dopo takeover e modifiche Git a porcelain invariato. L'happy path E2E aggiorna realmente la fixture canonica da `PLAN-E2E-1` a `PLAN-E2E-2` durante il flusso, avanza `current_item`/`next_item` e verifica revisione/digest nel manifest e nel resume prompt. Restano coperti `/eio takeover`, `/eio handoff manual` paused/no-history e il failure ambiguo con checkpoint/istruzioni preservati. I test bloccano `fetch` e osservano zero tentativi rete.
+`npm run check` valida i 16 moduli. `npm test` esegue 6 test core offline e 4 E2E con Pi/SessionManager reali e provider fake. I core riproducono anche stale confirm dopo takeover e modifiche Git a porcelain invariato. L'happy path E2E aggiorna realmente la fixture canonica da `PLAN-E2E-1` a `PLAN-E2E-2` durante il flusso, avanza `current_item`/`next_item` e verifica revisione/digest nel manifest e nel resume prompt. Restano coperti `/aio takeover`, `/aio handoff manual` paused/no-history e il failure ambiguo con checkpoint/istruzioni preservati. I test bloccano `fetch` e osservano zero tentativi rete.

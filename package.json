@@ -1,10 +1,25 @@
 {
-  "name": "eiopago",
+  "name": "aiopago",
   "version": "0.1.0",
-  "description": "Local continuity runner for Pi coding sessions",
+  "description": "Aiopago local continuity runner for Pi coding sessions",
   "type": "module",
   "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kinderp/aiopago.git"
+  },
+  "homepage": "https://github.com/kinderp/aiopago#readme",
+  "bugs": {
+    "url": "https://github.com/kinderp/aiopago/issues"
+  },
+  "keywords": [
+    "aiopago",
+    "pi",
+    "continuity",
+    "handoff"
+  ],
   "bin": {
+    "aio": "bin/aio.mjs",
     "eio": "bin/eio.mjs"
   },
   "main": "./src/index.mjs",
@@ -14,7 +29,9 @@
   "files": [
     "bin/",
     "src/",
-    "docs/portable-alpha.md"
+    "README.md",
+    "docs/portable-alpha.md",
+    "docs/rename-aiopago-migration.md"
   ],
   "engines": {
     "node": ">=22.19.0"
@@ -26,6 +43,7 @@
     "check": "node scripts/check.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs",
+    "aio": "node bin/aio.mjs",
     "eio": "node bin/eio.mjs",
     "calibration": "node scripts/calibration-run.mjs",
     "calibration:quality": "node scripts/calibration-quality-record.mjs",

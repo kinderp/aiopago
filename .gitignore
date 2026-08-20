@@ -1,4 +1,4 @@
-# Eiopago runtime state and sealed local handoff artifacts
+# Aiopago runtime state and sealed local handoff artifacts
 .guardian/runtime/
 .guardian/checkpoints/
 .guardian/manifests/

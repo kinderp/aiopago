@@ -4,7 +4,8 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { invariant } from "./errors.mjs";
 
-export const REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
+export const REPOSITORY_CONFIG_SCHEMA = "aiopago.repository/1.0.0";
+export const LEGACY_REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
 export const REPOSITORY_CONFIG_FILE = ".guardian/config.json";
 export const INSTALLATION_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -48,7 +49,7 @@ function runGit(cwd, args, execFile = execFileSync) {
     if (ownershipTarget) {
       const target = gitCompatiblePath(ownershipTarget);
       const command = `git config --global --add safe.directory ${commandArgument(target)}`;
-      invariant(false, "GIT_SAFE_DIRECTORY_REQUIRED", `Git requires explicit trust for this worktree:\n${target}\n\nIf you trust this repository, run manually:\n\n${command}\n\nEiopago does not modify Git global configuration automatically.`);
+      invariant(false, "GIT_SAFE_DIRECTORY_REQUIRED", `Git requires explicit trust for this worktree:\n${target}\n\nIf you trust this repository, run manually:\n\n${command}\n\nAiopago does not modify Git global configuration automatically.`);
     }
     invariant(false, "TARGET_NOT_GIT_WORKTREE", `Target is not a supported Git worktree: ${cwd}`);
   }
@@ -74,9 +75,9 @@ function inspectReservedPath(path, expectedType) {
     if (error?.code === "ENOENT") return;
     throw error;
   }
-  invariant(!stat.isSymbolicLink(), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Eiopago state path: ${path}`);
+  invariant(!stat.isSymbolicLink(), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Aiopago state path: ${path}`);
   invariant(expectedType === "directory" ? stat.isDirectory() : stat.isFile(), "REPOSITORY_STATE_PATH_TYPE_INVALID", `${path} must be a ${expectedType}`);
-  invariant(samePath(realpathSync(path), path), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Eiopago state path: ${path}`);
+  invariant(samePath(realpathSync(path), path), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Aiopago state path: ${path}`);
 }
 
 export function validateRepositoryStateBoundaries(targetRoot) {
@@ -117,8 +118,8 @@ function resolveInside(targetRoot, configuredPath, field) {
 }
 
 export function validateRepositoryConfig(config, targetRoot) {
-  invariant(config && typeof config === "object" && !Array.isArray(config), "REPOSITORY_CONFIG_INVALID", "Eiopago repository config must be a JSON object");
-  invariant(config.schema_version === REPOSITORY_CONFIG_SCHEMA, "REPOSITORY_CONFIG_SCHEMA_UNSUPPORTED", `Expected ${REPOSITORY_CONFIG_SCHEMA}`);
+  invariant(config && typeof config === "object" && !Array.isArray(config), "REPOSITORY_CONFIG_INVALID", "Aiopago repository config must be a JSON object");
+  invariant([REPOSITORY_CONFIG_SCHEMA, LEGACY_REPOSITORY_CONFIG_SCHEMA].includes(config.schema_version), "REPOSITORY_CONFIG_SCHEMA_UNSUPPORTED", `Expected ${REPOSITORY_CONFIG_SCHEMA} or legacy ${LEGACY_REPOSITORY_CONFIG_SCHEMA}`);
   const expectedFields = Object.keys(DEFAULT_REPOSITORY_CONFIG).sort();
   invariant(JSON.stringify(Object.keys(config).sort()) === JSON.stringify(expectedFields), "REPOSITORY_CONFIG_FIELDS_INVALID", `Supported fields: ${expectedFields.join(", ")}`);
   const taskLedgerPath = resolveInside(targetRoot, config.task_ledger, "task_ledger");
@@ -143,7 +144,7 @@ export function validateRepositoryConfig(config, targetRoot) {
 export function readRepositoryConfig(targetRoot) {
   validateRepositoryStateBoundaries(targetRoot);
   const path = join(targetRoot, REPOSITORY_CONFIG_FILE);
-  invariant(existsSync(path), "REPOSITORY_NOT_INITIALIZED", `Eiopago is not initialized in ${targetRoot}; run 'eio init' first`);
+  invariant(existsSync(path), "REPOSITORY_NOT_INITIALIZED", `Aiopago is not initialized in ${targetRoot}; run 'aio init' first`);
   let config;
   try { config = JSON.parse(readFileSync(path, "utf8")); }
   catch (error) { invariant(false, "REPOSITORY_CONFIG_JSON_INVALID", `${path}: ${error.message}`); }

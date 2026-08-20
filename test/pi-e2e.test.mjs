@@ -60,7 +60,7 @@ function fixtureLedger(root, modelPolicy = "offline-fake/offline-fake", required
 }
 
 function writeOwnerGateLedger(root) {
-  const blockedStep = "Owner gate: execute /eio handoff confirm";
+  const blockedStep = "Owner gate: execute /aio handoff confirm";
   const resumedStep = "Validate replacement continuity and finish H1-02 metrics";
   const task = {
     schema_version: "0.1.0", task_id: "TASK-E2E", title: "E2E owner gate", objective: "Advance a blocked handoff gate before sealing",
@@ -69,7 +69,7 @@ function writeOwnerGateLedger(root) {
     current_item: null, next_item: "ITEM-H1-02", next_step: blockedStep,
     model_policy: "offline-fake/offline-fake", reasoning_policy: "off", minimal_reads: ["TASK_PLAN.md", "docs/adr.md", "docs/safe.md", "docs/resume.md"],
     owner_gate: {
-      kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/eio handoff confirm", item_id: "ITEM-H1-02",
+      kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-H1-02",
       satisfied_plan_revision_id: "PLAN-E2E-GATE-2", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: "ITEM-H1-03", satisfied_next_step: resumedStep,
     },
     task_items: [
@@ -82,11 +82,11 @@ function writeOwnerGateLedger(root) {
 }
 
 async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null } = {}) {
-  const root = existingRoot ?? mkdtempSync(join(tmpdir(), "eiopago-pi-e2e-"));
+  const root = existingRoot ?? mkdtempSync(join(tmpdir(), "aiopago-pi-e2e-"));
   if (!existingRoot) {
     fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake", requiredLocalPaths);
     if (ownerGate) writeOwnerGateLedger(root);
-    git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Eiopago E2E"]);
+    git(root, ["init"]); git(root, ["config", "user.email", "e2e@example.invalid"]); git(root, ["config", "user.name", "Aiopago E2E"]);
     git(root, ["add", "."]); git(root, ["commit", "-m", "fixture"]);
   }
   const pi = await loadPi();
@@ -110,7 +110,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   });
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-  const sessions = mkdtempSync(join(tmpdir(), "eiopago-pi-sessions-"));
+  const sessions = mkdtempSync(join(tmpdir(), "aiopago-pi-sessions-"));
   const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy: "off", contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
   await runner.runtime.session.bindExtensions({
     mode: "print",
@@ -188,7 +188,7 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     const entries = target.sessionManager.getEntries();
     const serialized = JSON.stringify(entries);
     assert.equal(serialized.includes("SOURCE_ONLY_MARKER"), false);
-    assert.equal(serialized.includes("EIOPAGO_RESUME_V1"), true);
+    assert.equal(serialized.includes("AIOPAGO_RESUME_V1"), true);
     assert.equal(serialized.includes("task_plan_revision=PLAN-E2E-2"), true);
     assert.equal(serialized.includes("current_item=ITEM-E2E-HANDOFF"), true);
     assert.equal(serialized.includes("next_item=null"), true);
@@ -270,7 +270,7 @@ test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest 
     assert.equal(blocked.status, "BLOCKED");
     assert.equal(blocked.current_item, null);
     assert.equal(blocked.next_item, "ITEM-H1-02");
-    assert.match(blocked.next_step, /\/eio handoff confirm/);
+    assert.match(blocked.next_step, /\/aio handoff confirm/);
     const result = await x.runner.handoffDirect({ mode: "confirm", confirm: true });
     assert.equal(result.state, "RESUMED");
     const advanced = x.runner.ledger.read();
@@ -281,7 +281,7 @@ test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest 
     assert.equal(advanced.next_item, "ITEM-H1-03");
     assert.equal(advanced.task_items.find((item) => item.task_item_id === "ITEM-H1-02").status, "IN_PROGRESS");
     assert.equal(advanced.next_step, "Validate replacement continuity and finish H1-02 metrics");
-    assert.doesNotMatch(advanced.next_step, /\/eio handoff confirm/);
+    assert.doesNotMatch(advanced.next_step, /\/aio handoff confirm/);
     const checkpoint = x.runner.artifacts.verify("checkpoint", result.checkpoint_id, result.checkpoint_digest);
     const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
     assert.equal(checkpoint.payload.plan_revision_id, "PLAN-E2E-GATE-2");
@@ -289,7 +289,7 @@ test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest 
     assert.equal(manifest.payload.current_item, "ITEM-H1-02");
     assert.equal(manifest.payload.next_item, "ITEM-H1-03");
     assert.equal(manifest.payload.next_step, advanced.next_step);
-    assert.doesNotMatch(result.resume_prompt, /next_step=.*\/eio handoff confirm/);
+    assert.doesNotMatch(result.resume_prompt, /next_step=.*\/aio handoff confirm/);
     assert.equal(manifest.payload.runner_instance_id, x.runner.runnerInstanceId);
     assert.equal(manifest.payload.session_binding_id, result.session_binding_id);
     const binding = x.runner.storage.getRunnerSessionBinding(result.handoff_id);
@@ -330,10 +330,10 @@ test("Pi E2E direct session replacement and history fork outside the Guardian pe
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
-test("Pi E2E /eio takeover persists the latch and blocks the next prompt", async () => {
+test("Pi E2E /aio takeover persists the latch and blocks the next prompt", async () => {
   const x = await makeRunner();
   try {
-    await x.runner.runtime.session.prompt("/eio takeover");
+    await x.runner.runtime.session.prompt("/aio takeover");
     const latch = x.runner.storage.getLatch("TASK-E2E");
     assert.equal(latch.state, "ENGAGED");
     assert.equal(latch.reason, "HUMAN_TAKEOVER");
@@ -367,11 +367,11 @@ test("replacement creation ambiguity preserves checkpoint and exact fail-closed 
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
-test("Pi E2E /eio handoff manual leaves replacement paused with zero entries", async () => {
+test("Pi E2E /aio handoff manual leaves replacement paused with zero entries", async () => {
   const x = await makeRunner();
   try {
     await x.runner.runtime.session.prompt("source");
-    await x.runner.runtime.session.prompt("/eio handoff manual");
+    await x.runner.runtime.session.prompt("/aio handoff manual");
     let result;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       result = x.runner.storage.latestHandoffForTask("TASK-E2E");
@@ -573,7 +573,7 @@ async function continuityFailureScenario(code, mutate) {
 
 test("P0-B continuity failure matrix remains fail-closed", async (t) => {
   await t.test("target Git mismatch", () => continuityFailureScenario("GIT_STATE_MISMATCH", async ({ x }) => {
-    const other = mkdtempSync(join(tmpdir(), "eiopago-other-target-"));
+    const other = mkdtempSync(join(tmpdir(), "aiopago-other-target-"));
     git(other, ["init"]); git(other, ["config", "user.email", "other@example.invalid"]); git(other, ["config", "user.name", "Other Target"]);
     writeFileSync(join(other, "other.txt"), "other\n"); git(other, ["add", "."]); git(other, ["commit", "-m", "other"]);
     x.runner.handoffService.observeGit = () => observeGitState(other);

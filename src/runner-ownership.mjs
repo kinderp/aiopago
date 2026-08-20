@@ -1,6 +1,8 @@
 import { invariant } from "./errors.mjs";
 
-export const RUNNER_BINDING_CUSTOM_TYPE = "eiopago.runner-session-binding.v1";
+export const RUNNER_BINDING_CUSTOM_TYPE = "aiopago.runner-session-binding.v1";
+export const LEGACY_RUNNER_BINDING_CUSTOM_TYPE = "eiopago.runner-session-binding.v1";
+const RUNNER_BINDING_CUSTOM_TYPES = new Set([RUNNER_BINDING_CUSTOM_TYPE, LEGACY_RUNNER_BINDING_CUSTOM_TYPE]);
 const BINDING_FIELDS = ["handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id"];
 
 function assertBindingShape(binding) {
@@ -27,7 +29,7 @@ export function installRunnerSessionBinding(sessionManager, expected) {
 export function readRuntimeRunnerBinding(session) {
   invariant(session?.sessionManager && typeof session.sessionId === "string", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "runtime session missing");
   const entries = session.sessionManager.getEntries();
-  const matches = entries.filter((entry) => entry.type === "custom" && entry.customType === RUNNER_BINDING_CUSTOM_TYPE);
+  const matches = entries.filter((entry) => entry.type === "custom" && RUNNER_BINDING_CUSTOM_TYPES.has(entry.customType));
   invariant(matches.length === 1, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Runner binding entry missing or duplicated");
   const entry = matches[0];
   const bindingIndex = entries.indexOf(entry);

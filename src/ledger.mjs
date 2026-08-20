@@ -10,6 +10,10 @@ const TASK_STATUS_MESSAGE = `status must be one of ${TASK_STATUS_VALUES.join(", 
 const MAX_RESUME_LIST_ENTRIES = 64;
 const MAX_RESUME_ENTRY_LENGTH = 2048;
 
+function canonicalCommandName(command) {
+  return typeof command === "string" ? command.replace(/^\/(?:eio|eiopago)(?=\s|$)/, "/aio") : command;
+}
+
 function validateBoundedStringList(value, field, code = "LEDGER_RESUME_CONTEXT_INVALID") {
   invariant(Array.isArray(value) && value.length <= MAX_RESUME_LIST_ENTRIES, code, `${field} must be an array with at most ${MAX_RESUME_LIST_ENTRIES} entries`);
   for (const entry of value) invariant(typeof entry === "string" && entry.length > 0 && entry.length <= MAX_RESUME_ENTRY_LENGTH, code, `${field} entries must be non-empty bounded strings`);
@@ -67,7 +71,7 @@ export class TaskLedger {
     const gate = task.owner_gate;
     if (!gate || gate.status === "SATISFIED") return this.read();
     invariant(gate.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "OWNER_GATE_INVALID");
-    invariant(command === gate.command && actor?.startsWith("human:"), "OWNER_GATE_AUTHORIZATION_REQUIRED");
+    invariant(canonicalCommandName(command) === canonicalCommandName(gate.command) && actor?.startsWith("human:"), "OWNER_GATE_AUTHORIZATION_REQUIRED");
     invariant(task.current_item === null && task.next_item === gate.item_id, "OWNER_GATE_LIFECYCLE_MISMATCH");
     const item = task.task_items.find((candidate) => candidate.task_item_id === gate.item_id);
     invariant(item?.status === "BLOCKED", "OWNER_GATE_ITEM_NOT_BLOCKED");

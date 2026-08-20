@@ -1,6 +1,6 @@
 # Regole operative canoniche
 
-Questo file è la fonte canonica delle regole operative del progetto **eiopago**. Il mandato corrente e `CHECKPOINT.md` integrano queste regole con requisiti e stato di avanzamento.
+Questo file è la fonte canonica delle regole operative del progetto **aiopago**. Il mandato corrente e `CHECKPOINT.md` integrano queste regole con requisiti e stato di avanzamento.
 
 ## Chiusura e passaggio di sessione
 

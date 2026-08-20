@@ -6,7 +6,7 @@ import test from "node:test";
 import { MeasurementInstrumentation, METRICS_SCHEMA_VERSION, assertTelemetrySafe, measureHandoffArtifacts } from "../src/metrics.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
 
-function temp() { return mkdtempSync(join(tmpdir(), "eiopago-metrics-")); }
+function temp() { return mkdtempSync(join(tmpdir(), "aiopago-metrics-")); }
 function plan(item = "ITEM-H2-01") {
   return { task_id: "TASK-H2", current_item: item };
 }
