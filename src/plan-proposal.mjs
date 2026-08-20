@@ -3,7 +3,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { canonicalJson, sha256, stableId, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { validateTaskLedger } from "./ledger.mjs";
-import { LEGACY_TASK_LEDGER_SCHEMA, PlanRevisionWriter, TASK_LEDGER_SCHEMA, parseTaskPlanBytes, sameFilesystemIdentity } from "./plan-store.mjs";
+import { LEGACY_TASK_LEDGER_SCHEMA, MAX_PLAN_STATE_BYTES, PlanRevisionWriter, TASK_LEDGER_SCHEMA, parseTaskPlanBytes, sameFilesystemIdentity } from "./plan-store.mjs";
 
 export const PLAN_PROPOSAL_SCHEMA = "aiopago.plan-proposal/0.1.0";
 export const PLAN_DIFF_SCHEMA = "aiopago.plan-diff/0.1.0";
@@ -12,6 +12,10 @@ export const PLAN_APPLY_RESULT_SCHEMA = "aiopago.plan-apply-result/0.2.0";
 const PROPOSAL_REGISTRATION_SCHEMA = "aiopago.plan-proposal-registration/0.2.0";
 const COMMIT_INTENT_SCHEMA = "aiopago.plan-commit-intent/0.2.0";
 const COMMIT_WITNESS_SCHEMA = "aiopago.plan-commit-witness/0.2.0";
+const MAX_PROPOSAL_REGISTRATION_BYTES = 64 * 1024 * 1024;
+const MAX_PLAN_DIFF_BYTES = 96 * 1024 * 1024;
+const MAX_COMMIT_RECORD_BYTES = MAX_PLAN_STATE_BYTES;
+const MAX_PLAN_ATTEMPTS = 128;
 
 const PROPOSAL_FIELDS = [
   "base_content_digest",
@@ -161,7 +165,9 @@ export class PlanProposal {
     invariant(candidate.plan_revision_id === payload.proposed_plan_revision_id, "PLAN_REVISION_MISMATCH", "candidate_plan plan_revision_id must match proposed_plan_revision_id");
     invariant(candidate.requirements_version === payload.requirements_version, "PLAN_REQUIREMENTS_MISMATCH", "candidate_plan requirements_version must match proposal requirements_version");
     invariant(candidate.updated_at === payload.created_at, "PLAN_UPDATED_AT_MISMATCH", "candidate_plan updated_at must equal proposal created_at for deterministic materialization");
-    const proposalDigest = sha256(Buffer.from(canonicalJson(payload), "utf8"));
+    const canonicalPayloadBytes = Buffer.from(canonicalJson(payload), "utf8");
+    invariant(canonicalPayloadBytes.length <= MAX_PROPOSAL_REGISTRATION_BYTES, "PLAN_PROPOSAL_TOO_LARGE", `Canonical proposal exceeds ${MAX_PROPOSAL_REGISTRATION_BYTES} bytes`);
+    const proposalDigest = sha256(canonicalPayloadBytes);
     Object.assign(this, payload, { proposal_digest: proposalDigest });
     deepFreeze(this);
   }
@@ -193,6 +199,9 @@ function materializeObserved(observed, proposal) {
   invariant(observed.contentDigest === proposal.base_content_digest, "PLAN_CAS_CONFLICT", "Observed bytes do not match proposal base digest");
   const candidate = proposal.candidate_plan;
   validateTaskLedger(candidate);
+  const baseHasOwnerGate = Object.hasOwn(observed.task, "owner_gate");
+  const candidateHasOwnerGate = Object.hasOwn(candidate, "owner_gate");
+  invariant(baseHasOwnerGate === candidateHasOwnerGate && (!baseHasOwnerGate || sameValue(observed.task.owner_gate, candidate.owner_gate)), "PLAN_OWNER_GATE_MUTATION_FORBIDDEN", "Generic PlanProposal must preserve owner_gate exactly; only satisfyOwnerGate() may transition it");
   const json = canonicalPrettyJson(candidate).replaceAll("\n", observed.block.lineEnding);
   let text = observed.text.slice(0, observed.block.jsonIndex) + json + observed.text.slice(observed.block.jsonIndex + observed.block.json.length);
   text = replaceOnce(text, `**Current revision:** \`${observed.task.plan_revision_id}\``, `**Current revision:** \`${candidate.plan_revision_id}\``);
@@ -214,9 +223,9 @@ function jsonBytes(value) {
   return Buffer.from(`${canonicalJson(value)}\n`, "utf8");
 }
 
-function readJson(writer, path) {
+function readJson(writer, path, maximum = MAX_COMMIT_RECORD_BYTES) {
   try {
-    const parsed = JSON.parse(writer.readImmutable(path).toString("utf8"));
+    const parsed = JSON.parse(writer.readImmutable(path, maximum).toString("utf8"));
     return strictJsonClone(parsed, { code: "PLAN_PROVENANCE_INVALID", field: path });
   } catch (error) {
     if (error?.code === "PLAN_PROVENANCE_INVALID") throw error;
@@ -271,7 +280,7 @@ function validateIntent(intent, proposal, materialized, previousSnapshotReferenc
   return intent;
 }
 
-function resultFor({ proposal, materialized, provenance, provenanceReference, intent, intentReference, appliedAt, recoveredAt }) {
+function resultFor({ proposal, materialized, provenance, provenanceReference, intent, intentReference, appliedAt }) {
   return deepFreeze({
     schema: PLAN_APPLY_RESULT_SCHEMA,
     proposal_id: proposal.proposal_id,
@@ -283,7 +292,7 @@ function resultFor({ proposal, materialized, provenance, provenanceReference, in
     content_digest: materialized.content_digest,
     prepared_at: intent.prepared_at,
     applied_at: appliedAt,
-    recovered_at: recoveredAt,
+    recovered_at: null,
     diff: materialized.diff,
     provenance,
     provenance_reference: provenanceReference,
@@ -302,11 +311,8 @@ function validateStoredResult(result, proposal, materialized, provenanceReferenc
   invariant(result.task_id === proposal.task_id && result.previous_revision_id === proposal.base_plan_revision_id && result.plan_revision_id === proposal.proposed_plan_revision_id, "PLAN_PROVENANCE_INVALID", "Stored apply result revision identity is invalid");
   invariant(result.previous_content_digest === proposal.base_content_digest && result.content_digest === materialized.content_digest, "PLAN_PROVENANCE_INVALID", "Stored apply result digest identity is invalid");
   invariant(result.prepared_at === intent.prepared_at && result.provenance_reference === provenanceReference && sameValue(result.diff, materialized.diff), "PLAN_PROVENANCE_INVALID", "Stored apply result deterministic fields are invalid");
-  const normal = typeof result.applied_at === "string" && result.recovered_at === null;
-  const recovered = result.applied_at === null && typeof result.recovered_at === "string";
-  invariant(normal || recovered, "PLAN_PROVENANCE_INVALID", "Stored apply/recovery timestamps are not truthful");
-  if (normal) exactUtcTimestamp(result.applied_at, "applied_at", "PLAN_PROVENANCE_INVALID");
-  else exactUtcTimestamp(result.recovered_at, "recovered_at", "PLAN_PROVENANCE_INVALID");
+  invariant(typeof result.applied_at === "string" && result.recovered_at === null, "PLAN_PROVENANCE_INVALID", "Stored result must contain a live post-rename applied_at and no recovered success");
+  exactUtcTimestamp(result.applied_at, "applied_at", "PLAN_PROVENANCE_INVALID");
   exactFields(result.provenance, REVISION_FIELDS, "PLAN_PROVENANCE_INVALID", "Stored PlanRevision");
   invariant(sameValue(result.provenance, revisionFor(proposal, materialized, intent.previous_snapshot_reference)), "PLAN_PROVENANCE_INVALID", "Stored PlanRevision does not match deterministic materialization");
   exactFields(result.commit_witness, WITNESS_FIELDS, "PLAN_PROVENANCE_INVALID", "Stored commit witness");
@@ -323,7 +329,14 @@ export class PlanPort {
   }
 
   proposal(input) {
-    return input instanceof PlanProposal ? input : new PlanProposal(input);
+    invariant(input && typeof input === "object" && !Array.isArray(input), "PLAN_PROPOSAL_FIELDS_INVALID", "PlanProposal input must be an object");
+    const reconstructed = {};
+    for (const field of PROPOSAL_FIELDS) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, field);
+      invariant(descriptor && "value" in descriptor && descriptor.enumerable, "PLAN_PROPOSAL_FIELDS_INVALID", `PlanProposal must contain an own enumerable data field: ${field}`);
+      Object.defineProperty(reconstructed, field, { value: descriptor.value, enumerable: true, writable: true, configurable: true });
+    }
+    return new PlanProposal(reconstructed);
   }
 
   observe() {
@@ -358,6 +371,8 @@ export class PlanPort {
       proposal_digest: proposal.proposal_digest,
       proposal: proposalPayload(proposal),
     });
+    const registrationBytes = jsonBytes(expectedRegistration);
+    invariant(registrationBytes.length <= MAX_PROPOSAL_REGISTRATION_BYTES, "PLAN_PROPOSAL_TOO_LARGE", `Proposal registration exceeds ${MAX_PROPOSAL_REGISTRATION_BYTES} bytes`);
     let activeIntent;
     let activeIntentPath;
     let activeIntentReference;
@@ -368,19 +383,21 @@ export class PlanPort {
       const names = this.writer.stateDirectoryEntries(recordRoot);
       invariant(names.length <= 3 && names.every((entry) => ["proposal.json", "attempts", "applied.json"].includes(entry.name)), "PLAN_PROVENANCE_INVALID", "Proposal record directory contains an unexpected entry");
       invariant(this.writer.stateExists(registrationPath), "PLAN_PROVENANCE_INVALID", "Proposal record directory has no immutable proposal registration");
-      const registration = readJson(this.writer, registrationPath);
+      const registration = readJson(this.writer, registrationPath, MAX_PROPOSAL_REGISTRATION_BYTES);
       validateRegistration(registration, proposal);
       const intents = [];
       if (this.writer.stateExists(attemptsRoot)) {
         const attemptEntries = this.writer.stateDirectoryEntries(attemptsRoot);
-        invariant(attemptEntries.length <= 128, "PLAN_PROVENANCE_INVALID", "Too many plan commit attempts");
+        invariant(attemptEntries.length <= MAX_PLAN_ATTEMPTS, "PLAN_PROVENANCE_INVALID", "Too many plan commit attempts");
         for (const entry of attemptEntries) {
           invariant(entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name), "PLAN_PROVENANCE_INVALID", "Invalid plan commit-intent record");
           const path = join(attemptsRoot, entry.name);
-          intents.push({ path, reference: relative(dirname(this.path), path).replaceAll("\\", "/"), value: readJson(this.writer, path) });
+          const value = readJson(this.writer, path, MAX_COMMIT_RECORD_BYTES);
+          invariant(entry.name === `${value.attempt_token}.json`, "PLAN_PROVENANCE_INVALID", "Commit-intent filename does not match its attempt token");
+          intents.push({ path, reference: relative(dirname(this.path), path).replaceAll("\\", "/"), value });
         }
       }
-      const applied = this.writer.stateExists(appliedPath) ? readJson(this.writer, appliedPath) : null;
+      const applied = this.writer.stateExists(appliedPath) ? readJson(this.writer, appliedPath, MAX_COMMIT_RECORD_BYTES) : null;
       return { registration, intents, applied };
     };
 
@@ -404,35 +421,35 @@ export class PlanPort {
         validateTaskLedger(base.task);
         const materialized = materializeObserved(base, proposal);
         for (const attempt of tree.intents) validateIntent(attempt.value, proposal, materialized, previousSnapshotReference);
+        if (currentIsBase && tree.intents.length >= MAX_PLAN_ATTEMPTS) {
+          throw new GuardianError("PLAN_ATTEMPT_LIMIT_REACHED", `Proposal ${proposal.proposal_id} is explicitly abandoned after ${MAX_PLAN_ATTEMPTS} durable attempts; reconcile state and use a new proposal_id`, {
+            proposal_id: proposal.proposal_id,
+            maximum_attempts: MAX_PLAN_ATTEMPTS,
+            disposition: "ABANDON_PROPOSAL",
+          });
+        }
         if (currentIsBase) return null;
 
         const currentIsCandidate = current.task.plan_revision_id === proposal.proposed_plan_revision_id
           && current.contentDigest === materialized.content_digest
           && sameValue(current.task, proposal.candidate_plan);
         if (!currentIsCandidate) throw new GuardianError("PLAN_PROPOSAL_RECOVERY_CONFLICT", "Current authoritative plan is neither the exact proposal base nor its deterministic candidate");
+        if (!tree.applied) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Current candidate has no durable result written by the live post-rename Aiopago execution; filesystem identity cannot prove who performed the rename");
         const witnesses = tree.intents.filter((attempt) => sameFilesystemIdentity(attempt.value.candidate_temp_filesystem_identity, current.fileIdentity));
-        if (witnesses.length !== 1) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Current candidate bytes do not have one verifiable Aiopago replacement witness");
+        if (witnesses.length !== 1) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Stored apply result does not identify the exact current authority file object");
         const witnessed = witnesses[0];
         const provenance = revisionFor(proposal, materialized, previousSnapshotReference);
-        if (tree.applied) return deepFreeze(validateStoredResult(tree.applied, proposal, materialized, provenanceReference, witnessed.value, witnessed.reference));
-        const recoveredAt = this.now();
-        exactUtcTimestamp(recoveredAt, "recovered_at", "PLAN_RECOVERED_AT_INVALID");
-        const recovered = resultFor({
-          proposal, materialized, provenance, provenanceReference,
-          intent: witnessed.value, intentReference: witnessed.reference,
-          appliedAt: null, recoveredAt,
-        });
-        this.writer.writeImmutable(appliedPath, jsonBytes(recovered));
-        return recovered;
+        return deepFreeze(validateStoredResult(tree.applied, proposal, materialized, provenanceReference, witnessed.value, witnessed.reference));
       },
       prepare: (current, { previousSnapshotReference }) => {
         const materialized = materializeObserved(current, proposal);
+        invariant(jsonBytes(materialized.diff).length <= MAX_PLAN_DIFF_BYTES, "PLAN_DIFF_TOO_LARGE", `Plan diff exceeds ${MAX_PLAN_DIFF_BYTES} bytes`);
         activeMaterialized = materialized;
         const provenance = revisionFor(proposal, materialized, previousSnapshotReference);
         return {
           bytes: Buffer.from(materialized.bytes),
           beforeFinalAttestation: ({ candidateTempIdentity, candidateTempReference }) => {
-            this.writer.writeImmutable(registrationPath, jsonBytes(expectedRegistration), { conflictCode: "PLAN_PROPOSAL_ID_CONFLICT" });
+            this.writer.writeImmutable(registrationPath, registrationBytes, { conflictCode: "PLAN_PROPOSAL_ID_CONFLICT", maximum: MAX_PROPOSAL_REGISTRATION_BYTES });
             const preparedAt = this.now();
             exactUtcTimestamp(preparedAt, "prepared_at", "PLAN_PREPARED_AT_INVALID");
             const attemptToken = randomBytes(32).toString("hex");
@@ -457,7 +474,7 @@ export class PlanPort {
             });
             activeIntentPath = join(attemptsRoot, `${attemptToken}.json`);
             activeIntentReference = relative(dirname(this.path), activeIntentPath).replaceAll("\\", "/");
-            this.writer.writeImmutable(activeIntentPath, jsonBytes(activeIntent));
+            this.writer.writeImmutable(activeIntentPath, jsonBytes(activeIntent), { maximum: MAX_COMMIT_RECORD_BYTES });
           },
           afterCommit: ({ committed }) => {
             invariant(activeIntent && activeMaterialized && sameFilesystemIdentity(committed.fileIdentity, activeIntent.candidate_temp_filesystem_identity), "PLAN_COMMIT_WITNESS_INVALID", "Post-commit authority does not match the durable commit intent witness");
@@ -466,9 +483,9 @@ export class PlanPort {
             const result = resultFor({
               proposal, materialized: activeMaterialized, provenance, provenanceReference,
               intent: activeIntent, intentReference: activeIntentReference,
-              appliedAt, recoveredAt: null,
+              appliedAt,
             });
-            this.writer.writeImmutable(appliedPath, jsonBytes(result));
+            this.writer.writeImmutable(appliedPath, jsonBytes(result), { maximum: MAX_COMMIT_RECORD_BYTES });
             return result;
           },
         };

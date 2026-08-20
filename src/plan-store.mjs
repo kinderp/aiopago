@@ -17,6 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { TextDecoder } from "node:util";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
@@ -25,8 +26,8 @@ export const LEGACY_TASK_LEDGER_SCHEMA = "eiopago.task-ledger/0.1.0";
 
 const LEDGER_BLOCK = /```json task-ledger[^\S\r\n]*(\r?\n)([\s\S]*?)(\r?\n)```/;
 const SCHEMA_HEADER = /^\*\*Schema:\*\*[ \t]*`([^`]+)`[ \t]*$/gm;
-const MAX_PLAN_BYTES = 32 * 1024 * 1024;
-const MAX_STATE_BYTES = 32 * 1024 * 1024;
+export const MAX_PLAN_BYTES = 32 * 1024 * 1024;
+export const MAX_PLAN_STATE_BYTES = 128 * 1024 * 1024;
 const LOCK_SCHEMA = "aiopago.plan-write-lock/0.2.0";
 
 const DEFAULT_IO = Object.freeze({
@@ -54,6 +55,8 @@ function parseJson(text) {
 
 export function parseTaskPlanBytes(bytes, { requireSingleBlock = false } = {}) {
   const source = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  try { new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(source); }
+  catch { throw new GuardianError("PLAN_UTF8_INVALID", "TASK_PLAN.md must contain well-formed UTF-8 bytes"); }
   const text = source.toString("utf8");
   const block = LEDGER_BLOCK.exec(text);
   invariant(block, "LEDGER_FORMAT_INVALID", "TASK_PLAN.md must contain one json task-ledger block");
@@ -84,14 +87,31 @@ function closeQuietly(io, fd) {
   try { io.closeSync(fd); } catch {}
 }
 
+function directorySyncUnsupported(error, phase) {
+  if (["ENOTSUP", "EOPNOTSUPP", "ENOSYS"].includes(error?.code)) return true;
+  if (process.platform !== "win32") return false;
+  const windowsUnsupported = phase === "open"
+    ? ["EPERM", "EINVAL", "EISDIR"]
+    : ["EPERM", "EINVAL", "EBADF"];
+  return windowsUnsupported.includes(error?.code);
+}
+
 function syncDirectory(io, path) {
   let fd;
   try {
-    fd = io.openSync(path, "r");
-    io.fsyncSync(fd);
+    try { fd = io.openSync(path, "r"); }
+    catch (error) { if (directorySyncUnsupported(error, "open")) return false; throw error; }
+    try { io.fsyncSync(fd); }
+    catch (error) {
+      if (!directorySyncUnsupported(error, "fsync")) throw error;
+      io.closeSync(fd);
+      fd = undefined;
+      return false;
+    }
     io.closeSync(fd);
     fd = undefined;
-  } catch {
+    return true;
+  } finally {
     closeQuietly(io, fd);
   }
 }
@@ -145,7 +165,7 @@ export class PlanRevisionWriter {
     catch (error) { if (error?.code === "ENOENT") return false; throw error; }
   }
 
-  #readRegular(path, { maximum = MAX_STATE_BYTES, code = "PLAN_PROVENANCE_INVALID", allowHardlinks = false } = {}) {
+  #readRegular(path, { maximum = MAX_PLAN_STATE_BYTES, code = "PLAN_PROVENANCE_INVALID", allowHardlinks = false } = {}) {
     const absolute = resolve(path);
     let fd;
     try {
@@ -245,18 +265,18 @@ export class PlanRevisionWriter {
     return this.#io.readdirSync(absolute, { withFileTypes: true });
   }
 
-  readImmutable(path, maximum = MAX_STATE_BYTES) {
+  readImmutable(path, maximum = MAX_PLAN_STATE_BYTES) {
     return Buffer.from(this.#readRegular(resolve(path), { maximum, code: "PLAN_PROVENANCE_INVALID" }).bytes);
   }
 
-  writeImmutable(path, bytes, { conflictCode = "PLAN_PROVENANCE_CONFLICT" } = {}) {
+  writeImmutable(path, bytes, { conflictCode = "PLAN_PROVENANCE_CONFLICT", maximum = MAX_PLAN_STATE_BYTES } = {}) {
     const destination = resolve(path);
     const parent = dirname(destination);
-    this.#ensureRealDirectory(parent);
     const value = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
-    invariant(value.length <= MAX_STATE_BYTES, "PLAN_PROVENANCE_INVALID", `Immutable record exceeds ${MAX_STATE_BYTES} bytes`);
+    invariant(value.length <= maximum, "PLAN_PROVENANCE_INVALID", `Immutable record exceeds ${maximum} bytes`);
+    this.#ensureRealDirectory(parent);
     if (this.#pathExists(destination)) {
-      const existing = this.#readRegular(destination, { maximum: MAX_STATE_BYTES, code: "PLAN_PROVENANCE_INVALID" });
+      const existing = this.#readRegular(destination, { maximum, code: "PLAN_PROVENANCE_INVALID" });
       if (existing.bytes.equals(value)) return;
       throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
     }
@@ -278,7 +298,7 @@ export class PlanRevisionWriter {
       closeQuietly(this.#io, fd);
       if (ownsTemp) { try { this.#io.unlinkSync(temp); } catch {} }
       if (error?.code === "EEXIST") {
-        const existing = this.#readRegular(destination, { maximum: MAX_STATE_BYTES, code: "PLAN_PROVENANCE_INVALID" });
+        const existing = this.#readRegular(destination, { maximum, code: "PLAN_PROVENANCE_INVALID" });
         if (existing.bytes.equals(value)) return;
         throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
       }
@@ -364,6 +384,7 @@ export class PlanRevisionWriter {
       const prepared = prepare(current, Object.freeze({ previousSnapshotReference }));
       if (prepared?.noWrite) return prepared.result;
       invariant(prepared && Buffer.isBuffer(prepared.bytes), "PLAN_MATERIALIZATION_INVALID", "Plan mutation must materialize candidate bytes");
+      invariant(prepared.bytes.length <= MAX_PLAN_BYTES, "PLAN_AUTHORITY_TOO_LARGE", `Candidate TASK_PLAN.md exceeds the ${MAX_PLAN_BYTES}-byte authority limit`);
       const candidate = parseTaskPlanBytes(prepared.bytes, { requireSingleBlock });
       validate?.(candidate.task);
 
@@ -379,14 +400,15 @@ export class PlanRevisionWriter {
       }));
       this.#testHooks?.afterPreparation?.(Object.freeze({ current, candidate }));
 
+      this.#attestLock(lock);
       const finalObservation = this.readCurrent({ requireSingleBlock, validate });
       const attestation = expected ?? { planRevisionId: current.task.plan_revision_id, contentDigest: current.contentDigest };
       this.#casConflict(attestation, finalObservation, "final attestation");
       invariant(finalObservation.contentDigest === current.contentDigest, "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed while the mutation was being prepared");
-      this.#attestLock(lock);
       this.#io.renameSync(temp.path, this.path);
       temp.ownsTemp = false;
       committed = true;
+      this.#testHooks?.afterRename?.(Object.freeze({ candidate }));
 
       syncDirectory(this.#io, dirname(this.path));
       const committedFile = this.readCurrent({ requireSingleBlock, validate });

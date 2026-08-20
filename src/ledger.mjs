@@ -14,6 +14,14 @@ const MAX_LEDGER_LIST_ENTRIES = 1024;
 const TASK_REQUIRED_FIELDS = ["schema_version", "task_id", "title", "objective", "requirements_version", "plan_revision_id", "status", "completion_criteria", "risk", "created_at", "updated_at", "current_item", "next_item", "next_step", "task_items"];
 const ITEM_REQUIRED_FIELDS = ["task_item_id", "task_id", "title", "description", "status", "depends_on", "completion_criteria", "evidence", "requirements_refs", "risk", "milestone", "last_updated_at", "last_updated_by"];
 const ITEM_OPTIONAL_ID_FIELDS = ["last_session_id", "last_checkpoint_id", "supersedes", "superseded_by"];
+const TERMINAL_PROVENANCE_FIELDS = ["terminal_reason", "terminal_actor", "terminal_at"];
+
+function validateTerminalProvenance(value, label) {
+  for (const field of TERMINAL_PROVENANCE_FIELDS) invariant(Object.hasOwn(value, field), "LEDGER_TERMINAL_PROVENANCE_REQUIRED", `${label} ${value.status} requires ${field}`);
+  boundedString(value.terminal_reason, `${label} terminal_reason`);
+  boundedString(value.terminal_actor, `${label} terminal_actor`);
+  canonicalUtc(value.terminal_at, `${label} terminal_at`);
+}
 
 function boundedString(value, field, { id = false, allowEmpty = false } = {}) {
   const maximum = id ? MAX_ID_LENGTH : MAX_TEXT_LENGTH;
@@ -82,6 +90,7 @@ export function validateTaskLedger(task) {
   if (task.current_item !== null) boundedString(task.current_item, "current_item", { id: true });
   if (task.next_item !== null) boundedString(task.next_item, "next_item", { id: true });
   if (Object.hasOwn(task, "evidence")) boundedStringArray(task.evidence, "evidence");
+  if (["DROPPED", "SUPERSEDED"].includes(task.status)) validateTerminalProvenance(task, "Task");
   if (Object.hasOwn(task, "minimal_reads")) validateBoundedStringList(task.minimal_reads, "minimal_reads");
   canonicalRequiredLocalPaths(Object.hasOwn(task, "required_local_paths") ? task.required_local_paths : []);
   invariant(Array.isArray(task.task_items) && task.task_items.length > 0 && task.task_items.length <= MAX_LEDGER_LIST_ENTRIES, "LEDGER_ITEMS_INVALID", "task_items must be a non-empty bounded array");
@@ -107,6 +116,8 @@ export function validateTaskLedger(task) {
     canonicalUtc(item.last_updated_at, "last_updated_at");
     boundedString(item.last_updated_by, "last_updated_by");
     for (const field of ITEM_OPTIONAL_ID_FIELDS) if (Object.hasOwn(item, field)) boundedString(item[field], field, { id: true });
+    if (["DROPPED", "SUPERSEDED"].includes(item.status)) validateTerminalProvenance(item, `TaskItem ${item.task_item_id}`);
+    if (item.status === "SUPERSEDED") invariant(Object.hasOwn(item, "superseded_by"), "LEDGER_SUPERSESSION_INVALID", `SUPERSEDED TaskItem ${item.task_item_id} requires superseded_by`);
     if (item.status === "DONE") invariant(item.evidence.length > 0, "DONE_WITHOUT_EVIDENCE");
     ids.add(item.task_item_id);
   }
@@ -119,6 +130,34 @@ export function validateTaskLedger(task) {
   const visiting = new Set();
   const visited = new Set();
   const byId = new Map(task.task_items.map((item) => [item.task_item_id, item]));
+  const supersededTargets = new Set();
+  const replacementTargets = new Set();
+  for (const item of task.task_items) {
+    if (Object.hasOwn(item, "superseded_by")) {
+      invariant(item.superseded_by !== item.task_item_id && byId.has(item.superseded_by), "LEDGER_SUPERSESSION_INVALID", `${item.task_item_id}.superseded_by must reference another existing TaskItem`);
+      invariant(item.status === "SUPERSEDED", "LEDGER_SUPERSESSION_INVALID", `${item.task_item_id}.superseded_by requires SUPERSEDED status`);
+      const replacement = byId.get(item.superseded_by);
+      invariant(replacement.supersedes === item.task_item_id, "LEDGER_SUPERSESSION_INVALID", `${item.superseded_by}.supersedes must reciprocally reference ${item.task_item_id}`);
+      invariant(!supersededTargets.has(item.superseded_by), "LEDGER_SUPERSESSION_INVALID", `Replacement ${item.superseded_by} cannot replace multiple TaskItems`);
+      supersededTargets.add(item.superseded_by);
+    }
+    if (Object.hasOwn(item, "supersedes")) {
+      invariant(item.supersedes !== item.task_item_id && byId.has(item.supersedes), "LEDGER_SUPERSESSION_INVALID", `${item.task_item_id}.supersedes must reference another existing TaskItem`);
+      const replaced = byId.get(item.supersedes);
+      invariant(replaced.status === "SUPERSEDED" && replaced.superseded_by === item.task_item_id, "LEDGER_SUPERSESSION_INVALID", `${item.supersedes}.superseded_by must reciprocally reference ${item.task_item_id}`);
+      invariant(!replacementTargets.has(item.supersedes), "LEDGER_SUPERSESSION_INVALID", `TaskItem ${item.supersedes} cannot have multiple replacements`);
+      replacementTargets.add(item.supersedes);
+    }
+  }
+  for (const id of ids) {
+    const supersessionPath = new Set();
+    let cursor = byId.get(id);
+    while (cursor && Object.hasOwn(cursor, "superseded_by")) {
+      invariant(!supersessionPath.has(cursor.task_item_id), "LEDGER_SUPERSESSION_INVALID", `Supersession cycle includes ${cursor.task_item_id}`);
+      supersessionPath.add(cursor.task_item_id);
+      cursor = byId.get(cursor.superseded_by);
+    }
+  }
   const visit = (id) => {
     invariant(!visiting.has(id), "LEDGER_DAG_CYCLE", id);
     if (visited.has(id)) return;

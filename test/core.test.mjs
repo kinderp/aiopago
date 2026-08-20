@@ -140,6 +140,14 @@ test("Ledger status vocabulary remains canonical and rejects PENDING", () => {
       task.evidence = ["task verified"];
       task.task_items[0].evidence = ["item verified"];
     }
+    if (["DROPPED", "SUPERSEDED"].includes(status)) {
+      const terminal = { terminal_reason: "terminal fixture", terminal_actor: "human:test", terminal_at: "2026-01-01T00:00:00.000Z" };
+      Object.assign(task, terminal); Object.assign(task.task_items[0], terminal);
+    }
+    if (status === "SUPERSEDED") {
+      task.task_items[0].superseded_by = "ITEM-2";
+      task.task_items.push({ ...minimalTask().task_items[0], task_item_id: "ITEM-2", status: "PLANNED", supersedes: "ITEM-1" });
+    }
     writeLedger(path, task);
     assert.equal(new TaskLedger(path).read().status, status);
   }

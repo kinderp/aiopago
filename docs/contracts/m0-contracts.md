@@ -81,7 +81,7 @@ Stati: `PLANNED | IN_PROGRESS | BLOCKED | DONE | DROPPED | SUPERSEDED`.
 Invarianti:
 
 - `DONE` richiede tutti i criteri obbligatori soddisfatti e `evidence[]` verificabile.
-- `DROPPED` e `SUPERSEDED` conservano motivo, actor, timestamp e replacement ID se esiste.
+- `DROPPED` e `SUPERSEDED` richiedono i campi canonici bounded `terminal_reason`, `terminal_actor`, `terminal_at`; un replacement ID viene conservato dove applicabile.
 - Una nuova revisione non cancella revisioni precedenti.
 
 ### 2.2 `TaskItem`
@@ -108,6 +108,8 @@ superseded_by?
 
 - `depends_on` forma un DAG; cicli bloccano la revisione.
 - Stato `DONE` senza evidenza richiesta è invalido.
+- `DROPPED` e `SUPERSEDED` richiedono `terminal_reason`, `terminal_actor`, `terminal_at`.
+- Un TaskItem `SUPERSEDED` richiede `superseded_by` verso un altro TaskItem esistente; il replacement deve dichiarare reciprocamente `supersedes`. ID sconosciuti, self-reference, relazione non reciproca o contraddittoria sono invalidi.
 - Un requisito superseded non mantiene task attivi senza rivalutazione esplicita.
 
 ### 2.3 `PlanRevision`
