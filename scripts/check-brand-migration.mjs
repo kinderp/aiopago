@@ -39,7 +39,7 @@ const fullAllowlist = new Map(Object.entries({
 }));
 
 const shortAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [26, "rename closure compatibility summary and immutable session history"],
+  "CHECKPOINT.md": [27, "rename closure compatibility summary, 0.2-D alias evidence, and immutable session history"],
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
   [["bin", `${legacyShort}.mjs`].join("/")]: [1, "deprecated thin CLI wrapper"],

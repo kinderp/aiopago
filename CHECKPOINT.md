@@ -1,10 +1,19 @@
-# CHECKPOINT — AIOPAGO 0.2-C CLOSED / 0.2-D STARTED
+# CHECKPOINT — AIOPAGO 0.2-D READY FOR INDEPENDENT REVIEW
 
-- **0.2-B:** `CLOSED / ACCEPTED`; contratti CAS/lock/recovery/provenance e owner gate restano congelati.
-- **0.2-C:** `CLOSED / ACCEPTED`; candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate `2/2 CLEAN`, merge `488c4fd696003a6987ea50996bbab644e63ab56c` (PR #26). La storia tecnica 0.2-C non è stata alterata.
-- **0.2-D:** `IN PROGRESS`; issue #27, branch `feat/start-objective-0.2-d`, worktree `F:/dev/aiopago-0.2-d`, starting main `488c4fd696003a6987ea50996bbab644e63ab56c`.
-- **Perimetro autorizzato:** `aio start <objective>` deve produrre un full candidate Ledger tramite planner, legarlo all'osservazione originale, mostrare il diff 0.2-C, richiedere autorizzazione esplicita, applicare attraverso 0.2-C/0.2-B e fermarsi. 0.2-E e oltre restano NOT STARTED.
-- `checkpoint_message`: “0.2-C accettato 2/2 CLEAN; avviato 0.2-D su issue #27 dalla main di merge #26”.
+- **Stato/gate:** 0.2-D è `READY FOR INDEPENDENT REVIEW`, independent gate `0/2`; developer review non conta. Issue #27; draft PR #28; branch `feat/start-objective-0.2-d`; worktree `F:/dev/aiopago-0.2-d`; starting main e merge-base `488c4fd696003a6987ea50996bbab644e63ab56c`.
+- **Close-out precedente:** 0.2-B resta `CLOSED / ACCEPTED`. 0.2-C è `CLOSED / ACCEPTED`: candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate `2/2 CLEAN`, merge `488c4fd696003a6987ea50996bbab644e63ab56c` (PR #26). Nessun contratto 0.2-B/C è stato modificato.
+- **Architettura:** `aio start <objective>` valida un argv Unicode bounded, osserva una volta `TASK_PLAN.md`, passa obiettivo+osservazione immutabile al narrow planner, ricostruisce un intent 0.2-C con l'identità originale, esegue propose/validate/diff, mostra il PlanDiff completo, richiede un boolean umano esplicito e passa la stessa frozen proposal una volta ad apply. `TASK_PLAN.md` resta unica current authority.
+- **Production planner:** `PiObjectivePlanner` usa il Pi SDK 0.83.x e la configurazione model/auth/settings esistente in una sola sessione in-memory no-tools; estensioni, skill, prompt template, context file, temi, compaction e retry sono disabilitati. Output ammesso: un solo strict JSON root `{candidate_plan}`; nessuna repair/fallback, reasoning persistito, seconda call o provider routing.
+- **Observed-base/authorization:** nessun re-observe, rebase, merge o replan. A→C durante planning produce `PLAN_PROPOSAL_STALE` su B/base A e preserva C; C dopo preview/YES produce il conflitto CAS 0.2-B. Solo `y`/`yes` approvano; default, deny, blank, EOF e input ambiguo non applicano e non creano provenance apply. La specialized owner latch non viene soddisfatta dal prompt generale.
+- **Stop/exclusions:** dopo apply il comando riferisce revisione/proposal ID e termina senza Runner, task execution, shell o branch di implementazione. Nessun 0.2-E, issue adapter, generic workflow/DSL, `--yes`, durable Intent DB, raw writer export, shared DB o coupling FARO/Durex/Raiatea/Alfred.
+- **Test:** Node `v22.19.0`; focused 0.2-D **21/21 PASS**; Intent Adapter **30/30 PASS**; Plan Proposal **453 total, 451 PASS, 2 platform skip, 0 fail**; full suite **660 total, 658 PASS, 2 platform skip, 0 fail**; `npm run check` PASS (brand guard + 49 moduli); `npm pack --dry-run` e actual pack PASS (40 file); external tarball install/consumer PASS con packed `aio init`, production-planner fake happy `aio start`, `plan.*`, runtime/docs inclusi, internal subpath blocked e nessun raw writer export; `git diff --check` PASS.
+- **CLI E2E:** vero `bin/aio.mjs` con fake Pi deterministico copre happy/deny/provider failure/stale/help/missing objective; `bin/eio.mjs start` delega con warning deprecato. Nessuna call modello/rete nella suite.
+- **Developer adversarial review:** verificati i 20 attacchi richiesti: stale durante latency e dopo approval; fresh-base substitution; forged task/revision/requirements/dependency/DONE; malformed/duplicate/non-finite/prototype/accessor/oversize output; owner-gate bypass; default/EOF approval; proposal swap/second planner call; hidden apply/replan/retry/fallback; shell/prompt injection e delimiter escaping; public writer/subpath leakage; regressioni `plan.*`; no-auto-execution. Finding HIGH `0`, MEDIUM `0`, LOW `0`; self-review non conta nel gate.
+- **Candidate:** implementation freeze `ba87d5879254d523ad6674ffd6f8467ba7c446f3`; il candidate HEAD esatto include questo checkpoint finale e viene registrato nel draft PR #28 dopo il push (un commit non può contenere il proprio SHA).
+- **Next:** fresh Independent Review Round 1 sul candidate HEAD esatto di draft PR #28. 0.2-E resta `BLOCKED / NOT STARTED` pending acceptance 0.2-D.
+- `checkpoint_message`: “0.2-D objective→planner→exact diff→explicit authorization→controlled apply pronto per independent review; gate 0/2”.
+
+**STOP operativo:** non mark-ready, non fare merge e non iniziare 0.2-E.
 
 # CHECKPOINT — AIOPAGO 0.2-C ROUND 1 H-01 REMEDIATION
 
