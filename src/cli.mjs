@@ -14,6 +14,8 @@ Usage:
   aio why [--target <path>]
   aio next [--target <path>]
   aio plan [--raw | --check | --technical] [--target <path>]
+  aio start <objective> [--target <path>]
+  aio start -- <objective-beginning-with-hyphen>
   aio --help | --version
 
 Commands:
@@ -22,17 +24,21 @@ Commands:
   why     Explain the current plan/runtime observation boundary
   next    Show bounded guidance without changing or launching runtime state
   plan    Inspect or validate the authoritative TASK_PLAN.md read-only
+  start   Plan from an objective, show the proposal/diff, require authorization, then stop
 
-Without a command, aio starts Pi under the Aiopago Runner. Run init first.`;
+'aio start' never begins autonomous implementation. Without a command, aio starts Pi under the Aiopago Runner. Run init first.`;
 
-const COMMANDS = new Set(["init", "status", "why", "next", "plan"]);
+const COMMANDS = new Set(["init", "status", "why", "next", "plan", "start"]);
 const READ_ONLY_COMMANDS = new Set(["status", "why", "next", "plan"]);
 const PLAN_OPTIONS = new Set(["--raw", "--check", "--technical"]);
 
 function parse(argv) {
-  if (argv.includes("--help") || argv.includes("-h")) return { help: true };
-  if (argv.includes("--version") || argv.includes("-v")) return { version: true };
-  const values = [...argv];
+  const separator = argv.indexOf("--");
+  const optionValues = separator < 0 ? [...argv] : argv.slice(0, separator);
+  const literalValues = separator < 0 ? [] : argv.slice(separator + 1);
+  if (optionValues.includes("--help") || optionValues.includes("-h")) return { help: true };
+  if (optionValues.includes("--version") || optionValues.includes("-v")) return { version: true };
+  const values = optionValues;
   const command = COMMANDS.has(values[0]) ? values.shift() : null;
   let target = null;
   const targetIndex = values.indexOf("--target");
@@ -41,7 +47,7 @@ function parse(argv) {
     target = values[targetIndex + 1];
     values.splice(targetIndex, 2);
   }
-  if (command === "init" && values.length === 1 && target === null) target = values.shift();
+  if (command === "init" && values.length === 1 && target === null && literalValues.length === 0) target = values.shift();
   let planOption = null;
   if (command === "plan") {
     const options = values.filter((value) => PLAN_OPTIONS.has(value));
@@ -51,8 +57,17 @@ function parse(argv) {
       values.splice(values.indexOf(options[0]), 1);
     }
   }
+  let objective = null;
+  if (command === "start") {
+    const objectives = [...values, ...literalValues];
+    if (objectives.length !== 1) throw new GuardianError("START_OBJECTIVE_INVALID", objectives.length === 0 ? "aio start requires an objective" : "aio start accepts one objective argument; quote objectives containing spaces");
+    [objective] = objectives;
+    values.length = 0;
+    literalValues.length = 0;
+  }
+  if (literalValues.length > 0) throw new GuardianError("CLI_ARGUMENT_INVALID", `Unexpected argument: ${literalValues[0]}`);
   if (values.length > 0) throw new GuardianError("CLI_ARGUMENT_INVALID", `Unexpected argument: ${values[0]}`);
-  return { command, planOption, target: target ?? process.cwd() };
+  return { command, objective, planOption, target: target ?? process.cwd() };
 }
 
 function lineList(label, values) {
@@ -85,6 +100,30 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
     const result = await (options.initializeRepository ?? initializeRepository)(parsed.target, options.bootstrapOptions);
     stdout(formatInitSummary(result));
     return { action: "init", result };
+  }
+  if (parsed.command === "start") {
+    const start = await import("./start-planning.mjs");
+    start.validateObjective(parsed.objective);
+    const repository = (options.loadRepositoryContext ?? loadRepositoryContext)(parsed.target);
+    const createAdapter = options.createPlanAdapter ?? (await import("./intent-adapter.mjs")).createPlanAdapter;
+    const planner = options.planner ?? (await import("./pi-objective-planner.mjs")).createPiObjectivePlanner({
+      cwd: repository.targetRoot,
+      agentDir: options.agentDir,
+      pi: options.pi,
+      model: options.plannerModel,
+      thinkingLevel: options.plannerThinkingLevel,
+    });
+    const authorize = options.authorize ?? start.createStdinAuthorizer({ input: options.stdin, output: options.promptOutput });
+    const result = await start.startPlanning({
+      objective: parsed.objective,
+      plan: createAdapter(repository.taskLedgerPath),
+      planner,
+      authorize,
+      present: options.presentStartProposal ?? ((context) => stdout(start.formatStartProposal(context))),
+      proposalIdFactory: options.proposalIdFactory,
+    });
+    stdout(start.formatStartResult(result));
+    return { action: "start", result, repository };
   }
   if (READ_ONLY_COMMANDS.has(parsed.command)) {
     const workflow = await import("./human-workflow.mjs");
