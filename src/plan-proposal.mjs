@@ -3,6 +3,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { canonicalJson, sha256, stableId, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { validateTaskLedger } from "./ledger.mjs";
+import { materializeLedgerMarkdown } from "./plan-markdown.mjs";
 import { LEGACY_TASK_LEDGER_SCHEMA, MAX_PLAN_STATE_BYTES, PlanRevisionWriter, TASK_LEDGER_SCHEMA, parseTaskPlanBytes, sameFileFingerprint, sameFilesystemIdentity } from "./plan-store.mjs";
 
 export const PLAN_PROPOSAL_SCHEMA = "aiopago.plan-proposal/0.1.0";
@@ -173,68 +174,11 @@ export class PlanProposal {
   }
 }
 
-const METADATA_HEADERS = Object.freeze([
-  { field: "plan_revision_id", pattern: /^\*\*Current revision:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/ },
-  { field: "requirements_version", pattern: /^\*\*Requirements version:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/ },
-  { field: "updated_at", pattern: /^\*\*Updated:\*\*[ \t]*(\S(?:.*?\S)?)[ \t]*$/ },
-]);
-
-function markdownLines(text) {
-  const lines = [];
-  let start = 0;
-  while (start <= text.length) {
-    const newline = text.indexOf("\n", start);
-    const next = newline === -1 ? text.length : newline + 1;
-    let end = newline === -1 ? text.length : newline;
-    if (end > start && text[end - 1] === "\r") end -= 1;
-    lines.push({ start, end, next, content: text.slice(start, end) });
-    if (newline === -1) break;
-    start = next;
-  }
-  return lines;
-}
-
-function assertMetadata(observed) {
-  invariant(observed.schemaHeaderCount === 1, "PLAN_METADATA_INVALID", "A mutable TASK_PLAN.md must contain exactly one Schema header");
+function assertProposalMutationSchema(observed) {
   if (observed.ledgerSchema === LEGACY_TASK_LEDGER_SCHEMA) {
     throw new GuardianError("PLAN_LEGACY_MIGRATION_REQUIRED", `Reading ${LEGACY_TASK_LEDGER_SCHEMA} remains supported, but Plan Proposal mutation requires an explicit migration to ${TASK_LEDGER_SCHEMA}`);
   }
   invariant(observed.ledgerSchema === TASK_LEDGER_SCHEMA, "PLAN_LEDGER_SCHEMA_UNSUPPORTED", `Plan Proposal mutation requires ${TASK_LEDGER_SCHEMA}`);
-
-  const lines = markdownLines(observed.text);
-  const schemaLines = lines.map((line, index) => ({ line, index, content: index === 0 && line.content.startsWith("\ufeff") ? line.content.slice(1) : line.content }))
-    .filter(({ content }) => /^\*\*Schema:\*\*[ \t]*`aiopago\.task-ledger\/0\.1\.0`[ \t]*$/.test(content));
-  invariant(schemaLines.length === 1, "PLAN_METADATA_INVALID", "The authoritative Schema line must be structurally identifiable");
-  const schemaIndex = schemaLines[0].index;
-  const region = [];
-  for (let index = schemaIndex + 1; index < lines.length && lines[index].content.trim() !== ""; index += 1) region.push(lines[index]);
-  const metadataLike = region.filter((line) => /^\*\*(?:Current revision|Requirements version|Updated):\*\*/.test(line.content));
-  if (metadataLike.length === 0) return deepFreeze({ layout: "compact", spans: {} });
-
-  invariant(region.length === METADATA_HEADERS.length && metadataLike.length === METADATA_HEADERS.length, "PLAN_METADATA_MISMATCH", "Structural Ledger metadata must be exactly the three canonical lines immediately after Schema");
-  const spans = {};
-  for (let index = 0; index < METADATA_HEADERS.length; index += 1) {
-    const definition = METADATA_HEADERS[index];
-    const line = region[index];
-    const match = definition.pattern.exec(line.content);
-    invariant(match && match[1] === observed.task[definition.field], "PLAN_METADATA_MISMATCH", `Structural Ledger metadata does not match ${definition.field}`);
-    const valueOffset = line.content.indexOf(match[1], match.index);
-    spans[definition.field] = Object.freeze({ start: line.start + valueOffset, end: line.start + valueOffset + match[1].length, value: match[1] });
-  }
-  return deepFreeze({ layout: "extended", spans });
-}
-
-function replaceSpans(text, replacements) {
-  const ordered = [...replacements].sort((left, right) => right.start - left.start);
-  let previousStart = text.length + 1;
-  let result = text;
-  for (const replacement of ordered) {
-    invariant(Number.isInteger(replacement.start) && Number.isInteger(replacement.end) && replacement.start >= 0 && replacement.end >= replacement.start && replacement.end <= text.length && replacement.end <= previousStart, "PLAN_MATERIALIZATION_INVALID", "Materialization spans overlap or are out of bounds");
-    if (replacement.expected !== undefined) invariant(text.slice(replacement.start, replacement.end) === replacement.expected, "PLAN_METADATA_MISMATCH", "Structural Ledger metadata span changed unexpectedly");
-    result = result.slice(0, replacement.start) + replacement.value + result.slice(replacement.end);
-    previousStart = replacement.start;
-  }
-  return result;
 }
 
 function assertGenericProposalPreservesBlockedOwnerLatch(base, candidate) {
@@ -262,7 +206,7 @@ function assertGenericProposalPreservesBlockedOwnerLatch(base, candidate) {
 }
 
 function materializeObserved(observed, proposal) {
-  const metadata = assertMetadata(observed);
+  assertProposalMutationSchema(observed);
   invariant(observed.task.task_id === proposal.task_id, "PLAN_TASK_ID_MISMATCH", "Proposal task_id does not match the observed Ledger");
   invariant(observed.task.plan_revision_id === proposal.base_plan_revision_id, "PLAN_CAS_CONFLICT", "Observed revision does not match proposal base revision");
   invariant(observed.contentDigest === proposal.base_content_digest, "PLAN_CAS_CONFLICT", "Observed bytes do not match proposal base digest");
@@ -273,12 +217,14 @@ function materializeObserved(observed, proposal) {
   invariant(baseHasOwnerGate === candidateHasOwnerGate && (!baseHasOwnerGate || sameValue(observed.task.owner_gate, candidate.owner_gate)), "PLAN_OWNER_GATE_MUTATION_FORBIDDEN", "Generic PlanProposal must preserve owner_gate exactly; only satisfyOwnerGate() may transition it");
   assertGenericProposalPreservesBlockedOwnerLatch(observed.task, candidate);
   const json = canonicalPrettyJson(candidate).replaceAll("\n", observed.block.lineEnding);
-  const replacements = [{ start: observed.block.jsonIndex, end: observed.block.jsonIndex + observed.block.json.length, value: json, expected: observed.block.json }];
-  if (metadata.layout === "extended") for (const { field } of METADATA_HEADERS) {
-    const span = metadata.spans[field];
-    replacements.push({ ...span, expected: span.value, value: candidate[field] });
-  }
-  const text = replaceSpans(observed.text, replacements);
+  const { text } = materializeLedgerMarkdown(observed, {
+    json,
+    metadata: {
+      plan_revision_id: candidate.plan_revision_id,
+      requirements_version: candidate.requirements_version,
+      updated_at: candidate.updated_at,
+    },
+  });
   const bytes = Buffer.from(text, "utf8");
   const parsed = parseTaskPlanBytes(bytes, { requireSingleBlock: true });
   validateTaskLedger(parsed.task);

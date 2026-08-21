@@ -1,7 +1,8 @@
 import { resolve } from "node:path";
 import { sha256, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
-import { parseTaskPlanBytes, PlanRevisionWriter } from "./plan-store.mjs";
+import { materializeLedgerMarkdown } from "./plan-markdown.mjs";
+import { PlanRevisionWriter } from "./plan-store.mjs";
 
 const TASK_STATUS_VALUES = ["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"];
 const TASK_STATES = new Set(TASK_STATUS_VALUES);
@@ -21,6 +22,14 @@ const TERMINAL_PROVENANCE_FORMS = [
 const OWNER_GATE_COMMON_FIELDS = ["kind", "status", "item_id", "command", "satisfied_plan_revision_id", "satisfied_next_step"];
 const OWNER_GATE_OPTIONAL_FIELDS = ["satisfied_task_status", "satisfied_next_item"];
 const OWNER_GATE_AUDIT_FIELDS = ["satisfied_at", "satisfied_by"];
+const OWNER_GATE_LEGACY_SATISFIED_AUDIT_FIELDS = [
+  "evidence_handoff_id",
+  "post_fix_validation_handoff_id",
+  "post_fix_replacement_session_id",
+  "post_fix_continuity",
+  "final_acceptance",
+];
+const OWNER_GATE_LEGACY_ID_FIELDS = ["evidence_handoff_id", "post_fix_validation_handoff_id", "post_fix_replacement_session_id"];
 
 function validateTerminalProvenance(value, label) {
   const present = TERMINAL_PROVENANCE_FORMS.map((form) => Object.values(form).map((field) => Object.hasOwn(value, field)));
@@ -60,7 +69,27 @@ function canonicalUtc(value, field) {
 }
 
 function canonicalCommandName(command) {
-  return typeof command === "string" ? command.replace(/^\/(?:eio|eiopago)(?=\s|$)/, "/aio") : command;
+  if (typeof command !== "string") return command;
+  const normalized = command.trim().split(/\s+/).join(" ");
+  return normalized.replace(/^\/(?:eio|eiopago)(?=\s|$)/, "/aio");
+}
+
+function containsCanonicalCommandMention(text, gateCommand) {
+  if (typeof text !== "string") return false;
+  const canonicalGateCommand = canonicalCommandName(gateCommand);
+  if (typeof canonicalGateCommand !== "string" || !canonicalGateCommand.startsWith("/")) return false;
+  const targetTokenCount = canonicalGateCommand.split(" ").length;
+  for (const match of text.matchAll(/\/[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z0-9_-]+)*/g)) {
+    const tokens = match[0].trim().split(/[ \t]+/);
+    if (tokens.length < targetTokenCount) continue;
+    if (canonicalCommandName(tokens.slice(0, targetTokenCount).join(" ")) === canonicalGateCommand) return true;
+  }
+  return false;
+}
+
+function validateOwnerGateOpaqueId(value, field) {
+  boundedString(value, field, { id: true });
+  invariant(value.trim().length > 0, "LEDGER_FIELD_INVALID", `${field} must not be blank`);
 }
 
 function validateBoundedStringList(value, field, code = "LEDGER_RESUME_CONTEXT_INVALID") {
@@ -93,29 +122,36 @@ function validateOwnerGate(task, byId, inProgress) {
   fail(gate.kind === "HANDOFF_CONFIRM", "Unknown owner_gate kind is not forward-compatible");
   fail(gate.status === "BLOCKED" || gate.status === "SATISFIED", "owner_gate status must be BLOCKED or SATISFIED");
   for (const field of OWNER_GATE_COMMON_FIELDS) fail(Object.hasOwn(gate, field), `owner_gate missing ${field}`);
-  const allowed = new Set([...OWNER_GATE_COMMON_FIELDS, ...OWNER_GATE_OPTIONAL_FIELDS, ...(gate.status === "SATISFIED" ? OWNER_GATE_AUDIT_FIELDS : [])]);
+  const allowed = new Set([
+    ...OWNER_GATE_COMMON_FIELDS,
+    ...OWNER_GATE_OPTIONAL_FIELDS,
+    ...(gate.status === "SATISFIED" ? [...OWNER_GATE_AUDIT_FIELDS, ...OWNER_GATE_LEGACY_SATISFIED_AUDIT_FIELDS] : []),
+  ]);
   fail(Object.keys(gate).every((field) => allowed.has(field)), "owner_gate contains unsupported fields");
 
   try {
-    boundedString(gate.item_id, "owner_gate item_id", { id: true });
+    validateOwnerGateOpaqueId(gate.item_id, "owner_gate item_id");
     boundedString(gate.command, "owner_gate command");
-    boundedString(gate.satisfied_plan_revision_id, "owner_gate satisfied_plan_revision_id", { id: true });
+    validateOwnerGateOpaqueId(gate.satisfied_plan_revision_id, "owner_gate satisfied_plan_revision_id");
     boundedString(gate.satisfied_next_step, "owner_gate satisfied_next_step");
+    if (Object.hasOwn(gate, "satisfied_next_item") && gate.satisfied_next_item !== null) validateOwnerGateOpaqueId(gate.satisfied_next_item, "owner_gate satisfied_next_item");
+    for (const field of OWNER_GATE_LEGACY_ID_FIELDS) if (Object.hasOwn(gate, field)) validateOwnerGateOpaqueId(gate[field], `owner_gate ${field}`);
   } catch (error) {
     throw new GuardianError("OWNER_GATE_INVALID", error.message);
   }
-  fail(gate.item_id.trim().length > 0 && gate.command.trim().length > 0 && gate.satisfied_plan_revision_id.trim().length > 0 && gate.satisfied_next_step.trim().length > 0, "owner_gate identifiers, command, and target next step must not be blank");
-  fail(!gate.satisfied_next_step.includes(gate.command), "owner_gate satisfied_next_step must not contain its authorization command");
-  fail(byId.has(gate.item_id), "owner_gate item_id must reference an existing TaskItem");
-  if (Object.hasOwn(gate, "satisfied_task_status")) fail(TASK_STATES.has(gate.satisfied_task_status), `owner_gate satisfied_task_status ${TASK_STATUS_MESSAGE}`);
+  fail(gate.command.trim().length > 0 && gate.satisfied_next_step.trim().length > 0, "owner_gate command and target next step must not be blank");
+  fail(!containsCanonicalCommandMention(gate.satisfied_next_step, gate.command), "owner_gate satisfied_next_step must not mention its canonical authorization command or a supported alias");
+  if (Object.hasOwn(gate, "satisfied_task_status")) fail(gate.satisfied_task_status === "IN_PROGRESS", "owner_gate satisfied_task_status must be IN_PROGRESS for the active-work target projection");
   if (Object.hasOwn(gate, "satisfied_next_item") && gate.satisfied_next_item !== null) {
-    try { boundedString(gate.satisfied_next_item, "owner_gate satisfied_next_item", { id: true }); }
-    catch (error) { throw new GuardianError("OWNER_GATE_INVALID", error.message); }
-    fail(byId.has(gate.satisfied_next_item) && gate.satisfied_next_item !== gate.item_id, "owner_gate satisfied_next_item must reference a different existing TaskItem");
-    if (gate.status === "BLOCKED") fail(["PLANNED", "BLOCKED"].includes(byId.get(gate.satisfied_next_item).status), "BLOCKED owner_gate satisfied_next_item must remain a pending lifecycle target");
+    fail(gate.satisfied_next_item !== gate.item_id, "owner_gate satisfied_next_item must differ from item_id");
   }
 
   if (gate.status === "BLOCKED") {
+    fail(byId.has(gate.item_id), "A BLOCKED owner_gate item_id must reference a current TaskItem");
+    if (Object.hasOwn(gate, "satisfied_next_item") && gate.satisfied_next_item !== null) {
+      fail(byId.has(gate.satisfied_next_item), "A BLOCKED owner_gate satisfied_next_item must reference a current TaskItem");
+      fail(["PLANNED", "BLOCKED"].includes(byId.get(gate.satisfied_next_item).status), "BLOCKED owner_gate satisfied_next_item must remain a pending lifecycle target");
+    }
     fail(task.status === "BLOCKED", "A BLOCKED owner_gate requires BLOCKED task status");
     fail(gate.satisfied_plan_revision_id !== task.plan_revision_id, "A BLOCKED owner_gate must target a new plan revision");
     fail(task.current_item === null, "A BLOCKED owner_gate requires current_item=null");
@@ -129,6 +165,44 @@ function validateOwnerGate(task, byId, inProgress) {
   try { canonicalUtc(gate.satisfied_at, "owner_gate satisfied_at"); }
   catch (error) { throw new GuardianError("OWNER_GATE_INVALID", error.message); }
   fail(typeof gate.satisfied_by === "string" && gate.satisfied_by.startsWith("human:") && gate.satisfied_by.slice("human:".length).trim().length > 0 && gate.satisfied_by.length <= MAX_TEXT_LENGTH, "A SATISFIED owner_gate requires a bounded human:* satisfied_by actor");
+  if (Object.hasOwn(gate, "post_fix_continuity")) fail(gate.post_fix_continuity === "PASS", "Historical owner_gate post_fix_continuity must be the observed PASS value");
+  if (Object.hasOwn(gate, "final_acceptance")) fail(gate.final_acceptance === "PASS", "Historical owner_gate final_acceptance must be the observed PASS value");
+}
+
+function validateSatisfiedOwnerGateTransition(base, candidate, actor, now) {
+  const fail = (condition, message) => invariant(condition, "OWNER_GATE_TRANSITION_INVALID", message);
+  const gate = base.owner_gate;
+  const targetGate = candidate.owner_gate;
+  fail(gate?.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "The base owner gate must be a BLOCKED HANDOFF_CONFIRM gate");
+  fail(!Object.hasOwn(gate, "satisfied_task_status") || gate.satisfied_task_status === "IN_PROGRESS", "The owner gate target task status must be IN_PROGRESS");
+  fail(!containsCanonicalCommandMention(gate.satisfied_next_step, gate.command), "The target next step must not repeat the authorization command or an alias");
+
+  const protectedItem = base.task_items.find((item) => item.task_item_id === gate.item_id);
+  fail(protectedItem?.status === "BLOCKED" && base.status === "BLOCKED" && base.current_item === null && base.next_item === gate.item_id, "The protected base lifecycle is not satisfiable");
+  if (gate.satisfied_next_item !== undefined && gate.satisfied_next_item !== null) {
+    const next = base.task_items.find((item) => item.task_item_id === gate.satisfied_next_item);
+    fail(gate.satisfied_next_item !== gate.item_id && next && ["PLANNED", "BLOCKED"].includes(next.status), "satisfied_next_item must be a different current PLANNED or BLOCKED item");
+  }
+
+  fail(targetGate.status === "SATISFIED" && targetGate.satisfied_at === now && targetGate.satisfied_by === actor, "The candidate gate audit projection is invalid");
+  for (const field of Object.keys(gate)) {
+    if (field !== "status") fail(targetGate[field] === gate[field], `The candidate gate changed immutable field ${field}`);
+  }
+  fail(candidate.plan_revision_id === gate.satisfied_plan_revision_id, "The candidate revision does not match the gate target");
+  fail(candidate.status === "IN_PROGRESS", "The candidate task must enter IN_PROGRESS active work");
+  fail(candidate.current_item === gate.item_id, "The candidate current_item must be the protected item");
+  fail(candidate.next_item === (gate.satisfied_next_item ?? null), "The candidate next_item does not match the gate target");
+  fail(candidate.next_step === gate.satisfied_next_step, "The candidate next_step does not match the gate target");
+  fail(candidate.updated_at === now, "The candidate updated_at does not match the satisfaction time");
+
+  const candidateProtected = candidate.task_items.find((item) => item.task_item_id === gate.item_id);
+  fail(candidateProtected?.status === "IN_PROGRESS" && candidateProtected.last_updated_at === now && candidateProtected.last_updated_by === actor, "The protected item must enter IN_PROGRESS with the human audit actor");
+  fail(candidate.task_items.length === base.task_items.length, "Owner gate satisfaction must preserve the item projection");
+  for (const item of base.task_items) {
+    const target = candidate.task_items.find((entry) => entry.task_item_id === item.task_item_id);
+    fail(target, `Owner gate satisfaction removed TaskItem ${item.task_item_id}`);
+    if (item.task_item_id !== gate.item_id) fail(target.status === item.status, `Owner gate satisfaction changed unrelated TaskItem ${item.task_item_id}`);
+  }
 }
 
 export function validateTaskLedger(task) {
@@ -250,15 +324,13 @@ export class TaskLedger {
         const item = task.task_items.find((candidate) => candidate.task_item_id === gate.item_id);
         invariant(item?.status === "BLOCKED", "OWNER_GATE_ITEM_NOT_BLOCKED");
         invariant(typeof gate.satisfied_plan_revision_id === "string" && gate.satisfied_plan_revision_id !== task.plan_revision_id, "OWNER_GATE_REVISION_REQUIRED");
-        invariant(typeof gate.satisfied_next_step === "string" && gate.satisfied_next_step.length > 0 && !gate.satisfied_next_step.includes(gate.command), "OWNER_GATE_NEXT_STEP_INVALID");
-        const previousRevision = task.plan_revision_id;
-        const previousUpdatedAt = task.updated_at;
+        invariant(typeof gate.satisfied_next_step === "string" && gate.satisfied_next_step.length > 0 && !containsCanonicalCommandMention(gate.satisfied_next_step, gate.command), "OWNER_GATE_NEXT_STEP_INVALID");
         const now = utcNow();
         gate.status = "SATISFIED";
         gate.satisfied_at = now;
         gate.satisfied_by = actor;
         task.plan_revision_id = gate.satisfied_plan_revision_id;
-        task.status = gate.satisfied_task_status ?? "IN_PROGRESS";
+        task.status = "IN_PROGRESS";
         task.updated_at = now;
         task.current_item = gate.item_id;
         task.next_item = gate.satisfied_next_item ?? null;
@@ -266,13 +338,15 @@ export class TaskLedger {
         item.status = "IN_PROGRESS";
         item.last_updated_at = now;
         item.last_updated_by = actor;
+        validateSatisfiedOwnerGateTransition(observed.task, task, actor, now);
         validateTaskLedger(task);
         const json = JSON.stringify(task, null, 2).replaceAll("\n", observed.block.lineEnding);
-        const updated = observed.text.slice(0, observed.block.jsonIndex) + json + observed.text.slice(observed.block.jsonIndex + observed.block.json.length);
-        const materialized = updated
-          .replace(`**Current revision:** \`${previousRevision}\``, `**Current revision:** \`${task.plan_revision_id}\``)
-          .replace(`**Updated:** ${previousUpdatedAt}`, `**Updated:** ${now}`);
-        const bytes = Buffer.from(materialized, "utf8");
+        const { text } = materializeLedgerMarkdown(observed, {
+          json,
+          metadata: { plan_revision_id: task.plan_revision_id, updated_at: now },
+          allowSchemalessCompact: true,
+        });
+        const bytes = Buffer.from(text, "utf8");
         return { bytes, result: ledgerResult(task, sha256(bytes), this.path) };
       },
     });

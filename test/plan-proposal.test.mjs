@@ -7,7 +7,7 @@ import test from "node:test";
 import { initializeRepository } from "../src/bootstrap.mjs";
 import { canonicalJson, sha256, stableId } from "../src/canonical.mjs";
 import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
-import { MAX_PLAN_BYTES, PlanRevisionWriter } from "../src/plan-store.mjs";
+import { MAX_PLAN_BYTES, PlanRevisionWriter, parseTaskPlanBytes } from "../src/plan-store.mjs";
 import {
   PLAN_APPLY_RESULT_SCHEMA,
   PLAN_DIFF_SCHEMA,
@@ -552,6 +552,235 @@ test("owner_gate contract fails closed and preserves post-SATISFIED evolution", 
     const result = port.apply(proposal(releasedBytes, released, advanced, { proposal_id: "post-satisfied-advance", proposed_plan_revision_id: "PLAN-GATE-3" }));
     assert.equal(result.plan_revision_id, "PLAN-GATE-3");
     assert.equal(new TaskLedger(x.path).read().owner_gate.status, "SATISFIED");
+  });
+});
+
+test("historical b317f79 owner_gate shape remains readable, closed, and idempotent", async (t) => {
+  const historicalPath = join(process.cwd(), "test", "fixtures", "historical-owner-gate-b317f79.md");
+  const historicalBytes = readFileSync(historicalPath);
+  const historical = new TaskLedger(historicalPath).read();
+  assert.deepEqual(Object.keys(historical.owner_gate), [
+    "kind", "status", "command", "item_id", "satisfied_plan_revision_id", "satisfied_task_status",
+    "satisfied_next_item", "satisfied_next_step", "satisfied_at", "satisfied_by", "evidence_handoff_id",
+    "post_fix_validation_handoff_id", "post_fix_replacement_session_id", "post_fix_continuity", "final_acceptance",
+  ]);
+  assert.equal(historical.owner_gate.evidence_handoff_id, "HO-dafdf726b0f8d142760a96cc");
+  assert.equal(historical.owner_gate.post_fix_continuity, "PASS");
+  assert.equal(historical.owner_gate.final_acceptance, "PASS");
+  assert.doesNotThrow(() => validateTaskLedger(parseTaskPlanBytes(historicalBytes).task), "read-only canonical validation must accept the historical shape");
+
+  await t.test("already-SATISFIED specialized call is an exact no-write", () => {
+    const root = mkdtempSync(join(tmpdir(), "aiopago-historical-gate-")); git(root, ["init"]);
+    const path = join(root, "TASK_PLAN.md"); copyFileSync(historicalPath, path); const before = readFileSync(path);
+    const result = new TaskLedger(path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    assert.equal(result.owner_gate.status, "SATISFIED");
+    assert.equal(result.content_digest, sha256(before));
+    assert.deepEqual(readFileSync(path), before);
+  });
+
+  for (const [name, mutate] of [
+    ["unknown legacy-looking audit extension", (gate) => { gate.post_fix_runtime_attestation = "PASS"; }],
+    ["unknown authorization-like field", (gate) => { gate.authorized_by = "human:forged"; }],
+    ["unobserved continuity enum", (gate) => { gate.post_fix_continuity = "PARTIAL"; }],
+    ["unobserved acceptance enum", (gate) => { gate.final_acceptance = "ACCEPTED"; }],
+    ["malformed historical item reference", (gate) => { gate.item_id = "   "; }],
+    ["malformed historical next reference", (gate) => { gate.satisfied_next_item = "   "; }],
+    ["oversized historical item reference", (gate) => { gate.item_id = "x".repeat(513); }],
+  ]) await t.test(`${name} fails closed`, () => {
+    const value = structuredClone(parseTaskPlanBytes(historicalBytes).task); mutate(value.owner_gate);
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
+  });
+
+  await t.test("legacy audit extensions are forbidden on BLOCKED gates", () => {
+    const value = task({
+      status: "BLOCKED", current_item: null, next_item: "ITEM-1", next_step: "Await owner authorization.",
+      owner_gate: {
+        kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1",
+        satisfied_plan_revision_id: "PLAN-GATE-2", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: "ITEM-2",
+        satisfied_next_step: "Continue ITEM-1.", evidence_handoff_id: "opaque-historical-id",
+      },
+    });
+    value.task_items[0].status = "BLOCKED";
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
+  });
+});
+
+test("owner-gate satisfaction validates active-work targets and canonical command mentions", async (t) => {
+  const blockedTask = () => {
+    const value = task({
+      status: "BLOCKED", current_item: null, next_item: "ITEM-1", next_step: "Await owner authorization.",
+      owner_gate: {
+        kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/eio handoff confirm", item_id: "ITEM-1",
+        satisfied_plan_revision_id: "PLAN-GATE-TARGET-WITH-A-DIFFERENT-LENGTH", satisfied_task_status: "IN_PROGRESS",
+        satisfied_next_item: "ITEM-2", satisfied_next_step: "Continue ITEM-1, then ITEM-2.",
+      },
+    });
+    value.task_items[0].status = "BLOCKED";
+    return value;
+  };
+
+  for (const status of ["BLOCKED", "DONE", "DROPPED", "SUPERSEDED", "PLANNED"]) await t.test(`satisfied_task_status=${status} rejects before write`, () => {
+    const value = blockedTask(); value.owner_gate.satisfied_task_status = status; const x = fixture({ task: value });
+    assert.throws(() => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }), (error) => error.code === "OWNER_GATE_INVALID");
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+  });
+  await t.test("absent satisfied_task_status defaults to the explicit IN_PROGRESS projection", () => {
+    const value = blockedTask(); delete value.owner_gate.satisfied_task_status; const x = fixture({ task: value });
+    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio   handoff   confirm", actor: "human:test" });
+    assert.equal(released.status, "IN_PROGRESS");
+    assert.equal(released.current_item, "ITEM-1");
+    assert.equal(released.task_items[0].status, "IN_PROGRESS");
+  });
+  for (const [name, mutate] of [
+    ["DONE satisfied_next_item", (value) => { value.task_items[1].status = "DONE"; value.task_items[1].evidence = ["premature"]; }],
+    ["unknown satisfied_next_item", (value) => { value.owner_gate.satisfied_next_item = "ITEM-UNKNOWN"; }],
+    ["same satisfied_next_item", (value) => { value.owner_gate.satisfied_next_item = "ITEM-1"; }],
+  ]) await t.test(`${name} rejects`, () => {
+    const value = blockedTask(); mutate(value);
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
+  });
+
+  for (const [name, mention] of [
+    ["canonical command", "/aio handoff confirm"],
+    ["historical eio alias", "/eio handoff confirm"],
+    ["eiopago alias", "/eiopago handoff confirm"],
+    ["extra parser whitespace", "/aio   handoff\tconfirm"],
+  ]) await t.test(`${name} is rejected in satisfied_next_step`, () => {
+    const value = blockedTask(); value.owner_gate.satisfied_next_step = `Run ${mention} again.`;
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
+  });
+  await t.test("non-command prose is not treated as a slash command", () => {
+    const value = blockedTask(); value.owner_gate.satisfied_next_step = "Discuss the words handoff confirm, then continue ITEM-1.";
+    assert.doesNotThrow(() => validateTaskLedger(value));
+  });
+});
+
+test("satisfyOwnerGate shares structural Markdown materialization and preserves non-structural bytes", async (t) => {
+  const blockedTask = () => {
+    const value = task({
+      plan_revision_id: "P-1", status: "BLOCKED", current_item: null, next_item: "ITEM-1", next_step: "Await owner authorization.",
+      owner_gate: {
+        kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1",
+        satisfied_plan_revision_id: "PLAN-GATE-TARGET-WITH-A-MUCH-LONGER-REVISION-ID", satisfied_task_status: "IN_PROGRESS",
+        satisfied_next_item: "ITEM-2", satisfied_next_step: "Continue ITEM-1, then ITEM-2.",
+      },
+    });
+    value.task_items[0].status = "BLOCKED";
+    return value;
+  };
+  const outsideJson = (bytes) => {
+    const observed = parseTaskPlanBytes(bytes);
+    return observed.text.slice(0, observed.block.jsonIndex) + "<JSON>" + observed.text.slice(observed.block.jsonIndex + observed.block.json.length);
+  };
+  const fake = [
+    "**Current revision:** `P-1`",
+    "**Requirements version:** `REQ-PLAN-1`",
+    `**Updated:** ${BASE_TIME}`,
+  ].join("\n");
+
+  for (const [name, prose] of [
+    ["fenced metadata example", `Esempio Unicode Ω:\n\n\`\`\`markdown\n${fake}\n\`\`\``],
+    ["plain duplicate metadata prose", `Literal documentation:\n${fake}`],
+    ["blockquote metadata example", fake.split("\n").map((line) => `> ${line}`).join("\n")],
+  ]) await t.test(`compact ${name} is byte-exact`, () => {
+    const value = blockedTask(); const x = fixture({ task: value, prose: { before: prose, after: "Coda Unicode è." } });
+    const compact = Buffer.from(x.bytes.toString("utf8").replace(`**Current revision:** \`P-1\`\n**Requirements version:** \`REQ-PLAN-1\`\n**Updated:** ${BASE_TIME}\n`, ""));
+    writeFileSync(x.path, compact); const beforeOutside = outsideJson(compact);
+    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    const after = readFileSync(x.path);
+    assert.equal(released.plan_revision_id, value.owner_gate.satisfied_plan_revision_id);
+    assert.equal(outsideJson(after), beforeOutside);
+    assert.equal(after.toString("utf8").includes(`**Current revision:** \`${released.plan_revision_id}\``), false, "compact layout must remain compact");
+  });
+
+  for (const [name, prose, eol, bom, legacy] of [
+    ["legacy fenced duplicates with CRLF, BOM, and Unicode", `\`\`\`markdown\n${fake}\n\`\`\`\nUnicode π`, "\r\n", true, true],
+    ["canonical plain duplicates with LF", `Literal documentation:\n${fake}\nUnicode λ`, "\n", false, false],
+  ]) await t.test(`extended ${name} changes only exact header spans`, () => {
+    const value = blockedTask(); const x = fixture({ task: value, eol, prose: { before: prose, after: "Tail résumé." } });
+    const schemaBytes = legacy ? Buffer.from(x.bytes.toString("utf8").replace("aiopago.task-ledger/0.1.0", "eiopago.task-ledger/0.1.0")) : x.bytes;
+    const before = bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), schemaBytes]) : schemaBytes; writeFileSync(x.path, before);
+    const beforeOutside = outsideJson(before);
+    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/eiopago handoff confirm", actor: "human:test" });
+    const after = readFileSync(x.path); const afterOutside = outsideJson(after);
+    const expectedOutside = beforeOutside
+      .replace("**Current revision:** `P-1`", `**Current revision:** \`${released.plan_revision_id}\``)
+      .replace(`**Updated:** ${BASE_TIME}`, `**Updated:** ${released.updated_at}`);
+    assert.equal(afterOutside, expectedOutside);
+    assert.equal(afterOutside.includes(`**Requirements version:** \`REQ-PLAN-1\``), true);
+    assert.equal(afterOutside.includes(prose.replaceAll("\n", eol)), true);
+    assert.equal(after.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])), bom);
+    assert.equal(after.toString("utf8").replaceAll("\r\n", "").includes("\n"), eol === "\n");
+  });
+});
+
+test("SATISFIED owner-gate item references remain historical after later projection removal", async (t) => {
+  const blockedTask = () => {
+    const value = task({
+      status: "BLOCKED", current_item: null, next_item: "ITEM-1", next_step: "Await owner authorization.",
+      owner_gate: {
+        kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1",
+        satisfied_plan_revision_id: "PLAN-GATE-2", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: "ITEM-2",
+        satisfied_next_step: "Continue ITEM-1, then ITEM-2.",
+      },
+    });
+    value.task_items[0].status = "BLOCKED";
+    return value;
+  };
+  const currentPlan = (path) => parseTaskPlanBytes(readFileSync(path)).task;
+  const apply = (path, revision, time, mutate) => {
+    const bytes = readFileSync(path); const base = currentPlan(path); const next = structuredClone(base);
+    next.plan_revision_id = revision; next.updated_at = time; mutate(next);
+    return new PlanPort(path).apply(proposal(bytes, base, next, {
+      proposal_id: `proposal-${revision}`, proposed_plan_revision_id: revision, created_at: time,
+    }));
+  };
+
+  for (const removedReference of ["item_id", "satisfied_next_item"]) await t.test(`${removedReference} may leave the current projection`, () => {
+    const x = fixture({ task: blockedTask() });
+    new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    const releasedGate = structuredClone(currentPlan(x.path).owner_gate);
+    apply(x.path, "PLAN-GATE-3", "2026-08-20T10:10:00.000Z", (next) => {
+      next.current_item = "ITEM-2"; next.next_item = null; next.next_step = "Complete ITEM-2.";
+      next.task_items[0].status = "DONE"; next.task_items[0].evidence = ["ITEM-1 completed"];
+      next.task_items[0].last_updated_at = next.updated_at; next.task_items[1].status = "IN_PROGRESS";
+      next.task_items[1].last_updated_at = next.updated_at;
+    });
+    apply(x.path, "PLAN-GATE-4", "2026-08-20T10:15:00.000Z", (next) => {
+      next.status = "DONE"; next.current_item = null; next.next_item = null; next.next_step = "Task complete."; next.evidence = ["All work accepted"];
+      next.task_items[1].status = "DONE"; next.task_items[1].evidence = ["ITEM-2 completed"]; next.task_items[1].last_updated_at = next.updated_at;
+    });
+    const beforeRemoval = readFileSync(x.path); const beforeDigest = sha256(beforeRemoval);
+    const result = apply(x.path, "PLAN-GATE-5", "2026-08-20T10:20:00.000Z", (next) => {
+      const removedId = removedReference === "item_id" ? "ITEM-1" : "ITEM-2";
+      next.task_items = next.task_items.filter((entry) => entry.task_item_id !== removedId);
+      for (const entry of next.task_items) entry.depends_on = entry.depends_on.filter((id) => id !== removedId);
+      next.next_step = `Historical ${removedReference} removed from the current projection.`;
+    });
+    const current = new TaskLedger(x.path).read();
+    assert.equal(current.owner_gate.status, "SATISFIED");
+    assert.deepEqual(current.owner_gate, releasedGate, "the SATISFIED audit gate must remain exact");
+    const removedId = removedReference === "item_id" ? releasedGate.item_id : releasedGate.satisfied_next_item;
+    assert.equal(current.task_items.some((entry) => entry.task_item_id === removedId), false);
+    assert.equal(result.previous_content_digest, beforeDigest);
+    assert.deepEqual(readFileSync(join(x.root, result.provenance.previous_snapshot_reference)), beforeRemoval, "exact history must retain the projection containing the historical item");
+  });
+
+  await t.test("a well-formed absent SATISFIED reference is audit-only, while malformed references reject", () => {
+    const value = blockedTask(); value.owner_gate.status = "SATISFIED"; value.owner_gate.satisfied_at = NEXT_TIME; value.owner_gate.satisfied_by = "human:test";
+    value.plan_revision_id = value.owner_gate.satisfied_plan_revision_id; value.updated_at = NEXT_TIME; value.status = "IN_PROGRESS";
+    value.current_item = "ITEM-1"; value.next_item = "ITEM-2"; value.next_step = value.owner_gate.satisfied_next_step; value.task_items[0].status = "IN_PROGRESS";
+    value.owner_gate.item_id = "ITEM-HISTORICAL-ABSENT"; value.owner_gate.satisfied_next_item = "ITEM-NEXT-HISTORICAL-ABSENT";
+    assert.doesNotThrow(() => validateTaskLedger(value));
+    for (const malformed of [null, "", "   ", "x".repeat(513)]) {
+      const candidateValue = structuredClone(value); candidateValue.owner_gate.item_id = malformed;
+      assert.throws(() => validateTaskLedger(candidateValue), (error) => error.code === "OWNER_GATE_INVALID");
+    }
+  });
+
+  await t.test("a BLOCKED gate cannot reference an absent protected item", () => {
+    const value = blockedTask(); value.owner_gate.item_id = "ITEM-ABSENT"; value.next_item = "ITEM-1";
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
   });
 });
 
