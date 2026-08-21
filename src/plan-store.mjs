@@ -146,8 +146,9 @@ function stableFileFingerprint(stat) {
   });
 }
 
-function sameFileFingerprint(left, right) {
-  return left.device === right.device
+export function sameFileFingerprint(left, right) {
+  return Boolean(left && right)
+    && left.device === right.device
     && left.inode === right.inode
     && left.size === right.size
     && left.nlink === right.nlink
@@ -195,19 +196,32 @@ export class PlanRevisionWriter {
     const absolute = resolve(path);
     let fd;
     try {
-      const before = this.#io.lstatSync(absolute, { bigint: true });
-      invariant(before.isFile() && !before.isSymbolicLink(), code, `Expected a regular non-symlink file: ${absolute}`);
-      invariant(allowHardlinks || statValue(before, "nlink") === "1", code, `Unexpected hardlink count for ${absolute}`);
+      const beforeStat = this.#io.lstatSync(absolute, { bigint: true });
+      const before = stableFileFingerprint(beforeStat);
+      invariant(before.regular && !beforeStat.isSymbolicLink(), code, `Expected a regular non-symlink file: ${absolute}`);
+      invariant(allowHardlinks || before.nlink === "1", code, `Unexpected hardlink count for ${absolute}`);
       invariant(samePath(this.#io.realpathSync(absolute), absolute), code, `Refusing redirected file: ${absolute}`);
       fd = this.#io.openSync(absolute, "r");
-      const opened = this.#io.fstatSync(fd, { bigint: true });
-      invariant(opened.isFile() && sameFilesystemIdentity(fileIdentity(before), fileIdentity(opened)), code, `File identity changed while opening ${absolute}`);
-      invariant(Number(opened.size) <= maximum, code, `File exceeds ${maximum} bytes: ${absolute}`);
+      const openedStat = this.#io.fstatSync(fd, { bigint: true });
+      const opened = stableFileFingerprint(openedStat);
+      invariant(opened.regular && sameFileFingerprint(before, opened), code, `File changed while opening ${absolute}`);
+      invariant(Number(openedStat.size) <= maximum, code, `File exceeds ${maximum} bytes: ${absolute}`);
       const bytes = this.#io.readFileSync(fd);
-      invariant(bytes.length <= maximum && statValue(this.#io.fstatSync(fd, { bigint: true }), "size") === statValue(opened, "size"), code, `File changed while reading ${absolute}`);
+      const descriptorAfterStat = this.#io.fstatSync(fd, { bigint: true });
+      const descriptorAfter = stableFileFingerprint(descriptorAfterStat);
+      invariant(bytes.length <= maximum && bytes.length === Number(descriptorAfterStat.size) && sameFileFingerprint(opened, descriptorAfter), code, `File changed while reading ${absolute}`);
       this.#io.closeSync(fd);
       fd = undefined;
-      return Object.freeze({ bytes, identity: fileIdentity(opened), mode: Number(opened.mode) & 0o777 });
+
+      const postPath1Stat = this.#io.lstatSync(absolute, { bigint: true });
+      const postPath1 = stableFileFingerprint(postPath1Stat);
+      invariant(postPath1.regular && !postPath1Stat.isSymbolicLink() && (allowHardlinks || postPath1.nlink === "1"), code, `File pathname changed after reading ${absolute}`);
+      invariant(samePath(this.#io.realpathSync(absolute), absolute), code, `Refusing redirected file after reading ${absolute}`);
+      const postPath2Stat = this.#io.lstatSync(absolute, { bigint: true });
+      const postPath2 = stableFileFingerprint(postPath2Stat);
+      invariant(postPath2.regular && !postPath2Stat.isSymbolicLink() && (allowHardlinks || postPath2.nlink === "1")
+        && sameFileFingerprint(postPath1, postPath2) && sameFileFingerprint(descriptorAfter, postPath2), code, `File pathname changed after reading ${absolute}`);
+      return Object.freeze({ bytes, identity: fileIdentity(descriptorAfterStat), fingerprint: descriptorAfter, mode: Number(descriptorAfterStat.mode) & 0o777 });
     } finally {
       closeQuietly(this.#io, fd);
     }
@@ -276,12 +290,22 @@ export class PlanRevisionWriter {
       const opened = stableFileFingerprint(openedStat);
       invariant(sameFileFingerprint(before, opened), "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed while opening for final raw attestation");
       const bytes = this.#io.readFileSync(fd);
-      const afterStat = this.#io.fstatSync(fd, { bigint: true });
-      const after = stableFileFingerprint(afterStat);
-      invariant(bytes.length <= MAX_PLAN_BYTES && bytes.length === Number(afterStat.size) && sameFileFingerprint(opened, after), "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed during final raw attestation");
+      const descriptorAfterStat = this.#io.fstatSync(fd, { bigint: true });
+      const descriptorAfter = stableFileFingerprint(descriptorAfterStat);
+      invariant(bytes.length <= MAX_PLAN_BYTES && bytes.length === Number(descriptorAfterStat.size) && sameFileFingerprint(opened, descriptorAfter), "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed during final descriptor read");
       this.#io.closeSync(fd);
       fd = undefined;
-      return Object.freeze({ bytes, identity: fileIdentity(afterStat) });
+
+      const postPath1Stat = this.#io.lstatSync(this.path, { bigint: true });
+      const postPath1 = stableFileFingerprint(postPath1Stat);
+      invariant(postPath1.regular && !postPath1Stat.isSymbolicLink() && postPath1.nlink === "1", "PLAN_CAS_CONFLICT", "TASK_PLAN.md pathname changed after final descriptor read");
+      const canonicalPath = this.#io.realpathSync(this.path);
+      const postPath2Stat = this.#io.lstatSync(this.path, { bigint: true });
+      const postPath2 = stableFileFingerprint(postPath2Stat);
+      invariant(samePath(canonicalPath, this.path)
+        && postPath2.regular && !postPath2Stat.isSymbolicLink() && postPath2.nlink === "1"
+        && sameFileFingerprint(postPath1, postPath2) && sameFileFingerprint(descriptorAfter, postPath2), "PLAN_CAS_CONFLICT", "TASK_PLAN.md pathname no longer identifies the descriptor snapshot during final attestation");
+      return Object.freeze({ bytes, identity: fileIdentity(descriptorAfterStat), fingerprint: descriptorAfter });
     } catch (error) {
       if (error?.code === "PLAN_CAS_CONFLICT") throw error;
       if (["ENOENT", "ELOOP", "ENOTDIR"].includes(error?.code)) throw new GuardianError("PLAN_CAS_CONFLICT", "TASK_PLAN.md disappeared or was redirected during final raw attestation");
@@ -293,14 +317,16 @@ export class PlanRevisionWriter {
 
   #finalRawAuthorityAttestation(current) {
     const observed = this.#readAuthoritySnapshotRaw();
-    invariant(sameFilesystemIdentity(observed.identity, current.fileIdentity) && observed.bytes.equals(current.bytes), "PLAN_CAS_CONFLICT", "TASK_PLAN.md no longer equals the exact initial authority bytes and identity during final raw attestation");
+    invariant(sameFilesystemIdentity(observed.identity, current.fileIdentity)
+      && sameFileFingerprint(observed.fingerprint, current.fileFingerprint)
+      && observed.bytes.equals(current.bytes), "PLAN_CAS_CONFLICT", "TASK_PLAN.md no longer equals the exact initial authority bytes, identity, and fingerprint during final raw attestation");
   }
 
   readCurrent({ requireSingleBlock = false, validate } = {}) {
     const file = this.#readRegular(this.path, { maximum: MAX_PLAN_BYTES, code: "PLAN_PATH_REDIRECTED" });
     const observed = parseTaskPlanBytes(file.bytes, { requireSingleBlock });
     validate?.(observed.task);
-    return Object.freeze({ ...observed, fileIdentity: file.identity, mode: file.mode });
+    return Object.freeze({ ...observed, fileIdentity: file.identity, fileFingerprint: file.fingerprint, mode: file.mode });
   }
 
   readPlanBytes() {
@@ -455,7 +481,7 @@ export class PlanRevisionWriter {
     let committed = false;
     try {
       const current = this.readCurrent({ requireSingleBlock, validate });
-      const exactInitialAuthority = Object.freeze({ bytes: Buffer.from(current.bytes), fileIdentity: current.fileIdentity });
+      const exactInitialAuthority = Object.freeze({ bytes: Buffer.from(current.bytes), fileIdentity: current.fileIdentity, fileFingerprint: current.fileFingerprint });
       const existing = inspectExisting?.(current);
       if (existing !== undefined && existing !== null) return existing;
       if (expected) this.#casConflict(expected, current, "initial attestation");
