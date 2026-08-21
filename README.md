@@ -14,9 +14,9 @@ aio plan --target /path/to/repository
 aio start "Realizza un server P2P in Python con discovery dei peer e test" --target /path/to/repository
 ```
 
-`aio start <objective>` observes the initialized `TASK_PLAN.md`, asks the configured Pi model for one full structured candidate Ledger, validates it through the accepted `plan.*` adapter, shows the canonical diff, and asks `Apply this plan? [y/N]`. Only explicit `y`/`yes` applies. Denial or EOF leaves the plan unchanged. After an authorized plan apply, the command stops: it does not begin coding or execute plan items.
+`aio start <objective>` observes the initialized `TASK_PLAN.md`, asks the configured Pi model for one full structured candidate Ledger, validates it through the accepted `plan.*` adapter, shows the canonical diff, and asks `Apply this plan? [y/N]`. Approval requires exactly one complete LF/CRLF-terminated `y`/`yes` record (case-insensitive, no surrounding whitespace). EOF before the terminator and ambiguous/multiple piped records deny and leave the plan unchanged; there is no `--yes`. After an authorized plan apply, the command stops: it does not begin coding or execute plan items.
 
-The production planner uses existing Pi 0.83.x model/auth/settings configuration, one in-memory no-tools call, strict JSON output, and no hidden retry. See [`docs/0.2-d-start-objective.md`](docs/0.2-d-start-objective.md) for initialization behavior, observed-base/stale guarantees, authorization, provider failures, owner-gate protection, trust boundaries, and exclusions.
+The production planner uses existing Pi 0.83.x model/auth/settings discovery, one in-memory no-tools call, strict JSON output, and at most one provider/model call. Retry and compaction are disabled on the effective post-reload session settings without rewriting Pi settings. See [`docs/0.2-d-start-objective.md`](docs/0.2-d-start-objective.md) for initialization behavior, observed-base/stale guarantees, authorization, provider failures, owner-gate protection, trust boundaries, and exclusions.
 
 Run `aio --help` for the canonical CLI. The old `eio` executable remains temporarily available as a deprecated compatibility alias and prints its warning only to stderr.
 

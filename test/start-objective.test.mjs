@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -9,7 +9,9 @@ import { runCli } from "../src/cli.mjs";
 import { sha256 } from "../src/canonical.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { PiObjectivePlanner, parsePlannerResponse } from "../src/pi-objective-planner.mjs";
+import { loadPi } from "../src/pi-loader.mjs";
 import {
+  MAX_AUTHORIZATION_RECORD_BYTES,
   MAX_OBJECTIVE_BYTES,
   MAX_PLANNER_RESPONSE_BYTES,
   createStdinAuthorizer,
@@ -188,7 +190,14 @@ function fakePiRoot() {
   writeFileSync(join(root, "node_modules", "@earendil-works", "pi-ai", "dist", "index.js"), "export {};\n");
   writeFileSync(join(root, "dist", "index.js"), `
 export class ModelRuntime { static async create() { return {}; } }
-export class SettingsManager { static create() { return new SettingsManager(); } applyOverrides() {} async flush() {} }
+export class SettingsManager {
+  static create() { return new SettingsManager(); }
+  applyOverrides(value) { this.value = value; }
+  getRetryEnabled() { return this.value?.retry?.enabled; }
+  getRetrySettings() { return this.value?.retry ?? {}; }
+  getProviderRetrySettings() { return this.value?.retry?.provider ?? {}; }
+  getCompactionEnabled() { return this.value?.compaction?.enabled; }
+}
 export class SessionManager { static inMemory(cwd) { return { cwd }; } }
 export async function createAgentSessionServices(options) { return options; }
 export async function createAgentSessionFromServices(options) {
@@ -237,6 +246,115 @@ function spawnAio(bin, x, piRoot, objective, input, extraEnv = {}) {
   });
 }
 
+function fileSnapshot(path) {
+  if (!existsSync(path)) return { exists: false };
+  const bytes = readFileSync(path);
+  const stat = statSync(path);
+  return { exists: true, digest: sha256(bytes), size: stat.size, mtimeMs: stat.mtimeMs };
+}
+
+function recursiveFiles(root, prefix = "") {
+  if (!existsSync(root)) return [];
+  const files = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const relative = prefix ? join(prefix, entry.name) : entry.name;
+    if (entry.isDirectory()) files.push(...recursiveFiles(join(root, entry.name), relative));
+    else files.push(relative);
+  }
+  return files.sort();
+}
+
+async function realPiPlannerHarness(options = {}) {
+  const pi = await loadPi();
+  const cwd = options.cwd ?? mkdtempSync(join(tmpdir(), "aiopago-real-pi-planner-"));
+  const agentDir = options.agentDir ?? join(cwd, "agent");
+  mkdirSync(agentDir, { recursive: true });
+  const projectSettingsPath = join(cwd, ".pi", "settings.json");
+  const globalSettingsPath = join(agentDir, "settings.json");
+  if (options.projectSettings) {
+    mkdirSync(join(cwd, ".pi"), { recursive: true });
+    writeFileSync(projectSettingsPath, options.projectSettings);
+  }
+  if (options.globalSettings) writeFileSync(globalSettingsPath, options.globalSettings);
+
+  const before = {
+    project: fileSnapshot(projectSettingsPath), global: fileSnapshot(globalSettingsPath),
+    projectFiles: recursiveFiles(join(cwd, ".pi")), agentFiles: recursiveFiles(agentDir),
+  };
+  const credentials = new pi.ai.InMemoryCredentialStore();
+  const modelRuntime = await pi.coding.ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+  const model = {
+    id: "objective-planner-test", name: "Objective planner test", api: "openai-completions",
+    provider: "objective-planner-test", baseUrl: "offline://local", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: options.contextWindow ?? 100_000, maxTokens: 1000,
+  };
+  const defaultUsage = {
+    input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const responses = [...(options.responses ?? [])];
+  let calls = 0;
+  modelRuntime.registerProvider(model.provider, {
+    baseUrl: model.baseUrl, apiKey: "offline-placeholder", api: model.api, models: [model],
+    streamSimple() {
+      calls += 1;
+      const response = responses.shift() ?? { stopReason: "error", errorMessage: "unexpected extra provider call" };
+      const stream = pi.ai.createAssistantMessageEventStream();
+      const message = {
+        role: "assistant", content: response.content ?? [], api: model.api, provider: model.provider, model: model.id,
+        usage: response.usage ?? defaultUsage, stopReason: response.stopReason ?? "stop",
+        ...(response.errorMessage ? { errorMessage: response.errorMessage } : {}), timestamp: Date.now(),
+      };
+      queueMicrotask(() => {
+        stream.push({ type: "start", partial: { ...message, stopReason: "pending" } });
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
+          stream.push({ type: "error", reason: message.stopReason, error: message });
+        } else {
+          stream.push({ type: "done", reason: message.stopReason, message });
+        }
+        stream.end(message);
+      });
+      return stream;
+    },
+  });
+  await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
+
+  let settingsManager;
+  let effectiveAtSessionCreation;
+  const coding = {
+    ...pi.coding,
+    ModelRuntime: { create: async () => modelRuntime },
+    SettingsManager: {
+      create(...args) {
+        settingsManager = pi.coding.SettingsManager.create(...args);
+        return settingsManager;
+      },
+    },
+    createAgentSessionServices: (value) => pi.coding.createAgentSessionServices(value),
+    createAgentSessionFromServices(value) {
+      effectiveAtSessionCreation = {
+        retry: value.services.settingsManager.getRetrySettings(),
+        providerRetry: value.services.settingsManager.getProviderRetrySettings(),
+        compaction: value.services.settingsManager.getCompactionSettings(),
+      };
+      return pi.coding.createAgentSessionFromServices(value);
+    },
+  };
+  const planner = new PiObjectivePlanner({ cwd, agentDir, model, thinkingLevel: "off", pi: { coding } });
+  return {
+    pi, cwd, agentDir, planner,
+    get calls() { return calls; },
+    get effectiveAtSessionCreation() { return effectiveAtSessionCreation; },
+    assertPure() {
+      assert.deepEqual(fileSnapshot(projectSettingsPath), before.project);
+      assert.deepEqual(fileSnapshot(globalSettingsPath), before.global);
+      assert.deepEqual(recursiveFiles(join(cwd, ".pi")), before.projectFiles);
+      assert.deepEqual(recursiveFiles(agentDir), before.agentFiles);
+      assert.equal(recursiveFiles(cwd).some((path) => path.endsWith(".jsonl")), false);
+    },
+  };
+}
+
 test("happy path binds one observation, displays and applies the exact proposal, then stops", async () => {
   const x = fixture();
   const planned = candidate(x.base);
@@ -282,17 +400,67 @@ test("authorization defaults to deny and never auto-applies", async () => {
   assert.deepEqual(readFileSync(x.path), x.bytes);
 });
 
-test("EOF and every ambiguous authorization answer fail closed", async () => {
-  for (const answer of ["", "\n", "maybe\n", "y maybe\n", "si\n", "1\n"]) {
-    const input = Readable.from([answer]);
-    const output = new PassThrough();
-    assert.equal(await createStdinAuthorizer({ input, output })(), false, JSON.stringify(answer));
+test("production stdin authorizer accepts only one complete bounded y/yes record", async () => {
+  const allow = [
+    ["y\n"], ["yes\n"], ["Y\n"], ["YES\n"], ["y\r\n"], ["yes\r\n"],
+    ["ye", "s\n"], ["yes\r", "\n"],
+  ];
+  for (const chunks of allow) {
+    const input = Readable.from(chunks);
+    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough() })(), true, JSON.stringify(chunks));
   }
-  for (const answer of ["y\n", "YES\n", " yes \n"]) {
-    const input = Readable.from([answer]);
-    const output = new PassThrough();
-    assert.equal(await createStdinAuthorizer({ input, output })(), true, JSON.stringify(answer));
+  const tty = Readable.from(["yes\n"]);
+  Object.defineProperty(tty, "isTTY", { value: true });
+  assert.equal(await createStdinAuthorizer({ input: tty, output: new PassThrough() })(), true);
+  const pastedTty = Readable.from(["yes\nno\n"]);
+  Object.defineProperty(pastedTty, "isTTY", { value: true });
+  assert.equal(await createStdinAuthorizer({ input: pastedTty, output: new PassThrough() })(), false);
+
+  const deny = [
+    [], ["y"], ["yes"], ["yes\nno\n"], ["y\nanything\n"], ["yes\r\nno\r\n"],
+    ["yes\n "], ["\nyes\n"], [" yes \n"], ["maybe\n"], ["true\n"], ["1\n"],
+    ["ok\n"], ["yes please\n"], ["yes\r"], ["yes\rX\n"], ["yes\u0000\n"],
+    [Buffer.from([0xf9, 0x0a])], ["y".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
+    ["yes\n", "no\n"], ["yes", "\nno\n"],
+  ];
+  for (const chunks of deny) {
+    const input = Readable.from(chunks);
+    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough() })(), false, JSON.stringify(chunks));
   }
+
+  const broken = new Readable({ read() { this.destroy(new Error("stdin failed")); } });
+  assert.equal(await createStdinAuthorizer({ input: broken, output: new PassThrough() })(), false);
+});
+
+test("every denied or ambiguous production authorization preserves TASK_PLAN exact bytes and never applies", async () => {
+  const cases = [
+    [], ["y"], ["yes"], ["yes\nno\n"], ["y\nanything\n"], ["yes\r\nno\r\n"],
+    ["yes\n "], ["\nyes\n"], [" yes \n"], ["maybe\n"], ["true\n"], ["1\n"],
+    ["ok\n"], ["yes please\n"], ["yes\r"], ["x".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
+  ];
+  for (const chunks of cases) {
+    const x = fixture();
+    const tracked = instrument(x.plan);
+    const planner = fakePlanner(candidate(x.base));
+    const authorize = createStdinAuthorizer({ input: Readable.from(chunks), output: new PassThrough() });
+    const result = await startPlanning({ objective: "Authorization regression", plan: tracked.plan, planner, authorize });
+    assert.equal(result.status, "CANCELLED", JSON.stringify(chunks));
+    assert.equal(tracked.calls.apply, 0, JSON.stringify(chunks));
+    assert.equal(tracked.calls.observe, 1);
+    assert.equal(planner.calls, 1);
+    assert.deepEqual(readFileSync(x.path), x.bytes, JSON.stringify(chunks));
+  }
+
+  const x = fixture();
+  const tracked = instrument(x.plan);
+  const broken = new Readable({ read() { this.destroy(new Error("stdin failed")); } });
+  const result = await startPlanning({
+    objective: "Stream error regression", plan: tracked.plan, planner: fakePlanner(candidate(x.base)),
+    authorize: createStdinAuthorizer({ input: broken, output: new PassThrough() }),
+  });
+  assert.equal(result.status, "CANCELLED");
+  assert.equal(tracked.calls.apply, 0);
+  assert.deepEqual(readFileSync(x.path), x.bytes);
 });
 
 test("planner failure and malformed planner result do not prompt or mutate", async () => {
@@ -464,13 +632,32 @@ test("production Pi planner uses one in-memory no-tools call and strict output",
     },
     dispose() { seen.disposed = true; },
   };
-  const settings = { applyOverrides(value) { seen.settings = value; }, async flush() { seen.flushed = true; } };
+  const settings = {
+    effective: { retry: { enabled: true, maxRetries: 2, provider: { maxRetries: 2 } }, compaction: { enabled: true } },
+    async reload() { this.effective = { retry: { enabled: true, maxRetries: 2, provider: { maxRetries: 2 } }, compaction: { enabled: true } }; },
+    applyOverrides(value) { seen.settings = value; this.effective = value; },
+    getRetryEnabled() { return this.effective.retry.enabled; },
+    getRetrySettings() { return this.effective.retry; },
+    getProviderRetrySettings() { return this.effective.retry.provider; },
+    getCompactionEnabled() { return this.effective.compaction.enabled; },
+  };
   const pi = { coding: {
     ModelRuntime: { create: async () => ({}) },
     SettingsManager: { create: () => settings },
     SessionManager: { inMemory: (cwd) => ({ cwd }) },
-    async createAgentSessionServices(options) { seen.services = options; return { fake: "services" }; },
-    async createAgentSessionFromServices(options) { seen.sessionOptions = options; return { session }; },
+    async createAgentSessionServices(options) {
+      seen.services = options;
+      await options.settingsManager.reload();
+      seen.beforePostReloadOverride = options.settingsManager.getRetryEnabled();
+      return { fake: "services" };
+    },
+    async createAgentSessionFromServices(options) {
+      seen.sessionOptions = options;
+      seen.effectiveAtSessionCreation = {
+        retry: settings.getRetrySettings(), provider: settings.getProviderRetrySettings(), compaction: settings.getCompactionEnabled(),
+      };
+      return { session };
+    },
   } };
   const planner = new PiObjectivePlanner({ cwd: "F:/safe/project", pi });
   assert.deepEqual(await planner.plan(observed), { candidate_plan: planned });
@@ -483,19 +670,104 @@ test("production Pi planner uses one in-memory no-tools call and strict output",
   assert.match(seen.prompt, /\$\(no shell\)/);
   assert.equal(seen.prompt.split("</planning-input-json>").length - 1, 1, "only the real delimiter remains literal");
   assert.equal(seen.prompt.includes("must not leak"), false);
+  assert.equal(seen.beforePostReloadOverride, true);
+  assert.deepEqual(seen.effectiveAtSessionCreation, {
+    retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+    provider: { maxRetries: 0 }, compaction: false,
+  });
   assert.equal(seen.disposed, true);
-  assert.equal(seen.flushed, true);
 });
 
 test("production Pi planner reports provider failure without fallback or retry", async () => {
   let calls = 0;
   const session = { model: { provider: "fake", id: "planner" }, messages: [], async prompt() { calls += 1; throw new Error("offline"); }, dispose() {} };
+  const settings = {
+    applyOverrides() {}, getRetryEnabled: () => false, getRetrySettings: () => ({ maxRetries: 0 }),
+    getProviderRetrySettings: () => ({ maxRetries: 0 }), getCompactionEnabled: () => false,
+  };
   const pi = { coding: {
-    ModelRuntime: { create: async () => ({}) }, SettingsManager: { create: () => ({ applyOverrides() {}, async flush() {} }) },
+    ModelRuntime: { create: async () => ({}) }, SettingsManager: { create: () => settings },
     SessionManager: { inMemory: () => ({}) }, createAgentSessionServices: async () => ({}), createAgentSessionFromServices: async () => ({ session }),
   } };
   await assert.rejects(() => new PiObjectivePlanner({ cwd: ".", pi }).plan({ objective: "x", observation: {} }), assertCode("START_PLANNER_UNAVAILABLE"));
   assert.equal(calls, 1);
+});
+
+test("real Pi 0.83 SDK enforces post-reload no-retry/no-compaction without settings or session persistence", async () => {
+  const configured = `${JSON.stringify({
+    retry: { enabled: true, maxRetries: 1, baseDelayMs: 0, provider: { maxRetries: 1 } },
+    compaction: { enabled: true, reserveTokens: 1, keepRecentTokens: 1 },
+  }, null, 2)}\n`;
+
+  const retry = await realPiPlannerHarness({
+    projectSettings: configured, globalSettings: configured,
+    responses: [
+      { stopReason: "error", errorMessage: "HTTP 429 rate limit exceeded" },
+      { content: [{ type: "text", text: '{"candidate_plan":{"must_not_be_consumed":true}}' }] },
+    ],
+  });
+  await assert.rejects(
+    () => retry.planner.plan({ objective: "one call", observation: {} }),
+    (error) => error?.code === "START_PLANNER_UNAVAILABLE" && /did not complete successfully/.test(error.message),
+  );
+  assert.equal(retry.pi.version, "0.83.0");
+  assert.equal(retry.calls, 1);
+  assert.deepEqual(retry.effectiveAtSessionCreation, {
+    retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
+    providerRetry: { timeoutMs: undefined, maxRetries: 0, maxRetryDelayMs: 60000 },
+    compaction: { enabled: false, reserveTokens: 1, keepRecentTokens: 1 },
+  });
+  retry.assertPure();
+
+  const success = await realPiPlannerHarness({
+    projectSettings: configured,
+    contextWindow: 100,
+    responses: [
+      {
+        content: [{ type: "text", text: '{"candidate_plan":{"ok":true}}' }],
+        usage: {
+          input: 101, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 102,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+      },
+      { content: [{ type: "text", text: "compaction must not run" }] },
+    ],
+  });
+  assert.deepEqual(await success.planner.plan({ objective: "no compaction", observation: {} }), { candidate_plan: { ok: true } });
+  assert.equal(success.calls, 1);
+  assert.equal(success.effectiveAtSessionCreation.compaction.enabled, false);
+  success.assertPure();
+
+  const malformed = await realPiPlannerHarness({
+    globalSettings: configured,
+    responses: [{ content: [{ type: "text", text: "not-json" }] }],
+  });
+  await assert.rejects(() => malformed.planner.plan({ objective: "malformed", observation: {} }), assertCode("START_PLANNER_OUTPUT_INVALID"));
+  assert.equal(malformed.calls, 1);
+  malformed.assertPure();
+
+  const cancelledProvider = await realPiPlannerHarness({
+    responses: [{ stopReason: "aborted", errorMessage: "cancelled by caller" }],
+  });
+  await assert.rejects(() => cancelledProvider.planner.plan({ objective: "cancel", observation: {} }), assertCode("START_PLANNER_UNAVAILABLE"));
+  assert.equal(cancelledProvider.calls, 1);
+  cancelledProvider.assertPure();
+
+  const x = fixture();
+  const deny = await realPiPlannerHarness({
+    cwd: x.root,
+    projectSettings: configured,
+    responses: [{ content: [{ type: "text", text: JSON.stringify({ candidate_plan: candidate(x.base) }) }] }],
+  });
+  const tracked = instrument(x.plan);
+  const result = await startPlanning({ objective: "plan then deny", plan: tracked.plan, planner: deny.planner, authorize: () => false });
+  assert.equal(result.status, "CANCELLED");
+  assert.equal(deny.calls, 1);
+  assert.equal(tracked.calls.observe, 1);
+  assert.equal(tracked.calls.propose, 1);
+  assert.equal(tracked.calls.apply, 0);
+  assert.deepEqual(readFileSync(x.path), x.bytes);
+  deny.assertPure();
 });
 
 test("proposal formatter deterministically exposes revision, digest, lifecycle and item changes", async () => {
@@ -566,10 +838,16 @@ test("true aio CLI uses the production Pi boundary for happy, deny, provider err
   }
   {
     const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Deny objective", "no\n");
+    const result = spawnAio("bin/aio.mjs", x, piRoot, "Windows approval", "yes\r\n");
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Plan applied:\s+PLAN-CLI-FAKE-2/);
+  }
+  for (const input of ["no\n", "yes", "yes\nno\n", ""]) {
+    const x = fixture(); initializeFixtureRepository(x);
+    const result = spawnAio("bin/aio.mjs", x, piRoot, "Deny objective", input);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Plan not applied\./);
-    assert.deepEqual(readFileSync(x.path), x.bytes);
+    assert.deepEqual(readFileSync(x.path), x.bytes, JSON.stringify(input));
     assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), false);
   }
   {

@@ -6,6 +6,7 @@ import { MAX_PLAN_BYTES } from "./plan-store.mjs";
 
 export const MAX_OBJECTIVE_BYTES = 16 * 1024;
 export const MAX_PLANNER_RESPONSE_BYTES = MAX_PLAN_BYTES;
+export const MAX_AUTHORIZATION_RECORD_BYTES = 1024;
 export const START_PRODUCER = "aio-start/0.2-d";
 
 function deepFreeze(value) {
@@ -153,14 +154,39 @@ export function createStdinAuthorizer(options = {}) {
   return async () => {
     try {
       output.write("Apply this plan? [y/N] ");
-      let answer = "";
+      const record = [];
+      let state = "RECORD";
+
       for await (const chunk of input) {
-        answer += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-        if (answer.length > 1024) return false;
-        const newline = answer.search(/[\r\n]/);
-        if (newline >= 0) { answer = answer.slice(0, newline); break; }
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+        for (const byte of bytes) {
+          if (state === "COMPLETE") return false;
+          if (state === "EXPECT_LF") {
+            if (byte !== 0x0a) return false;
+            state = "COMPLETE";
+            continue;
+          }
+          if (byte === 0x0a) {
+            state = "COMPLETE";
+            continue;
+          }
+          if (byte === 0x0d) {
+            state = "EXPECT_LF";
+            continue;
+          }
+          record.push(byte);
+          if (record.length > MAX_AUTHORIZATION_RECORD_BYTES) return false;
+        }
+
+        // A terminal line is complete without waiting for terminal EOF. Any extra
+        // bytes already delivered in this chunk were rejected above. Pipes/files
+        // are consumed through EOF so their entire input is proven unambiguous.
+        if (input.isTTY === true && state === "COMPLETE") break;
       }
-      return /^(?:y|yes)$/i.test(answer.trim());
+
+      if (state !== "COMPLETE") return false;
+      const answer = Buffer.from(record.map((byte) => byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte));
+      return answer.equals(Buffer.from("y")) || answer.equals(Buffer.from("yes"));
     } catch {
       return false;
     }

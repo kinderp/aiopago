@@ -168,11 +168,9 @@ export class PiObjectivePlanner {
     catch (error) { throw error; }
     const { coding } = pi;
     let session;
-    let settingsManager;
     try {
       const modelRuntime = await coding.ModelRuntime.create();
-      settingsManager = coding.SettingsManager.create(this.cwd, this.agentDir);
-      settingsManager.applyOverrides({ compaction: { enabled: false }, retry: { enabled: false } });
+      const settingsManager = coding.SettingsManager.create(this.cwd, this.agentDir);
       const services = await coding.createAgentSessionServices({
         cwd: this.cwd,
         agentDir: this.agentDir,
@@ -188,6 +186,22 @@ export class PiObjectivePlanner {
           appendSystemPrompt: [],
         },
       });
+
+      // Pi 0.83 reloads this manager while creating services. Apply invocation-only
+      // policy after that reload and before the AgentSession captures the same manager.
+      settingsManager.applyOverrides({
+        compaction: { enabled: false },
+        retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } },
+      });
+      invariant(
+        settingsManager.getRetryEnabled() === false
+          && settingsManager.getRetrySettings().maxRetries === 0
+          && settingsManager.getProviderRetrySettings().maxRetries === 0
+          && settingsManager.getCompactionEnabled() === false,
+        "START_PLANNER_SETTINGS_INVALID",
+        "Planning session could not enforce no-retry/no-compaction settings",
+      );
+
       const created = await coding.createAgentSessionFromServices({
         services,
         sessionManager: coding.SessionManager.inMemory(this.cwd),
@@ -208,7 +222,6 @@ export class PiObjectivePlanner {
       );
     } finally {
       try { session?.dispose(); } catch {}
-      try { await settingsManager?.flush?.(); } catch {}
     }
   }
 }
