@@ -12,7 +12,7 @@ const shortPattern = new RegExp(`(?<![A-Za-z0-9])${legacyShort}(?![A-Za-z0-9])`,
 const fullAllowlist = new Map(Object.entries({
   "CHECKPOINT.md": [75, "rename closure allowlist and immutable session history"],
   "TASK_PLAN.md": [11, "closed Ledger provenance and stable IDs"],
-  "docs/0.2-b-plan-proposal-foundation.md": [3, "explicit legacy Ledger and command compatibility policy"],
+  "docs/0.2-b-plan-proposal-foundation.md": [4, "explicit legacy Ledger and command compatibility policy"],
   "docs/audit/guardian-requirements-coverage.md": [15, "historical audit record"],
   "docs/m1-h1-context-handoff-advisor.md": [1, "persisted runner-binding compatibility"],
   "docs/m1-h2-calibration-pilot.json": [7, "frozen digest-bound protocol"],
@@ -26,7 +26,7 @@ const fullAllowlist = new Map(Object.entries({
   "src/calibration-preflight.mjs": [1, "legacy attestation reader"],
   "src/calibration-quality.mjs": [1, "legacy quality-evidence reader"],
   "src/extension.mjs": [1, "deprecated TUI alias"],
-  "src/ledger.mjs": [1, "legacy command normalization"],
+  "src/owner-gate-internal.mjs": [1, "closed owner-command compatibility normalization"],
   "src/plan-store.mjs": [1, "legacy Ledger schema reader and mutation rejection"],
   "src/repository.mjs": [1, "legacy repository-config reader"],
   "src/runner-ownership.mjs": [1, "legacy session-binding reader"],
@@ -34,7 +34,7 @@ const fullAllowlist = new Map(Object.entries({
   "test/calibration-preflight.test.mjs": [1, "legacy protocol compatibility test"],
   "test/core.test.mjs": [4, "legacy Ledger, command and binding tests"],
   "test/fixtures/historical-owner-gate-b317f79.md": [1, "exact historical Ledger schema compatibility fixture"],
-  "test/plan-proposal.test.mjs": [5, "legacy Ledger, owner-gate and command compatibility tests"],
+  "test/plan-proposal.test.mjs": [8, "legacy Ledger, owner-gate and command compatibility tests"],
 }));
 
 const shortAllowlist = new Map(Object.entries({
@@ -42,7 +42,7 @@ const shortAllowlist = new Map(Object.entries({
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
   [["bin", `${legacyShort}.mjs`].join("/")]: [1, "deprecated thin CLI wrapper"],
-  "docs/0.2-b-plan-proposal-foundation.md": [1, "explicit legacy owner-command compatibility policy"],
+  "docs/0.2-b-plan-proposal-foundation.md": [2, "explicit legacy owner-command compatibility policy"],
   "docs/m1-h2-calibration-pilot.json": [2, "frozen digest-bound protocol"],
   "docs/m1-h2-threshold-calibration.md": [5, "historical calibration commands and environment"],
   "docs/m1-h2-workload-feasibility.md": [8, "historical workload commands"],
@@ -53,10 +53,10 @@ const shortAllowlist = new Map(Object.entries({
   "src/cli-entry.mjs": [1, "deprecated CLI warning"],
   "src/context-advisor.mjs": [1, "legacy environment fallback"],
   "src/extension.mjs": [1, "deprecated TUI alias"],
-  "src/ledger.mjs": [1, "legacy command normalization"],
+  "src/owner-gate-internal.mjs": [1, "closed owner-command compatibility normalization"],
   "test/core.test.mjs": [5, "legacy environment, Ledger and TUI tests"],
   "test/fixtures/historical-owner-gate-b317f79.md": [2, "exact historical owner-gate command and actor fixture"],
-  "test/plan-proposal.test.mjs": [3, "legacy owner-command alias compatibility tests"],
+  "test/plan-proposal.test.mjs": [6, "legacy owner-command alias compatibility tests"],
   "test/portable-alpha.test.mjs": [5, "deprecated CLI and package tests"],
 }));
 

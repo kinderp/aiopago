@@ -1,7 +1,13 @@
 import { resolve } from "node:path";
 import { sha256, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
-import { assertExactSatisfiedOwnerGateTransition, commandTokens, isCommandTokenWhitespace } from "./owner-gate-internal.mjs";
+import {
+  assertExactSatisfiedOwnerGateTransition,
+  canonicalOwnerCommand,
+  commandTokens,
+  HANDOFF_CONFIRM_CANONICAL_COMMAND,
+  isCommandTokenWhitespace,
+} from "./owner-gate-internal.mjs";
 import { materializeLedgerMarkdown } from "./plan-markdown.mjs";
 import { PlanRevisionWriter } from "./plan-store.mjs";
 
@@ -69,19 +75,19 @@ function canonicalUtc(value, field) {
   return value;
 }
 
-function canonicalCommandName(command) {
-  const tokens = commandTokens(command);
-  if (tokens === null) return command;
-  if (["/eio", "/eiopago"].includes(tokens[0])) tokens[0] = "/aio";
-  return tokens.join(" ");
+function isAuthorizedHumanActor(actor) {
+  return typeof actor === "string"
+    && actor.length <= MAX_TEXT_LENGTH
+    && actor.startsWith("human:")
+    && actor.slice("human:".length).trim().length > 0;
 }
 
 function containsCanonicalCommandMention(text, gateCommand) {
   if (typeof text !== "string") return false;
-  const canonicalGateCommand = canonicalCommandName(gateCommand);
-  const targetTokens = commandTokens(canonicalGateCommand);
-  if (typeof canonicalGateCommand !== "string" || !canonicalGateCommand.startsWith("/") || !targetTokens?.length) return false;
-  const embeddedBoundary = /[\p{L}\p{N}_\/-]/u;
+  const canonicalGateCommand = canonicalOwnerCommand(gateCommand);
+  const targetTokens = commandTokens(HANDOFF_CONFIRM_CANONICAL_COMMAND);
+  if (canonicalGateCommand === null) return false;
+  const embeddedBoundary = /[\p{L}\p{N}\p{M}_\/-]/u;
   const commandNameCharacter = /[A-Za-z0-9-]/;
   const commandArgumentCharacter = /[A-Za-z0-9_-]/;
 
@@ -106,7 +112,7 @@ function containsCanonicalCommandMention(text, gateCommand) {
     }
     if (parsedTokens !== targetTokens.length) continue;
     if (embeddedBoundary.test(text[end] ?? "")) continue;
-    if (canonicalCommandName(text.slice(start, end)) === canonicalGateCommand) return true;
+    if (canonicalOwnerCommand(text.slice(start, end)) === canonicalGateCommand) return true;
   }
   return false;
 }
@@ -163,7 +169,8 @@ function validateOwnerGate(task, byId, inProgress) {
   } catch (error) {
     throw new GuardianError("OWNER_GATE_INVALID", error.message);
   }
-  fail(gate.command.trim().length > 0 && gate.satisfied_next_step.trim().length > 0, "owner_gate command and target next step must not be blank");
+  fail(canonicalOwnerCommand(gate.command) === HANDOFF_CONFIRM_CANONICAL_COMMAND, "HANDOFF_CONFIRM owner_gate command must be the fixed semantic authorization command");
+  fail(gate.satisfied_next_step.trim().length > 0, "owner_gate target next step must not be blank");
   fail(!containsCanonicalCommandMention(gate.satisfied_next_step, gate.command), "owner_gate satisfied_next_step must not mention its canonical authorization command or a supported alias");
   if (Object.hasOwn(gate, "satisfied_task_status")) fail(gate.satisfied_task_status === "IN_PROGRESS", "owner_gate satisfied_task_status must be IN_PROGRESS for the active-work target projection");
   if (Object.hasOwn(gate, "satisfied_next_item") && gate.satisfied_next_item !== null) {
@@ -188,7 +195,7 @@ function validateOwnerGate(task, byId, inProgress) {
   fail(Object.hasOwn(gate, "satisfied_at") && Object.hasOwn(gate, "satisfied_by"), "A SATISFIED owner_gate requires satisfied_at and satisfied_by audit fields");
   try { canonicalUtc(gate.satisfied_at, "owner_gate satisfied_at"); }
   catch (error) { throw new GuardianError("OWNER_GATE_INVALID", error.message); }
-  fail(typeof gate.satisfied_by === "string" && gate.satisfied_by.startsWith("human:") && gate.satisfied_by.slice("human:".length).trim().length > 0 && gate.satisfied_by.length <= MAX_TEXT_LENGTH, "A SATISFIED owner_gate requires a bounded human:* satisfied_by actor");
+  fail(isAuthorizedHumanActor(gate.satisfied_by), "A SATISFIED owner_gate requires a bounded human:* satisfied_by actor");
   if (Object.hasOwn(gate, "post_fix_continuity")) fail(gate.post_fix_continuity === "PASS", "Historical owner_gate post_fix_continuity must be the observed PASS value");
   if (Object.hasOwn(gate, "final_acceptance")) fail(gate.final_acceptance === "PASS", "Historical owner_gate final_acceptance must be the observed PASS value");
 }
@@ -324,7 +331,12 @@ export class TaskLedger {
         const gate = task.owner_gate;
         if (!gate || gate.status === "SATISFIED") return { noWrite: true, result: ledgerResult(task, observed.contentDigest, this.path) };
         invariant(gate.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "OWNER_GATE_INVALID");
-        invariant(canonicalCommandName(command) === canonicalCommandName(gate.command) && actor?.startsWith("human:"), "OWNER_GATE_AUTHORIZATION_REQUIRED");
+        invariant(
+          canonicalOwnerCommand(gate.command) === HANDOFF_CONFIRM_CANONICAL_COMMAND
+            && canonicalOwnerCommand(command) === HANDOFF_CONFIRM_CANONICAL_COMMAND
+            && isAuthorizedHumanActor(actor),
+          "OWNER_GATE_AUTHORIZATION_REQUIRED",
+        );
         invariant(task.current_item === null && task.next_item === gate.item_id, "OWNER_GATE_LIFECYCLE_MISMATCH");
         const item = task.task_items.find((candidate) => candidate.task_item_id === gate.item_id);
         invariant(item?.status === "BLOCKED", "OWNER_GATE_ITEM_NOT_BLOCKED");

@@ -5,6 +5,8 @@ import { invariant } from "./errors.mjs";
 // preserves JavaScript /\s/ semantics used by the original canonicalizer.
 const COMMAND_TOKEN_WHITESPACE = /\s/u;
 
+export const HANDOFF_CONFIRM_CANONICAL_COMMAND = "/aio handoff confirm";
+
 export function isCommandTokenWhitespace(character) {
   return character !== undefined && COMMAND_TOKEN_WHITESPACE.test(character);
 }
@@ -22,6 +24,14 @@ export function commandTokens(value) {
     }
   }
   return tokens;
+}
+
+export function canonicalOwnerCommand(value) {
+  const tokens = commandTokens(value);
+  if (tokens === null) return null;
+  if (["/eio", "/eiopago"].includes(tokens[0])) tokens[0] = "/aio";
+  const canonical = tokens.join(" ");
+  return canonical === HANDOFF_CONFIRM_CANONICAL_COMMAND ? canonical : null;
 }
 
 export function assertExactSatisfiedOwnerGateTransition(base, candidate, actor, now) {

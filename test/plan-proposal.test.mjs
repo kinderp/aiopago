@@ -531,6 +531,94 @@ test("owner-gate mutation keeps authorization/lifecycle semantics and shares ato
   assert.deepEqual(readFileSync(x.path), committed);
 });
 
+test("HANDOFF_CONFIRM gate command is a closed semantic authorization enum", async (t) => {
+  const invalidCommands = [
+    "garbage",
+    "foo",
+    "/aio",
+    "/eio",
+    "/eiopago",
+    "/foo handoff confirm",
+    "/aio other confirm",
+    "/aio handoff",
+    "/aio confirm",
+    "/aio handoff confirm extra",
+    "/aio handoff confirm --force",
+    "/aio handoff confirmation",
+    "/aio handoff confirmatory",
+    "/aio handoff-confirm",
+    "/aio/handoff/confirm",
+    "",
+    "   ",
+    null,
+    7,
+    {},
+    [],
+  ];
+  for (const gateCommand of invalidCommands) await t.test(`${JSON.stringify(gateCommand)} rejects every public preflight without state`, () => {
+    const value = blockedOwnerGateTask();
+    value.owner_gate.command = gateCommand;
+    const x = fixture({ task: value });
+    const advanced = candidate(task());
+    const input = proposal(x.bytes, value, advanced);
+    assert.throws(() => new TaskLedger(x.path).read(), (error) => error?.code === "OWNER_GATE_INVALID");
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error?.code === "OWNER_GATE_INVALID");
+    assert.throws(
+      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }),
+      (error) => error?.code === "OWNER_GATE_INVALID",
+    );
+    assert.equal(existsSync(join(x.root, ".guardian")), false);
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+  });
+
+  const aliases = ["/aio handoff confirm", "/eio handoff confirm", "/eiopago handoff confirm"];
+  for (const gateCommand of aliases) {
+    for (const submittedCommand of aliases) await t.test(`${gateCommand} gate accepts ${submittedCommand}`, () => {
+      const value = blockedOwnerGateTask();
+      value.owner_gate.command = gateCommand;
+      const x = fixture({ task: value });
+      assert.equal(new TaskLedger(x.path).read().owner_gate.command, gateCommand);
+      const released = new TaskLedger(x.path).satisfyOwnerGate({ command: submittedCommand, actor: "human:test" });
+      assert.equal(released.owner_gate.status, "SATISFIED");
+      assert.equal(released.owner_gate.command, gateCommand, "compatibility bytes are not rewritten semantically");
+    });
+  }
+});
+
+test("submitted owner authorization and actor validation fail with stable specialized errors", async (t) => {
+  const invalidCommands = [
+    "garbage",
+    "/foo handoff confirm",
+    "/aio other confirm",
+    "/aio handoff confirm extra",
+    "/aio handoff confirmation",
+    "/aio/handoff/confirm",
+  ];
+  for (const command of invalidCommands) await t.test(`submitted ${JSON.stringify(command)} is unauthorized`, () => {
+    const x = fixture({ task: blockedOwnerGateTask() });
+    assert.throws(
+      () => new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" }),
+      (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
+    );
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+  });
+
+  const invalidActors = [null, undefined, 7, {}, [], Symbol("actor"), "", "human:", "human: ", "human:\t\n", " human:test", "agent:test", "model:test", `human:${"x".repeat(4096)}`];
+  for (const actor of invalidActors) await t.test(`actor ${String(actor)} is unauthorized without a generic exception`, () => {
+    const x = fixture({ task: blockedOwnerGateTask() });
+    assert.throws(
+      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor }),
+      (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
+    );
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+  });
+
+  for (const actor of ["human:test", "human:review", "human:/aio-handoff"]) await t.test(`${actor} authorizes`, () => {
+    const x = fixture({ task: blockedOwnerGateTask() });
+    assert.equal(new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor }).owner_gate.satisfied_by, actor);
+  });
+});
+
 test("owner_gate contract fails closed and preserves post-SATISFIED evolution", async (t) => {
   const blockedGate = {
     kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1",
@@ -706,9 +794,15 @@ test("owner-gate command tokenization is invariant across JS whitespace, aliases
     ["vertical tab U+000B", "\u000b"],
     ["form feed U+000C", "\u000c"],
     ["NBSP U+00A0", "\u00a0"],
+    ["OGHAM SPACE MARK U+1680", "\u1680"],
+    ["EN SPACE U+2002", "\u2002"],
     ["EM SPACE U+2003", "\u2003"],
     ["THIN SPACE U+2009", "\u2009"],
+    ["HAIR SPACE U+200A", "\u200a"],
+    ["LINE SEPARATOR U+2028", "\u2028"],
+    ["PARAGRAPH SEPARATOR U+2029", "\u2029"],
     ["NNBSP U+202F", "\u202f"],
+    ["MEDIUM MATHEMATICAL SPACE U+205F", "\u205f"],
     ["IDEOGRAPHIC SPACE U+3000", "\u3000"],
     ["BOM U+FEFF", "\ufeff"],
   ];
@@ -727,6 +821,19 @@ test("owner-gate command tokenization is invariant across JS whitespace, aliases
       assert.equal(released.owner_gate.status, "SATISFIED");
     });
   }
+
+  for (const [name, nonSeparator] of [["ZERO WIDTH SPACE U+200B", "\u200b"], ["WORD JOINER U+2060", "\u2060"]]) await t.test(`${name} remains a non-separator`, () => {
+    const command = `/aio${nonSeparator}handoff${nonSeparator}confirm`;
+    const invalidGate = blockedOwnerGateTask(); invalidGate.owner_gate.command = command;
+    assert.throws(() => validateTaskLedger(invalidGate), (error) => error?.code === "OWNER_GATE_INVALID");
+    const mention = blockedOwnerGateTask(); mention.owner_gate.satisfied_next_step = `Run ${command}.`;
+    assert.doesNotThrow(() => validateTaskLedger(mention));
+    const x = fixture({ task: blockedOwnerGateTask() });
+    assert.throws(
+      () => new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" }),
+      (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
+    );
+  });
 
   await t.test("wrong canonical command remains unauthorized", () => {
     const x = fixture({ task: blockedOwnerGateTask() });
@@ -756,6 +863,22 @@ test("owner-gate mention scanner recognizes Markdown punctuation without prefix 
       assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
     });
   }
+
+  for (const mark of ["\u0301", "\u0300", "\u20dd", "\ufe20"]) await t.test(`combining mark U+${mark.codePointAt(0).toString(16).toUpperCase()} continues the command token`, () => {
+    const suffixed = blockedOwnerGateTask();
+    suffixed.owner_gate.satisfied_next_step = `Run /aio handoff confirm${mark}.`;
+    assert.doesNotThrow(() => validateTaskLedger(suffixed));
+    const embedded = blockedOwnerGateTask();
+    embedded.owner_gate.satisfied_next_step = `Run /aio handoff confir${mark}m.`;
+    assert.doesNotThrow(() => validateTaskLedger(embedded));
+  });
+
+  await t.test("exact punctuation remains dangerous and extra dispatcher arguments remain blocked", () => {
+    for (const text of ["/aio handoff confirm.", "/eio handoff confirm,", "/eiopago handoff confirm extra"]) {
+      const value = blockedOwnerGateTask(); value.owner_gate.satisfied_next_step = `Run ${text}`;
+      assert.throws(() => validateTaskLedger(value), (error) => error?.code === "OWNER_GATE_INVALID");
+    }
+  });
 
   const negatives = [
     "Do not handoff confirm yet",
