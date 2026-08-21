@@ -118,12 +118,29 @@ function candidate(base, overrides = {}) {
   return Object.assign(value, overrides);
 }
 
-function intent(candidatePlan, overrides = {}) {
+function observationIdentity(observation) {
+  return {
+    task_id: observation.task_id,
+    plan_revision_id: observation.plan_revision_id,
+    content_digest: observation.content_digest,
+  };
+}
+
+function fixtureIdentity(x) {
+  return {
+    task_id: x.base.task_id,
+    plan_revision_id: x.base.plan_revision_id,
+    content_digest: sha256(x.bytes),
+  };
+}
+
+function intent(candidatePlan, base, overrides = {}) {
   return {
     schema: PLAN_INTENT_SCHEMA,
     proposal_id: "PPR-INTENT-ADAPTER-1",
     producer: "aiopago:test-structured-producer",
     change_reason: "Apply an externally produced structured candidate.",
+    base,
     candidate_plan: candidatePlan,
     ...overrides,
   };
@@ -208,16 +225,16 @@ test("observe/propose/validate/diff are read-only in a clean Git worktree", () =
   git(x.root, ["commit", "-m", "base"]);
   const before = git(x.root, ["status", "--porcelain=v1", "--untracked-files=all"]);
   const observation = x.adapter.observe();
-  const proposal = x.adapter.propose(intent(candidate(observation.plan)));
+  const proposal = x.adapter.propose(intent(candidate(observation.plan), observationIdentity(observation)));
   assert.equal(x.adapter.validate(proposal).valid, true);
   assert.equal(x.adapter.diff(proposal).schema, PLAN_DIFF_SCHEMA);
   assert.equal(git(x.root, ["status", "--porcelain=v1", "--untracked-files=all"]), before);
   assertNoState(x);
 });
 
-test("plan.propose derives base identity from current authority and rejects base spoofing fields", () => {
+test("plan.propose verifies the declared base and uses the matching authority identity", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   assert.equal(proposal.schema, PLAN_PROPOSAL_SCHEMA);
   assert.equal(proposal.task_id, x.base.task_id);
   assert.equal(proposal.base_plan_revision_id, x.base.plan_revision_id);
@@ -228,19 +245,129 @@ test("plan.propose derives base identity from current authority and rejects base
   assert.equal(Object.isFrozen(proposal.candidate_plan), true);
 
   assert.throws(
-    () => x.adapter.propose({ ...intent(candidate(x.base)), base_plan_revision_id: "PLAN-SPOOF", base_content_digest: `sha256:${"0".repeat(64)}` }),
+    () => x.adapter.propose({ ...intent(candidate(x.base), fixtureIdentity(x)), base_plan_revision_id: "PLAN-SPOOF", base_content_digest: `sha256:${"0".repeat(64)}` }),
     (error) => error.code === "PLAN_INTENT_FIELDS_INVALID",
   );
+  assertNoState(x);
+});
+
+test("observe A -> build B -> external C -> propose B fails stale and preserves C exact bytes", () => {
+  const x = fixture();
+  const observationA = x.adapter.observe();
+  const candidateB = candidate(structuredClone(observationA.plan), {
+    title: "Candidate B derived from A",
+    next_step: "Apply B only if A is still current.",
+  });
+  const intentB = intent(candidateB, observationIdentity(observationA));
+  const authorityC = candidate(x.base, {
+    plan_revision_id: "PLAN-EXTERNAL-C",
+    updated_at: "2026-08-21T10:06:00.000Z",
+    title: "Concurrent authority C",
+    next_step: "Preserve C and its legitimate concurrent change.",
+  });
+  writeFileSync(x.path, markdown(authorityC));
+  const exactC = readFileSync(x.path);
+
+  assert.throws(() => x.adapter.propose(intentB), (error) => {
+    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+    assert.deepEqual(error.details, {
+      expected_task_id: observationA.task_id,
+      observed_task_id: authorityC.task_id,
+      task_matches: true,
+      expected_plan_revision_id: observationA.plan_revision_id,
+      observed_plan_revision_id: authorityC.plan_revision_id,
+      revision_matches: false,
+      expected_content_digest: observationA.content_digest,
+      observed_content_digest: sha256(exactC),
+      digest_matches: false,
+    });
+    assert.doesNotThrow(() => JSON.parse(JSON.stringify(error.details)));
+    return true;
+  });
+  assert.deepEqual(readFileSync(x.path), exactC);
+  assert.equal(existsSync(join(x.root, ".guardian")), false);
+});
+
+test("plan.propose rejects a same-revision base whose exact content digest changed", () => {
+  const x = fixture();
+  const observationA = x.adapter.observe();
+  const sameRevisionC = structuredClone(x.base);
+  sameRevisionC.updated_at = "2026-08-21T10:06:00.000Z";
+  sameRevisionC.next_step = "Changed exact bytes without changing the revision ID.";
+  writeFileSync(x.path, markdown(sameRevisionC));
+  const exactC = readFileSync(x.path);
+  assert.throws(() => x.adapter.propose(intent(candidate(observationA.plan), observationIdentity(observationA))), (error) => {
+    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+    assert.equal(error.details.task_matches, true);
+    assert.equal(error.details.revision_matches, true);
+    assert.equal(error.details.digest_matches, false);
+    return true;
+  });
+  assert.deepEqual(readFileSync(x.path), exactC);
+  assert.equal(existsSync(join(x.root, ".guardian")), false);
+});
+
+test("plan.propose rejects an expected revision mismatch even when task and digest match", () => {
+  const x = fixture();
+  const forgedBase = { ...fixtureIdentity(x), plan_revision_id: "PLAN-FORGED-REVISION" };
+  assert.throws(() => x.adapter.propose(intent(candidate(x.base), forgedBase)), (error) => {
+    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+    assert.equal(error.details.task_matches, true);
+    assert.equal(error.details.revision_matches, false);
+    assert.equal(error.details.digest_matches, true);
+    return true;
+  });
+  assertNoState(x);
+});
+
+test("plan.propose rejects an expected task mismatch as stale", () => {
+  const x = fixture();
+  const forgedBase = { ...fixtureIdentity(x), task_id: "TASK-FORGED-BASE" };
+  assert.throws(() => x.adapter.propose(intent(candidate(x.base), forgedBase)), (error) => {
+    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+    assert.equal(error.details.task_matches, false);
+    assert.equal(error.details.revision_matches, true);
+    assert.equal(error.details.digest_matches, true);
+    return true;
+  });
+  assertNoState(x);
+});
+
+test("stale intent fails before PlanProposal construction", () => {
+  const x = fixture();
+  let proposalCalls = 0;
+  const port = {
+    observe() {
+      return {
+        task_id: x.base.task_id,
+        plan_revision_id: x.base.plan_revision_id,
+        content_digest: sha256(x.bytes),
+        bytes: Buffer.from(x.bytes),
+        plan: structuredClone(x.base),
+      };
+    },
+    proposal() { proposalCalls += 1; throw new Error("must not construct"); },
+  };
+  const adapter = new IntentAdapter(x.path, { port });
+  const staleBase = { ...fixtureIdentity(x), plan_revision_id: "PLAN-STALE" };
+  assert.throws(() => adapter.propose(intent(candidate(x.base), staleBase)), (error) => error.code === "PLAN_PROPOSAL_STALE");
+  assert.equal(proposalCalls, 0);
   assertNoState(x);
 });
 
 test("plan.propose snapshots caller data and output mutation cannot affect later operations", () => {
   const x = fixture();
   const candidatePlan = candidate(x.base);
-  const request = intent(candidatePlan);
+  const request = intent(candidatePlan, fixtureIdentity(x));
   const proposal = x.adapter.propose(request);
   candidatePlan.next_step = "mutated after propose";
   request.change_reason = "mutated after propose";
+  request.base.task_id = "TASK-MUTATED-AFTER-PROPOSE";
+  request.base.plan_revision_id = "PLAN-MUTATED-AFTER-PROPOSE";
+  request.base.content_digest = `sha256:${"0".repeat(64)}`;
+  assert.equal(proposal.task_id, x.base.task_id);
+  assert.equal(proposal.base_plan_revision_id, x.base.plan_revision_id);
+  assert.equal(proposal.base_content_digest, sha256(x.bytes));
   assert.equal(proposal.candidate_plan.next_step, "Continue the structured candidate plan.");
   assert.equal(x.adapter.validate(proposal).valid, true);
   assert.throws(() => { proposal.proposal_digest = `sha256:${"0".repeat(64)}`; }, TypeError);
@@ -251,20 +378,20 @@ test("plan.propose rejects invalid Ledger and strict JSON attacks deterministica
   const x = fixture();
   const invalid = candidate(x.base);
   invalid.task_items[0].status = "NOT_A_STATUS";
-  assert.throws(() => x.adapter.propose(intent(invalid)), (error) => error.code === "LEDGER_ITEM_STATUS_INVALID");
+  assert.throws(() => x.adapter.propose(intent(invalid, fixtureIdentity(x))), (error) => error.code === "LEDGER_ITEM_STATUS_INVALID");
 
   const attacks = [];
-  attacks.push(Object.assign(Object.create({ inherited: true }), intent(candidate(x.base))));
-  const accessor = intent(candidate(x.base));
+  attacks.push(Object.assign(Object.create({ inherited: true }), intent(candidate(x.base), fixtureIdentity(x))));
+  const accessor = intent(candidate(x.base), fixtureIdentity(x));
   Object.defineProperty(accessor, "producer", { enumerable: true, get() { return "attacker"; } });
   attacks.push(accessor);
-  const symbol = intent(candidate(x.base)); symbol[Symbol("hidden")] = true; attacks.push(symbol);
-  attacks.push({ ...intent(candidate(x.base)), producer: () => "bad" });
-  attacks.push({ ...intent(candidate(x.base)), producer: undefined });
-  attacks.push({ ...intent(candidate(x.base)), extra: Number.NaN });
-  attacks.push({ ...intent(candidate(x.base)), extra: 1n });
-  const cycle = intent(candidate(x.base)); cycle.candidate_plan.cycle = cycle; attacks.push(cycle);
-  attacks.push(new (class ForgedIntent { constructor() { Object.assign(this, intent(candidate(x.base))); } })());
+  const symbol = intent(candidate(x.base), fixtureIdentity(x)); symbol[Symbol("hidden")] = true; attacks.push(symbol);
+  attacks.push({ ...intent(candidate(x.base), fixtureIdentity(x)), producer: () => "bad" });
+  attacks.push({ ...intent(candidate(x.base), fixtureIdentity(x)), producer: undefined });
+  attacks.push({ ...intent(candidate(x.base), fixtureIdentity(x)), extra: Number.NaN });
+  attacks.push({ ...intent(candidate(x.base), fixtureIdentity(x)), extra: 1n });
+  const cycle = intent(candidate(x.base), fixtureIdentity(x)); cycle.candidate_plan.cycle = cycle; attacks.push(cycle);
+  attacks.push(new (class ForgedIntent { constructor() { Object.assign(this, intent(candidate(x.base), fixtureIdentity(x))); } })());
 
   for (const attack of attacks) {
     assert.throws(() => x.adapter.propose(attack), (error) => error.code === "PLAN_INTENT_JSON_DOMAIN_INVALID");
@@ -272,22 +399,72 @@ test("plan.propose rejects invalid Ledger and strict JSON attacks deterministica
   assertNoState(x);
 });
 
+test("plan.propose enforces exact strict base identity fields and digest syntax", () => {
+  const x = fixture();
+  const desired = candidate(x.base);
+
+  const missingBase = intent(desired, fixtureIdentity(x));
+  delete missingBase.base;
+  assert.throws(() => x.adapter.propose(missingBase), (error) => error.code === "PLAN_INTENT_FIELDS_INVALID");
+
+  const missingField = fixtureIdentity(x);
+  delete missingField.plan_revision_id;
+  assert.throws(() => x.adapter.propose(intent(desired, missingField)), (error) => error.code === "PLAN_INTENT_BASE_FIELDS_INVALID");
+  assert.throws(
+    () => x.adapter.propose(intent(desired, { ...fixtureIdentity(x), extra: true })),
+    (error) => error.code === "PLAN_INTENT_BASE_FIELDS_INVALID",
+  );
+  assert.throws(
+    () => x.adapter.propose(intent(desired, { ...fixtureIdentity(x), content_digest: `sha256:${"A".repeat(64)}` })),
+    (error) => error.code === "PLAN_INTENT_BASE_INVALID",
+  );
+  assert.throws(
+    () => x.adapter.propose(intent(desired, { ...fixtureIdentity(x), task_id: "x".repeat(4097) })),
+    (error) => error.code === "PLAN_INTENT_BASE_INVALID",
+  );
+  assertNoState(x);
+});
+
+test("plan.propose rejects custom prototypes, accessors, symbols, and cycles inside base", () => {
+  const x = fixture();
+  const desired = candidate(x.base);
+  const attacks = [];
+  attacks.push(Object.assign(Object.create({ inherited: true }), fixtureIdentity(x)));
+  const accessor = fixtureIdentity(x);
+  Object.defineProperty(accessor, "task_id", { enumerable: true, get() { return x.base.task_id; } });
+  attacks.push(accessor);
+  const symbol = fixtureIdentity(x); symbol[Symbol("hidden")] = true; attacks.push(symbol);
+  const cycle = fixtureIdentity(x); cycle.cycle = cycle; attacks.push(cycle);
+  attacks.push({ ...fixtureIdentity(x), task_id: undefined });
+  attacks.push({ ...fixtureIdentity(x), plan_revision_id: Number.NaN });
+  attacks.push({ ...fixtureIdentity(x), content_digest: 1n });
+  attacks.push({ ...fixtureIdentity(x), task_id: () => "TASK-FORGED" });
+
+  for (const base of attacks) {
+    assert.throws(
+      () => x.adapter.propose(intent(desired, base)),
+      (error) => error.code === "PLAN_INTENT_JSON_DOMAIN_INVALID",
+    );
+  }
+  assertNoState(x);
+});
+
 test("plan.propose fails closed for generic owner-gate mutation and lifecycle bypass", () => {
   const x = fixture({ task: blockedTask() });
   const removedGate = candidate(x.base); delete removedGate.owner_gate;
-  assert.throws(() => x.adapter.propose(intent(removedGate)), (error) => error.code === "PLAN_OWNER_GATE_MUTATION_FORBIDDEN");
+  assert.throws(() => x.adapter.propose(intent(removedGate, fixtureIdentity(x))), (error) => error.code === "PLAN_OWNER_GATE_MUTATION_FORBIDDEN");
 
   const lifecycle = candidate(x.base, { next_step: "Bypass the latch." });
-  assert.throws(() => x.adapter.propose(intent(lifecycle)), (error) => error.code === "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN");
+  assert.throws(() => x.adapter.propose(intent(lifecycle, fixtureIdentity(x))), (error) => error.code === "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN");
 
   const command = candidate(x.base); command.owner_gate.command = "/aio arbitrary release";
-  assert.throws(() => x.adapter.propose(intent(command)), (error) => error.code === "OWNER_GATE_INVALID");
+  assert.throws(() => x.adapter.propose(intent(command, fixtureIdentity(x))), (error) => error.code === "OWNER_GATE_INVALID");
   assertNoState(x);
 });
 
 test("plan.validate returns immutable materialization identity for a valid proposal", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   const validation = x.adapter.validate(proposal);
   assert.equal(validation.schema, PLAN_VALIDATION_SCHEMA);
   assert.equal(validation.valid, true);
@@ -301,7 +478,7 @@ test("plan.validate returns immutable materialization identity for a valid propo
 
 test("plan.validate reconstructs proposals and rejects malformed fields and forged digests", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   assert.throws(() => x.adapter.validate({ ...proposal, extra: true }), (error) => error.code === "PLAN_ADAPTER_PROPOSAL_FIELDS_INVALID");
   assert.throws(
     () => x.adapter.validate({ ...proposal, proposal_digest: `sha256:${"0".repeat(64)}` }),
@@ -314,7 +491,7 @@ test("plan.validate reconstructs proposals and rejects malformed fields and forg
 
 test("plan.validate distinguishes a valid stale proposal and plan.apply preserves CAS", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   const external = candidate(x.base, {
     plan_revision_id: "PLAN-EXTERNAL-3",
     updated_at: "2026-08-21T10:06:00.000Z",
@@ -322,12 +499,15 @@ test("plan.validate distinguishes a valid stale proposal and plan.apply preserve
   });
   writeFileSync(x.path, markdown(external));
   const externalBytes = readFileSync(x.path);
-  assert.throws(() => x.adapter.validate(proposal), (error) => {
-    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
-    assert.equal(error.details.revision_matches, false);
-    assert.equal(error.details.digest_matches, false);
-    return true;
-  });
+  for (const preview of ["validate", "diff"]) {
+    assert.throws(() => x.adapter[preview](proposal), (error) => {
+      assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+      assert.equal(error.details.task_matches, true);
+      assert.equal(error.details.revision_matches, false);
+      assert.equal(error.details.digest_matches, false);
+      return true;
+    });
+  }
   assert.throws(() => x.adapter.apply(proposal), (error) => error.code === "PLAN_CAS_CONFLICT");
   assert.deepEqual(readFileSync(x.path), externalBytes);
 });
@@ -360,7 +540,7 @@ test("plan.diff is deterministic and reports task and item added/removed/changed
   changed.task_items[0].title = "Changed ITEM-1 title";
   changed.task_items.splice(1, 1);
   changed.task_items.push(item("ITEM-3", "PLANNED", { depends_on: ["ITEM-1"], last_updated_at: NEXT_TIME }));
-  const proposal = x.adapter.propose(intent(changed));
+  const proposal = x.adapter.propose(intent(changed, fixtureIdentity(x)));
   const first = x.adapter.diff(proposal);
   const second = x.adapter.diff(JSON.parse(JSON.stringify(proposal)));
   assert.deepEqual(first, second);
@@ -378,7 +558,10 @@ test("observe -> propose -> validate -> diff -> apply produces exact candidate a
   const x = fixture();
   const observation = x.adapter.observe();
   const desired = candidate(observation.plan, { title: "Applied structured candidate" });
-  const proposal = x.adapter.propose(intent(desired));
+  const proposal = x.adapter.propose(intent(desired, observationIdentity(observation)));
+  assert.equal(proposal.task_id, observation.task_id);
+  assert.equal(proposal.base_plan_revision_id, observation.plan_revision_id);
+  assert.equal(proposal.base_content_digest, observation.content_digest);
   assert.equal(x.adapter.validate(proposal).valid, true);
   const diff = x.adapter.diff(proposal);
   assert.equal(diff.plan.changed.some((entry) => entry.field === "title"), true);
@@ -389,9 +572,33 @@ test("observe -> propose -> validate -> diff -> apply produces exact candidate a
   assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), true);
 });
 
+test("two adapters keep observation bases and authority state isolated", () => {
+  const left = fixture({ task: task({ task_id: "TASK-LEFT", title: "Left authority", task_items: [
+    item("ITEM-1", "IN_PROGRESS", { task_id: "TASK-LEFT" }),
+    item("ITEM-2", "PLANNED", { task_id: "TASK-LEFT", depends_on: ["ITEM-1"] }),
+  ] }) });
+  const right = fixture({ task: task({ task_id: "TASK-RIGHT", title: "Right authority", task_items: [
+    item("ITEM-1", "IN_PROGRESS", { task_id: "TASK-RIGHT" }),
+    item("ITEM-2", "PLANNED", { task_id: "TASK-RIGHT", depends_on: ["ITEM-1"] }),
+  ] }) });
+  const leftObservation = left.adapter.observe();
+  const rightObservation = right.adapter.observe();
+  const leftCandidate = candidate(leftObservation.plan, { title: "Applied only on left" });
+  const leftProposal = left.adapter.propose(intent(leftCandidate, observationIdentity(leftObservation)));
+  assert.throws(() => right.adapter.validate(leftProposal), (error) => {
+    assert.equal(error.code, "PLAN_PROPOSAL_STALE");
+    assert.equal(error.details.task_matches, false);
+    return true;
+  });
+  left.adapter.apply(leftProposal);
+  assert.equal(left.adapter.observe().plan.title, "Applied only on left");
+  assert.deepEqual(right.adapter.observe(), rightObservation);
+  assert.equal(existsSync(join(right.root, ".guardian")), false);
+});
+
 test("plan.apply supports same-runtime idempotence and restart remains ambiguous", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   const first = x.adapter.apply(proposal);
   const second = x.adapter.apply(JSON.parse(JSON.stringify(proposal)));
   assert.deepEqual(second, first);
@@ -400,7 +607,7 @@ test("plan.apply supports same-runtime idempotence and restart remains ambiguous
 
 test("plan.apply preserves lock contention without mutating authority", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   mkdirSync(join(x.root, ".guardian"));
   writeFileSync(join(x.root, ".guardian", "plan-write.lock"), "owned externally\n");
   assert.throws(() => x.adapter.apply(proposal), (error) => error.code === "PLAN_WRITE_LOCKED");
@@ -448,7 +655,7 @@ test("plan.apply rejects legacy mutation", () => {
 
 test("proposal ID conflicts remain fail-closed through plan.apply", () => {
   const x = fixture();
-  const firstProposal = x.adapter.propose(intent(candidate(x.base), { proposal_id: "PPR-SHARED-ID" }));
+  const firstProposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x), { proposal_id: "PPR-SHARED-ID" }));
   x.adapter.apply(firstProposal);
   const current = x.adapter.observe();
   const next = candidate(current.plan, {
@@ -456,7 +663,7 @@ test("proposal ID conflicts remain fail-closed through plan.apply", () => {
     updated_at: "2026-08-21T10:10:00.000Z",
     next_step: "A different payload reuses the proposal ID.",
   });
-  const conflict = x.adapter.propose(intent(next, { proposal_id: "PPR-SHARED-ID" }));
+  const conflict = x.adapter.propose(intent(next, observationIdentity(current), { proposal_id: "PPR-SHARED-ID" }));
   const before = readFileSync(x.path);
   assert.throws(() => x.adapter.apply(conflict), (error) => error.code === "PLAN_PROPOSAL_ID_CONFLICT");
   assert.deepEqual(readFileSync(x.path), before);
@@ -464,7 +671,7 @@ test("proposal ID conflicts remain fail-closed through plan.apply", () => {
 
 test("tampered provenance remains invalid through plan.apply", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   const result = x.adapter.apply(proposal);
   writeFileSync(join(x.root, result.provenance_reference), "{}\n");
   assert.throws(() => createPlanAdapter(x.path).apply(proposal), (error) => error.code === "PLAN_PROVENANCE_INVALID");
@@ -472,7 +679,7 @@ test("tampered provenance remains invalid through plan.apply", () => {
 
 test("plan.apply does not catch or relabel security-critical GuardianError codes", () => {
   const x = fixture();
-  const proposal = x.adapter.propose(intent(candidate(x.base)));
+  const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   const codes = [
     "PLAN_CAS_CONFLICT",
     "PLAN_RECOVERY_AMBIGUOUS",

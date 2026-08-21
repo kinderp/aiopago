@@ -7,7 +7,8 @@ export const PLAN_INTENT_SCHEMA = "aiopago.plan-intent/0.1.0";
 export const PLAN_OBSERVATION_SCHEMA = "aiopago.plan-observation/0.1.0";
 export const PLAN_VALIDATION_SCHEMA = "aiopago.plan-validation/0.1.0";
 
-const INTENT_FIELDS = ["candidate_plan", "change_reason", "producer", "proposal_id", "schema"].sort();
+const INTENT_FIELDS = ["base", "candidate_plan", "change_reason", "producer", "proposal_id", "schema"].sort();
+const INTENT_BASE_FIELDS = ["content_digest", "plan_revision_id", "task_id"].sort();
 const PROPOSAL_PAYLOAD_FIELDS = [
   "base_content_digest",
   "base_plan_revision_id",
@@ -46,6 +47,45 @@ function boundaryClone(value, { code, field }) {
   } catch (error) {
     if (error instanceof GuardianError) throw error;
     throw new GuardianError(error?.code ?? code, error?.message ?? `${field} is invalid`);
+  }
+}
+
+function validateIntentBase(base) {
+  exactFields(base, INTENT_BASE_FIELDS, "PLAN_INTENT_BASE_FIELDS_INVALID", "Plan intent base");
+  for (const field of ["task_id", "plan_revision_id", "content_digest"]) {
+    invariant(
+      typeof base[field] === "string" && base[field].length > 0 && base[field].length <= 4096,
+      "PLAN_INTENT_BASE_INVALID",
+      `base.${field} must be a non-empty bounded string`,
+    );
+  }
+  invariant(
+    /^sha256:[a-f0-9]{64}$/.test(base.content_digest),
+    "PLAN_INTENT_BASE_INVALID",
+    "base.content_digest must be an exact SHA-256 digest",
+  );
+}
+
+function assertBaseCurrent(expected, observed) {
+  const taskMatches = expected.task_id === observed.task_id;
+  const revisionMatches = expected.plan_revision_id === observed.plan_revision_id;
+  const digestMatches = expected.content_digest === observed.content_digest;
+  if (!taskMatches || !revisionMatches || !digestMatches) {
+    throw new GuardianError(
+      "PLAN_PROPOSAL_STALE",
+      "The expected plan base is stale relative to the current TASK_PLAN.md authority",
+      {
+        expected_task_id: expected.task_id,
+        observed_task_id: observed.task_id,
+        task_matches: taskMatches,
+        expected_plan_revision_id: expected.plan_revision_id,
+        observed_plan_revision_id: observed.plan_revision_id,
+        revision_matches: revisionMatches,
+        expected_content_digest: expected.content_digest,
+        observed_content_digest: observed.content_digest,
+        digest_matches: digestMatches,
+      },
+    );
   }
 }
 
@@ -99,27 +139,11 @@ export class IntentAdapter {
 
   #materializeCurrent(proposal) {
     const observed = this.#observeRaw();
-    invariant(
-      observed.task_id === proposal.task_id,
-      "PLAN_TASK_ID_MISMATCH",
-      "Proposal task_id does not match the current authoritative task",
-    );
-    const revisionMatches = observed.plan_revision_id === proposal.base_plan_revision_id;
-    const digestMatches = observed.content_digest === proposal.base_content_digest;
-    if (!revisionMatches || !digestMatches) {
-      throw new GuardianError(
-        "PLAN_PROPOSAL_STALE",
-        "The proposal base is stale relative to the current TASK_PLAN.md authority",
-        {
-          expected_plan_revision_id: proposal.base_plan_revision_id,
-          observed_plan_revision_id: observed.plan_revision_id,
-          revision_matches: revisionMatches,
-          expected_content_digest: proposal.base_content_digest,
-          observed_content_digest: observed.content_digest,
-          digest_matches: digestMatches,
-        },
-      );
-    }
+    assertBaseCurrent({
+      task_id: proposal.task_id,
+      plan_revision_id: proposal.base_plan_revision_id,
+      content_digest: proposal.base_content_digest,
+    }, observed);
     const materialized = this.#port.materialize(proposal, observed.bytes);
     invariant(
       materialized.bytes.length <= MAX_PLAN_BYTES,
@@ -144,8 +168,10 @@ export class IntentAdapter {
     const intent = boundaryClone(input, { code: "PLAN_INTENT_JSON_DOMAIN_INVALID", field: "plan.propose intent" });
     exactFields(intent, INTENT_FIELDS, "PLAN_INTENT_FIELDS_INVALID", "Plan intent");
     invariant(intent.schema === PLAN_INTENT_SCHEMA, "PLAN_INTENT_SCHEMA_UNSUPPORTED", `Expected ${PLAN_INTENT_SCHEMA}`);
+    validateIntentBase(intent.base);
 
     const observed = this.#observeRaw();
+    assertBaseCurrent(intent.base, observed);
     const candidate = intent.candidate_plan;
     const proposal = this.#port.proposal({
       schema: PLAN_PROPOSAL_SCHEMA,
