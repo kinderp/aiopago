@@ -8,9 +8,9 @@
 | Slice | Scope | Gate |
 |---|---|---|
 | **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
-| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **READY FOR INDEPENDENT REVIEW**; acceptance 0/2, non CLOSED |
-| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **NOT STARTED / BLOCKED** fino all'acceptance 0.2-B |
-| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | Nessun issue adapter |
+| **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **CLOSED / ACCEPTED**; due round indipendenti CLEAN sul candidate `7d53b6e5c99557c70f9e2aa89039618ca0ca7fe6` |
+| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **READY FOR INDEPENDENT REVIEW**; acceptance 0/2, non CLOSED |
+| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **NOT STARTED / BLOCKED** fino all'acceptance 0.2-C |
 | **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | Invarianti core preservate |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
 | **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
@@ -21,10 +21,11 @@
 Gate vincolante dopo 0.2-A:
 
 1. **Dedicated rename migration: COMPLETE**;
-2. **0.2-B Plan Proposal Foundation: READY FOR INDEPENDENT REVIEW, gate 0/2**;
-3. **0.2-C Intent Adapter minimo: NOT STARTED / BLOCKED** fino a due round indipendenti puliti.
+2. **0.2-B Plan Proposal Foundation: CLOSED / ACCEPTED** dopo due round indipendenti CLEAN;
+3. **0.2-C Intent Adapter minimo: READY FOR INDEPENDENT REVIEW**, gate 0/2;
+4. **0.2-D Start da obiettivo: NOT STARTED / BLOCKED** fino all'acceptance 0.2-C.
 
-La migration di nome e 0.2-A restano chiuse. La foundation 0.2-B non è ancora accepted/CLOSED e non espone l'adapter/intent surface di 0.2-C.
+La migration di nome, 0.2-A e 0.2-B restano chiuse. 0.2-C espone soltanto la superficie programmatica strutturata `plan.*`; non anticipa parsing naturale, provider o planning agent-driven di 0.2-D.
 
 ## Fondazione M0/M1
 

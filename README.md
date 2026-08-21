@@ -15,6 +15,19 @@ aio plan --target /path/to/repository
 
 Run `aio --help` for the canonical CLI. The old `eio` executable remains temporarily available as a deprecated compatibility alias and prints its warning only to stderr.
 
-See [`docs/portable-alpha.md`](docs/portable-alpha.md) for setup, read-only workflow commands, Runner operation and recovery. See [`docs/rename-aiopago-migration.md`](docs/rename-aiopago-migration.md) for legacy data and command compatibility.
+## Structured plan adapter
+
+The package root exposes the provider-neutral 0.2-C adapter without exposing raw plan writers:
+
+```js
+import { createPlanAdapter } from "aiopago";
+
+const plan = createPlanAdapter("./TASK_PLAN.md");
+const observation = plan.observe();
+// plan.propose(structuredIntent), plan.validate(proposal),
+// plan.diff(proposal), and plan.apply(proposal)
+```
+
+See [`docs/0.2-c-intent-adapter.md`](docs/0.2-c-intent-adapter.md) for the structured request/response contract, authority rules, errors, and security boundaries. See [`docs/portable-alpha.md`](docs/portable-alpha.md) for setup, read-only workflow commands, Runner operation and recovery. See [`docs/rename-aiopago-migration.md`](docs/rename-aiopago-migration.md) for legacy data and command compatibility.
 
 Repository: <https://github.com/kinderp/aiopago>
