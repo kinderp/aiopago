@@ -7,6 +7,7 @@ import test from "node:test";
 import { initializeRepository } from "../src/bootstrap.mjs";
 import { canonicalJson, sha256, stableId } from "../src/canonical.mjs";
 import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
+import { assertExactSatisfiedOwnerGateTransition } from "../src/owner-gate-internal.mjs";
 import { MAX_PLAN_BYTES, PlanRevisionWriter, parseTaskPlanBytes } from "../src/plan-store.mjs";
 import {
   PLAN_APPLY_RESULT_SCHEMA,
@@ -68,6 +69,46 @@ function task(overrides = {}) {
     ],
     ...overrides,
   };
+}
+
+function blockedOwnerGateTask(overrides = {}) {
+  const value = task({
+    status: "BLOCKED",
+    current_item: null,
+    next_item: "ITEM-1",
+    next_step: "Await owner authorization.",
+    owner_gate: {
+      kind: "HANDOFF_CONFIRM",
+      status: "BLOCKED",
+      command: "/aio handoff confirm",
+      item_id: "ITEM-1",
+      satisfied_plan_revision_id: "PLAN-GATE-2",
+      satisfied_task_status: "IN_PROGRESS",
+      satisfied_next_item: "ITEM-2",
+      satisfied_next_step: "Continue ITEM-1, then ITEM-2.",
+    },
+    ...overrides,
+  });
+  value.task_items[0].status = "BLOCKED";
+  return value;
+}
+
+function satisfiedOwnerGateCandidate(base, actor = "human:test", now = NEXT_TIME) {
+  const value = structuredClone(base);
+  value.owner_gate.status = "SATISFIED";
+  value.owner_gate.satisfied_at = now;
+  value.owner_gate.satisfied_by = actor;
+  value.plan_revision_id = value.owner_gate.satisfied_plan_revision_id;
+  value.status = "IN_PROGRESS";
+  value.updated_at = now;
+  value.current_item = value.owner_gate.item_id;
+  value.next_item = value.owner_gate.satisfied_next_item ?? null;
+  value.next_step = value.owner_gate.satisfied_next_step;
+  const protectedItem = value.task_items.find((entry) => entry.task_item_id === value.owner_gate.item_id);
+  protectedItem.status = "IN_PROGRESS";
+  protectedItem.last_updated_at = now;
+  protectedItem.last_updated_by = actor;
+  return value;
 }
 
 function ledgerText(value, eol = "\n", { before = "Human prose before the normative Ledger.", after = "Human prose after the normative Ledger." } = {}) {
@@ -652,6 +693,138 @@ test("owner-gate satisfaction validates active-work targets and canonical comman
   await t.test("non-command prose is not treated as a slash command", () => {
     const value = blockedTask(); value.owner_gate.satisfied_next_step = "Discuss the words handoff confirm, then continue ITEM-1.";
     assert.doesNotThrow(() => validateTaskLedger(value));
+  });
+});
+
+test("owner-gate command tokenization is invariant across JS whitespace, aliases, and mention scanning", async (t) => {
+  const separators = [
+    ["ASCII space", " "],
+    ["multiple ASCII spaces", "   "],
+    ["TAB U+0009", "\u0009"],
+    ["LF U+000A", "\u000a"],
+    ["CRLF", "\r\n"],
+    ["vertical tab U+000B", "\u000b"],
+    ["form feed U+000C", "\u000c"],
+    ["NBSP U+00A0", "\u00a0"],
+    ["EM SPACE U+2003", "\u2003"],
+    ["THIN SPACE U+2009", "\u2009"],
+    ["NNBSP U+202F", "\u202f"],
+    ["IDEOGRAPHIC SPACE U+3000", "\u3000"],
+    ["BOM U+FEFF", "\ufeff"],
+  ];
+  const legacyShortAlias = `/${["e", "i", "o"].join("")}`;
+  const aliases = ["/aio", legacyShortAlias, `${legacyShortAlias}pago`];
+
+  for (const [separatorName, separator] of separators) {
+    for (const alias of aliases) await t.test(`${alias} with ${separatorName} authorizes and cannot bypass next_step scanning`, () => {
+      const command = `${alias}${separator}handoff${separator}confirm`;
+      const invalid = blockedOwnerGateTask();
+      invalid.owner_gate.satisfied_next_step = `Run ${command} again`;
+      assert.throws(() => validateTaskLedger(invalid), (error) => error.code === "OWNER_GATE_INVALID");
+
+      const x = fixture({ task: blockedOwnerGateTask() });
+      const released = new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" });
+      assert.equal(released.owner_gate.status, "SATISFIED");
+    });
+  }
+
+  await t.test("wrong canonical command remains unauthorized", () => {
+    const x = fixture({ task: blockedOwnerGateTask() });
+    assert.throws(
+      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio other confirm", actor: "human:test" }),
+      (error) => error.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
+    );
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+  });
+});
+
+test("owner-gate mention scanner recognizes Markdown punctuation without prefix false positives", async (t) => {
+  const wrappers = [
+    ["inline code", (command) => `\`${command}\``],
+    ["parentheses and inline code", (command) => `(\`${command}\`)`],
+    ["quotes", (command) => `"${command}"`],
+    ["period", (command) => `${command}.`],
+    ["comma", (command) => `${command},`],
+    ["Markdown bullet", (command) => `- ${command}`],
+    ["Markdown emphasis", (command) => `**${command}**`],
+  ];
+  for (const [separatorName, separator] of [["ASCII", " "], ["NBSP", "\u00a0"], ["THIN SPACE", "\u2009"], ["EM SPACE", "\u2003"], ["LF", "\n"]]) {
+    for (const [wrapperName, wrap] of wrappers) await t.test(`${wrapperName} with ${separatorName} whitespace rejects`, () => {
+      const value = blockedOwnerGateTask();
+      const legacyFullAlias = `/${["e", "i", "o", "pago"].join("")}`;
+      value.owner_gate.satisfied_next_step = wrap(`${legacyFullAlias}${separator}handoff${separator}confirm`);
+      assert.throws(() => validateTaskLedger(value), (error) => error.code === "OWNER_GATE_INVALID");
+    });
+  }
+
+  const negatives = [
+    "Do not handoff confirm yet",
+    "handoff confirm",
+    "/aio handoff confirmation",
+    "/aio handoff confirmatory",
+    "/aio handoff-confirm",
+    "/aio other confirm",
+    "/foo handoff confirm",
+    "https://example.com/aio/handoff/confirm",
+    "prefix/aio handoff confirm",
+    "path/to/aio handoff confirm",
+  ];
+  for (const text of negatives) await t.test(`does not match ${JSON.stringify(text)}`, () => {
+    const value = blockedOwnerGateTask();
+    value.owner_gate.satisfied_next_step = text;
+    assert.doesNotThrow(() => validateTaskLedger(value));
+  });
+});
+
+test("specialized owner-gate transition permits only its exact structured delta", async (t) => {
+  const base = blockedOwnerGateTask({ transition_extension: { stable: true } });
+  base.task_items[0].protected_extension = { stable: true };
+  base.task_items[1].unrelated_extension = { stable: true };
+  const actor = "human:test";
+  const exact = () => satisfiedOwnerGateCandidate(base, actor, NEXT_TIME);
+  assert.doesNotThrow(() => assertExactSatisfiedOwnerGateTransition(base, exact(), actor, NEXT_TIME));
+
+  const unauthorized = [
+    ["Task title", (value) => { value.title = "Mutated title"; }],
+    ["Task objective", (value) => { value.objective = "Mutated objective"; }],
+    ["Task requirements_version", (value) => { value.requirements_version = "REQ-MUTATED"; }],
+    ["Task completion_criteria", (value) => { value.completion_criteria.push("Mutated criterion"); }],
+    ["Task risk", (value) => { value.risk = "LOW"; }],
+    ["Task created_at", (value) => { value.created_at = "2026-08-20T09:00:00.000Z"; }],
+    ["Task evidence", (value) => { value.evidence.push("forged evidence"); }],
+    ["Task model_policy", (value) => { value.model_policy = "mutated"; }],
+    ["Task reasoning_policy", (value) => { value.reasoning_policy = "low"; }],
+    ["Task extension field", (value) => { value.transition_extension.stable = false; }],
+    ["unrelated item title", (value) => { value.task_items[1].title = "Mutated"; }],
+    ["unrelated item description", (value) => { value.task_items[1].description = "Mutated"; }],
+    ["unrelated item status", (value) => { value.task_items[1].status = "BLOCKED"; }],
+    ["unrelated item depends_on", (value) => { value.task_items[1].depends_on = []; }],
+    ["unrelated item completion_criteria", (value) => { value.task_items[1].completion_criteria.push("Mutated"); }],
+    ["unrelated item evidence", (value) => { value.task_items[1].evidence.push("forged"); }],
+    ["unrelated item requirements_refs", (value) => { value.task_items[1].requirements_refs.push("REQ-MUTATED"); }],
+    ["unrelated item risk", (value) => { value.task_items[1].risk = "LOW"; }],
+    ["unrelated item milestone", (value) => { value.task_items[1].milestone = "0.2-C"; }],
+    ["unrelated item last_updated_at", (value) => { value.task_items[1].last_updated_at = NEXT_TIME; }],
+    ["unrelated item last_updated_by", (value) => { value.task_items[1].last_updated_by = "agent:forged"; }],
+    ["unrelated item supersedes", (value) => { value.task_items[1].supersedes = "ITEM-1"; }],
+    ["unrelated item superseded_by", (value) => { value.task_items[1].superseded_by = "ITEM-1"; }],
+    ["unrelated item extension field", (value) => { value.task_items[1].unrelated_extension.stable = false; }],
+    ["protected item title", (value) => { value.task_items[0].title = "Mutated protected title"; }],
+    ["protected item dependency", (value) => { value.task_items[0].depends_on = ["ITEM-2"]; }],
+    ["protected item evidence", (value) => { value.task_items[0].evidence.push("forged"); }],
+    ["protected item extension field", (value) => { value.task_items[0].protected_extension.stable = false; }],
+    ["owner_gate command", (value) => { value.owner_gate.command = "/aio other confirm"; }],
+    ["owner_gate satisfied_next_item", (value) => { value.owner_gate.satisfied_next_item = null; }],
+    ["owner_gate extension field", (value) => { value.owner_gate.forged = true; }],
+    ["item reordering", (value) => { value.task_items.reverse(); }],
+  ];
+  for (const [name, mutate] of unauthorized) await t.test(`${name} rejects with transition error`, () => {
+    const value = exact();
+    mutate(value);
+    assert.throws(
+      () => assertExactSatisfiedOwnerGateTransition(base, value, actor, NEXT_TIME),
+      (error) => error.code === "OWNER_GATE_TRANSITION_INVALID",
+    );
   });
 });
 

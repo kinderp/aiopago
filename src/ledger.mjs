@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { sha256, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
+import { assertExactSatisfiedOwnerGateTransition, commandTokens, isCommandTokenWhitespace } from "./owner-gate-internal.mjs";
 import { materializeLedgerMarkdown } from "./plan-markdown.mjs";
 import { PlanRevisionWriter } from "./plan-store.mjs";
 
@@ -69,20 +70,43 @@ function canonicalUtc(value, field) {
 }
 
 function canonicalCommandName(command) {
-  if (typeof command !== "string") return command;
-  const normalized = command.trim().split(/\s+/).join(" ");
-  return normalized.replace(/^\/(?:eio|eiopago)(?=\s|$)/, "/aio");
+  const tokens = commandTokens(command);
+  if (tokens === null) return command;
+  if (["/eio", "/eiopago"].includes(tokens[0])) tokens[0] = "/aio";
+  return tokens.join(" ");
 }
 
 function containsCanonicalCommandMention(text, gateCommand) {
   if (typeof text !== "string") return false;
   const canonicalGateCommand = canonicalCommandName(gateCommand);
-  if (typeof canonicalGateCommand !== "string" || !canonicalGateCommand.startsWith("/")) return false;
-  const targetTokenCount = canonicalGateCommand.split(" ").length;
-  for (const match of text.matchAll(/\/[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z0-9_-]+)*/g)) {
-    const tokens = match[0].trim().split(/[ \t]+/);
-    if (tokens.length < targetTokenCount) continue;
-    if (canonicalCommandName(tokens.slice(0, targetTokenCount).join(" ")) === canonicalGateCommand) return true;
+  const targetTokens = commandTokens(canonicalGateCommand);
+  if (typeof canonicalGateCommand !== "string" || !canonicalGateCommand.startsWith("/") || !targetTokens?.length) return false;
+  const embeddedBoundary = /[\p{L}\p{N}_\/-]/u;
+  const commandNameCharacter = /[A-Za-z0-9-]/;
+  const commandArgumentCharacter = /[A-Za-z0-9_-]/;
+
+  for (let start = text.indexOf("/"); start !== -1; start = text.indexOf("/", start + 1)) {
+    const previous = start === 0 ? undefined : text[start - 1];
+    if (previous !== undefined && embeddedBoundary.test(previous)) continue;
+
+    let cursor = start + 1;
+    if (!/[A-Za-z]/.test(text[cursor] ?? "")) continue;
+    while (commandNameCharacter.test(text[cursor] ?? "")) cursor += 1;
+
+    let parsedTokens = 1;
+    let end = cursor;
+    while (parsedTokens < targetTokens.length) {
+      if (!isCommandTokenWhitespace(text[cursor])) break;
+      while (isCommandTokenWhitespace(text[cursor])) cursor += 1;
+      const argumentStart = cursor;
+      while (commandArgumentCharacter.test(text[cursor] ?? "")) cursor += 1;
+      if (cursor === argumentStart) break;
+      parsedTokens += 1;
+      end = cursor;
+    }
+    if (parsedTokens !== targetTokens.length) continue;
+    if (embeddedBoundary.test(text[end] ?? "")) continue;
+    if (canonicalCommandName(text.slice(start, end)) === canonicalGateCommand) return true;
   }
   return false;
 }
@@ -172,7 +196,6 @@ function validateOwnerGate(task, byId, inProgress) {
 function validateSatisfiedOwnerGateTransition(base, candidate, actor, now) {
   const fail = (condition, message) => invariant(condition, "OWNER_GATE_TRANSITION_INVALID", message);
   const gate = base.owner_gate;
-  const targetGate = candidate.owner_gate;
   fail(gate?.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "The base owner gate must be a BLOCKED HANDOFF_CONFIRM gate");
   fail(!Object.hasOwn(gate, "satisfied_task_status") || gate.satisfied_task_status === "IN_PROGRESS", "The owner gate target task status must be IN_PROGRESS");
   fail(!containsCanonicalCommandMention(gate.satisfied_next_step, gate.command), "The target next step must not repeat the authorization command or an alias");
@@ -184,25 +207,7 @@ function validateSatisfiedOwnerGateTransition(base, candidate, actor, now) {
     fail(gate.satisfied_next_item !== gate.item_id && next && ["PLANNED", "BLOCKED"].includes(next.status), "satisfied_next_item must be a different current PLANNED or BLOCKED item");
   }
 
-  fail(targetGate.status === "SATISFIED" && targetGate.satisfied_at === now && targetGate.satisfied_by === actor, "The candidate gate audit projection is invalid");
-  for (const field of Object.keys(gate)) {
-    if (field !== "status") fail(targetGate[field] === gate[field], `The candidate gate changed immutable field ${field}`);
-  }
-  fail(candidate.plan_revision_id === gate.satisfied_plan_revision_id, "The candidate revision does not match the gate target");
-  fail(candidate.status === "IN_PROGRESS", "The candidate task must enter IN_PROGRESS active work");
-  fail(candidate.current_item === gate.item_id, "The candidate current_item must be the protected item");
-  fail(candidate.next_item === (gate.satisfied_next_item ?? null), "The candidate next_item does not match the gate target");
-  fail(candidate.next_step === gate.satisfied_next_step, "The candidate next_step does not match the gate target");
-  fail(candidate.updated_at === now, "The candidate updated_at does not match the satisfaction time");
-
-  const candidateProtected = candidate.task_items.find((item) => item.task_item_id === gate.item_id);
-  fail(candidateProtected?.status === "IN_PROGRESS" && candidateProtected.last_updated_at === now && candidateProtected.last_updated_by === actor, "The protected item must enter IN_PROGRESS with the human audit actor");
-  fail(candidate.task_items.length === base.task_items.length, "Owner gate satisfaction must preserve the item projection");
-  for (const item of base.task_items) {
-    const target = candidate.task_items.find((entry) => entry.task_item_id === item.task_item_id);
-    fail(target, `Owner gate satisfaction removed TaskItem ${item.task_item_id}`);
-    if (item.task_item_id !== gate.item_id) fail(target.status === item.status, `Owner gate satisfaction changed unrelated TaskItem ${item.task_item_id}`);
-  }
+  assertExactSatisfiedOwnerGateTransition(base, candidate, actor, now);
 }
 
 export function validateTaskLedger(task) {
