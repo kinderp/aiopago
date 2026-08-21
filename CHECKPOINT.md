@@ -1,3 +1,11 @@
+# CHECKPOINT — AIOPAGO 0.2-C CLOSED / 0.2-D STARTED
+
+- **0.2-B:** `CLOSED / ACCEPTED`; contratti CAS/lock/recovery/provenance e owner gate restano congelati.
+- **0.2-C:** `CLOSED / ACCEPTED`; candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate `2/2 CLEAN`, merge `488c4fd696003a6987ea50996bbab644e63ab56c` (PR #26). La storia tecnica 0.2-C non è stata alterata.
+- **0.2-D:** `IN PROGRESS`; issue #27, branch `feat/start-objective-0.2-d`, worktree `F:/dev/aiopago-0.2-d`, starting main `488c4fd696003a6987ea50996bbab644e63ab56c`.
+- **Perimetro autorizzato:** `aio start <objective>` deve produrre un full candidate Ledger tramite planner, legarlo all'osservazione originale, mostrare il diff 0.2-C, richiedere autorizzazione esplicita, applicare attraverso 0.2-C/0.2-B e fermarsi. 0.2-E e oltre restano NOT STARTED.
+- `checkpoint_message`: “0.2-C accettato 2/2 CLEAN; avviato 0.2-D su issue #27 dalla main di merge #26”.
+
 # CHECKPOINT — AIOPAGO 0.2-C ROUND 1 H-01 REMEDIATION
 
 - **Stato:** Independent Review Round 1 sul candidate `ce87816b83a4439357c230dbbdd6ac8a9fc78e37` = **BLOCKED**. H-01 è rimediato e 0.2-C torna `READY FOR INDEPENDENT REVIEW`; il nuovo gate è `0/2`, non CLOSED. 0.2-B resta CLOSED/ACCEPTED; 0.2-D resta NOT STARTED/BLOCKED.
