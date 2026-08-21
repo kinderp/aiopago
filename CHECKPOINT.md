@@ -1,3 +1,20 @@
+# CHECKPOINT — AIOPAGO 0.2-C READY FOR INDEPENDENT REVIEW
+
+- **Stato:** `0.2-C = READY FOR INDEPENDENT REVIEW`; gate indipendente `0/2`, non CLOSED. 0.2-B è CLOSED/ACCEPTED; 0.2-D resta NOT STARTED/BLOCKED.
+- **Base/worktree:** `origin/main=091c481d96064d4481d7e5514b269fda3202f6af`; branch `feat/intent-adapter-0.2-c`; worktree `F:/dev/aiopago-0.2-c`; issue #25; draft PR #26. Main non è stato riscritto.
+- **HEAD:** implementation commit `1dd7627`; il candidate HEAD operativo è il commit documentale che contiene questa sezione e viene registrato esattamente nel draft PR dopo il push finale.
+- **Scope/API:** package root espone soltanto `plan` e `createPlanAdapter(path)`, con `plan.observe/propose/validate/diff/apply`. Input esclusivamente strutturato; nessun parser naturale, provider/LLM, planner loop, auto-approval, CLI/TUI mutante o altro 0.2-D.
+- **Design:** facade pubblica frozen/null-prototype sopra `PlanPort` interno. Strict JSON clone a ogni boundary; proposal serializzabile ricostruita e digest ricalcolato; base task/revision/exact-byte digest derivati dall'osservazione corrente e mai fidati dal caller. Observe/propose/validate/diff non creano `.guardian`; validate distingue stale con `PLAN_PROPOSAL_STALE`; diff riusa la semantica 0.2-B.
+- **Mutation/authority:** soltanto `plan.apply` delega al controlled 0.2-B path. `TASK_PLAN.md` resta unica current authority; CAS, owned lock, final pathname continuity, exact history, registration/intents/applied evidence, volatile receipt, ambiguity, attempt cap, durability, owner latch, legacy boundary e codici security-critical restano invariati. Raw `PlanPort`, `PlanProposal`, `PlanRevisionWriter` e internals non sono package-root exports.
+- **Test/gate:** Node `v22.19.0`; focused adapter **22/22 PASS**; Plan Proposal **453 test: 451 PASS, 2 platform skip, 0 fail**; full suite **631 test: 629 PASS, 2 platform skip, 0 fail**; `npm run check` PASS (46 moduli); `npm pack --dry-run` PASS (37 file); tarball estratto fuori repo con root import/observe, runtime files e internal-export boundary PASS; `git diff --check` PASS.
+- **Developer adversarial review:** caller base spoofing, stale overwrite, forged object/digest/prototype/accessor/symbol/cycle, post-call mutation, read-only state creation, owner-latch bypass, raw-writer leakage, response/prototype mutation, error relabel, same-runtime/restart behavior, legacy migration e 0.2-D scope leak verificati. La constructor/prototype reachability della prima facade è stata trovata e rimossa con una facade null-prototype e prototype interno frozen. Zero finding HIGH/MEDIUM aperti; self-review non conta come acceptance.
+- **Known LOW:** nessun nuovo LOW 0.2-C noto. Restano soltanto i residual 0.2-B accettati: intervallo irreducibile prima dell'ingresso in rename contro writer non cooperativi; directory fsync esplicitamente unsupported; ACL/extended metadata non portabili; stale lock e restart ambiguity richiedono riconciliazione umana.
+- `checkpoint_message`: “0.2-C adapter strutturato completo e verificato; pronto per independent review, gate 0/2”.
+
+**STOP operativo:** candidate congelato dopo il push finale. Non dichiarare CLOSED, non contare la developer review e non iniziare 0.2-D.
+
+**Prossimo passo ESATTO:** eseguire Independent Review Round 1 sul candidate HEAD esatto del draft PR #26.
+
 # CHECKPOINT — AIOPAGO 0.2-B INDEPENDENT REVIEW ROUND 1 BLOCKED REMEDIATION
 
 - **Stato:** `0.2-B = READY FOR INDEPENDENT REVIEW`; gate indipendente `0/2`. La developer review non conta. 0.2-C resta `NOT STARTED / BLOCKED` e l'Efficiency Benchmark non è implementato.
