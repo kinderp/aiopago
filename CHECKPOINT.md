@@ -1,3 +1,15 @@
+# CHECKPOINT — AIOPAGO 0.2-D CLOSED / ACCEPTED
+
+- **Stato:** 0.2-D è **CLOSED / ACCEPTED** al candidate `95b0c93baab323c4cddd12b030d62798f035ed37`.
+- **Independent gate:** Round 1 **CLEAN**; Round 2 **CLEAN**; gate finale **2/2 CLEAN**.
+- **Integrazione:** merge commit `f670b6ea81980cdfd33b69d2f4817964a47d878a`; PR #28 **MERGED**; issue #27 **CLOSED / COMPLETED**.
+- **Risultato:** `aio start <objective>` lega un'unica observation immutabile a un planner Pi isolato e a una full candidate strutturata, passa da preview e autorizzazione TTY interattiva in due fasi, applica tramite 0.2-C/0.2-B e poi si ferma senza esecuzione automatica.
+- **0.2-E:** **NOT STARTED / READY TO START**. “Ready to start” non indica lavoro in corso.
+- **Next session:** iniziare discovery/design 0.2-E soltanto quando richiesto esplicitamente; nessun issue, branch, worktree, progetto o implementazione 0.2-E è stato avviato.
+- `checkpoint_message`: “0.2-D CLOSED / ACCEPTED; independent gate 2/2 CLEAN; 0.2-E NOT STARTED / READY TO START”.
+
+**STOP operativo:** stato odierno chiuso. Nessun altro lavoro oggi.
+
 # CHECKPOINT — AIOPAGO 0.2-D FRESH ROUND 1 H-01/L-01 REMEDIATION
 
 - **Stato/gate:** fresh Independent Review Round 1 sul candidate precedente `5f292dcb7aafb0dc5a2196cdf69636692588f396` = **BLOCKED**. H-01 real TTY multiline paste e L-01 pipe lifecycle/documentation mismatch sono rimediati; 0.2-D torna `READY FOR INDEPENDENT REVIEW`, gate nuovo `0/2`; developer review non conta. Issue #27; draft PR #28; branch `feat/start-objective-0.2-d`; worktree `F:/dev/aiopago-0.2-d`; `origin/main` e merge-base `488c4fd696003a6987ea50996bbab644e63ab56c`.

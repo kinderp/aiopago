@@ -1,6 +1,6 @@
 # Aiopago/Guardian — roadmap di prodotto
 
-**Versione:** 0.2 — 2026-08-20
+**Versione:** 0.2 — 2026-08-21
 **Fonte autorevole:** questo file governa scope e ordine delle milestone; lo stato runtime dei task appartiene al Master Task Ledger e non viene dedotto da questa roadmap.
 
 ## Sequenza Aiopago 0.2
@@ -10,8 +10,8 @@
 | **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
 | **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **CLOSED / ACCEPTED**; due round indipendenti CLEAN sul candidate `7d53b6e5c99557c70f9e2aa89039618ca0ca7fe6` |
 | **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **CLOSED / ACCEPTED**; candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate 2/2 CLEAN, merge `488c4fd696003a6987ea50996bbab644e63ab56c` |
-| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **READY FOR INDEPENDENT REVIEW**; draft PR #28, gate 0/2; nessun issue adapter |
-| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | **BLOCKED / NOT STARTED** pending acceptance 0.2-D |
+| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **CLOSED / ACCEPTED**; candidate `95b0c93baab323c4cddd12b030d62798f035ed37`, independent gate 2/2 CLEAN, merge `f670b6ea81980cdfd33b69d2f4817964a47d878a` |
+| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | **NOT STARTED / READY TO START** |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
 | **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
 | **0.2-H — Completamento guidato** | Verifica criteria/evidence e chiusura confermata | `DONE` non implica acceptance esterna |
@@ -23,10 +23,10 @@ Gate vincolante dopo 0.2-A:
 1. **Dedicated rename migration: COMPLETE**;
 2. **0.2-B Plan Proposal Foundation: CLOSED / ACCEPTED** dopo due round indipendenti CLEAN;
 3. **0.2-C Intent Adapter minimo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN;
-4. **0.2-D Start da obiettivo: READY FOR INDEPENDENT REVIEW**, draft PR #28, gate 0/2;
-5. **0.2-E UX interattiva unificata: BLOCKED / NOT STARTED** fino all'acceptance 0.2-D.
+4. **0.2-D Start da obiettivo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN; PR #28 merged e issue #27 completed;
+5. **0.2-E UX interattiva unificata: NOT STARTED / READY TO START**.
 
-La migration di nome, 0.2-A, 0.2-B e 0.2-C restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti.
+La migration di nome e le slice 0.2-A, 0.2-B, 0.2-C e 0.2-D restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti; 0.2-E è pronta per una futura sessione esplicitamente richiesta, ma non è iniziata.
 
 ## Fondazione M0/M1
 
