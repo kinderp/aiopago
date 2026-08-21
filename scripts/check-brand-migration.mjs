@@ -13,6 +13,7 @@ const fullAllowlist = new Map(Object.entries({
   "CHECKPOINT.md": [75, "rename closure allowlist and immutable session history"],
   "TASK_PLAN.md": [11, "closed Ledger provenance and stable IDs"],
   "docs/0.2-b-plan-proposal-foundation.md": [4, "explicit legacy Ledger and command compatibility policy"],
+  "docs/0.2-d-start-objective.md": [2, "accepted rename CLI/TUI compatibility boundary"],
   "docs/audit/guardian-requirements-coverage.md": [15, "historical audit record"],
   "docs/m1-h1-context-handoff-advisor.md": [1, "persisted runner-binding compatibility"],
   "docs/m1-h2-calibration-pilot.json": [7, "frozen digest-bound protocol"],
@@ -38,11 +39,12 @@ const fullAllowlist = new Map(Object.entries({
 }));
 
 const shortAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [26, "rename closure compatibility summary and immutable session history"],
+  "CHECKPOINT.md": [27, "rename closure compatibility summary, 0.2-D alias evidence, and immutable session history"],
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
   [["bin", `${legacyShort}.mjs`].join("/")]: [1, "deprecated thin CLI wrapper"],
   "docs/0.2-b-plan-proposal-foundation.md": [2, "explicit legacy owner-command compatibility policy"],
+  "docs/0.2-d-start-objective.md": [1, "deprecated CLI compatibility documentation"],
   "docs/m1-h2-calibration-pilot.json": [2, "frozen digest-bound protocol"],
   "docs/m1-h2-threshold-calibration.md": [5, "historical calibration commands and environment"],
   "docs/m1-h2-workload-feasibility.md": [8, "historical workload commands"],
@@ -58,6 +60,7 @@ const shortAllowlist = new Map(Object.entries({
   "test/fixtures/historical-owner-gate-b317f79.md": [2, "exact historical owner-gate command and actor fixture"],
   "test/plan-proposal.test.mjs": [6, "legacy owner-command alias compatibility tests"],
   "test/portable-alpha.test.mjs": [5, "deprecated CLI and package tests"],
+  "test/start-objective.test.mjs": [3, "deprecated CLI start compatibility test"],
 }));
 
 const legacyPathAllowlist = new Map([

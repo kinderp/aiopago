@@ -11,7 +11,12 @@ npm install --global https://github.com/kinderp/aiopago.git
 aio init /path/to/repository
 aio status --target /path/to/repository
 aio plan --target /path/to/repository
+aio start "Realizza un server P2P in Python con discovery dei peer e test" --target /path/to/repository
 ```
+
+`aio start <objective>` observes the initialized `TASK_PLAN.md`, asks the configured Pi model for one full structured candidate Ledger, validates it through the accepted `plan.*` adapter, and shows the canonical diff. Mutation requires an interactive terminal: first enter an exact LF/CRLF-terminated `y`/`yes` record (case-insensitive, no surrounding whitespace), then enter the exact fresh challenge generated and displayed only after that first record. Piped, redirected, file, CI, and other non-TTY stdin always deny; a queued multiline paste is consumed as the challenge response and cannot approve. Tests/programmatic callers may inject the explicit authorization boundary, but the CLI has no `--yes`. After an authorized plan apply, the command stops: it does not begin coding or execute plan items.
+
+The production planner uses existing Pi 0.83.x model/auth/settings discovery, one in-memory no-tools call, strict JSON output, and at most one provider/model call. Retry and compaction are disabled on the effective post-reload session settings without rewriting Pi settings. See [`docs/0.2-d-start-objective.md`](docs/0.2-d-start-objective.md) for initialization behavior, observed-base/stale guarantees, authorization, provider failures, owner-gate protection, trust boundaries, and exclusions.
 
 Run `aio --help` for the canonical CLI. The old `eio` executable remains temporarily available as a deprecated compatibility alias and prints its warning only to stderr.
 
@@ -48,6 +53,6 @@ plan.diff(proposal);
 // A human or upper layer may then choose plan.apply(proposal).
 ```
 
-See [`docs/0.2-c-intent-adapter.md`](docs/0.2-c-intent-adapter.md) for the structured request/response contract, authority rules, errors, and security boundaries. See [`docs/portable-alpha.md`](docs/portable-alpha.md) for setup, read-only workflow commands, Runner operation and recovery. See [`docs/rename-aiopago-migration.md`](docs/rename-aiopago-migration.md) for legacy data and command compatibility.
+See [`docs/0.2-c-intent-adapter.md`](docs/0.2-c-intent-adapter.md) for the accepted structured request/response contract, authority rules, errors, and security boundaries. See [`docs/0.2-d-start-objective.md`](docs/0.2-d-start-objective.md) for objective planning and authorization. See [`docs/portable-alpha.md`](docs/portable-alpha.md) for setup, read-only workflow commands, Runner operation and recovery. See [`docs/rename-aiopago-migration.md`](docs/rename-aiopago-migration.md) for legacy data and command compatibility.
 
 Repository: <https://github.com/kinderp/aiopago>

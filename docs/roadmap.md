@@ -9,9 +9,9 @@
 |---|---|---|
 | **0.2-A — Read-only Human Workflow** | `status`, `why`, `next`, `plan`, projection umana e osservazione realmente read-only | **CLOSED**; nessuna mutation |
 | **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **CLOSED / ACCEPTED**; due round indipendenti CLEAN sul candidate `7d53b6e5c99557c70f9e2aa89039618ca0ca7fe6` |
-| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **READY FOR INDEPENDENT REVIEW**; acceptance 0/2, non CLOSED |
-| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **NOT STARTED / BLOCKED** fino all'acceptance 0.2-C |
-| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | Invarianti core preservate |
+| **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **CLOSED / ACCEPTED**; candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate 2/2 CLEAN, merge `488c4fd696003a6987ea50996bbab644e63ab56c` |
+| **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **READY FOR INDEPENDENT REVIEW**; draft PR #28, gate 0/2; nessun issue adapter |
+| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | **BLOCKED / NOT STARTED** pending acceptance 0.2-D |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | Richiede protocollo core dedicato |
 | **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
 | **0.2-H — Completamento guidato** | Verifica criteria/evidence e chiusura confermata | `DONE` non implica acceptance esterna |
@@ -22,10 +22,11 @@ Gate vincolante dopo 0.2-A:
 
 1. **Dedicated rename migration: COMPLETE**;
 2. **0.2-B Plan Proposal Foundation: CLOSED / ACCEPTED** dopo due round indipendenti CLEAN;
-3. **0.2-C Intent Adapter minimo: READY FOR INDEPENDENT REVIEW**, gate 0/2;
-4. **0.2-D Start da obiettivo: NOT STARTED / BLOCKED** fino all'acceptance 0.2-C.
+3. **0.2-C Intent Adapter minimo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN;
+4. **0.2-D Start da obiettivo: READY FOR INDEPENDENT REVIEW**, draft PR #28, gate 0/2;
+5. **0.2-E UX interattiva unificata: BLOCKED / NOT STARTED** fino all'acceptance 0.2-D.
 
-La migration di nome, 0.2-A e 0.2-B restano chiuse. 0.2-C espone soltanto la superficie programmatica strutturata `plan.*`; non anticipa parsing naturale, provider o planning agent-driven di 0.2-D.
+La migration di nome, 0.2-A, 0.2-B e 0.2-C restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti.
 
 ## Fondazione M0/M1
 
