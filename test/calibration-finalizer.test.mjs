@@ -44,6 +44,11 @@ function ledger() {
       depends_on: [],
       completion_criteria: [`${id} complete`],
       evidence: [`${id} evidence`],
+      requirements_refs: ["REQ-1"],
+      risk: "LOW",
+      milestone: "H2-CALIBRATION",
+      last_updated_at: "2026-08-09T00:30:00.000Z",
+      last_updated_by: "human:test",
     })),
   };
 }

@@ -1,3 +1,19 @@
+# CHECKPOINT — AIOPAGO 0.2-B INDEPENDENT REVIEW ROUND 1 BLOCKED REMEDIATION
+
+- **Stato:** `0.2-B = READY FOR INDEPENDENT REVIEW`; gate indipendente `0/2`. La developer review non conta. 0.2-C resta `NOT STARTED / BLOCKED` e l'Efficiency Benchmark non è implementato.
+- **Base/perimetro:** remediation partita dal feature HEAD atteso `433dc3de1f76303307f6c5e21363d37936356dc8` con `origin/main=323782ee7c491dfbf097606b7313f4d7c98865b1`; nessun rebase/merge, nessuna modifica a main.
+- **H-01:** una generic proposal con `HANDOFF_CONFIRM/BLOCKED` preserva owner gate, task status, current/next item, next step, item set/status e dependency/supersession topology; il protected item resta BLOCKED e nessun item diventa IN_PROGRESS. Soltanto `satisfyOwnerGate()` HUMAN con exact command rilascia la latch.
+- **H-02:** dopo semantic validation/preparation e lock attestation, la final primitive legge soltanto raw authority bytes con fingerprint pre/open/post (identity, regular state, size, nlink, mtime/ctime nanosecondi dove disponibili), li confronta con la copia esatta dell'initial authority e invoca immediatamente rename senza decode, parse, callback o altro filesystem I/O.
+- **H-03/timestamp:** proposal/intent/applied/history e witness filesystem sono derived audit evidence, non autenticatori. Restart/new `PlanPort` con exact candidate resta sempre `PLAN_RECOVERY_AMBIGUOUS`; soltanto una receipt privata volatile installata dopo il live post-rename path consente same-instance idempotence. `applied.json` è exclusive, `applied_at >= prepared_at`, e clock rollback produce pending/ambiguity.
+- **M-01/M-02:** contract e bootstrap 0.1.0 sono ripristinati byte-identici a main. Il validator accetta legacy `reason/actor/timestamp`, alias `terminal_*` o entrambi coerenti senza nuova reciprocità/cardinalità supersession. Layout compact bootstrap ed extended metadata sono mutabili; partial/duplicate/mismatch falliscono chiuso.
+- **M-03/L-01:** immutable exact-existing viene file-fsynced e directory-risynced a ogni retry; errori inattesi riemergono. Il preflight UTF-8/structure/semantic avviene prima del lock, quindi authority malformata non crea `.guardian`; il reread sotto lock resta autorevole.
+- **Regressioni/scope:** strict JSON, reconstruction, 32 MiB, exact history, lock ownership/release, no public raw replace, UTF-8 fatal, attempt bound e 0.2-A read-only restano coperti. Root `TASK_PLAN.md` invariato; nessun lavoro 0.2-C/Efficiency Benchmark.
+- **Gate locale:** Node `v22.19.0`; Plan Proposal **181 test: 180 PASS, 1 platform skip, 0 fail**; full suite **337 test: 336 PASS, 1 platform skip, 0 fail**; `npm run check` PASS. Pack/diff finali registrati al commit di remediation.
+- **Residual LOW:** irreducibile transizione user-space→rename contro editor non cooperativo; directory sync esplicitamente unsupported non garantisce power-loss durability; ACL/Windows extended metadata non sono preservabili atomicamente con Node standard; stale lock e restart ambiguity richiedono riconciliazione umana.
+- `checkpoint_message`: “0.2-B Round 1 BLOCKED remediation completa; pronta per independent review, gate 0/2”.
+
+**STOP operativo:** non dichiarare CLOSED e non iniziare 0.2-C o Efficiency Benchmark prima delle relative autorizzazioni/gate.
+
 # CHECKPOINT — AIOPAGO RENAME COMPLETE
 
 - **Brand:** Aiopago. **Repository:** `kinderp/aiopago` (`https://github.com/kinderp/aiopago`). **Default branch:** `main`. **CLI canonical:** `aio`. **Legacy CLI:** `eio` (deprecated, thin wrapper, warning soltanto su stderr). **0.2-A:** CLOSED. **Rename:** COMPLETE. **Next:** 0.2-B Plan Proposal Foundation.
