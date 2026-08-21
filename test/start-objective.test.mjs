@@ -246,6 +246,28 @@ function spawnAio(bin, x, piRoot, objective, input, extraEnv = {}) {
   });
 }
 
+function runAioInPty(x, piRoot, objective, mode) {
+  if (process.platform === "win32" || spawnSync("python3", ["--version"]).status !== 0) return null;
+  const repositoryRoot = join(import.meta.dirname, "..");
+  const result = spawnSync("python3", [
+    join(import.meta.dirname, "helpers", "pty-start-harness.py"),
+    process.execPath,
+    join(repositoryRoot, "bin", "aio.mjs"),
+    objective,
+    x.root,
+    repositoryRoot,
+    mode,
+  ], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    env: { ...process.env, PI_CODING_AGENT_ROOT: piRoot },
+    timeout: 30_000,
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const record = JSON.parse(result.stdout.trim());
+  return { ...record, output: Buffer.from(record.output, "base64").toString("utf8") };
+}
+
 function fileSnapshot(path) {
   if (!existsSync(path)) return { exists: false };
   const bytes = readFileSync(path);
@@ -400,49 +422,107 @@ test("authorization defaults to deny and never auto-applies", async () => {
   assert.deepEqual(readFileSync(x.path), x.bytes);
 });
 
-test("production stdin authorizer accepts only one complete bounded y/yes record", async () => {
+test("interactive production authorization requires two exact bounded records on one shared reader", async () => {
+  const challenge = "ABCDEFGH";
   const allow = [
-    ["y\n"], ["yes\n"], ["Y\n"], ["YES\n"], ["y\r\n"], ["yes\r\n"],
-    ["ye", "s\n"], ["yes\r", "\n"],
+    ["y\n", `${challenge}\n`], ["yes\n", `${challenge}\n`], ["Y\n", `${challenge}\n`],
+    ["YES\r\n", `${challenge}\r\n`], ["ye", "s\n", "ABCD", "EFGH\n"],
+    ["yes\r", "\n", `${challenge}\r`, "\n"],
   ];
   for (const chunks of allow) {
     const input = Readable.from(chunks);
-    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough() })(), true, JSON.stringify(chunks));
+    Object.defineProperty(input, "isTTY", { value: true });
+    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough(), challengeFactory: () => challenge })(), true, JSON.stringify(chunks));
+    assert.equal(input.destroyed, false, "authorizer cleanup must not destroy the terminal stream");
   }
-  const tty = Readable.from(["yes\n"]);
-  Object.defineProperty(tty, "isTTY", { value: true });
-  assert.equal(await createStdinAuthorizer({ input: tty, output: new PassThrough() })(), true);
-  const pastedTty = Readable.from(["yes\nno\n"]);
-  Object.defineProperty(pastedTty, "isTTY", { value: true });
-  assert.equal(await createStdinAuthorizer({ input: pastedTty, output: new PassThrough() })(), false);
 
   const deny = [
-    [], ["y"], ["yes"], ["yes\nno\n"], ["y\nanything\n"], ["yes\r\nno\r\n"],
-    ["yes\n "], ["\nyes\n"], [" yes \n"], ["maybe\n"], ["true\n"], ["1\n"],
-    ["ok\n"], ["yes please\n"], ["yes\r"], ["yes\rX\n"], ["yes\u0000\n"],
-    [Buffer.from([0xf9, 0x0a])], ["y".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
-    ["yes\n", "no\n"], ["yes", "\nno\n"],
+    [], ["y"], ["yes"], ["yes\n"], ["yes\nno\n"], ["yes\n", "no\n"],
+    ["yes\n", `${challenge}`], ["yes\n", `${challenge} \n`], ["yes\n", ` ${challenge}\n`],
+    ["yes\n", `${challenge}\nextra\n`], ["yes\n", `${challenge}\rX\n`],
+    ["\nyes\n"], [" yes \n"], ["maybe\n"], ["yes please\n"], ["yes\r"],
+    ["yes\u0000\n"], [Buffer.from([0xf9, 0x0a])],
+    ["y".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
+    ["yes\n", "x".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
   ];
   for (const chunks of deny) {
     const input = Readable.from(chunks);
-    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough() })(), false, JSON.stringify(chunks));
+    Object.defineProperty(input, "isTTY", { value: true });
+    assert.equal(await createStdinAuthorizer({ input, output: new PassThrough(), challengeFactory: () => challenge })(), false, JSON.stringify(chunks));
   }
 
   const broken = new Readable({ read() { this.destroy(new Error("stdin failed")); } });
+  Object.defineProperty(broken, "isTTY", { value: true });
+  assert.equal(await createStdinAuthorizer({ input: broken, output: new PassThrough(), challengeFactory: () => challenge })(), false);
+});
+
+test("challenge is generated exactly once only after affirmative phase 1 and reader cleanup is non-destructive", async () => {
+  const challenge = "ABCDEFGH";
+  const input = new PassThrough();
+  Object.defineProperty(input, "isTTY", { value: true });
+  const initialListeners = input.eventNames().map((name) => [name, input.listenerCount(name)]);
+  const rendered = { text: "", write(value) { this.text += value; return true; } };
+  let generated = 0;
+  const decision = createStdinAuthorizer({
+    input,
+    output: rendered,
+    challengeFactory: () => { generated += 1; return challenge; },
+  })();
+  assert.equal(generated, 0);
+  assert.equal(rendered.text, "Apply this plan? [y/N] ");
+  input.write("yes\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(generated, 1);
+  assert.equal(rendered.text, `Apply this plan? [y/N] Confirm ${challenge}: `);
+  input.write(`${challenge}\n`);
+  assert.equal(await decision, true);
+  assert.equal(generated, 1);
+  assert.equal(input.destroyed, false);
+  assert.deepEqual(input.eventNames().map((name) => [name, input.listenerCount(name)]), initialListeners);
+  input.end();
+
+  const denyInput = new PassThrough();
+  Object.defineProperty(denyInput, "isTTY", { value: true });
+  const denyListeners = denyInput.eventNames().map((name) => [name, denyInput.listenerCount(name)]);
+  let deniedGeneration = 0;
+  const denied = createStdinAuthorizer({
+    input: denyInput,
+    output: new PassThrough(),
+    challengeFactory: () => { deniedGeneration += 1; return challenge; },
+  })();
+  denyInput.write("no\n");
+  assert.equal(await denied, false);
+  assert.equal(deniedGeneration, 0);
+  assert.equal(denyInput.destroyed, false);
+  assert.deepEqual(denyInput.eventNames().map((name) => [name, denyInput.listenerCount(name)]), denyListeners);
+  denyInput.end();
+});
+
+test("non-interactive stdin is never a production authorization channel", async () => {
+  for (const chunks of [[], ["yes"], ["yes\n"], ["y\r\n"], ["yes\nno\n"]]) {
+    const input = Readable.from(chunks);
+    const output = new PassThrough();
+    let generated = 0;
+    assert.equal(await createStdinAuthorizer({ input, output, challengeFactory: () => { generated += 1; return "ABCDEFGH"; } })(), false, JSON.stringify(chunks));
+    assert.equal(generated, 0);
+  }
+  const broken = new Readable({ read() { this.destroy(new Error("must not be consumed")); } });
   assert.equal(await createStdinAuthorizer({ input: broken, output: new PassThrough() })(), false);
 });
 
-test("every denied or ambiguous production authorization preserves TASK_PLAN exact bytes and never applies", async () => {
+test("every denied or ambiguous interactive authorization preserves TASK_PLAN exact bytes and never applies", async () => {
   const cases = [
-    [], ["y"], ["yes"], ["yes\nno\n"], ["y\nanything\n"], ["yes\r\nno\r\n"],
-    ["yes\n "], ["\nyes\n"], [" yes \n"], ["maybe\n"], ["true\n"], ["1\n"],
-    ["ok\n"], ["yes please\n"], ["yes\r"], ["x".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
+    [], ["y"], ["yes"], ["yes\n"], ["yes\nno\n"], ["yes\n", "no\n"],
+    ["yes\r\nno\r\n"], ["yes\nABCDEFGH\nextra\n"], ["\nyes\n"], [" yes \n"],
+    ["maybe\n"], ["yes please\n"], ["yes\r"], ["x".repeat(MAX_AUTHORIZATION_RECORD_BYTES + 1) + "\n"],
   ];
   for (const chunks of cases) {
     const x = fixture();
     const tracked = instrument(x.plan);
     const planner = fakePlanner(candidate(x.base));
-    const authorize = createStdinAuthorizer({ input: Readable.from(chunks), output: new PassThrough() });
+    const input = Readable.from(chunks);
+    Object.defineProperty(input, "isTTY", { value: true });
+    const authorize = createStdinAuthorizer({ input, output: new PassThrough(), challengeFactory: () => "ABCDEFGH" });
     const result = await startPlanning({ objective: "Authorization regression", plan: tracked.plan, planner, authorize });
     assert.equal(result.status, "CANCELLED", JSON.stringify(chunks));
     assert.equal(tracked.calls.apply, 0, JSON.stringify(chunks));
@@ -454,9 +534,10 @@ test("every denied or ambiguous production authorization preserves TASK_PLAN exa
   const x = fixture();
   const tracked = instrument(x.plan);
   const broken = new Readable({ read() { this.destroy(new Error("stdin failed")); } });
+  Object.defineProperty(broken, "isTTY", { value: true });
   const result = await startPlanning({
     objective: "Stream error regression", plan: tracked.plan, planner: fakePlanner(candidate(x.base)),
-    authorize: createStdinAuthorizer({ input: broken, output: new PassThrough() }),
+    authorize: createStdinAuthorizer({ input: broken, output: new PassThrough(), challengeFactory: () => "ABCDEFGH" }),
   });
   assert.equal(result.status, "CANCELLED");
   assert.equal(tracked.calls.apply, 0);
@@ -522,6 +603,29 @@ test("a blocked owner gate cannot be removed or bypassed by planner or approval"
   }
 });
 
+test("two-phase generic confirmation cannot satisfy or release a blocked HUMAN owner gate", async () => {
+  const base = blockedTask();
+  const x = fixture(base);
+  const value = structuredClone(base);
+  value.plan_revision_id = "PLAN-BLOCKED-GENERIC-2";
+  value.updated_at = NEXT_TIME;
+  value.objective = "Refine only generic planning metadata while preserving the latch.";
+  const input = Readable.from(["yes\nABCDEFGH\n"]);
+  Object.defineProperty(input, "isTTY", { value: true });
+  const result = await startPlanning({
+    objective: "Do not release HANDOFF_CONFIRM",
+    plan: x.plan,
+    planner: fakePlanner(value),
+    authorize: createStdinAuthorizer({ input, output: new PassThrough(), challengeFactory: () => "ABCDEFGH" }),
+  });
+  assert.equal(result.status, "APPLIED");
+  const applied = createPlanAdapter(x.path).observe().plan;
+  assert.equal(applied.status, "BLOCKED");
+  assert.equal(applied.owner_gate.status, "BLOCKED");
+  assert.equal(applied.owner_gate.command, "/aio handoff confirm");
+  assert.equal(applied.task_items[0].status, "BLOCKED");
+});
+
 test("stale during planner latency uses original A and preserves externally committed C exactly", async () => {
   const x = fixture();
   const b = candidate(x.base, "PLAN-B", NEXT_TIME);
@@ -558,6 +662,31 @@ test("stale after display and affirmative authorization is an existing CAS confl
   }), assertCode("PLAN_CAS_CONFLICT"));
   assert.deepEqual(readFileSync(x.path), cBytes);
   assert.deepEqual(createPlanAdapter(x.path).observe().plan, c);
+});
+
+test("stale authority change between the two terminal phases remains a fail-closed CAS conflict", async () => {
+  const x = fixture();
+  const b = candidate(x.base, "PLAN-B", NEXT_TIME);
+  const c = candidate(x.base, "PLAN-C", EXTERNAL_TIME);
+  const input = new PassThrough();
+  Object.defineProperty(input, "isTTY", { value: true });
+  let cBytes;
+  const authorize = createStdinAuthorizer({
+    input,
+    output: new PassThrough(),
+    challengeFactory: () => {
+      externalApply(x, c, "PPR-EXTERNAL-C-BETWEEN-AUTH-PHASES");
+      cBytes = readFileSync(x.path);
+      queueMicrotask(() => input.write("ABCDEFGH\n"));
+      return "ABCDEFGH";
+    },
+  });
+  queueMicrotask(() => input.write("yes\n"));
+  await assert.rejects(() => startPlanning({ objective: "Race between confirmations", plan: x.plan, planner: fakePlanner(b), authorize }), assertCode("PLAN_CAS_CONFLICT"));
+  assert.deepEqual(readFileSync(x.path), cBytes);
+  assert.deepEqual(createPlanAdapter(x.path).observe().plan, c);
+  assert.equal(input.destroyed, false);
+  input.end();
 });
 
 test("read-side start does not hide PLAN_RECOVERY_AMBIGUOUS and performs no retry", async () => {
@@ -825,27 +954,13 @@ test("runCli start deny, missing objective, whitespace, leading hyphen and help 
   assert.match(help[0], /never begins autonomous implementation/);
 });
 
-test("true aio CLI uses the production Pi boundary for happy, deny, provider error and stale flows", () => {
+test("true aio CLI denies every piped or redirected production stdin input", () => {
   const piRoot = fakePiRoot();
-  {
+  for (const input of ["yes\n", "y\r\n", "yes", "yes\nno\n", ""]) {
     const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Pianifica OAuth mantenendo il completato", "yes\n");
+    const result = spawnAio("bin/aio.mjs", x, piRoot, "Deny non-interactive objective", input);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Apply this plan\? \[y\/N\]/);
-    assert.match(result.stdout, /Plan applied:\s+PLAN-CLI-FAKE-2/);
-    assert.match(result.stdout, /implementation has not been started/);
-    assert.equal(createPlanAdapter(x.path).observe().plan.objective, "Pianifica OAuth mantenendo il completato");
-  }
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Windows approval", "yes\r\n");
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Plan applied:\s+PLAN-CLI-FAKE-2/);
-  }
-  for (const input of ["no\n", "yes", "yes\nno\n", ""]) {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Deny objective", input);
-    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Interactive confirmation required\./);
     assert.match(result.stdout, /Plan not applied\./);
     assert.deepEqual(readFileSync(x.path), x.bytes, JSON.stringify(input));
     assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), false);
@@ -864,6 +979,37 @@ test("true aio CLI uses the production Pi boundary for happy, deny, provider err
     assert.match(result.stderr, /PLAN_PROPOSAL_STALE/);
     assert.doesNotMatch(result.stdout, /Apply this plan/);
     assert.equal(createPlanAdapter(x.path).observe().plan.plan_revision_id, "PLAN-CLI-CONCURRENT-C");
+  }
+});
+
+test("real canonical PTY blocks the old multiline paste and supports post-prompt challenge confirmation", { skip: process.platform === "win32" ? "Unix PTY regression" : false }, (t) => {
+  if (spawnSync("python3", ["--version"]).status !== 0) return t.skip("python3 PTY harness unavailable");
+  const piRoot = fakePiRoot();
+  {
+    const x = fixture(); initializeFixtureRepository(x);
+    const result = runAioInPty(x, piRoot, "PTY prebuffered paste", "paste");
+    assert.equal(result.status, 0, result.output);
+    assert.match(result.output, /Confirm [A-HJ-NP-Z2-9]{8,12}:/);
+    assert.match(result.output, /Plan not applied\./);
+    assert.deepEqual(readFileSync(x.path), x.bytes);
+    assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), false);
+  }
+  {
+    const x = fixture(); initializeFixtureRepository(x);
+    const result = runAioInPty(x, piRoot, "PTY happy objective", "happy");
+    assert.equal(result.status, 0, result.output);
+    assert.equal(result.sent_first, true);
+    assert.equal(result.sent_second, true);
+    assert.match(result.output, /Confirm [A-HJ-NP-Z2-9]{8,12}:/);
+    assert.match(result.output, /Plan applied:\s+PLAN-CLI-FAKE-2/);
+    assert.equal(createPlanAdapter(x.path).observe().plan.objective, "PTY happy objective");
+  }
+  {
+    const x = fixture(); initializeFixtureRepository(x);
+    const result = runAioInPty(x, piRoot, "PTY wrong challenge", "wrong");
+    assert.equal(result.status, 0, result.output);
+    assert.match(result.output, /Plan not applied\./);
+    assert.deepEqual(readFileSync(x.path), x.bytes);
   }
 });
 

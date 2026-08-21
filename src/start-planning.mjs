@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { stdin as processStdin, stdout as processStdout } from "node:process";
 import { opaqueId, strictJsonClone } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
@@ -8,6 +9,17 @@ export const MAX_OBJECTIVE_BYTES = 16 * 1024;
 export const MAX_PLANNER_RESPONSE_BYTES = MAX_PLAN_BYTES;
 export const MAX_AUTHORIZATION_RECORD_BYTES = 1024;
 export const START_PRODUCER = "aio-start/0.2-d";
+
+const AUTHORIZATION_CHALLENGE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const AUTHORIZATION_CHALLENGE_LENGTH = 10;
+const AUTHORIZATION_CHALLENGE_PATTERN = /^[A-HJ-NP-Z2-9]{8,12}$/;
+
+function createAuthorizationChallenge() {
+  const entropy = randomBytes(AUTHORIZATION_CHALLENGE_LENGTH);
+  let challenge = "";
+  for (const byte of entropy) challenge += AUTHORIZATION_CHALLENGE_ALPHABET[byte & 31];
+  return challenge;
+}
 
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -148,47 +160,87 @@ export function formatStartResult(result) {
   ].join("\n");
 }
 
+function createAuthorizationRecordReader(input) {
+  // Readable.iterator({ destroyOnReturn: false }) lets us close our iterator after
+  // the decision without destroying process.stdin. Both records share this one
+  // iterator and pending buffer, so chunk/canonical-read boundaries have no meaning.
+  const iterator = typeof input.iterator === "function"
+    ? input.iterator({ destroyOnReturn: false })
+    : input[Symbol.asyncIterator]();
+  let pending = Buffer.alloc(0);
+  let offset = 0;
+  let ended = false;
+
+  async function nextByte() {
+    while (offset >= pending.length) {
+      pending = Buffer.alloc(0);
+      offset = 0;
+      if (ended) return null;
+      const next = await iterator.next();
+      if (next.done) { ended = true; return null; }
+      pending = Buffer.isBuffer(next.value) ? next.value : Buffer.from(String(next.value), "utf8");
+    }
+    return pending[offset++];
+  }
+
+  return {
+    async readRecord() {
+      const record = [];
+      while (true) {
+        const byte = await nextByte();
+        if (byte === null) return { complete: false };
+        if (byte === 0x0a) return { complete: true, record: Buffer.from(record), trailing: offset < pending.length };
+        if (byte === 0x0d) {
+          const lf = await nextByte();
+          if (lf !== 0x0a) return { complete: false };
+          return { complete: true, record: Buffer.from(record), trailing: offset < pending.length };
+        }
+        if (byte < 0x20 || byte > 0x7e) return { complete: false };
+        record.push(byte);
+        if (record.length > MAX_AUTHORIZATION_RECORD_BYTES) return { complete: false };
+      }
+    },
+    async close() {
+      try { await iterator.return?.(); }
+      catch { /* Authorization is already fail-closed; cleanup must not mask it. */ }
+    },
+  };
+}
+
 export function createStdinAuthorizer(options = {}) {
   const input = options.input ?? processStdin;
   const output = options.output ?? processStdout;
+  // Internal deterministic seam for this blocked package subpath's tests only.
+  const challengeFactory = options.challengeFactory ?? createAuthorizationChallenge;
   return async () => {
+    if (input.isTTY !== true) {
+      try { output.write("Interactive confirmation required.\n"); }
+      catch { /* Denial does not depend on rendering the explanation. */ }
+      return false;
+    }
+
+    let reader;
     try {
       output.write("Apply this plan? [y/N] ");
-      const record = [];
-      let state = "RECORD";
+      reader = createAuthorizationRecordReader(input);
+      const first = await reader.readRecord();
+      if (!first.complete) return false;
+      const answer = Buffer.from(first.record.map((byte) => byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte));
+      if (!answer.equals(Buffer.from("y")) && !answer.equals(Buffer.from("yes"))) return false;
 
-      for await (const chunk of input) {
-        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
-        for (const byte of bytes) {
-          if (state === "COMPLETE") return false;
-          if (state === "EXPECT_LF") {
-            if (byte !== 0x0a) return false;
-            state = "COMPLETE";
-            continue;
-          }
-          if (byte === 0x0a) {
-            state = "COMPLETE";
-            continue;
-          }
-          if (byte === 0x0d) {
-            state = "EXPECT_LF";
-            continue;
-          }
-          record.push(byte);
-          if (record.length > MAX_AUTHORIZATION_RECORD_BYTES) return false;
-        }
+      // This must happen after phase 1. Pre-buffered terminal input therefore
+      // cannot know the invocation-local production challenge.
+      const challenge = challengeFactory();
+      if (typeof challenge !== "string" || !AUTHORIZATION_CHALLENGE_PATTERN.test(challenge)) return false;
+      output.write(`Confirm ${challenge}: `);
 
-        // A terminal line is complete without waiting for terminal EOF. Any extra
-        // bytes already delivered in this chunk were rejected above. Pipes/files
-        // are consumed through EOF so their entire input is proven unambiguous.
-        if (input.isTTY === true && state === "COMPLETE") break;
-      }
-
-      if (state !== "COMPLETE") return false;
-      const answer = Buffer.from(record.map((byte) => byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte));
-      return answer.equals(Buffer.from("y")) || answer.equals(Buffer.from("yes"));
+      const second = await reader.readRecord();
+      if (!second.complete || second.trailing) return false;
+      return second.record.equals(Buffer.from(challenge, "ascii"));
     } catch {
       return false;
+    } finally {
+      await reader?.close();
     }
   };
 }
