@@ -130,6 +130,32 @@ function fileIdentity(stat) {
   return Object.freeze({ device: statValue(stat, "dev"), inode: statValue(stat, "ino") });
 }
 
+function timestampValue(stat, nanoseconds, milliseconds) {
+  if (stat[nanoseconds] !== undefined) return statValue(stat, nanoseconds);
+  return String(Math.trunc(Number(stat[milliseconds]) * 1_000_000));
+}
+
+function stableFileFingerprint(stat) {
+  return Object.freeze({
+    ...fileIdentity(stat),
+    size: statValue(stat, "size"),
+    nlink: statValue(stat, "nlink"),
+    mtimeNs: timestampValue(stat, "mtimeNs", "mtimeMs"),
+    ctimeNs: timestampValue(stat, "ctimeNs", "ctimeMs"),
+    regular: stat.isFile(),
+  });
+}
+
+function sameFileFingerprint(left, right) {
+  return left.device === right.device
+    && left.inode === right.inode
+    && left.size === right.size
+    && left.nlink === right.nlink
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.regular === right.regular;
+}
+
 export function sameFilesystemIdentity(left, right) {
   return Boolean(left && right && left.device === right.device && left.inode === right.inode);
 }
@@ -238,6 +264,38 @@ export class PlanRevisionWriter {
     if (releaseError) throw releaseError;
   }
 
+  #readAuthoritySnapshotRaw() {
+    let fd;
+    try {
+      const beforeStat = this.#io.lstatSync(this.path, { bigint: true });
+      const before = stableFileFingerprint(beforeStat);
+      invariant(before.regular && !beforeStat.isSymbolicLink() && before.nlink === "1" && samePath(this.#io.realpathSync(this.path), this.path), "PLAN_CAS_CONFLICT", "TASK_PLAN.md is not a stable regular authority file during final raw attestation");
+      invariant(Number(beforeStat.size) <= MAX_PLAN_BYTES, "PLAN_CAS_CONFLICT", "TASK_PLAN.md exceeds the authority limit during final raw attestation");
+      fd = this.#io.openSync(this.path, "r");
+      const openedStat = this.#io.fstatSync(fd, { bigint: true });
+      const opened = stableFileFingerprint(openedStat);
+      invariant(sameFileFingerprint(before, opened), "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed while opening for final raw attestation");
+      const bytes = this.#io.readFileSync(fd);
+      const afterStat = this.#io.fstatSync(fd, { bigint: true });
+      const after = stableFileFingerprint(afterStat);
+      invariant(bytes.length <= MAX_PLAN_BYTES && bytes.length === Number(afterStat.size) && sameFileFingerprint(opened, after), "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed during final raw attestation");
+      this.#io.closeSync(fd);
+      fd = undefined;
+      return Object.freeze({ bytes, identity: fileIdentity(afterStat) });
+    } catch (error) {
+      if (error?.code === "PLAN_CAS_CONFLICT") throw error;
+      if (["ENOENT", "ELOOP", "ENOTDIR"].includes(error?.code)) throw new GuardianError("PLAN_CAS_CONFLICT", "TASK_PLAN.md disappeared or was redirected during final raw attestation");
+      throw error;
+    } finally {
+      closeQuietly(this.#io, fd);
+    }
+  }
+
+  #finalRawAuthorityAttestation(current) {
+    const observed = this.#readAuthoritySnapshotRaw();
+    invariant(sameFilesystemIdentity(observed.identity, current.fileIdentity) && observed.bytes.equals(current.bytes), "PLAN_CAS_CONFLICT", "TASK_PLAN.md no longer equals the exact initial authority bytes and identity during final raw attestation");
+  }
+
   readCurrent({ requireSingleBlock = false, validate } = {}) {
     const file = this.#readRegular(this.path, { maximum: MAX_PLAN_BYTES, code: "PLAN_PATH_REDIRECTED" });
     const observed = parseTaskPlanBytes(file.bytes, { requireSingleBlock });
@@ -269,16 +327,33 @@ export class PlanRevisionWriter {
     return Buffer.from(this.#readRegular(resolve(path), { maximum, code: "PLAN_PROVENANCE_INVALID" }).bytes);
   }
 
-  writeImmutable(path, bytes, { conflictCode = "PLAN_PROVENANCE_CONFLICT", maximum = MAX_PLAN_STATE_BYTES } = {}) {
+  #redurabilizeExisting(path, identity) {
+    let fd;
+    try {
+      fd = this.#io.openSync(path, "r+");
+      const stat = this.#io.fstatSync(fd, { bigint: true });
+      invariant(stat.isFile() && sameFilesystemIdentity(fileIdentity(stat), identity), "PLAN_PROVENANCE_INVALID", `Immutable record changed before durability retry: ${path}`);
+      this.#io.fsyncSync(fd);
+      this.#io.closeSync(fd);
+      fd = undefined;
+      syncDirectory(this.#io, dirname(path));
+    } finally {
+      closeQuietly(this.#io, fd);
+    }
+  }
+
+  writeImmutable(path, bytes, { conflictCode = "PLAN_PROVENANCE_CONFLICT", maximum = MAX_PLAN_STATE_BYTES, allowExistingExact = true } = {}) {
     const destination = resolve(path);
     const parent = dirname(destination);
     const value = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
     invariant(value.length <= maximum, "PLAN_PROVENANCE_INVALID", `Immutable record exceeds ${maximum} bytes`);
     this.#ensureRealDirectory(parent);
     if (this.#pathExists(destination)) {
+      if (!allowExistingExact) throw new GuardianError(conflictCode, `Immutable plan record already exists before exclusive publication: ${destination}`);
       const existing = this.#readRegular(destination, { maximum, code: "PLAN_PROVENANCE_INVALID" });
-      if (existing.bytes.equals(value)) return;
-      throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+      if (!existing.bytes.equals(value)) throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+      this.#redurabilizeExisting(destination, existing.identity);
+      return;
     }
     const temp = temporaryPath(destination, "immutable");
     let fd;
@@ -298,9 +373,11 @@ export class PlanRevisionWriter {
       closeQuietly(this.#io, fd);
       if (ownsTemp) { try { this.#io.unlinkSync(temp); } catch {} }
       if (error?.code === "EEXIST") {
+        if (!allowExistingExact) throw new GuardianError(conflictCode, `Immutable plan record was precreated before exclusive publication: ${destination}`);
         const existing = this.#readRegular(destination, { maximum, code: "PLAN_PROVENANCE_INVALID" });
-        if (existing.bytes.equals(value)) return;
-        throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+        if (!existing.bytes.equals(value)) throw new GuardianError(conflictCode, `Immutable plan record already exists with different bytes: ${destination}`);
+        this.#redurabilizeExisting(destination, existing.identity);
+        return;
       }
       throw error;
     }
@@ -371,12 +448,14 @@ export class PlanRevisionWriter {
   }) {
     invariant(typeof validate === "function", "PLAN_VALIDATOR_REQUIRED", "Every plan mutation must provide the canonical semantic validator");
     invariant(typeof prepare === "function", "PLAN_PREPARE_REQUIRED", "Every plan mutation must provide a deterministic candidate preparation");
+    this.readCurrent({ requireSingleBlock, validate });
     const lock = this.#acquireLock();
     let operationError;
     let temp;
     let committed = false;
     try {
       const current = this.readCurrent({ requireSingleBlock, validate });
+      const exactInitialAuthority = Object.freeze({ bytes: Buffer.from(current.bytes), fileIdentity: current.fileIdentity });
       const existing = inspectExisting?.(current);
       if (existing !== undefined && existing !== null) return existing;
       if (expected) this.#casConflict(expected, current, "initial attestation");
@@ -401,10 +480,7 @@ export class PlanRevisionWriter {
       this.#testHooks?.afterPreparation?.(Object.freeze({ current, candidate }));
 
       this.#attestLock(lock);
-      const finalObservation = this.readCurrent({ requireSingleBlock, validate });
-      const attestation = expected ?? { planRevisionId: current.task.plan_revision_id, contentDigest: current.contentDigest };
-      this.#casConflict(attestation, finalObservation, "final attestation");
-      invariant(finalObservation.contentDigest === current.contentDigest, "PLAN_CAS_CONFLICT", "TASK_PLAN.md changed while the mutation was being prepared");
+      this.#finalRawAuthorityAttestation(exactInitialAuthority);
       this.#io.renameSync(temp.path, this.path);
       temp.ownsTemp = false;
       committed = true;

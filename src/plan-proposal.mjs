@@ -173,18 +173,27 @@ export class PlanProposal {
   }
 }
 
+const METADATA_HEADERS = Object.freeze([
+  { field: "plan_revision_id", pattern: /^\*\*Current revision:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/gm },
+  { field: "requirements_version", pattern: /^\*\*Requirements version:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/gm },
+  { field: "updated_at", pattern: /^\*\*Updated:\*\*[ \t]*([^\r\n]+?)[ \t]*$/gm },
+]);
+
 function assertMetadata(observed) {
   invariant(observed.schemaHeaderCount === 1, "PLAN_METADATA_INVALID", "A mutable TASK_PLAN.md must contain exactly one Schema header");
   if (observed.ledgerSchema === LEGACY_TASK_LEDGER_SCHEMA) {
     throw new GuardianError("PLAN_LEGACY_MIGRATION_REQUIRED", `Reading ${LEGACY_TASK_LEDGER_SCHEMA} remains supported, but Plan Proposal mutation requires an explicit migration to ${TASK_LEDGER_SCHEMA}`);
   }
   invariant(observed.ledgerSchema === TASK_LEDGER_SCHEMA, "PLAN_LEDGER_SCHEMA_UNSUPPORTED", `Plan Proposal mutation requires ${TASK_LEDGER_SCHEMA}`);
-  const expected = [
-    `**Current revision:** \`${observed.task.plan_revision_id}\``,
-    `**Requirements version:** \`${observed.task.requirements_version}\``,
-    `**Updated:** ${observed.task.updated_at}`,
-  ];
-  for (const line of expected) invariant(observed.text.split(line).length - 1 === 1, "PLAN_METADATA_MISMATCH", `Missing or ambiguous Ledger metadata: ${line}`);
+  const matches = METADATA_HEADERS.map(({ pattern }) => [...observed.text.matchAll(pattern)]);
+  const compact = matches.every((entries) => entries.length === 0);
+  const extended = matches.every((entries) => entries.length === 1);
+  invariant(compact || extended, "PLAN_METADATA_MISMATCH", "Ledger metadata must be either fully absent (compact layout) or uniquely present (extended layout)");
+  if (extended) for (let index = 0; index < METADATA_HEADERS.length; index += 1) {
+    const field = METADATA_HEADERS[index].field;
+    invariant(matches[index][0][1] === observed.task[field], "PLAN_METADATA_MISMATCH", `Ledger metadata does not match ${field}`);
+  }
+  return extended ? "extended" : "compact";
 }
 
 function replaceOnce(text, before, after) {
@@ -192,8 +201,30 @@ function replaceOnce(text, before, after) {
   return text.replace(before, after);
 }
 
+function assertGenericProposalPreservesBlockedOwnerLatch(base, candidate) {
+  const gate = base.owner_gate;
+  if (!gate || gate.kind !== "HANDOFF_CONFIRM" || gate.status !== "BLOCKED") return;
+  for (const field of ["status", "current_item", "next_item", "next_step"]) {
+    invariant(sameValue(base[field], candidate[field]), "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", `Generic PlanProposal cannot change ${field} while a HANDOFF_CONFIRM owner latch is BLOCKED`);
+  }
+  const baseItems = new Map(base.task_items.map((item) => [item.task_item_id, item]));
+  const candidateItems = new Map(candidate.task_items.map((item) => [item.task_item_id, item]));
+  invariant(baseItems.size === candidateItems.size && [...baseItems.keys()].every((id) => candidateItems.has(id)), "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", "Generic PlanProposal cannot restructure lifecycle-critical items while the owner latch is BLOCKED");
+  const protectedItem = candidateItems.get(gate.item_id);
+  invariant(protectedItem?.status === "BLOCKED", "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", "The owner-latch TaskItem must remain present and BLOCKED");
+  invariant(candidate.task_items.every((item) => item.status !== "IN_PROGRESS"), "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", "No TaskItem may become IN_PROGRESS while the owner latch is BLOCKED");
+  for (const [id, before] of baseItems) {
+    const after = candidateItems.get(id);
+    invariant(before.status === after.status, "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", `TaskItem ${id} status cannot change while the owner latch is BLOCKED`);
+    invariant(sameValue(before.depends_on, after.depends_on), "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", `TaskItem ${id} dependency topology cannot change while the owner latch is BLOCKED`);
+    for (const field of ["supersedes", "superseded_by"]) {
+      invariant(Object.hasOwn(before, field) === Object.hasOwn(after, field) && (!Object.hasOwn(before, field) || before[field] === after[field]), "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN", `TaskItem ${id} supersession topology cannot change while the owner latch is BLOCKED`);
+    }
+  }
+}
+
 function materializeObserved(observed, proposal) {
-  assertMetadata(observed);
+  const metadataLayout = assertMetadata(observed);
   invariant(observed.task.task_id === proposal.task_id, "PLAN_TASK_ID_MISMATCH", "Proposal task_id does not match the observed Ledger");
   invariant(observed.task.plan_revision_id === proposal.base_plan_revision_id, "PLAN_CAS_CONFLICT", "Observed revision does not match proposal base revision");
   invariant(observed.contentDigest === proposal.base_content_digest, "PLAN_CAS_CONFLICT", "Observed bytes do not match proposal base digest");
@@ -202,11 +233,14 @@ function materializeObserved(observed, proposal) {
   const baseHasOwnerGate = Object.hasOwn(observed.task, "owner_gate");
   const candidateHasOwnerGate = Object.hasOwn(candidate, "owner_gate");
   invariant(baseHasOwnerGate === candidateHasOwnerGate && (!baseHasOwnerGate || sameValue(observed.task.owner_gate, candidate.owner_gate)), "PLAN_OWNER_GATE_MUTATION_FORBIDDEN", "Generic PlanProposal must preserve owner_gate exactly; only satisfyOwnerGate() may transition it");
+  assertGenericProposalPreservesBlockedOwnerLatch(observed.task, candidate);
   const json = canonicalPrettyJson(candidate).replaceAll("\n", observed.block.lineEnding);
   let text = observed.text.slice(0, observed.block.jsonIndex) + json + observed.text.slice(observed.block.jsonIndex + observed.block.json.length);
-  text = replaceOnce(text, `**Current revision:** \`${observed.task.plan_revision_id}\``, `**Current revision:** \`${candidate.plan_revision_id}\``);
-  text = replaceOnce(text, `**Requirements version:** \`${observed.task.requirements_version}\``, `**Requirements version:** \`${candidate.requirements_version}\``);
-  text = replaceOnce(text, `**Updated:** ${observed.task.updated_at}`, `**Updated:** ${candidate.updated_at}`);
+  if (metadataLayout === "extended") {
+    text = replaceOnce(text, `**Current revision:** \`${observed.task.plan_revision_id}\``, `**Current revision:** \`${candidate.plan_revision_id}\``);
+    text = replaceOnce(text, `**Requirements version:** \`${observed.task.requirements_version}\``, `**Requirements version:** \`${candidate.requirements_version}\``);
+    text = replaceOnce(text, `**Updated:** ${observed.task.updated_at}`, `**Updated:** ${candidate.updated_at}`);
+  }
   const bytes = Buffer.from(text, "utf8");
   const parsed = parseTaskPlanBytes(bytes, { requireSingleBlock: true });
   validateTaskLedger(parsed.task);
@@ -313,6 +347,7 @@ function validateStoredResult(result, proposal, materialized, provenanceReferenc
   invariant(result.prepared_at === intent.prepared_at && result.provenance_reference === provenanceReference && sameValue(result.diff, materialized.diff), "PLAN_PROVENANCE_INVALID", "Stored apply result deterministic fields are invalid");
   invariant(typeof result.applied_at === "string" && result.recovered_at === null, "PLAN_PROVENANCE_INVALID", "Stored result must contain a live post-rename applied_at and no recovered success");
   exactUtcTimestamp(result.applied_at, "applied_at", "PLAN_PROVENANCE_INVALID");
+  invariant(Date.parse(result.applied_at) >= Date.parse(result.prepared_at), "PLAN_PROVENANCE_INVALID", "Stored applied_at cannot precede prepared_at");
   exactFields(result.provenance, REVISION_FIELDS, "PLAN_PROVENANCE_INVALID", "Stored PlanRevision");
   invariant(sameValue(result.provenance, revisionFor(proposal, materialized, intent.previous_snapshot_reference)), "PLAN_PROVENANCE_INVALID", "Stored PlanRevision does not match deterministic materialization");
   exactFields(result.commit_witness, WITNESS_FIELDS, "PLAN_PROVENANCE_INVALID", "Stored commit witness");
@@ -321,6 +356,8 @@ function validateStoredResult(result, proposal, materialized, provenanceReferenc
 }
 
 export class PlanPort {
+  #liveAppliedReceipts = new Map();
+
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
     this.writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
@@ -434,12 +471,16 @@ export class PlanPort {
           && current.contentDigest === materialized.content_digest
           && sameValue(current.task, proposal.candidate_plan);
         if (!currentIsCandidate) throw new GuardianError("PLAN_PROPOSAL_RECOVERY_CONFLICT", "Current authoritative plan is neither the exact proposal base nor its deterministic candidate");
-        if (!tree.applied) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Current candidate has no durable result written by the live post-rename Aiopago execution; filesystem identity cannot prove who performed the rename");
-        const witnesses = tree.intents.filter((attempt) => sameFilesystemIdentity(attempt.value.candidate_temp_filesystem_identity, current.fileIdentity));
-        if (witnesses.length !== 1) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Stored apply result does not identify the exact current authority file object");
-        const witnessed = witnesses[0];
+        if (!tree.applied) throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Current candidate has no live receipt in this PlanPort instance; filesystem evidence cannot authenticate who committed it");
+        const witnessed = tree.intents.filter((attempt) => attempt.value.attempt_token === tree.applied?.commit_witness?.attempt_token && attempt.reference === tree.applied?.commit_witness?.commit_intent_reference);
+        invariant(witnessed.length === 1, "PLAN_PROVENANCE_INVALID", "Stored apply result does not identify exactly one validated commit intent");
         const provenance = revisionFor(proposal, materialized, previousSnapshotReference);
-        return deepFreeze(validateStoredResult(tree.applied, proposal, materialized, provenanceReference, witnessed.value, witnessed.reference));
+        const validated = deepFreeze(validateStoredResult(tree.applied, proposal, materialized, provenanceReference, witnessed[0].value, witnessed[0].reference));
+        const receipt = this.#liveAppliedReceipts.get(proposal.proposal_digest);
+        if (!receipt || receipt.attemptToken !== witnessed[0].value.attempt_token || receipt.contentDigest !== current.contentDigest || !sameValue(receipt.result, validated)) {
+          throw new GuardianError("PLAN_RECOVERY_AMBIGUOUS", "Exact disk proposal, intent, applied result, and filesystem witness are derived evidence only; this PlanPort instance has no matching live commit receipt");
+        }
+        return receipt.result;
       },
       prepare: (current, { previousSnapshotReference }) => {
         const materialized = materializeObserved(current, proposal);
@@ -480,13 +521,17 @@ export class PlanPort {
             invariant(activeIntent && activeMaterialized && sameFilesystemIdentity(committed.fileIdentity, activeIntent.candidate_temp_filesystem_identity), "PLAN_COMMIT_WITNESS_INVALID", "Post-commit authority does not match the durable commit intent witness");
             const appliedAt = this.now();
             exactUtcTimestamp(appliedAt, "applied_at", "PLAN_APPLIED_AT_INVALID");
+            invariant(Date.parse(appliedAt) >= Date.parse(activeIntent.prepared_at), "PLAN_APPLIED_AT_INVALID", "applied_at cannot precede prepared_at");
             const result = resultFor({
               proposal, materialized: activeMaterialized, provenance, provenanceReference,
               intent: activeIntent, intentReference: activeIntentReference,
               appliedAt,
             });
-            this.writer.writeImmutable(appliedPath, jsonBytes(result), { maximum: MAX_COMMIT_RECORD_BYTES });
-            return result;
+            validateStoredResult(result, proposal, activeMaterialized, provenanceReference, activeIntent, activeIntentReference);
+            this.writer.writeImmutable(appliedPath, jsonBytes(result), { maximum: MAX_COMMIT_RECORD_BYTES, allowExistingExact: false });
+            const validated = deepFreeze(validateStoredResult(result, proposal, activeMaterialized, provenanceReference, activeIntent, activeIntentReference));
+            this.#liveAppliedReceipts.set(proposal.proposal_digest, deepFreeze({ attemptToken: activeIntent.attempt_token, contentDigest: committed.contentDigest, result: validated }));
+            return validated;
           },
         };
       },

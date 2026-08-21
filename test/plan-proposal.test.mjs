@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, closeSync, copyFileSync, existsSync, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import test from "node:test";
+import { initializeRepository } from "../src/bootstrap.mjs";
 import { canonicalJson, sha256, stableId } from "../src/canonical.mjs";
 import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
 import { MAX_PLAN_BYTES, PlanRevisionWriter } from "../src/plan-store.mjs";
@@ -226,6 +227,29 @@ test("CRLF materialization preserves line endings and unrelated whitespace byte-
   assert.equal(text.startsWith(prefixBefore), true);
 });
 
+test("compact origin/main bootstrap Ledger is directly mutable and metadata layouts fail closed", async (t) => {
+  await t.test("real bootstrap compact template applies without prose migration", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aiopago-bootstrap-plan-")); git(root, ["init"]);
+    await initializeRepository(root, { piInspector: async () => ({ root: "/fake/pi", version: "0.83.0", name: "pi" }), now: BASE_TIME });
+    const path = join(root, "TASK_PLAN.md"); const before = readFileSync(path); const port = new PlanPort(path); const observed = port.observe();
+    const c = candidate(observed.plan); const input = proposal(before, observed.plan, c); const preview = port.materialize(input, before);
+    const outside = (bytes) => bytes.toString("utf8").replace(/```json task-ledger\r?\n[\s\S]*?\r?\n```/, "```json task-ledger\n<JSON>\n```");
+    assert.equal(outside(preview.bytes), outside(before));
+    const result = port.apply(input); assert.equal(result.plan_revision_id, "PLAN-CANDIDATE-2");
+    const text = readFileSync(path, "utf8"); assert.equal(text.includes("**Current revision:**"), false); assert.match(text, /## Ledger lifecycle contract/);
+  });
+  for (const [name, mutate] of [
+    ["one of three", (text) => text.replace(`**Requirements version:** \`REQ-PLAN-1\`\n`, "").replace(`**Updated:** ${BASE_TIME}\n`, "")],
+    ["two of three", (text) => text.replace(`**Updated:** ${BASE_TIME}\n`, "")],
+    ["duplicate", (text) => text.replace(`**Updated:** ${BASE_TIME}`, `**Updated:** ${BASE_TIME}\n**Updated:** ${BASE_TIME}`)],
+    ["mismatch", (text) => text.replace("**Requirements version:** `REQ-PLAN-1`", "**Requirements version:** `REQ-WRONG`")],
+  ]) await t.test(`${name} metadata rejects`, () => {
+    const x = fixture(); const bytes = Buffer.from(mutate(x.bytes.toString("utf8"))); writeFileSync(x.path, bytes);
+    assert.throws(() => new PlanPort(x.path).apply(proposal(bytes, x.base)), (error) => error.code === "PLAN_METADATA_MISMATCH");
+    assert.deepEqual(readFileSync(x.path), bytes);
+  });
+});
+
 test("proposal validation reuses canonical Ledger validation and rejects malformed foundations before writing", async (t) => {
   const cases = [
     ["invalid task_id", (x) => proposal(x.bytes, x.base, candidate(x.base), { task_id: "TASK-OTHER" }), "PLAN_TASK_ID_MISMATCH"],
@@ -287,14 +311,16 @@ test("CAS rejects revision-only, digest-only, and current byte changes without a
   });
 });
 
-test("proposal identity is durable, idempotent for the same payload, and conflicts for different payload", () => {
+test("proposal identity uses a volatile same-PlanPort receipt and restart remains ambiguous", () => {
   const x = fixture();
   const input = proposal(x.bytes, x.base);
-  const first = new PlanPort(x.path, { now: () => "2026-08-20T10:06:00.000Z" }).apply(input);
+  const port = new PlanPort(x.path, { now: () => "2026-08-20T10:06:00.000Z" });
+  const first = port.apply(input);
   const bytes = readFileSync(x.path);
-  const second = new PlanPort(x.path, { now: () => "2099-01-01T00:00:00.000Z" }).apply(structuredClone(input));
+  const second = port.apply(structuredClone(input));
   assert.deepEqual(second, first);
   assert.deepEqual(readFileSync(x.path), bytes);
+  assert.throws(() => new PlanPort(x.path).apply(structuredClone(input)), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
   const conflicting = structuredClone(input);
   conflicting.change_reason = "Different content under the same opaque identity.";
   assert.throws(() => new PlanPort(x.path).apply(conflicting), (error) => error.code === "PLAN_PROPOSAL_ID_CONFLICT");
@@ -412,8 +438,29 @@ test("generic PlanProposal cannot delete, introduce, or mutate owner_gate author
     assert.throws(() => new PlanPort(x.path).apply(proposal(x.bytes, x.base, c)), (error) => error.code === "PLAN_OWNER_GATE_MUTATION_FORBIDDEN");
     assert.deepEqual(readFileSync(x.path), x.bytes);
   });
-  await t.test("unchanged gate permits unrelated plan mutation", () => {
-    const x = fixture({ task: structuredClone(gated) }); const result = new PlanPort(x.path).apply(proposal(x.bytes, x.base));
+  await t.test("unchanged gate cannot bypass the protected lifecycle projection", async (projection) => {
+    const bypasses = [
+      ["protected item IN_PROGRESS", (c) => { c.status = "IN_PROGRESS"; c.current_item = "ITEM-1"; c.next_item = "ITEM-2"; c.task_items[0].status = "IN_PROGRESS"; }],
+      ["protected item DONE", (c) => { c.next_item = "ITEM-2"; c.task_items[0].status = "DONE"; c.task_items[0].evidence = ["forged done"]; }],
+      ["protected item DROPPED", (c) => { c.next_item = "ITEM-2"; Object.assign(c.task_items[0], { status: "DROPPED", reason: "skip", actor: "human:forged", timestamp: NEXT_TIME }); }],
+      ["current item change", (c) => { c.status = "IN_PROGRESS"; c.current_item = "ITEM-2"; c.next_item = null; c.task_items[1].status = "IN_PROGRESS"; }],
+      ["next item change", (c) => { c.next_item = "ITEM-2"; }],
+      ["task status advance", (c) => { c.status = "PLANNED"; }],
+      ["next step bypass", (c) => { c.next_step = "Execute work without confirmation."; }],
+      ["another item IN_PROGRESS", (c) => { c.status = "IN_PROGRESS"; c.current_item = "ITEM-2"; c.next_item = null; c.task_items[1].status = "IN_PROGRESS"; }],
+      ["dependency topology bypass", (c) => { c.task_items[1].depends_on = []; }],
+    ];
+    for (const [name, mutate] of bypasses) await projection.test(name, () => {
+      const x = fixture({ task: structuredClone(gated) }); const c = candidate(x.base, { next_step: x.base.next_step }); mutate(c);
+      assert.doesNotThrow(() => new PlanProposal(proposal(x.bytes, x.base, c)));
+      assert.throws(() => new PlanPort(x.path).apply(proposal(x.bytes, x.base, c)), (error) => error.code === "PLAN_OWNER_LATCH_BYPASS_FORBIDDEN");
+      assert.deepEqual(readFileSync(x.path), x.bytes);
+    });
+  });
+  await t.test("unchanged blocked latch permits only unrelated non-lifecycle mutation", () => {
+    const x = fixture({ task: structuredClone(gated) }); const c = candidate(x.base, { next_step: x.base.next_step, title: "Safe prose metadata edit" });
+    c.task_items[1].description = "Safe unrelated description edit.";
+    const result = new PlanPort(x.path).apply(proposal(x.bytes, x.base, c));
     assert.equal(result.plan_revision_id, "PLAN-CANDIDATE-2"); assert.deepEqual(new TaskLedger(x.path).read().owner_gate, gated.owner_gate);
   });
   await t.test("a proposal cannot introduce an owner gate", () => {
@@ -504,6 +551,19 @@ function exactJsonWrite(path, value) {
   writeFileSync(path, `${canonicalJson(value)}\n`);
 }
 
+function forgeAppliedFromIntent(x, input, materialized, appliedAt = "2026-08-20T10:07:00.000Z") {
+  const root = proposalRecordRoot(x, input); const attempts = join(root, "attempts"); const name = readdirSync(attempts)[0];
+  const intentPath = join(attempts, name); const intent = JSON.parse(readFileSync(intentPath, "utf8")); const appliedPath = join(root, "applied.json");
+  const value = {
+    schema: PLAN_APPLY_RESULT_SCHEMA, proposal_id: input.proposal_id, proposal_digest: new PlanProposal(input).proposal_digest, task_id: input.task_id,
+    previous_revision_id: input.base_plan_revision_id, plan_revision_id: input.proposed_plan_revision_id, previous_content_digest: input.base_content_digest,
+    content_digest: materialized.content_digest, prepared_at: intent.prepared_at, applied_at: appliedAt, recovered_at: null, diff: materialized.diff,
+    provenance: intent.provenance, provenance_reference: relative(x.root, appliedPath).replaceAll("\\", "/"),
+    commit_witness: { schema: "aiopago.plan-commit-witness/0.2.0", attempt_token: intent.attempt_token, filesystem_identity: intent.candidate_temp_filesystem_identity, commit_intent_reference: relative(x.root, intentPath).replaceAll("\\", "/") },
+  };
+  exactJsonWrite(appliedPath, value); return value;
+}
+
 test("strict JSON domain rejects non-JSON and mutable host values at any depth", async (t) => {
   const cases = [
     ["Uint8Array", () => new Uint8Array([1])],
@@ -571,37 +631,34 @@ test("Ledger validator rejects empty IDs, bad timestamps, and significant wrong 
   });
 });
 
-test("terminal provenance and coherent supersession relationships enforce the M0 contract", async (t) => {
-  const terminal = { terminal_reason: "Replaced by a better-scoped item.", terminal_actor: "human:owner", terminal_at: NEXT_TIME };
-  const validSupersession = task({
-    status: "PLANNED", current_item: null, next_item: "ITEM-2", next_step: "Start replacement ITEM-2.",
-    task_items: [
-      item("ITEM-1", "SUPERSEDED", { ...terminal, superseded_by: "ITEM-2" }),
-      item("ITEM-2", "PLANNED", { depends_on: [], supersedes: "ITEM-1" }),
-    ],
+test("schema 0.1.0 terminal provenance accepts compatible aliases without new supersession policy", async (t) => {
+  const legacy = { reason: "Replaced by a better-scoped item.", actor: "human:owner", timestamp: NEXT_TIME };
+  const modern = { terminal_reason: legacy.reason, terminal_actor: legacy.actor, terminal_at: legacy.timestamp };
+  for (const [name, provenance] of [["legacy", legacy], ["terminal aliases", modern], ["both equal", { ...legacy, ...modern }]]) await t.test(name, () => {
+    const value = task({ next_item: null }); value.task_items[1].status = "DROPPED"; Object.assign(value.task_items[1], provenance);
+    assert.doesNotThrow(() => validateTaskLedger(value));
   });
-  assert.doesNotThrow(() => validateTaskLedger(validSupersession));
-  for (const status of ["DROPPED", "SUPERSEDED"]) await t.test(`Task ${status} requires reason actor timestamp`, () => {
-    const value = task({ status, current_item: null, next_item: null, next_step: "Terminal task." }); value.task_items[0].status = "PLANNED";
+  await t.test("conflicting aliases reject", () => {
+    const value = task({ next_item: null }); value.task_items[1].status = "DROPPED"; Object.assign(value.task_items[1], legacy, modern, { terminal_actor: "human:other" });
+    assert.throws(() => validateTaskLedger(value), (error) => error.code === "LEDGER_TERMINAL_PROVENANCE_CONFLICT");
+  });
+  for (const [name, provenance] of [["missing semantic field", { reason: "why", actor: "human:test" }], ["mixed partial aliases", { ...legacy, terminal_reason: legacy.reason }]]) await t.test(name, () => {
+    const value = task({ next_item: null }); value.task_items[1].status = "DROPPED"; Object.assign(value.task_items[1], provenance);
     assert.throws(() => validateTaskLedger(value), (error) => error.code === "LEDGER_TERMINAL_PROVENANCE_REQUIRED");
-    Object.assign(value, terminal); assert.doesNotThrow(() => validateTaskLedger(value));
   });
-  await t.test("DROPPED TaskItem requires bounded terminal provenance", () => {
-    const value = task({ next_item: null }); value.task_items[1].status = "DROPPED";
-    assert.throws(() => validateTaskLedger(value), (error) => error.code === "LEDGER_TERMINAL_PROVENANCE_REQUIRED");
-    Object.assign(value.task_items[1], terminal); assert.doesNotThrow(() => validateTaskLedger(value));
+  await t.test("old 0.1.0 terminal form remains readable and mutable", () => {
+    const value = task({ next_item: null }); value.task_items[1].status = "DROPPED"; Object.assign(value.task_items[1], legacy);
+    const x = fixture({ task: value }); assert.equal(new TaskLedger(x.path).read().task_items[1].reason, legacy.reason);
+    const c = candidate(value); c.task_items[1].description = "Mutated without rewriting legacy provenance.";
+    const result = new PlanPort(x.path).apply(proposal(x.bytes, value, c)); assert.equal(result.plan_revision_id, "PLAN-CANDIDATE-2");
+    const stored = new TaskLedger(x.path).read().task_items[1]; assert.equal(stored.reason, legacy.reason); assert.equal(Object.hasOwn(stored, "terminal_reason"), false);
   });
-  const invalid = [
-    ["missing replacement", (v) => { delete v.task_items[0].superseded_by; }],
-    ["unknown replacement", (v) => { v.task_items[0].superseded_by = "ITEM-UNKNOWN"; }],
-    ["self replacement", (v) => { v.task_items[0].superseded_by = "ITEM-1"; }],
-    ["missing reciprocal supersedes", (v) => { delete v.task_items[1].supersedes; }],
-    ["contradictory reciprocal relationship", (v) => { v.task_items[1].supersedes = "ITEM-2"; }],
-    ["supersedes unknown item", (v) => { v.task_items[1].supersedes = "ITEM-UNKNOWN"; }],
-  ];
-  for (const [name, mutate] of invalid) await t.test(name, () => { const value = structuredClone(validSupersession); mutate(value); assert.throws(() => validateTaskLedger(value), (error) => error.code === "LEDGER_SUPERSESSION_INVALID"); });
-  await t.test("supersession cycle", () => {
-    const value = structuredClone(validSupersession); Object.assign(value.task_items[1], terminal, { status: "SUPERSEDED", superseded_by: "ITEM-1" }); value.task_items[0].supersedes = "ITEM-2";
+  await t.test("old non-reciprocal supersession fixture remains valid", () => {
+    const value = task({ status: "PLANNED", current_item: null, next_item: "ITEM-2", task_items: [item("ITEM-1", "SUPERSEDED", { ...legacy, superseded_by: "ITEM-2" }), item("ITEM-2", "PLANNED")] });
+    assert.doesNotThrow(() => validateTaskLedger(value));
+  });
+  for (const [name, mutate] of [["unknown", (v) => { v.task_items[0].superseded_by = "UNKNOWN"; }], ["self", (v) => { v.task_items[0].superseded_by = "ITEM-1"; }]]) await t.test(`replacement ${name} rejects`, () => {
+    const value = task({ status: "PLANNED", current_item: null, next_item: "ITEM-2", task_items: [item("ITEM-1", "SUPERSEDED", { ...legacy, superseded_by: "ITEM-2" }), item("ITEM-2", "PLANNED")] }); mutate(value);
     assert.throws(() => validateTaskLedger(value), (error) => error.code === "LEDGER_SUPERSESSION_INVALID");
   });
 });
@@ -638,12 +695,28 @@ test("candidate preparation is complete before final CAS and concurrent edits ar
     assert.throws(() => new PlanPort(x.path, { writerOptions: { io } }).apply(proposal(x.bytes, x.base)), (error) => error.code === "PLAN_CAS_CONFLICT");
     assert.equal(mutated, true); assert.deepEqual(readFileSync(x.path), human);
   });
+  await t.test("same-size mutation after raw bytes copy is caught by post-read metadata", () => {
+    const x = fixture(); let planReads = 0; let mutated = false; const fdPaths = new Map();
+    const human = Buffer.from(x.bytes); const index = human.indexOf(Buffer.from("Human prose before")); human[index] = human[index] === 0x48 ? 0x4a : 0x48;
+    assert.equal(human.length, x.bytes.length);
+    const io = {
+      openSync(path, flags, mode) { const fd = openSync(path, flags, mode); fdPaths.set(fd, String(path)); return fd; },
+      closeSync(fd) { fdPaths.delete(fd); return closeSync(fd); },
+      readFileSync(target, ...args) {
+        const path = typeof target === "number" ? fdPaths.get(target) : String(target); const bytes = readFileSync(target, ...args);
+        if (path === x.path && ++planReads === 3) { mutated = true; writeFileSync(x.path, human); }
+        return bytes;
+      },
+    };
+    assert.throws(() => new PlanPort(x.path, { writerOptions: { io } }).apply(proposal(x.bytes, x.base)), (error) => error.code === "PLAN_CAS_CONFLICT");
+    assert.equal(mutated, true); assert.deepEqual(readFileSync(x.path), human);
+  });
   await t.test("final authority observation is immediately adjacent to rename", () => {
     const x = fixture(); const events = []; const fdPaths = new Map(); let planReads = 0; let finalPlanFd;
     const io = {
       openSync(path, flags, mode) { events.push(["open", String(path)]); const fd = openSync(path, flags, mode); fdPaths.set(fd, String(path)); return fd; },
       closeSync(fd) { const path = fdPaths.get(fd); const result = closeSync(fd); fdPaths.delete(fd); events.push(["close", path]); if (fd === finalPlanFd) events.push(["FINAL_AUTHORITY_OBSERVATION_COMPLETE", path]); return result; },
-      readFileSync(target, ...args) { const path = typeof target === "number" ? fdPaths.get(target) : String(target); if (path === x.path) { planReads += 1; if (planReads === 2) finalPlanFd = target; } events.push(["read", path]); return readFileSync(target, ...args); },
+      readFileSync(target, ...args) { const path = typeof target === "number" ? fdPaths.get(target) : String(target); if (path === x.path) { planReads += 1; if (planReads === 3) finalPlanFd = target; } events.push(["read", path]); return readFileSync(target, ...args); },
       writeFileSync(target, value, options) { events.push(["write", fdPaths.get(target) ?? String(target)]); return writeFileSync(target, value, options); },
       fsyncSync(fd) { events.push(["fsync", fdPaths.get(fd)]); return fsyncSync(fd); },
       fchmodSync(fd, mode) { events.push(["fchmod", fdPaths.get(fd)]); return fchmodSync(fd, mode); },
@@ -700,12 +773,50 @@ test("recovery requires deterministic candidate evidence and a matching filesyst
   });
 });
 
+test("disk applied evidence cannot authenticate restart or precreation", async (t) => {
+  await t.test("external orphan-temp rename plus forged exact applied evidence is ambiguous", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const preview = new PlanPort(x.path).materialize(input, x.bytes); const orphan = join(x.root, "external-orphan.tmp");
+    const io = { renameSync(from, to) { if (String(to) === x.path && String(from).includes(".replace.tmp")) { renameSync(from, orphan); throw new Error("stop before authority rename"); } return renameSync(from, to); } };
+    assert.throws(() => new PlanPort(x.path, { writerOptions: { io }, now: () => "2026-08-20T10:06:00.000Z" }).apply(input), /stop before authority rename/);
+    forgeAppliedFromIntent(x, input, preview); renameSync(orphan, x.path);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
+  });
+  await t.test("external write plus forged exact applied evidence is ambiguous", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const preview = new PlanPort(x.path).materialize(input, x.bytes);
+    assert.throws(() => new PlanPort(x.path, { writerOptions: { io: failureIo("replace") }, now: () => "2026-08-20T10:06:00.000Z" }).apply(input));
+    forgeAppliedFromIntent(x, input, preview); writeFileSync(x.path, preview.bytes);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
+  });
+  await t.test("even genuine exact disk applied evidence is ambiguous to a new PlanPort", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const live = new PlanPort(x.path); const first = live.apply(input);
+    assert.deepEqual(live.apply(input), first);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
+  });
+  await t.test("precreated exact applied result prevents live success", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); let precreated = false;
+    const io = { linkSync(from, to) { if (String(to).endsWith("applied.json")) { copyFileSync(from, to); precreated = true; } return linkSync(from, to); } };
+    assert.throws(() => new PlanPort(x.path, { writerOptions: { io }, now: () => "2026-08-20T10:06:00.000Z" }).apply(input), (error) => error.code === "PLAN_APPLY_COMMITTED_PROVENANCE_PENDING");
+    assert.equal(precreated, true); assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
+  });
+  await t.test("forged earlier applied_at is provenance-invalid before ambiguity", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const result = new PlanPort(x.path, { now: () => "2026-08-20T10:06:00.000Z" }).apply(input);
+    const path = join(x.root, result.provenance_reference); const stored = JSON.parse(readFileSync(path, "utf8")); stored.applied_at = "1970-01-01T00:00:00.000Z"; exactJsonWrite(path, stored);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_PROVENANCE_INVALID");
+  });
+});
+
 test("applied timestamps distinguish preparation, live commit, and ambiguous crash windows truthfully", async (t) => {
   await t.test("failed preparation T1 then successful retry T2", () => {
     const x = fixture(); const input = proposal(x.bytes, x.base);
     assert.throws(() => new PlanPort(x.path, { writerOptions: { io: failureIo("replace") }, now: () => "2026-08-20T10:06:00.000Z" }).apply(input));
     const result = new PlanPort(x.path, { now: () => "2026-08-20T11:00:00.000Z" }).apply(input);
     assert.equal(result.prepared_at, "2026-08-20T11:00:00.000Z"); assert.equal(result.applied_at, "2026-08-20T11:00:00.000Z"); assert.equal(result.recovered_at, null);
+  });
+  await t.test("wall clock rollback after rename returns pending without inventing a timestamp", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const times = ["2026-08-20T10:06:00.000Z", "1970-01-01T00:00:00.000Z"];
+    assert.throws(() => new PlanPort(x.path, { now: () => times.shift() }).apply(input), (error) => error.code === "PLAN_APPLY_COMMITTED_PROVENANCE_PENDING");
+    assert.equal(existsSync(join(proposalRecordRoot(x, input), "applied.json")), false);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
   });
   await t.test("rename witnessed but result missing is ambiguous", () => {
     const x = fixture(); const input = proposal(x.bytes, x.base);
@@ -721,8 +832,10 @@ test("strict UTF-8 authority rejects malformed bytes and preserves valid Unicode
     const x = fixture(); const malformed = Buffer.from(x.bytes); malformed[malformed.indexOf(Buffer.from("Human prose before")) + 2] = 0x80; writeFileSync(x.path, malformed);
     assert.throws(() => new TaskLedger(x.path).read(), (error) => error.code === "PLAN_UTF8_INVALID");
     const input = proposal(malformed, x.base);
+    assert.equal(existsSync(join(x.root, ".guardian")), false);
     assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_UTF8_INVALID");
     assert.deepEqual(readFileSync(x.path), malformed);
+    assert.equal(existsSync(join(x.root, ".guardian")), false);
   });
   await t.test("valid Unicode and a UTF-8 BOM are accepted and preserved", () => {
     const x = fixture({ prose: { before: "Unicode α € 😀 before.", after: "Unicode 尾 after." } });
@@ -761,11 +874,12 @@ test("attempt capacity is enforced before attempt 129 while applied idempotency 
     assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_ATTEMPT_LIMIT_REACHED" && error.details.disposition === "ABANDON_PROPOSAL");
     assert.equal(readdirSync(attempts).length, 128); assert.deepEqual(readFileSync(x.path), before);
   });
-  await t.test("trustworthy applied result remains idempotent at capacity", () => {
-    const x = fixture(); const input = proposal(x.bytes, x.base); const first = new PlanPort(x.path).apply(input); const committed = readFileSync(x.path);
+  await t.test("live receipt remains idempotent at capacity but restart does not", () => {
+    const x = fixture(); const input = proposal(x.bytes, x.base); const port = new PlanPort(x.path); const first = port.apply(input); const committed = readFileSync(x.path);
     fillAttempts(x, input, { preserveWitness: true });
-    const second = new PlanPort(x.path, { now: () => "2099-01-01T00:00:00.000Z" }).apply(input);
+    const second = port.apply(input);
     assert.deepEqual(second, first); assert.deepEqual(readFileSync(x.path), committed);
+    assert.throws(() => new PlanPort(x.path).apply(input), (error) => error.code === "PLAN_RECOVERY_AMBIGUOUS");
   });
 });
 
@@ -798,6 +912,20 @@ test("directory fsync surfaces unexpected errors and only tolerates explicit uns
     const x = fixture(); const io = directoryIo("fsync", "ENOTSUP"); const result = new PlanPort(x.path, { writerOptions: { io } }).apply(proposal(x.bytes, x.base));
     assert.equal(io.injected, true); assert.equal(result.plan_revision_id, "PLAN-CANDIDATE-2");
   });
+});
+
+test("exact-existing immutable records are re-durabilized after directory fsync failure", () => {
+  const root = mkdtempSync(join(tmpdir(), "aiopago-redurable-")); const destination = join(root, "records", "record.json"); const value = Buffer.from("durable evidence\n");
+  let failDirectorySync = true; let directoryAttempts = 0; const fdPaths = new Map();
+  const io = {
+    openSync(path, flags, mode) { const fd = openSync(path, flags, mode); fdPaths.set(fd, String(path)); return fd; },
+    closeSync(fd) { fdPaths.delete(fd); return closeSync(fd); },
+    fsyncSync(fd) { if (fdPaths.get(fd) === dirname(destination)) { directoryAttempts += 1; if (failDirectorySync) { const error = new Error("injected redurability I/O failure"); error.code = `E${"IO"}`; throw error; } } return fsyncSync(fd); },
+  };
+  const writer = new PlanRevisionWriter(join(root, "TASK_PLAN.md"), { io });
+  assert.throws(() => writer.writeImmutable(destination, value), /injected redurability I\/O failure/); assert.deepEqual(readFileSync(destination), value);
+  assert.throws(() => writer.writeImmutable(destination, value), /injected redurability I\/O failure/); assert.equal(directoryAttempts, 2);
+  failDirectorySync = false; assert.doesNotThrow(() => writer.writeImmutable(destination, value)); assert.equal(directoryAttempts, 3);
 });
 
 test("exact previous Markdown bytes remain content-addressed and recoverable across revisions", () => {
