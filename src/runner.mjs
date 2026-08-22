@@ -6,6 +6,7 @@ import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./con
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
+import { assertGuidedHandoffEligibilityIdentity } from "./handoff-consent.mjs";
 import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
@@ -163,11 +164,38 @@ export class GuardianRunner {
     return verifyCalibrationRuntimeState({ runner: this, attestationPath: this.calibration.attestationPath, requestModel });
   }
 
-  async handoffFromCommand(ctx, mode) {
+  captureTrustedSource(expectedEligibility = null) {
+    const sourceSession = this.runtime?.session;
+    invariant(sourceSession?.sessionId, "HANDOFF_SOURCE_CHANGED", "The Runner has no current source session");
+    if (expectedEligibility !== null) {
+      assertGuidedHandoffEligibilityIdentity(expectedEligibility);
+      invariant(expectedEligibility.runnerInstanceId === this.runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Guided consent belongs to a different Runner instance");
+      invariant(expectedEligibility.sessionId === sourceSession.sessionId, "HANDOFF_SOURCE_CHANGED", "Guided consent belongs to a different source session");
+    }
+    const sourceSessionId = sourceSession.sessionId;
+    const runnerInstanceId = this.runnerInstanceId;
+    const verifyCurrentSource = () => {
+      invariant(this.runnerInstanceId === runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Runner identity changed before handoff reservation");
+      invariant(this.runtime?.session === sourceSession && this.runtime.session.sessionId === sourceSessionId,
+        "HANDOFF_SOURCE_CHANGED", "Runner source session changed before handoff reservation");
+      return Object.freeze({ sessionId: sourceSessionId, runnerInstanceId });
+    };
+    verifyCurrentSource();
+    return Object.freeze({ sourceSession, verifyCurrentSource });
+  }
+
+  async handoffFromCommand(ctx, mode, options = {}) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
     if (this.confirmMode === "confirm") invariant(mode === "confirm", "CALIBRATION_CONFIRM_MODE_REQUIRED");
+    const guided = options.intent === "guided-advisor";
+    invariant(guided || options.intent === undefined || options.intent === "explicit-command", "HANDOFF_INTENT_INVALID");
+    invariant(!guided || options.expectedEligibility !== undefined, "HANDOFF_CONSENT_REQUIRED", "Guided advisor handoff requires its approved eligibility identity");
+    const expectedEligibility = guided ? options.expectedEligibility : null;
+    const trustedSource = this.captureTrustedSource(expectedEligibility);
     return this.handoffService.handoff({
-      sourceSession: this.runtime.session,
+      sourceSession: trustedSource.sourceSession,
+      currentSourceVerifier: trustedSource.verifyCurrentSource,
+      expectedEligibility,
       mode,
       actor: "human:/aio-handoff",
       replacePaused: async (parentSession, ownership, onPaused) => {
@@ -192,9 +220,11 @@ export class GuardianRunner {
 
   async recoverHandoffFromCommand(ctx, failedHandoffId) {
     invariant(typeof failedHandoffId === "string" && failedHandoffId.length > 0, "CONTINUITY_RECOVERY_HANDOFF_ID_REQUIRED");
+    const trustedSource = this.captureTrustedSource();
     return this.handoffService.recoverContinuityFailure({
       failedHandoffId,
-      sourceSession: this.runtime.session,
+      sourceSession: trustedSource.sourceSession,
+      currentSourceVerifier: trustedSource.verifyCurrentSource,
       sourceAttestation: this.currentRecoverySourceAttestation(),
       actor: "human:/aio-handoff-recover",
       replacePaused: async (parentSession, ownership, onPaused) => {
@@ -236,8 +266,10 @@ export class GuardianRunner {
   }
 
   async handoffDirect({ mode = "confirm", confirm = true } = {}) {
+    const trustedSource = this.captureTrustedSource();
     return this.handoffService.handoff({
-      sourceSession: this.runtime.session,
+      sourceSession: trustedSource.sourceSession,
+      currentSourceVerifier: trustedSource.verifyCurrentSource,
       mode,
       actor: "human:test-or-host",
       replacePaused: async (parentSession, ownership, onPaused) => {
@@ -263,9 +295,11 @@ export class GuardianRunner {
   }
 
   async recoverHandoffDirect(failedHandoffId, { confirm = true } = {}) {
+    const trustedSource = this.captureTrustedSource();
     return this.handoffService.recoverContinuityFailure({
       failedHandoffId,
-      sourceSession: this.runtime.session,
+      sourceSession: trustedSource.sourceSession,
+      currentSourceVerifier: trustedSource.verifyCurrentSource,
       sourceAttestation: this.currentRecoverySourceAttestation(),
       actor: "human:test-or-host-recovery",
       replacePaused: async (parentSession, ownership, onPaused) => {

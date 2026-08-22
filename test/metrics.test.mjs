@@ -49,6 +49,8 @@ function instrumentation(storage, overrides = {}) {
   });
 }
 function correlateTarget(storage, sessionId = "SES-target") {
+  storage.ensureLatch("TASK-H2");
+  const latch = storage.engageLatch("TASK-H2", "INTEGRITY", "human:test");
   storage.reserveHandoff({
     handoff_id: "HO-H2",
     source_session_id: "SES-source",
@@ -57,8 +59,8 @@ function correlateTarget(storage, sessionId = "SES-target") {
     current_item: "ITEM-H2-01",
     checkpoint_id: "CP-H2",
     state: "REPLACEMENT_SESSION_CREATING",
-    latch_generation: 1,
-  });
+    latch_generation: latch.generation,
+  }, { latch, expectedHandoff: null });
   const handoff = storage.getHandoff("HO-H2");
   handoff.target_session_id = sessionId;
   handoff.state = "REPLACEMENT_SESSION_CREATED_PAUSED";

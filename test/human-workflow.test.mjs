@@ -8,6 +8,7 @@ import { initializeRepository } from "../src/bootstrap.mjs";
 import { runCli } from "../src/cli.mjs";
 import { sha256 } from "../src/canonical.mjs";
 import { observeHumanWorkflow, observeTaskPlan, projectHumanWorkflow } from "../src/human-workflow.mjs";
+import { handoffConsentIdentity } from "../src/handoff-consent.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { readRuntimeProjection } from "../src/runtime-reader.mjs";
 import { GuardianStorage } from "../src/storage.mjs";
@@ -94,6 +95,7 @@ function seedResumeReady(storage, plan, suffix = "one") {
   storage.ensureLatch(plan.task_id);
   const latch = storage.engageLatch(plan.task_id, "INTEGRITY", "human:test");
   const handoffId = `HO-${suffix}`;
+  const expectedHandoff = handoffConsentIdentity(storage.latestHandoffForTask(plan.task_id));
   storage.reserveHandoff({
     handoff_id: handoffId,
     source_session_id: `SES-source-${suffix}`,
@@ -119,7 +121,7 @@ function seedResumeReady(storage, plan, suffix = "one") {
     dispatch_state: "NOT_STARTED",
     dispatch_attempt_id: null,
     dispatch_attempt_no: 0,
-  });
+  }, { latch, expectedHandoff });
   const created = storage.getHandoff(handoffId);
   created.target_session_id = `SES-target-${suffix}`;
   created.target_session_file = `/private/target-${suffix}.jsonl`;

@@ -393,7 +393,13 @@ function advisorHarness({ decision = true, handoffImpl = null, handoff = null } 
   const x = runnerFixture({ contextPercent: 60, handoff });
   let admissionOpen = true;
   x.runner.storage.isAdmissionOpen = () => admissionOpen;
-  x.runner.handoffFromCommand = handoffImpl ?? (async (_ctx, mode) => { assert.equal(mode, "confirm"); x.mutations.handoff += 1; });
+  x.runner.handoffFromCommand = handoffImpl ?? (async (_ctx, mode, options) => {
+    assert.equal(mode, "confirm");
+    assert.equal(options.intent, "guided-advisor");
+    assert.equal(options.expectedEligibility.sessionId, x.runner.runtime.session.sessionId);
+    assert.equal(options.expectedEligibility.runnerInstanceId, x.runner.runnerInstanceId);
+    x.mutations.handoff += 1;
+  });
   const confirmations = [];
   const notices = [];
   let resolveDecision;
@@ -519,6 +525,23 @@ test("guided advisor deduplicates concurrent events and cancels safely on takeov
     await pending;
     assert.equal(x.mutations.handoff, 0);
   });
+});
+
+test("guided stale/takeover errors say the handoff was not started and retain exact technical identity", async (t) => {
+  for (const [code, wording] of [
+    ["HANDOFF_CONSENT_STALE", /stato è cambiato.*handoff non è stato avviato/i],
+    ["HUMAN_TAKEOVER_ACTIVE", /takeover umano è attivo.*handoff non è stato avviato/i],
+  ]) {
+    await t.test(code, async () => {
+      const error = Object.assign(new Error("trusted boundary refused"), { code });
+      const x = advisorHarness({ decision: true, handoffImpl: async () => { x.mutations.handoff += 1; throw error; } });
+      await x.handlers.get("turn_end")({}, x.ctx);
+      assert.equal(x.mutations.handoff, 1);
+      assert.match(x.notices[0].text, wording);
+      assert.match(x.notices[0].text, new RegExp(code));
+      assert.match(x.notices[0].text, /non ritenterà automaticamente/);
+    });
+  }
 });
 
 test("guided handoff errors retain their precise code, actionable next step and no automatic retry", async () => {

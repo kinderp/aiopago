@@ -51,8 +51,14 @@ export function formatGuardianStatus(runner, ctx = null) {
 function guidedHandoffFailure(error, projection) {
   const code = error?.code ?? "HANDOFF_FAILED";
   const detail = String(error?.message ?? error).replace(/\s+/g, " ").trim().slice(0, 320);
+  const stale = ["HANDOFF_CONSENT_STALE", "HANDOFF_SOURCE_CHANGED", "HANDOFF_RUNNER_CHANGED", "LATCH_GENERATION_MISMATCH"].includes(code);
+  const takeover = code === "HUMAN_TAKEOVER_ACTIVE";
   return [
-    "Handoff guidato non riuscito.",
+    stale
+      ? "Lo stato è cambiato dopo il consenso; l’handoff non è stato avviato."
+      : takeover
+        ? "Il takeover umano è attivo; l’handoff non è stato avviato."
+        : "Handoff guidato non riuscito.",
     `Causa: ${detail}`,
     `Prossima azione: ${projection.nextAction}`,
     `Dettaglio tecnico: ${code}`,
@@ -84,7 +90,7 @@ async function adviseHandoff(runner, ctx, guided) {
       safeNotify(ctx, "Lo stato è cambiato mentre la conferma era aperta; l’handoff non è stato avviato. Ispeziona /aio status e conferma di nuovo a una futura advisory.", "warning");
       return;
     }
-    await runner.handoffFromCommand(ctx, "confirm");
+    await runner.handoffFromCommand(ctx, "confirm", { intent: "guided-advisor", expectedEligibility });
   } catch (error) {
     const projection = projectGuardianWorkflow(runner, ctx);
     safeNotify(ctx, guidedHandoffFailure(error, projection), "error");

@@ -538,7 +538,9 @@ test("Runner ownership attestation passes only when runtime, journal, manifest, 
   });
   await t.test("SQLite persists and supersedes the authoritative Runner relation", () => {
     const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
-    storage.reserveHandoff({ handoff_id: expected.handoff_id, source_session_id: "SES-source", target_session_id: null, task_id: "TASK-T", state: "REPLACEMENT_SESSION_CREATING", latch_generation: 1 });
+    storage.ensureLatch("TASK-T");
+    const reservationLatch = storage.engageLatch("TASK-T", "INTEGRITY", "human:test");
+    storage.reserveHandoff({ handoff_id: expected.handoff_id, source_session_id: "SES-source", target_session_id: null, task_id: "TASK-T", state: "REPLACEMENT_SESSION_CREATING", latch_generation: reservationLatch.generation }, { latch: reservationLatch, expectedHandoff: null });
     const handoff = storage.getHandoff(expected.handoff_id);
     handoff.target_session_id = expected.replacement_session_id;
     handoff.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
@@ -576,7 +578,7 @@ test("SQLite linearizes latch release and one resume admission", () => {
     task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
     resume_prompt_id: "RP-one", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
   };
-  storage.reserveHandoff(h);
+  storage.reserveHandoff(h, { latch, expectedHandoff: null });
   const first = storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one");
   const second = storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one");
   assert.equal(first.admission_id, second.admission_id);
@@ -598,7 +600,7 @@ test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
     handoff_id: "HO-stale-confirm", source_session_id: "SES-source", target_session_id: "SES-target",
     task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
     resume_prompt_id: "RP-stale-confirm", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
-  });
+  }, { latch, expectedHandoff: null });
   storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
   assert.throws(
     () => storage.authorizeAndAdmit("HO-stale-confirm", "human:stale-confirm", "resume:RP-stale-confirm", "ADM-stale-confirm"),

@@ -4,6 +4,12 @@ import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import {
+  assertGuidedHandoffEligibilityIdentity,
+  assertHandoffConsentIdentity,
+  assertPlanConsentIdentity,
+  handoffConsentIdentity,
+} from "./handoff-consent.mjs";
 import { canonicalRequiredLocalPaths, validateRequiredLocalPaths } from "./ledger.mjs";
 import { measureHandoffArtifacts } from "./metrics.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
@@ -28,7 +34,7 @@ export function verifyRequiredLocalPaths(repositoryRoot, paths) {
 }
 
 export class HandoffService {
-  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null }) {
+  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null }) {
     invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
     this.storage = storage;
     this.artifacts = artifacts;
@@ -39,6 +45,16 @@ export class HandoffService {
     this.modelPolicy = modelPolicy;
     this.reasoningPolicy = reasoningPolicy;
     this.telemetry = telemetry;
+    this.testHooks = testHooks;
+  }
+
+  verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
+    invariant(!required || typeof currentSourceVerifier === "function", "HANDOFF_SOURCE_ATTESTATION_REQUIRED");
+    if (typeof currentSourceVerifier !== "function") return null;
+    const attestation = currentSourceVerifier();
+    invariant(attestation?.sessionId === sourceSession.sessionId && attestation?.runnerInstanceId === this.runnerInstanceId,
+      "HANDOFF_SOURCE_CHANGED", "Current Runner source attestation no longer matches this handoff");
+    return attestation;
   }
 
   metric(lifecycleState, details) {
@@ -46,14 +62,39 @@ export class HandoffService {
     catch { return null; }
   }
 
-  async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null }) {
+  async handoff({ sourceSession, currentSourceVerifier = null, expectedEligibility = null, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null }) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
-    const sourceFile = normalizePath(sourceSession.sessionFile);
+    const guided = expectedEligibility !== null;
+    if (guided) assertGuidedHandoffEligibilityIdentity(expectedEligibility);
+    const sourceFile = normalizePath(sourceSession?.sessionFile);
     invariant(sourceFile, "PERSISTED_SOURCE_SESSION_REQUIRED");
     const sourceSessionId = sourceSession.sessionId;
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
+    if (guided) {
+      invariant(expectedEligibility.runnerInstanceId === this.runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Guided consent belongs to a different Runner");
+      invariant(expectedEligibility.sessionId === sourceSessionId, "HANDOFF_SOURCE_CHANGED", "Guided consent belongs to a different source session");
+    }
+
     let plan = this.ledger.read();
+    if (guided) assertPlanConsentIdentity(plan, expectedEligibility);
     const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
     const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
+    const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id));
+    assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
+    const observedLatch = this.storage.getLatch(plan.task_id);
+    const expectedLatch = guided ? {
+      task_id: plan.task_id,
+      state: expectedEligibility.latch.state,
+      generation: expectedEligibility.latch.generation,
+      reason: expectedEligibility.latch.reason,
+    } : {
+      task_id: plan.task_id,
+      state: observedLatch?.state,
+      generation: observedLatch?.generation,
+      reason: observedLatch?.reason ?? null,
+    };
+    this.storage.assertLatchIdentity(plan.task_id, expectedLatch);
+
     if (recoveryOf === null) {
       const pending = this.storage.pendingContinuityFailureForTask(plan.task_id);
       invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : undefined);
@@ -65,55 +106,75 @@ export class HandoffService {
       this.ledger.satisfyOwnerGate?.({ command: "/aio handoff confirm", actor });
       plan = this.ledger.read();
     }
+    const trustedPlanIdentity = Object.freeze({
+      taskId: plan.task_id,
+      planRevisionId: plan.plan_revision_id,
+      contentDigest: plan.content_digest,
+    });
     this.assertModelPolicy(plan, sourceSession);
-    const safe = await this.safePoint.request(sourceSession, actor);
+    const safePointReason = expectedLatch.state === "ENGAGED" ? expectedLatch.reason : "INTEGRITY";
+    invariant(typeof safePointReason === "string" && safePointReason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
+    const safe = await this.safePoint.request(sourceSession, actor, safePointReason, { expectedLatch });
+    await this.testHooks?.afterSafePoint?.({ safe, plan, sourceSession });
     const git = this.observeGit();
-    const handoffId = stableId("HO", sourceSessionId, plan.plan_revision_id, String(safe.latch_generation));
-    const checkpointId = stableId("CP", handoffId, plan.content_digest);
-    const createdAt = utcNow();
-    const base = {
-      handoff_id: handoffId,
-      source_session_id: sourceSessionId,
-      source_session_file: sourceFile,
-      target_session_id: null,
-      target_session_file: null,
-      runner_instance_id: this.runnerInstanceId,
-      session_binding_id: opaqueId("BIND"),
-      parent_session_id: sourceSessionId,
-      parent_session_file: sourceFile,
-      parent_checkpoint_id: recoveryParent?.checkpoint_id ?? parentHandoff?.checkpoint_id ?? null,
-      recovery_of_handoff_id: recoveryOf,
-      task_id: plan.task_id,
-      current_item: plan.current_item,
-      next_item: plan.next_item,
-      next_step: plan.next_step,
-      task_plan_revision: plan.plan_revision_id,
-      task_plan_digest: plan.content_digest,
-      requirements_version: plan.requirements_version,
-      latch_generation: safe.latch_generation,
-      checkpoint_id: checkpointId,
-      checkpoint_digest: null,
-      resume_manifest_id: stableId("RM", handoffId),
-      resume_manifest_digest: null,
-      resume_prompt_id: null,
-      resume_prompt_digest: null,
-      resume_prompt: null,
-      authorization_state: "NOT_AUTHORIZED",
-      admission_state: "NOT_COMMITTED",
-      admission_id: null,
-      dispatch_state: "NOT_STARTED",
-      dispatch_attempt_id: null,
-      dispatch_attempt_no: 0,
-      expected_git_state: git,
-      model_policy: this.modelPolicy ?? plan.model_policy ?? null,
-      reasoning_policy: this.reasoningPolicy ?? plan.reasoning_policy ?? null,
-      state: "SAFE_TO_HANDOFF",
-      created_at: createdAt,
-      updated_at: createdAt,
-    };
-    const reserved = this.storage.reserveHandoff(base);
+
+    let base;
+    let handoffId;
+    let checkpointId;
+    const reserved = this.ledger.withAuthorityCoordination((currentPlan) => {
+      plan = currentPlan;
+      this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
+      assertPlanConsentIdentity(currentPlan, trustedPlanIdentity);
+      assertHandoffConsentIdentity(this.storage.latestHandoffForTask(currentPlan.task_id), expectedHandoff);
+      this.storage.assertLatchIdentity(currentPlan.task_id, safe.latch);
+      handoffId = stableId("HO", sourceSessionId, currentPlan.plan_revision_id, String(safe.latch_generation));
+      checkpointId = stableId("CP", handoffId, currentPlan.content_digest);
+      const createdAt = utcNow();
+      base = {
+        handoff_id: handoffId,
+        source_session_id: sourceSessionId,
+        source_session_file: sourceFile,
+        target_session_id: null,
+        target_session_file: null,
+        runner_instance_id: this.runnerInstanceId,
+        session_binding_id: opaqueId("BIND"),
+        parent_session_id: sourceSessionId,
+        parent_session_file: sourceFile,
+        parent_checkpoint_id: recoveryParent?.checkpoint_id ?? parentHandoff?.checkpoint_id ?? null,
+        recovery_of_handoff_id: recoveryOf,
+        task_id: currentPlan.task_id,
+        current_item: currentPlan.current_item,
+        next_item: currentPlan.next_item,
+        next_step: currentPlan.next_step,
+        task_plan_revision: currentPlan.plan_revision_id,
+        task_plan_digest: currentPlan.content_digest,
+        requirements_version: currentPlan.requirements_version,
+        latch_generation: safe.latch_generation,
+        checkpoint_id: checkpointId,
+        checkpoint_digest: null,
+        resume_manifest_id: stableId("RM", handoffId),
+        resume_manifest_digest: null,
+        resume_prompt_id: null,
+        resume_prompt_digest: null,
+        resume_prompt: null,
+        authorization_state: "NOT_AUTHORIZED",
+        admission_state: "NOT_COMMITTED",
+        admission_id: null,
+        dispatch_state: "NOT_STARTED",
+        dispatch_attempt_id: null,
+        dispatch_attempt_no: 0,
+        expected_git_state: git,
+        model_policy: this.modelPolicy ?? currentPlan.model_policy ?? null,
+        reasoning_policy: this.reasoningPolicy ?? currentPlan.reasoning_policy ?? null,
+        state: "SAFE_TO_HANDOFF",
+        created_at: createdAt,
+        updated_at: createdAt,
+      };
+      return this.storage.reserveHandoff(base, { latch: safe.latch, expectedHandoff });
+    });
     let handoff = reserved.handoff;
     if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
+    await this.testHooks?.afterReservation?.({ handoff, safe, plan, sourceSession });
     this.metric("STARTED", {
       handoff,
       session_id: sourceSessionId,
@@ -145,10 +206,26 @@ export class HandoffService {
       throw error;
     }
 
+    await this.testHooks?.beforeReplacement?.({ handoff: this.storage.getHandoff(handoffId), safe, plan, sourceSession });
+    try {
+      this.storage.assertLatchIdentity(plan.task_id, safe.latch);
+    } catch (error) {
+      handoff = this.storage.getHandoff(handoffId);
+      handoff.state = "HANDOFF_FAILED";
+      handoff.failure = { code: error.code ?? "LATCH_GENERATION_MISMATCH", message: error.message };
+      handoff.manual_recovery = [
+        "Human control changed after durable handoff reservation; no replacement session was created.",
+        `Inspect /aio status and reconcile handoff ${handoffId}; do not retry automatically.`,
+      ];
+      this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { code: handoff.failure.code, error: handoff.failure.message, event_key: `handoff-failed:${handoffId}` });
+      throw error;
+    }
+
     handoff.state = "REPLACEMENT_SESSION_CREATING";
     this.storage.saveHandoff(handoff, "REPLACEMENT_SESSION_CREATE_INTENT", { parent_session_file: sourceFile, event_key: `replacement-intent:${handoffId}` });
     let replacementResult;
     try {
+      this.storage.assertLatchIdentity(plan.task_id, safe.latch);
       const expectedBinding = {
         schema_version: "1.0.0",
         handoff_id: handoffId,
@@ -161,6 +238,15 @@ export class HandoffService {
       if (handoff.target_session_id) throw error;
       this.storage.supersedeRunnerSessionBinding(handoffId, "replacement creation failed before target registration");
       handoff.state = "HANDOFF_FAILED";
+      if (["HUMAN_TAKEOVER_ACTIVE", "LATCH_GENERATION_MISMATCH"].includes(error?.code)) {
+        handoff.failure = { code: error.code, message: error.message };
+        handoff.manual_recovery = [
+          "Human control changed before replacement creation; no replacement session was created.",
+          `Inspect /aio status and reconcile handoff ${handoffId}; do not retry automatically.`,
+        ];
+        this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { code: error.code, error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
+        throw error;
+      }
       handoff.failure = { code: "REPLACEMENT_SESSION_CREATE_UNKNOWN", message: error.message };
       handoff.manual_recovery = this.buildManualRecovery(handoff, "Replacement creation outcome is ambiguous");
       this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
@@ -233,9 +319,10 @@ export class HandoffService {
     return h;
   }
 
-  async recoverContinuityFailure({ failedHandoffId, sourceSession, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume }) {
+  async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume }) {
     const failed = this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier);
     invariant(sourceAttestation?.session_id === sourceSession?.sessionId && sourceAttestation?.runner_instance_id === this.runnerInstanceId, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The recovery source must be the fresh session owned by the current Runner");
     invariant(sourceSession.sessionId !== failed.source_session_id && sourceSession.sessionId !== failed.target_session_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The failed handoff sessions are evidence, not the fresh recovery source");
     invariant(conversationHistory(sourceSession).length === 0 && sourceSession.isIdle, "CONTINUITY_RECOVERY_SOURCE_INVALID", "The current Runner source must remain idle with zero conversation history");
@@ -250,7 +337,8 @@ export class HandoffService {
     invariant(sameGitState(failed.expected_git_state, this.observeGit()), "GIT_STATE_MISMATCH", "recovery source differs from failed handoff Git state");
     const latch = this.storage.getLatch(failed.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
-    await this.safePoint.request(sourceSession, actor);
+    invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
+    await this.safePoint.request(sourceSession, actor, latch.reason, { expectedLatch: { task_id: failed.task_id, state: latch.state, generation: latch.generation, reason: latch.reason } });
     this.storage.prepareContinuityRecovery(failedHandoffId, {
       sourceSessionId: sourceSession.sessionId,
       runnerInstanceId: this.runnerInstanceId,
@@ -258,6 +346,7 @@ export class HandoffService {
     });
     return this.handoff({
       sourceSession,
+      currentSourceVerifier,
       replacePaused,
       mode: "confirm",
       actor,

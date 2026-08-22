@@ -135,8 +135,25 @@ export class SafePointCoordinator {
     this.gate = gate;
   }
 
-  async request(session, actor = "human:handoff", reason = "INTEGRITY") {
-    const latch = this.storage.engageLatch(this.taskId, reason, actor);
+  acquiredLatch(latch, reason) {
+    const current = this.storage.getLatch(this.taskId);
+    if (reason !== "HUMAN_TAKEOVER" && current?.state === "ENGAGED" && current.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover interrupted safe-point acquisition");
+    }
+    invariant(current?.state === "ENGAGED" && current.generation === latch.generation && current.reason === reason,
+      "LATCH_GENERATION_MISMATCH", "Safe-point latch identity changed during asynchronous drain");
+    return current;
+  }
+
+  async request(session, actor = "human:handoff", reason = "INTEGRITY", options = {}) {
+    const observed = options.expectedLatch ?? this.storage.getLatch(this.taskId) ?? this.storage.ensureLatch(this.taskId);
+    const expectedLatch = {
+      task_id: this.taskId,
+      state: observed.state,
+      generation: observed.generation,
+      reason: observed.reason ?? null,
+    };
+    const latch = this.storage.claimLatch(this.taskId, reason, actor, reason === "HUMAN_TAKEOVER" ? null : expectedLatch);
     session.clearQueue();
     session.abortRetry();
     session.abortCompaction();
@@ -145,16 +162,27 @@ export class SafePointCoordinator {
     // FINISH CURRENT ATOMIC OPERATION: abort only a bare LLM stream. An admitted
     // tool keeps its signal and is allowed to reach its declared terminal boundary;
     // the closed transport gate rejects the subsequent LLM continuation.
-    if (admittedBeforeLatch.length === 0 && (!session.isIdle || session.isStreaming)) await session.abort();
+    if (admittedBeforeLatch.length === 0 && (!session.isIdle || session.isStreaming)) {
+      await session.abort();
+      this.acquiredLatch(latch, reason);
+    }
     await session.waitForIdle();
+    this.acquiredLatch(latch, reason);
     await this.gate.waitForNoStreams();
+    this.acquiredLatch(latch, reason);
     const operations = this.storage.operationsForTask(this.taskId);
     const active = operations.filter((operation) => operation.state === "ACTIVE");
     if (active.length > 0) throw new GuardianError("SAFE_POINT_ACTIVE_OPERATION", "FINISH CURRENT ATOMIC OPERATION has not reached a terminal boundary", active.map((row) => row.operation_id));
     const unknown = operations.filter((operation) => operation.outcome === "UNKNOWN" || (operation.outcome === "KNOWN_SUCCESS" && operation.profile !== "READ_ONLY" && !operation.effect_reference));
     if (unknown.length > 0) throw new GuardianError("HUMAN_DECISION_REQUIRED", "A mutating operation has no known/evidenced outcome", unknown.map((row) => row.operation_id));
     invariant(session.pendingMessageCount === 0 && !session.isRetrying && !session.isCompacting && session.isIdle, "SAFE_POINT_INVARIANT_FAILED");
-    return { state: "SAFE_TO_HANDOFF", latch_generation: latch.generation, operations };
+    const finalLatch = this.acquiredLatch(latch, reason);
+    return {
+      state: reason === "HUMAN_TAKEOVER" ? "HUMAN_TAKEOVER" : "SAFE_TO_HANDOFF",
+      latch_generation: finalLatch.generation,
+      latch: Object.freeze({ task_id: this.taskId, state: finalLatch.state, generation: finalLatch.generation, reason: finalLatch.reason }),
+      operations,
+    };
   }
 }
 

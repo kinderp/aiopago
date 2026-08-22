@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { opaqueId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
+import { handoffConsentIdentity } from "./handoff-consent.mjs";
 
 const TERMINAL_HANDOFF = new Set(["RESUMED", "RESUME_DISPATCH_UNKNOWN", "HUMAN_DECISION_REQUIRED", "HANDOFF_FAILED", "CONTINUITY_FAILED"]);
 
@@ -232,25 +233,54 @@ export class GuardianStorage {
 
   getLatch(taskId) { return this.db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId) ?? null; }
 
-  engageLatch(taskId, reason, actor) {
+  claimLatch(taskId, reason, actor, expected = null) {
+    invariant(typeof taskId === "string" && taskId.length > 0 && typeof reason === "string" && reason.length > 0 && typeof actor === "string" && actor.length > 0, "LATCH_CLAIM_INVALID");
+    if (expected !== null) {
+      invariant(expected.task_id === taskId && ["ENGAGED", "RELEASED"].includes(expected.state)
+        && Number.isInteger(expected.generation) && expected.generation >= 0
+        && (expected.reason === null || typeof expected.reason === "string"), "LATCH_CLAIM_INVALID");
+    }
     this.ensureLatch(taskId);
     return this.transaction(() => {
       const latch = this.getLatch(taskId);
+      if (reason !== "HUMAN_TAKEOVER" && latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover has priority over handoff safe-point acquisition");
+      }
+      if (expected && (latch.state !== expected.state || latch.generation !== expected.generation || (latch.reason ?? null) !== expected.reason)) {
+        throw new GuardianError("LATCH_GENERATION_MISMATCH", "Canonical latch no longer matches the expected safe-point precondition", { expected, observed: latch });
+      }
       if (latch.state === "ENGAGED") {
         if (reason === "HUMAN_TAKEOVER" && latch.reason !== reason) {
           const event = this.appendEvent("LATCH_ESCALATED", { task_id: taskId, generation: latch.generation, from: latch.reason, reason, actor }, { eventKey: `latch-escalated:${taskId}:${latch.generation}` });
-          this.db.prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=?")
-            .run(reason, actor, event.event_id, taskId, latch.generation);
+          const changed = this.db.prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
+            .run(reason, actor, event.event_id, taskId, latch.generation, latch.reason);
+          invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch escalation raced");
           return this.getLatch(taskId);
         }
+        invariant(latch.reason === reason, "LATCH_REASON_MISMATCH", `${latch.reason} != ${reason}`);
         return latch;
       }
       const generation = latch.generation + 1;
       const event = this.appendEvent("LATCH_ENGAGED", { task_id: taskId, generation, reason, actor }, { eventKey: `latch-engaged:${taskId}:${generation}` });
-      this.db.prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND generation=?")
-        .run(generation, reason, event.occurred_at, actor, event.event_id, taskId, latch.generation);
+      const changed = this.db.prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND state='RELEASED' AND generation=? AND reason IS ?")
+        .run(generation, reason, event.occurred_at, actor, event.event_id, taskId, latch.generation, latch.reason);
+      invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch acquisition raced");
       return this.getLatch(taskId);
     });
+  }
+
+  engageLatch(taskId, reason, actor) {
+    return this.claimLatch(taskId, reason, actor);
+  }
+
+  assertLatchIdentity(taskId, expected, { allowHumanTakeover = false } = {}) {
+    const latch = this.getLatch(taskId);
+    if (!allowHumanTakeover && latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover has priority over handoff");
+    }
+    invariant(latch?.state === expected?.state && latch.generation === expected?.generation
+      && (latch.reason ?? null) === (expected?.reason ?? null), "LATCH_GENERATION_MISMATCH", "Canonical latch identity changed");
+    return latch;
   }
 
   isAdmissionOpen(taskId) {
@@ -258,8 +288,22 @@ export class GuardianStorage {
     catch { return false; }
   }
 
-  reserveHandoff(projection) {
+  reserveHandoff(projection, precondition = null) {
+    invariant(precondition && precondition.latch && Object.hasOwn(precondition, "expectedHandoff"), "HANDOFF_RESERVATION_PRECONDITION_REQUIRED");
     return this.transaction(() => {
+      const latch = this.getLatch(projection.task_id);
+      if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover won before durable handoff reservation");
+      }
+      invariant(latch?.state === "ENGAGED"
+        && latch.generation === precondition.latch.generation
+        && latch.reason === precondition.latch.reason
+        && projection.latch_generation === latch.generation,
+      "LATCH_GENERATION_MISMATCH", "Durable handoff reservation does not match the acquired safe-point latch");
+      const latestRow = this.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(projection.task_id);
+      const latest = latestRow ? this.getHandoff(latestRow.handoff_id) : null;
+      invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(precondition.expectedHandoff),
+        "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before durable reservation");
       const active = this.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
       if (active) return { created: false, handoff: this.getHandoff(active.handoff_id) };
       const now = utcNow();
@@ -357,6 +401,7 @@ export class GuardianStorage {
       invariant(continuityFailure, "CONTINUITY_RECOVERY_UNSAFE", "terminal continuity failure journal evidence is missing");
       const latch = this.getLatch(handoff.task_id);
       invariant(latch?.state === "ENGAGED" && latch.generation === handoff.latch_generation, "LATCH_GENERATION_MISMATCH");
+      invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
       const binding = this.getRunnerSessionBinding(handoffId);
       invariant(binding?.status === "ACTIVE" && binding.replacement_session_id === handoff.target_session_id && binding.runner_instance_id === handoff.runner_instance_id && binding.session_binding_id === handoff.session_binding_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed target binding is not active and coherent");
       const currentUse = this.db.prepare("SELECT handoff_id,state FROM handoffs WHERE source_session_id=? OR target_session_id=? LIMIT 1").get(sourceSessionId, sourceSessionId);

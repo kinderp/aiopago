@@ -2,6 +2,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError } from "./errors.mjs";
+import {
+  guidedHandoffEligibilityIdentityFromAuthority,
+  sameGuidedHandoffEligibility,
+} from "./handoff-consent.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { discoverTargetRepository, readRepositoryConfig, REPOSITORY_CONFIG_FILE } from "./repository.mjs";
 import { readRuntimeProjection } from "./runtime-reader.mjs";
@@ -378,37 +382,16 @@ export function guidedHandoffEligibilityIdentity(observation) {
   if (!validateRuntimeObservation(observation.runtime, observation.plan).valid) return null;
   const runtime = observation.runtime;
   if (runtime.latch.state !== "RELEASED") return null;
-  return deepFreeze({
-    taskId: observation.plan.plan.task_id,
-    planRevisionId: observation.plan.plan.plan_revision_id,
-    contentDigest: observation.plan.digest,
+  return guidedHandoffEligibilityIdentityFromAuthority({
+    plan: { ...observation.plan.plan, content_digest: observation.plan.digest },
     sessionId: runtime.session.id,
     runnerInstanceId: runtime.session.runnerInstanceId,
-    latch: {
-      state: runtime.latch.state,
-      generation: runtime.latch.generation,
-      reason: runtime.latch.reason ?? null,
-    },
-    handoff: runtime.handoff ? {
-      handoffId: runtime.handoff.handoff_id,
-      state: runtime.handoff.state,
-      sourceSessionId: runtime.handoff.source_session_id,
-      targetSessionId: runtime.handoff.target_session_id,
-      runnerInstanceId: runtime.handoff.runner_instance_id,
-      taskPlanRevision: runtime.handoff.task_plan_revision,
-      taskPlanDigest: runtime.handoff.task_plan_digest,
-      latchGeneration: runtime.handoff.latch_generation,
-      authorizationState: runtime.handoff.authorization_state,
-      admissionState: runtime.handoff.admission_state,
-      dispatchState: runtime.handoff.dispatch_state,
-      failure: projectedFailure(runtime.handoff.failure, runtime.handoff.state),
-    } : null,
+    latch: runtime.latch,
+    handoff: runtime.handoff,
   });
 }
 
-export function sameGuidedHandoffEligibility(left, right) {
-  return left !== null && right !== null && sameIdentity(left, right);
-}
+export { sameGuidedHandoffEligibility };
 
 function itemById(plan, id) {
   return id ? plan.task_items.find((item) => item.task_item_id === id) ?? null : null;

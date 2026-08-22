@@ -323,6 +323,14 @@ export class TaskLedger {
     return ledgerResult(observed.task, observed.contentDigest, this.path);
   }
 
+  withAuthorityCoordination(use) {
+    invariant(typeof use === "function", "PLAN_COORDINATION_CALLBACK_REQUIRED");
+    return this.writer.coordinate({
+      validate: validateTaskLedger,
+      use: (observed) => use(ledgerResult(observed.task, observed.contentDigest, this.path)),
+    });
+  }
+
   satisfyOwnerGate({ command, actor }) {
     return this.writer.commit({
       validate: validateTaskLedger,

@@ -465,6 +465,28 @@ export class PlanRevisionWriter {
     return reference;
   }
 
+  coordinate({ requireSingleBlock = false, validate, use }) {
+    invariant(typeof validate === "function", "PLAN_VALIDATOR_REQUIRED", "Plan coordination requires the canonical semantic validator");
+    invariant(typeof use === "function", "PLAN_COORDINATION_CALLBACK_REQUIRED");
+    this.readCurrent({ requireSingleBlock, validate });
+    const lock = this.#acquireLock();
+    let operationError;
+    try {
+      const current = this.readCurrent({ requireSingleBlock, validate });
+      this.#attestLock(lock);
+      const result = use(current);
+      invariant(!result || typeof result.then !== "function", "PLAN_COORDINATION_ASYNC_FORBIDDEN", "Plan coordination callback must remain synchronous and bounded");
+      this.#attestLock(lock);
+      return result;
+    } catch (error) {
+      operationError = error;
+      throw error;
+    } finally {
+      try { this.#releaseLock(lock); }
+      catch (releaseError) { if (!operationError) throw releaseError; }
+    }
+  }
+
   commit({
     expected = null,
     requireSingleBlock = false,
