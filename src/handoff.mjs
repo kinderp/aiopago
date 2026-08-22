@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import { reserveTrustedHandoffPlan } from "./handoff-plan-internal.mjs";
 import {
   assertGuidedHandoffEligibilityIdentity,
   assertHandoffConsentIdentity,
@@ -17,6 +18,77 @@ import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-owners
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
 
 const HISTORY_ENTRY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function planList(plan, field) {
+  return Array.isArray(plan[field]) ? structuredClone(plan[field]) : [];
+}
+
+function captureReservedPlanSnapshot(plan) {
+  return deepFreeze({
+    task_id: plan.task_id,
+    objective: plan.objective,
+    current_item: plan.current_item,
+    next_item: plan.next_item,
+    next_step: plan.next_step,
+    plan_revision_id: plan.plan_revision_id,
+    content_digest: plan.content_digest,
+    requirements_version: plan.requirements_version,
+    completion_criteria: planList(plan, "completion_criteria"),
+    relevant_decisions: planList(plan, "relevant_decisions"),
+    relevant_tests: planList(plan, "relevant_tests"),
+    evidence_references: planList(plan, "evidence_references"),
+    minimal_reads: planList(plan, "minimal_reads"),
+    required_local_paths: planList(plan, "required_local_paths"),
+    model_policy: plan.model_policy ?? null,
+    reasoning_policy: plan.reasoning_policy ?? null,
+  });
+}
+
+function assertReservedPlanConsistency(handoff, plan) {
+  invariant(plan && handoff.task_id === plan.task_id
+    && handoff.task_plan_revision === plan.plan_revision_id
+    && handoff.task_plan_digest === plan.content_digest
+    && handoff.requirements_version === plan.requirements_version
+    && handoff.current_item === plan.current_item
+    && handoff.next_item === plan.next_item
+    && handoff.next_step === plan.next_step,
+  "HANDOFF_PLAN_PROVENANCE_MISMATCH", "Reserved handoff and immutable plan snapshot disagree");
+  return plan;
+}
+
+function assertCheckpointPlanConsistency(handoff, plan, checkpoint) {
+  assertReservedPlanConsistency(handoff, plan);
+  invariant(checkpoint?.checkpoint_id === handoff.checkpoint_id
+    && checkpoint.task_id === plan.task_id
+    && checkpoint.plan_revision_id === plan.plan_revision_id
+    && checkpoint.plan_content_digest === plan.content_digest
+    && checkpoint.requirements_version === plan.requirements_version,
+  "CHECKPOINT_MISMATCH", "Checkpoint and reserved plan snapshot disagree");
+}
+
+function assertManifestPlanConsistency(handoff, plan, manifest) {
+  assertReservedPlanConsistency(handoff, plan);
+  invariant(manifest?.task_id === plan.task_id
+    && manifest.task_plan_revision === plan.plan_revision_id
+    && manifest.task_plan_digest === plan.content_digest
+    && manifest.requirements_version === plan.requirements_version
+    && manifest.objective === plan.objective
+    && manifest.current_item === plan.current_item
+    && manifest.next_item === plan.next_item
+    && manifest.next_step === plan.next_step
+    && JSON.stringify(manifest.relevant_decisions) === JSON.stringify(plan.relevant_decisions)
+    && JSON.stringify(manifest.relevant_tests) === JSON.stringify(plan.relevant_tests)
+    && JSON.stringify(manifest.evidence_references) === JSON.stringify(plan.evidence_references)
+    && JSON.stringify(manifest.minimal_reads) === JSON.stringify(plan.minimal_reads)
+    && JSON.stringify(manifest.required_local_paths) === JSON.stringify(canonicalRequiredLocalPaths(plan.required_local_paths)),
+  "MANIFEST_MISMATCH", "Manifest and reserved plan snapshot disagree");
+}
 
 function conversationHistory(session) {
   return session.sessionManager.getEntries().filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
@@ -77,6 +149,11 @@ export class HandoffService {
 
     let plan = this.ledger.read();
     if (guided) assertPlanConsentIdentity(plan, expectedEligibility);
+    const ownerGateExpected = Object.freeze({
+      taskId: plan.task_id,
+      planRevisionId: plan.plan_revision_id,
+      contentDigest: plan.content_digest,
+    });
     const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
     const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
     const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id));
@@ -103,9 +180,11 @@ export class HandoffService {
       this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
     }
     if (mode === "confirm" && recoveryOf === null) {
-      this.ledger.satisfyOwnerGate?.({ command: "/aio handoff confirm", actor });
-      plan = this.ledger.read();
+      await this.testHooks?.beforeOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
+      plan = this.ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor, expected: ownerGateExpected });
+      await this.testHooks?.afterOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
     }
+    plan = captureReservedPlanSnapshot(plan);
     const trustedPlanIdentity = Object.freeze({
       taskId: plan.task_id,
       planRevisionId: plan.plan_revision_id,
@@ -118,62 +197,62 @@ export class HandoffService {
     await this.testHooks?.afterSafePoint?.({ safe, plan, sourceSession });
     const git = this.observeGit();
 
-    let base;
-    let handoffId;
-    let checkpointId;
-    const reserved = this.ledger.withAuthorityCoordination((currentPlan) => {
-      plan = currentPlan;
-      this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
-      assertPlanConsentIdentity(currentPlan, trustedPlanIdentity);
-      assertHandoffConsentIdentity(this.storage.latestHandoffForTask(currentPlan.task_id), expectedHandoff);
-      this.storage.assertLatchIdentity(currentPlan.task_id, safe.latch);
-      handoffId = stableId("HO", sourceSessionId, currentPlan.plan_revision_id, String(safe.latch_generation));
-      checkpointId = stableId("CP", handoffId, currentPlan.content_digest);
-      const createdAt = utcNow();
-      base = {
-        handoff_id: handoffId,
-        source_session_id: sourceSessionId,
-        source_session_file: sourceFile,
-        target_session_id: null,
-        target_session_file: null,
-        runner_instance_id: this.runnerInstanceId,
-        session_binding_id: opaqueId("BIND"),
-        parent_session_id: sourceSessionId,
-        parent_session_file: sourceFile,
-        parent_checkpoint_id: recoveryParent?.checkpoint_id ?? parentHandoff?.checkpoint_id ?? null,
-        recovery_of_handoff_id: recoveryOf,
-        task_id: currentPlan.task_id,
-        current_item: currentPlan.current_item,
-        next_item: currentPlan.next_item,
-        next_step: currentPlan.next_step,
-        task_plan_revision: currentPlan.plan_revision_id,
-        task_plan_digest: currentPlan.content_digest,
-        requirements_version: currentPlan.requirements_version,
-        latch_generation: safe.latch_generation,
-        checkpoint_id: checkpointId,
-        checkpoint_digest: null,
-        resume_manifest_id: stableId("RM", handoffId),
-        resume_manifest_digest: null,
-        resume_prompt_id: null,
-        resume_prompt_digest: null,
-        resume_prompt: null,
-        authorization_state: "NOT_AUTHORIZED",
-        admission_state: "NOT_COMMITTED",
-        admission_id: null,
-        dispatch_state: "NOT_STARTED",
-        dispatch_attempt_id: null,
-        dispatch_attempt_no: 0,
-        expected_git_state: git,
-        model_policy: this.modelPolicy ?? currentPlan.model_policy ?? null,
-        reasoning_policy: this.reasoningPolicy ?? currentPlan.reasoning_policy ?? null,
-        state: "SAFE_TO_HANDOFF",
-        created_at: createdAt,
-        updated_at: createdAt,
-      };
-      return this.storage.reserveHandoff(base, { latch: safe.latch, expectedHandoff });
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
+    assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
+    this.storage.assertLatchIdentity(plan.task_id, safe.latch);
+    const handoffId = stableId("HO", sourceSessionId, plan.plan_revision_id, String(safe.latch_generation));
+    const checkpointId = stableId("CP", handoffId, plan.content_digest);
+    const createdAt = utcNow();
+    const base = {
+      handoff_id: handoffId,
+      source_session_id: sourceSessionId,
+      source_session_file: sourceFile,
+      target_session_id: null,
+      target_session_file: null,
+      runner_instance_id: this.runnerInstanceId,
+      session_binding_id: opaqueId("BIND"),
+      parent_session_id: sourceSessionId,
+      parent_session_file: sourceFile,
+      parent_checkpoint_id: recoveryParent?.checkpoint_id ?? parentHandoff?.checkpoint_id ?? null,
+      recovery_of_handoff_id: recoveryOf,
+      task_id: plan.task_id,
+      current_item: plan.current_item,
+      next_item: plan.next_item,
+      next_step: plan.next_step,
+      task_plan_revision: plan.plan_revision_id,
+      task_plan_digest: plan.content_digest,
+      requirements_version: plan.requirements_version,
+      latch_generation: safe.latch_generation,
+      checkpoint_id: checkpointId,
+      checkpoint_digest: null,
+      resume_manifest_id: stableId("RM", handoffId),
+      resume_manifest_digest: null,
+      resume_prompt_id: null,
+      resume_prompt_digest: null,
+      resume_prompt: null,
+      authorization_state: "NOT_AUTHORIZED",
+      admission_state: "NOT_COMMITTED",
+      admission_id: null,
+      dispatch_state: "NOT_STARTED",
+      dispatch_attempt_id: null,
+      dispatch_attempt_no: 0,
+      expected_git_state: git,
+      model_policy: this.modelPolicy ?? plan.model_policy ?? null,
+      reasoning_policy: this.reasoningPolicy ?? plan.reasoning_policy ?? null,
+      reserved_plan_snapshot: plan,
+      state: "SAFE_TO_HANDOFF",
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    const reserved = reserveTrustedHandoffPlan(this.ledger, {
+      expected: trustedPlanIdentity,
+      storage: this.storage,
+      projection: base,
+      precondition: { latch: safe.latch, expectedHandoff },
     });
     let handoff = reserved.handoff;
     if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
+    assertReservedPlanConsistency(handoff, plan);
     await this.testHooks?.afterReservation?.({ handoff, safe, plan, sourceSession });
     this.metric("STARTED", {
       handoff,
@@ -293,7 +372,11 @@ export class HandoffService {
     h.state = "MANIFEST_PERSISTING";
     this.storage.saveHandoff(h, "STATE_TRANSITION", { from: "REPLACEMENT_SESSION_CREATED_PAUSED", to: h.state });
     try {
-      const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h));
+      const plan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
+      const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
+      assertCheckpointPlanConsistency(h, plan, checkpoint.payload);
+      await this.testHooks?.beforeManifest?.({ handoff: h, plan, checkpoint: checkpoint.payload, target });
+      const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan));
       h.resume_manifest_digest = manifest.digest;
       h.state = "MANIFEST_PERSISTED";
       this.storage.saveHandoff(h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
@@ -372,9 +455,12 @@ export class HandoffService {
     invariant(["MANIFEST_PERSISTED", "RESUME_READY"].includes(h.state), "CONTINUITY_STATE_INVALID", h.state);
     const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
     const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
+    const reservedPlan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
+    const m = manifest.payload;
+    assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
+    assertManifestPlanConsistency(h, reservedPlan, m);
     const plan = this.ledger.read();
     const currentGit = this.observeGit();
-    const m = manifest.payload;
     invariant(m.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
     const header = targetSession.sessionManager.getHeader();
     const entries = targetSession.sessionManager.getEntries();
@@ -512,6 +598,7 @@ export class HandoffService {
   }
 
   buildCheckpoint(h, plan, operations) {
+    assertReservedPlanConsistency(h, plan);
     const relevantTests = Array.isArray(plan.relevant_tests) ? plan.relevant_tests : [];
     const relevantDecisions = Array.isArray(plan.relevant_decisions) ? plan.relevant_decisions : [];
     const changes = operations
@@ -527,6 +614,7 @@ export class HandoffService {
       session_lineage: [h.source_session_id],
       run_lineage: [],
       plan_revision_id: h.task_plan_revision,
+      plan_content_digest: h.task_plan_digest,
       requirements_version: h.requirements_version,
       checkpoint_message: `Aiopago handoff for ${plan.task_id} sealed at a Runner-owned safe point`,
       created_at: h.created_at,
@@ -547,12 +635,12 @@ export class HandoffService {
     };
   }
 
-  buildManifest(h) {
-    const plan = this.ledger.read();
+  buildManifest(h, plan) {
+    assertReservedPlanConsistency(h, plan);
     const relevantDecisions = Array.isArray(plan.relevant_decisions) ? plan.relevant_decisions : [];
     const relevantTests = Array.isArray(plan.relevant_tests) ? plan.relevant_tests : [];
     const evidenceReferences = Array.isArray(plan.evidence_references) ? plan.evidence_references : [];
-    return {
+    const manifest = {
       manifest_version: "1.1.0",
       resume_manifest_id: h.resume_manifest_id,
       created_at: h.created_at,
@@ -594,6 +682,8 @@ export class HandoffService {
       handoff_id: h.handoff_id,
       resume_prompt_id: h.resume_prompt_id,
     };
+    assertManifestPlanConsistency(h, plan, manifest);
+    return manifest;
   }
 
   buildPrompt(h, manifest) {

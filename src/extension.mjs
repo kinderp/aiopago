@@ -166,11 +166,13 @@ export function createGuardianExtension(runner) {
     }
 
     pi.on("session_start", (event, ctx) => {
+      runner.noteSessionStart?.(event, ctx);
       runner.contextAdvisor.reset();
       safeMetric(runner, "startSession", ctx, event);
     });
     pi.on("session_shutdown", (event, ctx) => {
       guided.shutdownEpoch += 1;
+      runner.noteSessionShutdown?.(event, ctx);
       safeMetric(runner, "endSession", ctx, event);
     });
 

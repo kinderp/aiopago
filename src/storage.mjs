@@ -4,8 +4,42 @@ import { DatabaseSync } from "node:sqlite";
 import { opaqueId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { handoffConsentIdentity } from "./handoff-consent.mjs";
+import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal.mjs";
 
 const TERMINAL_HANDOFF = new Set(["RESUMED", "RESUME_DISPATCH_UNKNOWN", "HUMAN_DECISION_REQUIRED", "HANDOFF_FAILED", "CONTINUITY_FAILED"]);
+
+const HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "source_session_id",
+  "source_session_file",
+  "task_id",
+  "task_plan_revision",
+  "task_plan_digest",
+  "requirements_version",
+  "current_item",
+  "next_item",
+  "next_step",
+  "latch_generation",
+  "runner_instance_id",
+  "session_binding_id",
+  "parent_session_id",
+  "parent_session_file",
+  "parent_checkpoint_id",
+  "recovery_of_handoff_id",
+  "checkpoint_id",
+  "resume_manifest_id",
+  "model_policy",
+  "reasoning_policy",
+]);
+
+function sameHandoffReservationIdentity(existing, projection) {
+  if (!existing || !projection) return false;
+  return HANDOFF_RESERVATION_IDENTITY_FIELDS.every((field) => {
+    const left = existing[field] ?? null;
+    const right = projection[field] ?? null;
+    return left === right;
+  });
+}
 
 export class GuardianStorage {
   constructor(path = ".guardian/runtime/guardian.sqlite") {
@@ -14,6 +48,7 @@ export class GuardianStorage {
     this.db = new DatabaseSync(this.path);
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate();
+    registerTrustedHandoffStorageCapability(this, { reserve: this.reserveHandoff.bind(this) });
   }
 
   migrate() {
@@ -300,12 +335,20 @@ export class GuardianStorage {
         && latch.reason === precondition.latch.reason
         && projection.latch_generation === latch.generation,
       "LATCH_GENERATION_MISMATCH", "Durable handoff reservation does not match the acquired safe-point latch");
+      const active = this.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
+      if (active) {
+        const existing = this.getHandoff(active.handoff_id);
+        if (sameHandoffReservationIdentity(existing, projection)) return { created: false, handoff: existing };
+        throw new GuardianError("HANDOFF_ACTIVE_SOURCE_CONFLICT", "The source session is already reserved by a different handoff operation", {
+          source_session_id: projection.source_session_id,
+          existing_handoff_id: existing?.handoff_id ?? active.handoff_id,
+          requested_handoff_id: projection.handoff_id,
+        });
+      }
       const latestRow = this.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(projection.task_id);
       const latest = latestRow ? this.getHandoff(latestRow.handoff_id) : null;
       invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(precondition.expectedHandoff),
         "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before durable reservation");
-      const active = this.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
-      if (active) return { created: false, handoff: this.getHandoff(active.handoff_id) };
       const now = utcNow();
       this.db.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
         .run(projection.handoff_id, projection.source_session_id, null, projection.task_id, projection.state, projection.latch_generation, JSON.stringify(projection), now, now);

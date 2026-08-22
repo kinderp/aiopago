@@ -7,6 +7,7 @@ import test from "node:test";
 import { canonicalJson, digestObject, sha256 } from "../src/canonical.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState } from "../src/git-state.mjs";
+import { guidedHandoffEligibilityIdentityFromAuthority } from "../src/handoff-consent.mjs";
 import { HandoffService } from "../src/handoff.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
@@ -230,6 +231,41 @@ test("Pi SDK Runner boundary: plan movement while guided confirmation is open re
     assert.equal(trustedInvocations, 0);
     assert.match(notices.at(-1).text, /stato è cambiato.*handoff non è stato avviato/i);
     assert.equal(x.runner.storage.latestHandoffForTask("TASK-E2E"), null);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("Pi SDK lifecycle: registered session_shutdown during SafePoint invalidates trusted source before reservation", async () => {
+  const x = await makeRunner();
+  try {
+    const source = x.runner.runtime.session;
+    const plan = x.runner.ledger.read();
+    const expectedEligibility = guidedHandoffEligibilityIdentityFromAuthority({
+      plan,
+      sessionId: source.sessionId,
+      runnerInstanceId: x.runner.runnerInstanceId,
+      latch: x.runner.storage.getLatch(plan.task_id),
+      handoff: null,
+    });
+    let releaseIdle;
+    let waitStarted;
+    const waiting = new Promise((resolve) => { waitStarted = resolve; });
+    const release = new Promise((resolve) => { releaseIdle = resolve; });
+    source.waitForIdle = async () => { waitStarted(); await release; };
+    let replacements = 0;
+    const ctx = {
+      async newSession() { replacements += 1; throw new Error("replacement must not start"); },
+      ui: { async confirm() { return false; }, notify() {}, setEditorText() {} },
+    };
+    const pending = x.runner.handoffFromCommand(ctx, "confirm", { intent: "guided-advisor", expectedEligibility });
+    await waiting;
+    await source.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    releaseIdle();
+    await assert.rejects(() => pending, (error) => error.code === "HANDOFF_SOURCE_CHANGED");
+    assert.equal(x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+    assert.equal(x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 0);
+    assert.equal(replacements, 0);
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }

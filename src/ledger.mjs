@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { sha256, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
+import { registerTrustedHandoffPlanCapability } from "./handoff-plan-internal.mjs";
 import {
   assertExactSatisfiedOwnerGateTransition,
   canonicalOwnerCommand,
@@ -316,6 +317,19 @@ export class TaskLedger {
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
     this.writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
+    registerTrustedHandoffPlanCapability(this, {
+      attest: (expected, reserve) => this.writer.coordinate({
+        validate: validateTaskLedger,
+        use: (observed) => {
+          const plan = ledgerResult(observed.task, observed.contentDigest, this.path);
+          invariant(plan.task_id === expected?.taskId
+            && plan.plan_revision_id === expected?.planRevisionId
+            && plan.content_digest === expected?.contentDigest,
+          "HANDOFF_CONSENT_STALE", "The authoritative plan changed before durable handoff reservation");
+          return reserve();
+        },
+      }),
+    });
   }
 
   read() {
@@ -323,16 +337,9 @@ export class TaskLedger {
     return ledgerResult(observed.task, observed.contentDigest, this.path);
   }
 
-  withAuthorityCoordination(use) {
-    invariant(typeof use === "function", "PLAN_COORDINATION_CALLBACK_REQUIRED");
-    return this.writer.coordinate({
-      validate: validateTaskLedger,
-      use: (observed) => use(ledgerResult(observed.task, observed.contentDigest, this.path)),
-    });
-  }
-
-  satisfyOwnerGate({ command, actor }) {
+  satisfyOwnerGate({ command, actor, expected = null }) {
     return this.writer.commit({
+      expected,
       validate: validateTaskLedger,
       prepare: (observed) => {
         const task = structuredClone(observed.task);

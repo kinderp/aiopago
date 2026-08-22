@@ -410,10 +410,14 @@ export class PlanRevisionWriter {
   }
 
   #casConflict(expected, observed, phase) {
+    const taskMatches = expected.taskId === undefined || observed.task.task_id === expected.taskId;
     const revisionMatches = observed.task.plan_revision_id === expected.planRevisionId;
     const digestMatches = observed.contentDigest === expected.contentDigest;
-    if (!revisionMatches || !digestMatches) {
+    if (!taskMatches || !revisionMatches || !digestMatches) {
       throw new GuardianError("PLAN_CAS_CONFLICT", `TASK_PLAN.md no longer matches the proposal base during ${phase}; create a new proposal from a fresh observation`, {
+        expected_task_id: expected.taskId ?? null,
+        observed_task_id: observed.task.task_id,
+        task_matches: taskMatches,
         expected_plan_revision_id: expected.planRevisionId,
         observed_plan_revision_id: observed.task.plan_revision_id,
         revision_matches: revisionMatches,

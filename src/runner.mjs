@@ -93,6 +93,8 @@ export class GuardianRunner {
     Object.assign(this, fields);
     this.replacementPermit = 0;
     this.runtime = null;
+    this.sessionLifecycleEpoch = 0;
+    this.sessionLifecycle = null;
   }
 
   async createRuntime(options) {
@@ -131,7 +133,53 @@ export class GuardianRunner {
       agentDir: options.agentDir ?? coding.getAgentDir(),
       sessionManager,
     });
+    this.ensureCurrentSessionLifecycle(this.runtime.session);
     this.recoverySourceSession = this.runtime.session;
+  }
+
+  lifecycleSessionId(ctx = null) {
+    try {
+      const id = ctx?.sessionManager?.getSessionId?.();
+      if (typeof id === "string" && id.length > 0) return id;
+    } catch {}
+    const current = this.runtime?.session?.sessionId;
+    return typeof current === "string" && current.length > 0 ? current : null;
+  }
+
+  ensureCurrentSessionLifecycle(session) {
+    invariant(session?.sessionId, "HANDOFF_SOURCE_CHANGED", "The Runner has no current source session");
+    if (this.sessionLifecycle === null) {
+      this.sessionLifecycleEpoch += 1;
+      this.sessionLifecycle = Object.freeze({ sessionId: session.sessionId, epoch: this.sessionLifecycleEpoch, active: true });
+    }
+    invariant(this.sessionLifecycle.sessionId === session.sessionId && this.sessionLifecycle.active,
+      "HANDOFF_SOURCE_CHANGED", "The current Runner session lifecycle is not ACTIVE");
+    return this.sessionLifecycle;
+  }
+
+  noteSessionStart(_event, ctx = null) {
+    const sessionId = this.lifecycleSessionId(ctx);
+    if (!sessionId) return null;
+    if (this.sessionLifecycle?.sessionId === sessionId && this.sessionLifecycle.active) return this.sessionLifecycle;
+    this.sessionLifecycleEpoch += 1;
+    this.sessionLifecycle = Object.freeze({ sessionId, epoch: this.sessionLifecycleEpoch, active: true });
+    return this.sessionLifecycle;
+  }
+
+  noteSessionShutdown(_event, ctx = null) {
+    const sessionId = this.lifecycleSessionId(ctx);
+    if (!sessionId || (this.sessionLifecycle && this.sessionLifecycle.sessionId !== sessionId)) return false;
+    this.sessionLifecycleEpoch += 1;
+    this.sessionLifecycle = Object.freeze({ sessionId, epoch: this.sessionLifecycleEpoch, active: false });
+    return true;
+  }
+
+  noteCurrentReplacementActive(session) {
+    invariant(this.runtime?.session === session && session?.sessionId, "HANDOFF_SOURCE_CHANGED", "Replacement lifecycle does not match the current Runner session");
+    if (this.sessionLifecycle?.sessionId === session.sessionId && this.sessionLifecycle.active) return this.sessionLifecycle;
+    this.sessionLifecycleEpoch += 1;
+    this.sessionLifecycle = Object.freeze({ sessionId: session.sessionId, epoch: this.sessionLifecycleEpoch, active: true });
+    return this.sessionLifecycle;
   }
 
   currentRecoverySourceAttestation() {
@@ -150,6 +198,7 @@ export class GuardianRunner {
 
   commandTarget(replacementCtx) {
     const session = this.runtime.session;
+    this.noteCurrentReplacementActive(session);
     return {
       session,
       setEditor: (text) => replacementCtx.ui.setEditorText(text),
@@ -167,6 +216,7 @@ export class GuardianRunner {
   captureTrustedSource(expectedEligibility = null) {
     const sourceSession = this.runtime?.session;
     invariant(sourceSession?.sessionId, "HANDOFF_SOURCE_CHANGED", "The Runner has no current source session");
+    const lifecycle = this.ensureCurrentSessionLifecycle(sourceSession);
     if (expectedEligibility !== null) {
       assertGuidedHandoffEligibilityIdentity(expectedEligibility);
       invariant(expectedEligibility.runnerInstanceId === this.runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Guided consent belongs to a different Runner instance");
@@ -174,11 +224,16 @@ export class GuardianRunner {
     }
     const sourceSessionId = sourceSession.sessionId;
     const runnerInstanceId = this.runnerInstanceId;
+    const lifecycleEpoch = lifecycle.epoch;
     const verifyCurrentSource = () => {
       invariant(this.runnerInstanceId === runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Runner identity changed before handoff reservation");
       invariant(this.runtime?.session === sourceSession && this.runtime.session.sessionId === sourceSessionId,
         "HANDOFF_SOURCE_CHANGED", "Runner source session changed before handoff reservation");
-      return Object.freeze({ sessionId: sourceSessionId, runnerInstanceId });
+      invariant(this.sessionLifecycle?.active === true
+        && this.sessionLifecycle.sessionId === sourceSessionId
+        && this.sessionLifecycle.epoch === lifecycleEpoch,
+      "HANDOFF_SOURCE_CHANGED", "Runner source session lifecycle changed or is no longer ACTIVE");
+      return Object.freeze({ sessionId: sourceSessionId, runnerInstanceId, lifecycleEpoch, active: true });
     };
     verifyCurrentSource();
     return Object.freeze({ sourceSession, verifyCurrentSource });
@@ -280,6 +335,7 @@ export class GuardianRunner {
             setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
           });
           if (result.cancelled) return result;
+          this.noteCurrentReplacementActive(this.runtime.session);
           const target = {
             session: this.runtime.session,
             setEditor: () => {},
@@ -310,6 +366,7 @@ export class GuardianRunner {
             setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
           });
           if (result.cancelled) return result;
+          this.noteCurrentReplacementActive(this.runtime.session);
           const target = {
             session: this.runtime.session,
             setEditor: () => {},
