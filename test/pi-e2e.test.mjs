@@ -608,6 +608,46 @@ test("CONTINUITY_FAILED recovery crosses a process restart and accepts sealed le
   }
 });
 
+test("CONTINUITY_FAILED recovery fails closed when HUMAN_TAKEOVER races its SafePoint", async () => {
+  let runnerA = await makeRunner();
+  let runnerB = null;
+  let takeover = null;
+  try {
+    const continuity = runnerA.runner.handoffService.continuity.bind(runnerA.runner.handoffService);
+    runnerA.runner.handoffService.continuity = () => { const error = new Error("forced recovery fixture"); error.code = "CONTINUITY_FAILED"; throw error; };
+    await assert.rejects(() => runnerA.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "CONTINUITY_FAILED");
+    runnerA.runner.handoffService.continuity = continuity;
+    const failed = runnerA.runner.storage.latestHandoffForTask("TASK-E2E");
+    const root = runnerA.root;
+    await runnerA.runner.dispose(); runnerA.restoreFetch(); runnerA = null;
+
+    runnerB = await makeRunner({ existingRoot: root });
+    takeover = new GuardianStorage(runnerB.runner.storage.path);
+    const fresh = runnerB.runner.runtime.session;
+    let releaseIdle;
+    let waitStarted;
+    const waiting = new Promise((resolve) => { waitStarted = resolve; });
+    const release = new Promise((resolve) => { releaseIdle = resolve; });
+    fresh.waitForIdle = async () => { waitStarted(); await release; };
+    const rowsBefore = runnerB.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count;
+    const pending = runnerB.runner.recoverHandoffDirect(failed.handoff_id, { confirm: true });
+    const rejected = assert.rejects(pending, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
+    await waiting;
+    takeover.engageLatch(failed.task_id, "HUMAN_TAKEOVER", "human:/aio-takeover");
+    releaseIdle();
+    await rejected;
+    assert.equal(runnerB.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, rowsBefore);
+    assert.equal(runnerB.runner.storage.getLatch(failed.task_id).reason, "HUMAN_TAKEOVER");
+    assert.equal(runnerB.runner.storage.events(failed.handoff_id).some((event) => event.event_type === "CONTINUITY_RECOVERY_STARTED"), false);
+    assert.equal(runnerB.runner.runtime.session.sessionId, fresh.sessionId);
+    assert.equal(runnerB.calls, 0);
+  } finally {
+    takeover?.close();
+    if (runnerA) { await runnerA.runner.dispose(); runnerA.restoreFetch(); }
+    if (runnerB) { await runnerB.runner.dispose(); runnerB.restoreFetch(); }
+  }
+});
+
 test("CONTINUITY_FAILED recovery rejects unknown or durable resume effects and unsupported states", async (t) => {
   await t.test("UNKNOWN dispatch projection", async () => {
     const x = await makeRunner({ requiredLocalPaths: ["docs/missing-unknown.md"] });
