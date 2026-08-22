@@ -6,8 +6,10 @@ import {
   formatHumanWhy,
   formatPlan,
   formatPlanTechnical,
+  guidedHandoffEligibilityIdentity,
   observeRunnerHumanWorkflow,
   projectHumanWorkflow,
+  sameGuidedHandoffEligibility,
 } from "./human-workflow.mjs";
 
 function message(error) { return error instanceof GuardianError ? `${error.code}: ${error.message}` : error?.message ?? String(error); }
@@ -64,6 +66,8 @@ async function adviseHandoff(runner, ctx, guided) {
   if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
+  const expectedEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
+  if (!expectedEligibility) return;
 
   guided.inFlight = true;
   const epoch = guided.shutdownEpoch;
@@ -74,9 +78,10 @@ async function adviseHandoff(runner, ctx, guided) {
       `Contesto al ${percent}% (soglia advisory: ${proposal.thresholdPercent}%).\nHandoff consigliato perché la soglia è stata raggiunta.\n\nPreparare una nuova sessione?`,
     );
     if (!prepare || guided.shutdownEpoch !== epoch) return;
-    const current = readLedgerForHook(runner, ctx, "warning");
-    if (!current || !runner.storage.isAdmissionOpen(current.task_id)) {
-      safeNotify(ctx, "Handoff non avviato: il controllo runtime è cambiato durante la conferma. Ispeziona /aio status.", "warning");
+    const currentEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
+    if (!sameGuidedHandoffEligibility(expectedEligibility, currentEligibility)
+      || !runner.storage.isAdmissionOpen(currentEligibility?.taskId)) {
+      safeNotify(ctx, "Lo stato è cambiato mentre la conferma era aperta; l’handoff non è stato avviato. Ispeziona /aio status e conferma di nuovo a una futura advisory.", "warning");
       return;
     }
     await runner.handoffFromCommand(ctx, "confirm");

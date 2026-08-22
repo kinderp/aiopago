@@ -17,6 +17,18 @@ const PREPARING_HANDOFF_STATES = new Set([
   "MANIFEST_PERSISTING", "MANIFEST_PERSISTED", "RESUME_ADMISSION_COMMITTED",
   "RESUME_DISPATCHING", "RESUME_DISPATCHED",
 ]);
+const KNOWN_HANDOFF_STATES = new Set([
+  ...PREPARING_HANDOFF_STATES,
+  ...FAILED_HANDOFF_STATES,
+  "CONTINUITY_FAILED", "RESUME_READY", "RESUMED", "HUMAN_DECISION_REQUIRED",
+]);
+const HANDOFF_STATES_REQUIRING_TARGET = new Set([
+  "REPLACEMENT_SESSION_CREATED_PAUSED", "RUNNER_OWNERSHIP_ATTESTATION_FAILED",
+  "MANIFEST_PERSISTING", "MANIFEST_PERSISTED", "CONTINUITY_FAILED", "RESUME_READY",
+  "RESUME_ADMISSION_COMMITTED", "RESUME_DISPATCHING", "RESUME_DISPATCHED",
+  "RESUME_DISPATCH_FAILED", "RESUME_DISPATCH_UNKNOWN", "RESUMED",
+]);
+const HANDOFF_STATES_REQUIRING_FAILURE = new Set([...FAILED_HANDOFF_STATES, "CONTINUITY_FAILED"]);
 
 function boundedText(value, length = 320) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, length);
@@ -32,14 +44,28 @@ function diagnostic(error, fallback = "READ_FAILED") {
 
 function publicDiagnostic(error, fallback = "READ_FAILED") {
   if (!error) return null;
-  const result = {
-    code: error.code ?? fallback,
+  return {
+    code: boundedText(error.code ?? fallback, 128) || fallback,
     message: boundedText(error.message ?? error),
   };
-  if (error.details !== undefined) {
-    try { result.details = structuredClone(error.details); } catch { /* diagnostics remain bounded */ }
-  }
-  return result;
+}
+
+function projectedFailure(failure, fallback = "HANDOFF_FAILED") {
+  if (!failure) return null;
+  return {
+    code: boundedText(failure.code ?? fallback, 128) || fallback,
+    message: boundedText(failure.message ?? failure),
+  };
+}
+
+function isPlainRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function validIdentity(value, maximum = 320) {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum;
 }
 
 function deepFreeze(value, seen = new Set()) {
@@ -127,11 +153,25 @@ function handoffIdentity(handoff) {
   return handoff ? {
     handoff_id: handoff.handoff_id,
     state: handoff.state,
+    task_id: handoff.task_id ?? null,
+    source_session_id: handoff.source_session_id ?? null,
     target_session_id: handoff.target_session_id ?? null,
+    runner_instance_id: handoff.runner_instance_id ?? null,
+    task_plan_revision: handoff.task_plan_revision ?? null,
+    task_plan_digest: handoff.task_plan_digest ?? null,
+    latch_generation: handoff.latch_generation ?? null,
     authorization_state: handoff.authorization_state ?? null,
     admission_state: handoff.admission_state ?? null,
     dispatch_state: handoff.dispatch_state ?? null,
+    failure: projectedFailure(handoff.failure, handoff.state),
   } : null;
+}
+
+function observedHandoffFailure(handoff) {
+  if (!handoff) return null;
+  if (handoff.failure) return publicDiagnostic(handoff.failure, handoff.state);
+  if (!HANDOFF_STATES_REQUIRING_FAILURE.has(handoff.state)) return null;
+  return { code: handoff.state, message: `Handoff runtime is in ${handoff.state}` };
 }
 
 function sameIdentity(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
@@ -201,10 +241,15 @@ export function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
         workflow: "LIVE_RUNNER",
         condition: "LIVE_RUNNER",
         error: null,
+        planIdentity: {
+          taskId: secondPlan.plan.task_id,
+          revision: secondPlan.plan.plan_revision_id,
+          digest: secondPlan.digest,
+        },
         latch: latchIdentity(latchAfter),
         handoff: handoff ? {
           ...handoffIdentity(handoff),
-          failure: publicDiagnostic(handoff.failure, handoff.failure?.code ?? "HANDOFF_FAILED"),
+          failure: observedHandoffFailure(handoff),
           manual_recovery: Array.isArray(handoff.manual_recovery) ? handoff.manual_recovery.map((line) => boundedText(line, 640)) : [],
         } : null,
         session: {
@@ -241,6 +286,128 @@ export function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
       }),
     });
   }
+}
+
+function invalidRuntime(message) {
+  return Object.freeze({
+    valid: false,
+    error: Object.freeze({ code: "RUNTIME_OBSERVATION_INVALID", message: boundedText(message) }),
+  });
+}
+
+/** A verified live observation is a positive claim and therefore has one
+ * strict coherence boundary before projection. Unverified/unavailable
+ * observations intentionally use their separate conservative shape. */
+function validateRuntimeObservationUnchecked(runtime, planObservation) {
+  if (!isPlainRecord(runtime)) return invalidRuntime("The verified runtime observation is not a record");
+  if (runtime.available !== true || runtime.verified !== true
+    || runtime.workflow !== "LIVE_RUNNER" || runtime.condition !== "LIVE_RUNNER"
+    || runtime.error !== null || (runtime.failure !== undefined && runtime.failure !== null)) {
+    return invalidRuntime("The verified runtime claim has contradictory availability, workflow, condition, or error fields");
+  }
+  const plan = planObservation?.valid === true ? planObservation.plan : null;
+  if (!plan || !isPlainRecord(runtime.planIdentity)
+    || runtime.planIdentity.taskId !== plan.task_id
+    || runtime.planIdentity.revision !== plan.plan_revision_id
+    || runtime.planIdentity.digest !== planObservation.digest) {
+    return invalidRuntime("The verified runtime is not bound to the authoritative task, revision, and digest");
+  }
+  if (!isPlainRecord(runtime.session) || !validIdentity(runtime.session.id)
+    || !validIdentity(runtime.session.runnerInstanceId)
+    || !validIdentity(runtime.session.model)
+    || !(runtime.session.reasoning === null || runtime.session.reasoning === undefined || validIdentity(runtime.session.reasoning))
+    || !(runtime.session.ownership === "source" || /^replacement:(ACTIVE|SUPERSEDED)$/.test(runtime.session.ownership ?? ""))) {
+    return invalidRuntime("The verified runtime has no coherent session and Runner identity");
+  }
+  if (!isPlainRecord(runtime.latch) || !["ENGAGED", "RELEASED"].includes(runtime.latch.state)
+    || !Number.isInteger(runtime.latch.generation) || runtime.latch.generation < 0
+    || !(runtime.latch.reason === null || runtime.latch.reason === undefined || validIdentity(runtime.latch.reason))
+    || (runtime.latch.state === "RELEASED" && runtime.latch.reason != null)
+    || (runtime.latch.state === "ENGAGED" && !validIdentity(runtime.latch.reason))) {
+    return invalidRuntime("The verified runtime has no valid latch identity");
+  }
+  if (runtime.handoff !== null) {
+    const handoff = runtime.handoff;
+    if (!isPlainRecord(handoff) || !validIdentity(handoff.handoff_id) || !KNOWN_HANDOFF_STATES.has(handoff.state)
+      || handoff.task_id !== plan.task_id || !validIdentity(handoff.source_session_id)
+      || !validIdentity(handoff.runner_instance_id) || !validIdentity(handoff.task_plan_revision)
+      || !validIdentity(handoff.task_plan_digest) || !Number.isInteger(handoff.latch_generation) || handoff.latch_generation < 0
+      || !(handoff.target_session_id === null || validIdentity(handoff.target_session_id))
+      || (HANDOFF_STATES_REQUIRING_TARGET.has(handoff.state) && !validIdentity(handoff.target_session_id))
+      || !["authorization_state", "admission_state", "dispatch_state"].every((key) => handoff[key] === null || validIdentity(handoff[key], 128))
+      || !Array.isArray(handoff.manual_recovery) || handoff.manual_recovery.some((line) => typeof line !== "string")) {
+      return invalidRuntime("The verified runtime has a malformed or incoherent handoff identity");
+    }
+    if (HANDOFF_STATES_REQUIRING_FAILURE.has(handoff.state)
+      && (!isPlainRecord(handoff.failure) || !validIdentity(handoff.failure.code, 128) || !validIdentity(handoff.failure.message, 4096))) {
+      return invalidRuntime("The verified runtime failure state has no bounded failure code and message");
+    }
+    if (!HANDOFF_STATES_REQUIRING_FAILURE.has(handoff.state) && handoff.failure !== null) {
+      return invalidRuntime("The verified runtime has a failure object that contradicts its handoff state");
+    }
+  }
+  if (runtime.context !== undefined && runtime.context !== null) {
+    const context = runtime.context;
+    if (!isPlainRecord(context) || !["available", "unavailable"].includes(context.availability)
+      || typeof context.recommended !== "boolean"
+      || !(context.percent === null || (Number.isFinite(context.percent) && context.percent >= 0 && context.percent <= 100))
+      || !(context.tokens === null || Number.isFinite(context.tokens))
+      || !(context.contextWindow === null || Number.isFinite(context.contextWindow))
+      || !(context.thresholdPercent === null || (Number.isFinite(context.thresholdPercent) && context.thresholdPercent >= 0 && context.thresholdPercent <= 100))
+      || (context.availability === "unavailable" && (context.percent !== null || context.tokens !== null || context.contextWindow !== null || context.recommended))
+      || (context.recommended && (!Number.isFinite(context.percent) || !Number.isFinite(context.thresholdPercent) || context.percent < context.thresholdPercent))) {
+      return invalidRuntime("The verified runtime has malformed or contradictory context evidence");
+    }
+  }
+  if (runtime.git !== undefined && runtime.git !== null
+    && (!isPlainRecord(runtime.git) || Object.values(runtime.git).some((value) => value !== null && !validIdentity(value, 2048)))) {
+    return invalidRuntime("The verified runtime Git evidence is malformed");
+  }
+  return Object.freeze({ valid: true, error: null });
+}
+
+export function validateRuntimeObservation(runtime, planObservation) {
+  try { return validateRuntimeObservationUnchecked(runtime, planObservation); }
+  catch { return invalidRuntime("The verified runtime observation could not be safely inspected"); }
+}
+
+/** Ephemeral preparation-consent identity. It contains authority/control facts,
+ * never display strings or naturally moving context percentages. */
+export function guidedHandoffEligibilityIdentity(observation) {
+  if (observation?.plan?.valid !== true || observation?.runtime?.verified !== true) return null;
+  if (!validateRuntimeObservation(observation.runtime, observation.plan).valid) return null;
+  const runtime = observation.runtime;
+  if (runtime.latch.state !== "RELEASED") return null;
+  return deepFreeze({
+    taskId: observation.plan.plan.task_id,
+    planRevisionId: observation.plan.plan.plan_revision_id,
+    contentDigest: observation.plan.digest,
+    sessionId: runtime.session.id,
+    runnerInstanceId: runtime.session.runnerInstanceId,
+    latch: {
+      state: runtime.latch.state,
+      generation: runtime.latch.generation,
+      reason: runtime.latch.reason ?? null,
+    },
+    handoff: runtime.handoff ? {
+      handoffId: runtime.handoff.handoff_id,
+      state: runtime.handoff.state,
+      sourceSessionId: runtime.handoff.source_session_id,
+      targetSessionId: runtime.handoff.target_session_id,
+      runnerInstanceId: runtime.handoff.runner_instance_id,
+      taskPlanRevision: runtime.handoff.task_plan_revision,
+      taskPlanDigest: runtime.handoff.task_plan_digest,
+      latchGeneration: runtime.handoff.latch_generation,
+      authorizationState: runtime.handoff.authorization_state,
+      admissionState: runtime.handoff.admission_state,
+      dispatchState: runtime.handoff.dispatch_state,
+      failure: projectedFailure(runtime.handoff.failure, runtime.handoff.state),
+    } : null,
+  });
+}
+
+export function sameGuidedHandoffEligibility(left, right) {
+  return left !== null && right !== null && sameIdentity(left, right);
 }
 
 function itemById(plan, id) {
@@ -293,7 +460,15 @@ function baseProjection(observation, fields) {
       availability: runtime.verified === true ? "available" : runtime.available ? "unverified" : "unavailable",
       verified: runtime.verified === true,
       condition: runtime.condition ?? "RUNTIME_NOT_OBSERVED",
-      context: runtime.context ? { ...runtime.context } : null,
+      context: runtime.context ? {
+        availability: runtime.context.availability,
+        percent: runtime.context.percent ?? null,
+        tokens: runtime.context.tokens ?? null,
+        contextWindow: runtime.context.contextWindow ?? null,
+        thresholdPercent: runtime.context.thresholdPercent ?? null,
+        recommended: runtime.context.recommended === true,
+        error: publicDiagnostic(runtime.context.error, "CONTEXT_USAGE_READ_FAILED"),
+      } : null,
     },
     humanControl: {
       latchState: runtime.latch?.state ?? "unverified",
@@ -327,11 +502,19 @@ function baseProjection(observation, fields) {
         ownership: runtime.session?.ownership ?? null,
         model: runtime.session?.model ?? null,
         reasoning: runtime.session?.reasoning ?? null,
-        git: runtime.git ? { ...runtime.git } : null,
+        git: runtime.git ? {
+          repository: runtime.git.repository ?? null,
+          worktree: runtime.git.worktree ?? null,
+          branch: runtime.git.branch ?? null,
+          head: runtime.git.head ?? null,
+          base: runtime.git.base ?? null,
+          indexDigest: runtime.git.indexDigest ?? null,
+          worktreeDigest: runtime.git.worktreeDigest ?? null,
+        } : null,
         latchGeneration: runtime.latch?.generation ?? null,
         handoffId: runtime.handoff?.handoff_id ?? null,
         handoffState: runtime.handoff?.state ?? null,
-        failure: runtime.handoff?.failure ?? null,
+        failure: projectedFailure(runtime.handoff?.failure, runtime.handoff?.state ?? "HANDOFF_FAILED"),
       } : null,
     },
     ...fields,
@@ -357,6 +540,11 @@ export function projectHumanWorkflow(observation) {
       "ispeziona la diagnostica tecnica e correggi la configurazione; non continuare il lavoro alla cieca.");
   }
   if (!observation.plan?.valid) {
+    if (observation.plan?.error?.code === "PLAN_CHANGED_DURING_READ") {
+      return project("NEEDS_ATTENTION", "attention", "richiede attenzione", observation,
+        "Il piano autorevole è cambiato mentre veniva letto; questo non implica che TASK_PLAN.md sia corrotto.",
+        "attendi che la modifica sia completa, quindi osserva di nuovo lo stato.");
+    }
     return project("NEEDS_ATTENTION", "error", "richiede attenzione", observation,
       "TASK_PLAN.md non è valido e non può essere usato come piano autorevole.",
       "esegui “aio plan --check”, ispeziona “aio plan --raw” e correggi manualmente il piano.");
@@ -380,16 +568,18 @@ export function projectHumanWorkflow(observation) {
           : "usa il piano autorevole per orientarti, ma non dedurre avvio o retry da questa projection; serve un Core Observation Port esterno.");
   }
 
-  if (!runtime.latch || !["ENGAGED", "RELEASED"].includes(runtime.latch.state) || !Number.isInteger(runtime.latch.generation) || runtime.latch.generation < 0) {
+  const validation = validateRuntimeObservation(runtime, observation.plan);
+  if (!validation.valid) {
     return project("NEEDS_ATTENTION", "error", "richiede attenzione", {
       ...observation,
       runtime: {
         available: true,
         verified: false,
+        workflow: "NEEDS_ATTENTION",
         condition: "RUNTIME_OBSERVATION_INVALID",
-        error: { code: "RUNTIME_OBSERVATION_INVALID", message: "The live runtime observation has no valid latch identity" },
+        error: validation.error,
       },
-    }, "L’osservazione live non contiene un’identità latch valida e non può provare l’ammissione.",
+    }, "L’osservazione live verificata è incompleta o incoerente e non può provare uno stato operativo sicuro.",
     "ispeziona la diagnostica tecnica e osserva di nuovo senza dedurre permessi runtime.");
   }
   const latch = runtime.latch;
@@ -515,6 +705,14 @@ export function formatPlan(value) {
   const plan = view.planSummary;
   if (!plan) {
     const diagnostic = view.technical.diagnostic ?? { code: "PLAN_UNAVAILABLE", message: "Piano autorevole non disponibile" };
+    if (diagnostic.code === "PLAN_CHANGED_DURING_READ") {
+      return [
+        "Piano autorevole cambiato durante la lettura",
+        `Artifact: ${view.planPath ?? "non disponibile"}`,
+        `Diagnostica: ${diagnostic.code}: ${diagnostic.message}`,
+        "Azione: attendi che la modifica sia completa, quindi osserva di nuovo lo stato.",
+      ].join("\n");
+    }
     return [
       "Piano autorevole non valido",
       `Artifact: ${view.planPath ?? "non disponibile"}`,
@@ -579,6 +777,10 @@ export function formatHumanTechnical(value) {
     `Handoff: ${view.handoff.id ?? "none"}; state=${view.handoff.state}`,
     `Advisor/context: ${view.runtimeSummary.context?.percent == null ? "unavailable" : `${Math.round(view.runtimeSummary.context.percent)}%`}; threshold=${view.runtimeSummary.context?.thresholdPercent ?? "unavailable"}%`,
     ...(diagnostic ? [`Diagnostic: ${diagnostic.code}: ${diagnostic.message}`] : []),
+    ...(runtime?.failure ? [
+      `Runtime failure code: ${runtime.failure.code}`,
+      `Runtime failure message: ${runtime.failure.message}`,
+    ] : []),
     ...view.handoff.recovery,
   ].join("\n");
 }

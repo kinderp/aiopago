@@ -9,6 +9,7 @@ import { createGuardianExtension } from "../src/extension.mjs";
 import {
   formatHumanNext,
   formatHumanStatus,
+  formatHumanTechnical,
   formatHumanWhy,
   formatPlan,
   observeRunnerHumanWorkflow,
@@ -44,6 +45,24 @@ function runnerFixture({ contextPercent = 35, handoff = null, latch = { state: "
   const path = writeLedger(root);
   const mutations = { handoff: 0, takeover: 0, resume: 0, editor: 0, provider: 0 };
   const ledger = new TaskLedger(path);
+  const initialPlan = ledger.read();
+  const authority = {
+    latch: structuredClone(latch),
+    handoff: handoff ? {
+      task_id: initialPlan.task_id,
+      source_session_id: "SESSION-SOURCE",
+      runner_instance_id: "RUNNER-UX",
+      task_plan_revision: initialPlan.plan_revision_id,
+      task_plan_digest: initialPlan.content_digest,
+      latch_generation: latch.generation,
+      authorization_state: "NOT_AUTHORIZED",
+      admission_state: "NOT_COMMITTED",
+      dispatch_state: "NOT_STARTED",
+      failure: null,
+      manual_recovery: [],
+      ...structuredClone(handoff),
+    } : null,
+  };
   const runner = {
     cwd: root,
     roots: { targetRoot: root, runtimeRoot: join(root, ".guardian", "runtime"), artifactRoot: join(root, ".guardian") },
@@ -51,10 +70,10 @@ function runnerFixture({ contextPercent = 35, handoff = null, latch = { state: "
     runnerInstanceId: "RUNNER-UX",
     runtime: { session: { sessionId: "SESSION-UX", model: { provider: "offline", id: "fake" }, thinkingLevel: "off" } },
     storage: {
-      getLatch: () => ({ ...latch }),
-      latestHandoffForTask: () => handoff ? structuredClone(handoff) : null,
+      getLatch: () => structuredClone(authority.latch),
+      latestHandoffForTask: () => authority.handoff ? structuredClone(authority.handoff) : null,
       getRunnerSessionBinding: () => null,
-      isAdmissionOpen: () => latch.state === "RELEASED",
+      isAdmissionOpen: () => authority.latch.state === "RELEASED",
     },
     handoffService: {
       observeGit: () => ({ repository_id: root.replaceAll("\\", "/"), workdir: root.replaceAll("\\", "/"), branch: "feat/ux", head_sha: "a".repeat(40), base_sha: "a".repeat(40), index_digest: "sha256:index", worktree_digest: "sha256:worktree" }),
@@ -70,7 +89,7 @@ function runnerFixture({ contextPercent = 35, handoff = null, latch = { state: "
     getContextUsage: () => ({ percent: contextPercent, tokens: contextPercent, contextWindow: 100 }),
     ui: { notify() {}, async confirm() { return false; }, setEditorText() { mutations.editor += 1; } },
   };
-  return { root, path, runner, ctx, mutations };
+  return { root, path, runner, ctx, mutations, authority };
 }
 
 function install(runner) {
@@ -91,6 +110,49 @@ function semantic(view) {
     objective: view.objective,
     currentActivity: view.currentActivity,
     progress: view.progress,
+  };
+}
+
+function verifiedObservation({ planValue = task(), runtime = {} } = {}) {
+  const plan = { valid: true, path: "/repo/TASK_PLAN.md", digest: "sha256:plan", plan: planValue };
+  return {
+    initialized: true,
+    targetRoot: "/repo",
+    plan,
+    runtime: {
+      available: true,
+      verified: true,
+      workflow: "LIVE_RUNNER",
+      condition: "LIVE_RUNNER",
+      error: null,
+      planIdentity: { taskId: planValue.task_id, revision: planValue.plan_revision_id, digest: plan.digest },
+      session: { id: "SESSION-1", runnerInstanceId: "RUNNER-1", model: "offline/fake", reasoning: "off", ownership: "source" },
+      latch: { state: "RELEASED", generation: 4, reason: null },
+      handoff: null,
+      context: { availability: "available", percent: 35, tokens: 35, contextWindow: 100, thresholdPercent: 50, recommended: false },
+      git: null,
+      ...runtime,
+    },
+  };
+}
+
+function verifiedHandoff(observation, overrides = {}) {
+  return {
+    handoff_id: "HO-1",
+    state: "RESUMED",
+    task_id: observation.plan.plan.task_id,
+    source_session_id: "SESSION-SOURCE",
+    target_session_id: "SESSION-1",
+    runner_instance_id: "RUNNER-1",
+    task_plan_revision: observation.plan.plan.plan_revision_id,
+    task_plan_digest: observation.plan.digest,
+    latch_generation: 3,
+    authorization_state: "AUTHORIZED",
+    admission_state: "COMMITTED",
+    dispatch_state: "ACKNOWLEDGED",
+    failure: null,
+    manual_recovery: [],
+    ...overrides,
   };
 }
 
@@ -155,6 +217,111 @@ test("runtime availability is explicit and live Runner facts remain derived rath
   assert.equal(Object.hasOwn(live, "storage"), false);
 });
 
+test("verified runtime coherence validator fails the public projector closed before every positive state", async (t) => {
+  const malformed = [
+    ["missing session ID", (o) => { delete o.runtime.session.id; }],
+    ["malformed session ID", (o) => { o.runtime.session.id = ""; }],
+    ["missing latch", (o) => { delete o.runtime.latch; }],
+    ["malformed latch generation", (o) => { o.runtime.latch.generation = "4"; }],
+    ["unknown latch state", (o) => { o.runtime.latch.state = "FUTURE"; }],
+    ["handoff state missing handoff ID", (o) => { o.runtime.handoff = verifiedHandoff(o); delete o.runtime.handoff.handoff_id; }],
+    ["failure state missing failure code", (o) => { o.runtime.handoff = verifiedHandoff(o, { state: "HANDOFF_FAILED", target_session_id: null, failure: { message: "failed" } }); }],
+    ["healthy workflow carrying a runtime error", (o) => { o.runtime.error = { code: "BROKEN", message: "contradiction" }; }],
+    ["healthy workflow carrying a top-level failure object", (o) => { o.runtime.failure = { code: "BROKEN", message: "contradiction" }; }],
+    ["malformed nested handoff object", (o) => { o.runtime.handoff = []; }],
+    ["mismatched runtime task binding", (o) => { o.runtime.planIdentity.taskId = "TASK-OTHER"; }],
+    ["unknown verified workflow", (o) => { o.runtime.workflow = "FUTURE_HEALTHY"; }],
+    ["malformed nested context", (o) => { o.runtime.context.percent = Number.NaN; }],
+  ];
+  for (const [name, mutate] of malformed) {
+    await t.test(name, () => {
+      const observation = verifiedObservation();
+      mutate(observation);
+      const view = projectHumanWorkflow(observation);
+      assert.equal(view.state, "NEEDS_ATTENTION");
+      assert.equal(view.runtimeSummary.verified, false);
+      assert.equal(view.technical.diagnostic.code, "RUNTIME_OBSERVATION_INVALID");
+      assert.doesNotMatch(view.state, /WORKING|COMPLETED/);
+    });
+  }
+
+  const working = projectHumanWorkflow(verifiedObservation());
+  assert.equal(working.state, "WORKING");
+  const donePlan = task();
+  donePlan.status = "DONE";
+  donePlan.current_item = null;
+  donePlan.next_item = null;
+  donePlan.task_items = donePlan.task_items.map((item) => ({ ...item, status: "DONE", evidence: ["verified"] }));
+  const completed = projectHumanWorkflow(verifiedObservation({ planValue: donePlan }));
+  assert.equal(completed.state, "COMPLETED");
+});
+
+test("technical output preserves nested handoff/continuity root failure identity without aliasing caller data", () => {
+  for (const [state, code, message] of [
+    ["HANDOFF_FAILED", "REPLACEMENT_SESSION_CREATE_UNKNOWN", "replacement outcome is ambiguous"],
+    ["CONTINUITY_FAILED", "REQUIRED_LOCAL_PATH_MISSING", "Required local path docs/resume.md is missing"],
+  ]) {
+    const observation = verifiedObservation({ runtime: { latch: { state: "ENGAGED", generation: 5, reason: "INTEGRITY" } } });
+    const failure = { code, message };
+    observation.runtime.handoff = verifiedHandoff(observation, { state, failure, manual_recovery: ["inspect safely"] });
+    const view = projectHumanWorkflow(observation);
+    assert.equal(view.technical.runtime.failure.code, code);
+    assert.notEqual(view.technical.runtime.failure, failure);
+    assert.equal(Object.isFrozen(view.technical.runtime.failure), true);
+    assert.equal(Object.isFrozen(failure), false);
+    const output = formatHumanTechnical(view);
+    assert.match(output, new RegExp(code));
+    assert.match(output, new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(output, /condition=LIVE_RUNNER/);
+    assert.match(output, new RegExp(`state=${state}`));
+    failure.code = "CALLER_MUTATED";
+    failure.message = "caller changed";
+    assert.equal(view.technical.runtime.failure.code, code);
+    assert.doesNotMatch(formatHumanTechnical(view), /CALLER_MUTATED|caller changed/);
+  }
+
+  const runtimeError = verifiedObservation();
+  runtimeError.runtime.verified = false;
+  runtimeError.runtime.workflow = "NEEDS_ATTENTION";
+  runtimeError.runtime.condition = "RUNTIME_READ_FAILED";
+  runtimeError.runtime.error = { code: "SQLITE_CORRUPT", message: "runtime database cannot be read" };
+  const runtimeOutput = formatHumanTechnical(projectHumanWorkflow(runtimeError));
+  assert.match(runtimeOutput, /SQLITE_CORRUPT/);
+  assert.match(runtimeOutput, /runtime database cannot be read/);
+
+  const noFailure = formatHumanTechnical(projectHumanWorkflow(verifiedObservation()));
+  assert.doesNotMatch(noFailure, /Runtime failure code:/);
+  const bounded = verifiedObservation();
+  bounded.runtime.verified = false;
+  bounded.runtime.condition = "RUNTIME_READ_FAILED";
+  bounded.runtime.workflow = "NEEDS_ATTENTION";
+  bounded.runtime.error = { code: "UNKNOWN_RUNTIME_DIAGNOSTIC", message: `unknown ${" detail".repeat(100)}` };
+  const boundedView = projectHumanWorkflow(bounded);
+  assert.equal(boundedView.technical.diagnostic.code, "UNKNOWN_RUNTIME_DIAGNOSTIC");
+  assert.ok(boundedView.technical.diagnostic.message.length <= 320);
+});
+
+test("PLAN_CHANGED_DURING_READ requests re-observation and does not describe plan corruption", () => {
+  const observation = {
+    initialized: true,
+    targetRoot: "/repo",
+    plan: {
+      valid: false,
+      path: "/repo/TASK_PLAN.md",
+      error: { code: "PLAN_CHANGED_DURING_READ", message: "plan moved" },
+    },
+    runtime: { available: false, verified: false },
+  };
+  const view = projectHumanWorkflow(observation);
+  assert.equal(view.state, "NEEDS_ATTENTION");
+  assert.equal(view.technical.diagnostic.code, "PLAN_CHANGED_DURING_READ");
+  assert.match(`${view.reason} ${view.nextAction}`, /cambiat|osserva di nuovo/i);
+  assert.doesNotMatch(`${view.reason} ${view.nextAction}`, /non è valido|correggi manualmente|plan --check/i);
+  const planOutput = formatPlan(view);
+  assert.match(planOutput, /cambiato durante la lettura|osserva di nuovo/i);
+  assert.doesNotMatch(planOutput, /non valido|plan --check|correggi manualmente/i);
+});
+
 test("invalid TASK_PLAN has the same projected state/reason/next in CLI and Pi without mutation", async () => {
   const x = runnerFixture();
   writeFileSync(x.path, "# invalid human plan\n");
@@ -182,24 +349,65 @@ test("technical disclosure retains plan, Runner, Git, latch, handoff, session, m
   for (const expected of ["TASK-UX", "PLAN-UX-1", "RUNNER-UX", "SESSION-UX", "offline/fake", "feat/ux", "generation=4", "HO-UX", "63%"] ) assert.match(output, new RegExp(expected.replace("/", "\\/")));
 });
 
-function advisorHarness({ decision = true, handoffImpl = null } = {}) {
-  const x = runnerFixture({ contextPercent: 60 });
+test("/aio status technical renders exact durable continuity failure code and message", async () => {
+  const x = runnerFixture({
+    latch: { state: "ENGAGED", generation: 7, reason: "INTEGRITY" },
+    handoff: {
+      handoff_id: "HO-CONTINUITY",
+      state: "CONTINUITY_FAILED",
+      target_session_id: "SESSION-UX",
+      failure: { code: "REQUIRED_LOCAL_PATH_MISSING", message: "Required local path docs/local.md is missing" },
+    },
+  });
+  const notices = [];
+  x.ctx.ui.notify = (text) => notices.push(text);
+  const { commands } = install(x.runner);
+  await commands.get("aio").handler("status technical", x.ctx);
+  assert.match(notices[0], /CONTINUITY_FAILED/);
+  assert.match(notices[0], /REQUIRED_LOCAL_PATH_MISSING/);
+  assert.match(notices[0], /Required local path docs\/local\.md is missing/);
+});
+
+function runnerHandoff(x, overrides = {}) {
+  const plan = x.runner.ledger.read();
+  return {
+    handoff_id: "HO-OLD",
+    state: "RESUMED",
+    task_id: plan.task_id,
+    source_session_id: "SESSION-SOURCE",
+    target_session_id: x.runner.runtime.session.sessionId,
+    runner_instance_id: x.runner.runnerInstanceId,
+    task_plan_revision: plan.plan_revision_id,
+    task_plan_digest: plan.content_digest,
+    latch_generation: Math.max(0, x.authority.latch.generation - 1),
+    authorization_state: "AUTHORIZED",
+    admission_state: "COMMITTED",
+    dispatch_state: "ACKNOWLEDGED",
+    failure: null,
+    manual_recovery: [],
+    ...overrides,
+  };
+}
+
+function advisorHarness({ decision = true, handoffImpl = null, handoff = null } = {}) {
+  const x = runnerFixture({ contextPercent: 60, handoff });
   let admissionOpen = true;
   x.runner.storage.isAdmissionOpen = () => admissionOpen;
   x.runner.handoffFromCommand = handoffImpl ?? (async (_ctx, mode) => { assert.equal(mode, "confirm"); x.mutations.handoff += 1; });
   const confirmations = [];
+  const notices = [];
   let resolveDecision;
   const pendingDecision = decision === "deferred" ? new Promise((resolve) => { resolveDecision = resolve; }) : null;
   const ctx = {
     ...x.ctx,
     ui: {
-      notify() {},
+      notify(text, type) { notices.push({ text, type }); },
       async confirm(_title, text) { confirmations.push(text); return pendingDecision ?? decision; },
       setEditorText() { throw new Error("editor command ceremony is forbidden"); },
     },
   };
   const installed = install(x.runner);
-  return { ...x, ...installed, ctx, confirmations, resolveDecision, setAdmission(value) { admissionOpen = value; } };
+  return { ...x, ...installed, ctx, confirmations, notices, resolveDecision, setAdmission(value) { admissionOpen = value; } };
 }
 
 test("guided advisor NO performs no handoff mutation and YES invokes the trusted use case exactly once without editor ceremony", async () => {
@@ -218,6 +426,65 @@ test("guided advisor NO performs no handoff mutation and YES invokes the trusted
   assert.equal(yes.mutations.editor, 0);
 });
 
+test("guided preparation consent is bound to exact plan/session/latch/handoff/Runner authority identity", async (t) => {
+  async function stale(name, mutate, options = {}) {
+    await t.test(name, async () => {
+      const x = advisorHarness({ decision: "deferred", ...options });
+      const pending = x.handlers.get("turn_end")({}, x.ctx);
+      assert.equal(x.confirmations.length, 1, "identity is captured before the prompt is displayed");
+      await mutate(x);
+      x.resolveDecision(true);
+      await pending;
+      assert.equal(x.mutations.handoff, 0, "stale YES must not cross the trusted mutation boundary");
+      assert.equal(x.notices.length, 1);
+      assert.match(x.notices[0].text, /stato è cambiato.*handoff non è stato avviato/i);
+    });
+  }
+
+  await stale("plan revision changes during prompt", (x) => {
+    writeLedger(x.root, { ...task(), plan_revision_id: "PLAN-R1-2", updated_at: "2026-08-22T00:01:00.000Z" });
+  });
+  await stale("plan digest changes while revision and visible status remain", (x) => {
+    writeLedger(x.root, { ...task(), objective: "Same status, different authoritative plan bytes." });
+  });
+  await stale("plan and session both move from R1/S1 to R2/S2", (x) => {
+    writeLedger(x.root, { ...task(), plan_revision_id: "PLAN-R1-2", updated_at: "2026-08-22T00:01:00.000Z" });
+    x.runner.runtime.session = { ...x.runner.runtime.session, sessionId: "SESSION-S2" };
+  });
+  await stale("session ID changes with the same model", (x) => {
+    x.runner.runtime.session = { ...x.runner.runtime.session, sessionId: "SESSION-S2" };
+  });
+  await stale("latch state changes", (x) => {
+    x.authority.latch = { state: "ENGAGED", generation: 5, reason: "HUMAN_TAKEOVER" };
+  });
+  await stale("latch ABA returns RELEASED with a new generation", (x) => {
+    x.authority.latch = { state: "RELEASED", generation: 5, reason: null };
+  });
+  await stale("handoff appears while prompt is open", (x) => {
+    x.authority.handoff = runnerHandoff(x, { handoff_id: "HO-NEW" });
+  });
+  await stale("existing terminal handoff identity changes", (x) => {
+    x.authority.handoff.handoff_id = "HO-CHANGED";
+  }, { handoff: { handoff_id: "HO-OLD", state: "RESUMED", target_session_id: "SESSION-UX" } });
+  await stale("Runner instance replacement invalidates consent", (x) => {
+    x.runner.runnerInstanceId = "RUNNER-REPLACEMENT";
+  });
+
+  await t.test("no state movement invokes trusted handoff exactly once", async () => {
+    const x = advisorHarness({ decision: true });
+    await x.handlers.get("turn_end")({}, x.ctx);
+    assert.equal(x.mutations.handoff, 1);
+  });
+  await t.test("context percentage movement alone does not stale authority consent", async () => {
+    const x = advisorHarness({ decision: "deferred" });
+    const pending = x.handlers.get("turn_end")({}, x.ctx);
+    x.ctx.getContextUsage = () => ({ percent: 88, tokens: 88, contextWindow: 100 });
+    x.resolveDecision(true);
+    await pending;
+    assert.equal(x.mutations.handoff, 1);
+  });
+});
+
 test("guided advisor deduplicates concurrent events and cancels safely on takeover/existing handoff/session shutdown", async (t) => {
   await t.test("two turn_end events", async () => {
     const x = advisorHarness({ decision: "deferred" });
@@ -231,6 +498,7 @@ test("guided advisor deduplicates concurrent events and cancels safely on takeov
   await t.test("takeover wins during prompt", async () => {
     const x = advisorHarness({ decision: "deferred" });
     const pending = x.handlers.get("turn_end")({}, x.ctx);
+    x.authority.latch = { state: "ENGAGED", generation: 1, reason: "HUMAN_TAKEOVER" };
     x.setAdmission(false);
     x.resolveDecision(true);
     await pending;

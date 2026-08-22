@@ -63,9 +63,22 @@ test("Context Handoff Advisor invokes the trusted handoff use case once only aft
   let prepared = null;
   let automaticHandoffs = 0;
   const decisions = [false, true];
+  const root = temp();
+  const ledgerPath = join(root, "TASK_PLAN.md");
+  minimalLedger(ledgerPath);
   const runner = {
-    ledger: { read: () => ({ task_id: "TASK-T" }) },
-    storage: { isAdmissionOpen: () => true },
+    cwd: root,
+    roots: { targetRoot: root, runtimeRoot: join(root, ".guardian", "runtime"), artifactRoot: join(root, ".guardian") },
+    ledger: new TaskLedger(ledgerPath),
+    runnerInstanceId: "RUNNER-ADVISOR",
+    runtime: { session: { sessionId: "SESSION-ADVISOR", model: { provider: "offline", id: "fake" }, thinkingLevel: "off" } },
+    storage: {
+      isAdmissionOpen: () => true,
+      getLatch: () => ({ state: "RELEASED", generation: 0, reason: null }),
+      latestHandoffForTask: () => null,
+      getRunnerSessionBinding: () => null,
+    },
+    handoffService: { observeGit: () => ({}) },
     contextAdvisor: new ContextHandoffAdvisor({ thresholdPercent: 50 }),
     metrics: {
       captureModelCall() { throw new Error("telemetry must not alter advisor behavior"); },
@@ -247,10 +260,16 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
   const runner = {
     calibration: null,
     ledger: new TaskLedger(path),
+    roots: { targetRoot: root, runtimeRoot: join(root, ".guardian", "runtime"), artifactRoot: join(root, ".guardian") },
+    runnerInstanceId: "RUNNER-RECOVERED-LEDGER",
+    runtime: { session: { sessionId: "SESSION-RECOVERED-LEDGER", model: { provider: "offline", id: "fake" }, thinkingLevel: "off" } },
     storage: {
       isAdmissionOpen() { admissionChecks += 1; return true; },
-      latestHandoffForTask() { throw new Error("invalid status must not inspect handoffs"); },
+      getLatch() { return { state: "RELEASED", generation: 0, reason: null }; },
+      latestHandoffForTask() { return null; },
+      getRunnerSessionBinding() { return null; },
     },
+    handoffService: { observeGit: () => ({}) },
     contextAdvisor: {
       thresholdPercent: 50,
       reset() {},
@@ -320,7 +339,7 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
   await handlers.get("turn_end")({}, ctx);
   assert.equal(admissionChecks, 2);
   assert.equal(advisorObservations, 1);
-  assert.equal(contextReads, 1);
+  assert.equal(contextReads, 2, "advisor plus eligibility observation read context without making it authority identity");
   assert.equal(confirmations, 1);
 });
 

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { canonicalJson, digestObject, sha256 } from "../src/canonical.mjs";
+import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState } from "../src/git-state.mjs";
 import { HandoffService } from "../src/handoff.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
@@ -184,19 +185,53 @@ test("Pi SDK E2E: /aio status, why, next and plan use the shared read-only proje
     const countersBefore = x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get();
     const latchBefore = x.runner.storage.getLatch("TASK-E2E");
 
-    for (const command of ["/aio status", "/aio why", "/aio next", "/aio plan"]) await x.runner.runtime.session.prompt(command);
+    for (const command of ["/aio status", "/aio why", "/aio next", "/aio plan", "/aio status technical", "/aio plan technical"]) await x.runner.runtime.session.prompt(command);
 
-    assert.equal(notifications.length, 4);
+    assert.equal(notifications.length, 6);
     assert.match(notifications[0].text, /^Aiopago — /);
     assert.match(notifications[0].text, /Pi real runtime handoff/);
     assert.match(notifications[1].text, /^Perché/);
     assert.match(notifications[2].text, /^Prossima azione:/);
     assert.match(notifications[3].text, /^Piano autorevole: E2E/);
+    assert.match(notifications[4].text, /^Aiopago status — technical/);
+    assert.match(notifications[4].text, /TASK-E2E.*PLAN-E2E-1|Task: TASK-E2E revision=PLAN-E2E-1/);
+    assert.match(notifications[5].text, /^Aiopago plan — technical/);
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
     assert.deepEqual(readFileSync(join(x.root, "TASK_PLAN.md")), planBefore);
     assert.deepEqual(x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get(), countersBefore);
     assert.deepEqual(x.runner.storage.getLatch("TASK-E2E"), latchBefore);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("Pi SDK Runner boundary: plan movement while guided confirmation is open rejects stale YES before handoff", async () => {
+  const x = await makeRunner();
+  try {
+    const handlers = new Map();
+    createGuardianExtension(x.runner)({ registerCommand() {}, on(name, handler) { handlers.set(name, handler); } });
+    x.runner.contextAdvisor.observe = () => ({ percent: 60, thresholdPercent: 50 });
+    let resolveConfirmation;
+    const confirmation = new Promise((resolve) => { resolveConfirmation = resolve; });
+    let trustedInvocations = 0;
+    x.runner.handoffFromCommand = async () => { trustedInvocations += 1; };
+    const notices = [];
+    const ctx = {
+      hasUI: true,
+      getContextUsage: () => ({ percent: 60, tokens: 60, contextWindow: 100 }),
+      ui: {
+        confirm: async () => confirmation,
+        notify(text, type) { notices.push({ text, type }); },
+      },
+    };
+    const pending = handlers.get("turn_end")({}, ctx);
+    writeFixtureLedger(x.root, true);
+    resolveConfirmation(true);
+    await pending;
+    assert.equal(trustedInvocations, 0);
+    assert.match(notices.at(-1).text, /stato è cambiato.*handoff non è stato avviato/i);
+    assert.equal(x.runner.storage.latestHandoffForTask("TASK-E2E"), null);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
