@@ -317,18 +317,24 @@ export class TaskLedger {
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
     this.writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
+    const coordinateExactPlan = (expected, use, code, message) => this.writer.coordinate({
+      validate: validateTaskLedger,
+      use: (observed) => {
+        const plan = ledgerResult(observed.task, observed.contentDigest, this.path);
+        invariant(plan.task_id === expected?.taskId
+          && plan.plan_revision_id === expected?.planRevisionId
+          && plan.content_digest === expected?.contentDigest,
+        code, message);
+        return use(plan);
+      },
+    });
     registerTrustedHandoffPlanCapability(this, {
-      attest: (expected, reserve) => this.writer.coordinate({
-        validate: validateTaskLedger,
-        use: (observed) => {
-          const plan = ledgerResult(observed.task, observed.contentDigest, this.path);
-          invariant(plan.task_id === expected?.taskId
-            && plan.plan_revision_id === expected?.planRevisionId
-            && plan.content_digest === expected?.contentDigest,
-          "HANDOFF_CONSENT_STALE", "The authoritative plan changed before durable handoff reservation");
-          return reserve();
-        },
-      }),
+      attest: (expected, reserve) => coordinateExactPlan(
+        expected, reserve, "HANDOFF_CONSENT_STALE", "The authoritative plan changed before durable handoff reservation",
+      ),
+      attestRecovery: (expected, capture) => coordinateExactPlan(
+        expected, capture, "PLAN_REVISION_MISMATCH", "The authoritative plan no longer matches the failed handoff recovery provenance",
+      ),
     });
   }
 

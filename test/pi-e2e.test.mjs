@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState } from "../src/git-state.mjs";
 import { guidedHandoffEligibilityIdentityFromAuthority } from "../src/handoff-consent.mjs";
 import { HandoffService } from "../src/handoff.mjs";
+import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
 import { readRuntimeRunnerBinding, RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
@@ -50,7 +51,7 @@ function writeFixtureLedger(root, advanced = false, modelPolicy = "offline-fake/
     ...(requiredLocalPaths ? { required_local_paths: requiredLocalPaths } : {}),
     task_items: [setup, handoff],
   };
-  writeFileSync(join(root, "TASK_PLAN.md"), `# E2E Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
+  writeFileSync(join(root, "TASK_PLAN.md"), `# E2E Ledger\n\n**Schema:** \`aiopago.task-ledger/0.1.0\`\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
 function fixtureLedger(root, modelPolicy = "offline-fake/offline-fake", requiredLocalPaths = undefined) {
@@ -83,7 +84,7 @@ function writeOwnerGateLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null } = {}) {
+async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null, modelReasoning = false, reasoningPolicy = "off" } = {}) {
   const root = existingRoot ?? mkdtempSync(join(tmpdir(), "aiopago-pi-e2e-"));
   if (!existingRoot) {
     fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake", requiredLocalPaths);
@@ -94,7 +95,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   const pi = await loadPi();
   const credentials = new pi.ai.InMemoryCredentialStore();
   const modelRuntime = await pi.coding.ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
-  const model = { id: "offline-fake", name: "Offline fake", api: "openai-completions", provider: "offline-fake", baseUrl: "offline://local", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 };
+  const model = { id: "offline-fake", name: "Offline fake", api: "openai-completions", provider: "offline-fake", baseUrl: "offline://local", reasoning: modelReasoning, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 };
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
   let calls = 0;
   let networkAttempts = 0;
@@ -113,7 +114,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const sessions = mkdtempSync(join(tmpdir(), "aiopago-pi-sessions-"));
-  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy: "off", contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
+  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
   await runner.runtime.session.bindExtensions({
     mode: "print",
     commandContextActions: {
@@ -128,8 +129,8 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   return { root, runner, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
 }
 
-async function makeContinuityRecoveryFixture() {
-  let previous = await makeRunner();
+async function makeContinuityRecoveryFixture(options = {}) {
+  let previous = await makeRunner(options);
   try {
     previous.runner.handoffService.continuity = () => {
       const error = new Error("forced M-06 continuity failure fixture");
@@ -146,7 +147,7 @@ async function makeContinuityRecoveryFixture() {
     await previous.runner.dispose();
     previous.restoreFetch();
     previous = null;
-    const current = await makeRunner({ existingRoot: root });
+    const current = await makeRunner({ ...options, existingRoot: root });
     return { ...current, failed };
   } catch (error) {
     if (previous) {
@@ -174,6 +175,36 @@ function instrumentRecoveryPreparation(runner) {
     return prepare(...args);
   };
   return () => calls;
+}
+
+function prepareRecoveryPlanChange(root, suffix = "M07") {
+  const adapter = createPlanAdapter(join(root, "TASK_PLAN.md"));
+  const observation = adapter.observe();
+  const candidate = structuredClone(observation.plan);
+  candidate.plan_revision_id = `${observation.plan_revision_id}-${suffix}`;
+  candidate.updated_at = "2026-08-22T23:59:00.000Z";
+  candidate.objective = `${candidate.objective} (${suffix} drift)`;
+  const proposal = adapter.propose({
+    schema: PLAN_INTENT_SCHEMA,
+    proposal_id: `PPR-${suffix}-${Date.now()}`,
+    producer: "aiopago:m07-real-plan-port",
+    change_reason: "Exercise final recovery plan coordination.",
+    base: {
+      task_id: observation.task_id,
+      plan_revision_id: observation.plan_revision_id,
+      content_digest: observation.content_digest,
+    },
+    candidate_plan: candidate,
+  });
+  return { adapter, observation, proposal, apply: () => adapter.apply(proposal) };
+}
+
+function recoveryAttackSnapshot(runner, failedHandoffId) {
+  return {
+    ...recoveryDurableSnapshot(runner, failedHandoffId),
+    activeSources: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM active_sources").get().count,
+    recoveryChildren: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE projection_json LIKE ?").get(`%\"recovery_of_handoff_id\":\"${failedHandoffId}\"%`).count,
+  };
 }
 
 function convertFailedManifestToLegacyV1(runner, failed) {
@@ -415,6 +446,236 @@ test("M-06 Pi recovery revalidates the actual registered source lifecycle before
       assert.equal(x.networkAttempts, 0);
     } finally { await x.runner.dispose(); x.restoreFetch(); }
   });
+});
+
+test("M-07 actual Pi recovery re-attests every mutable SafePoint precondition before atomic preparation/reservation", async (t) => {
+  async function runAttack(name, { options = {}, mutate, restore, errorCodes, restartForRetry = false, waitKind = "idle" }) {
+    await t.test(name, async () => {
+      let x = await makeContinuityRecoveryFixture(options);
+      try {
+        const source = x.runner.runtime.session;
+        const durableBefore = recoveryAttackSnapshot(x.runner, x.failed.handoff_id);
+        const latchBefore = x.runner.storage.getLatch(x.failed.task_id);
+        const prepareCalls = instrumentRecoveryPreparation(x.runner);
+        const waitForIdle = source.waitForIdle.bind(source);
+        const waitForNoStreams = x.runner.gate.waitForNoStreams.bind(x.runner.gate);
+        const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+        let replacementAttempts = 0;
+        x.runner.runtime.newSession = (...args) => { replacementAttempts += 1; return newSession(...args); };
+        if (waitKind === "streams") {
+          x.runner.gate.activeStreams = 1;
+          x.runner.gate.waitForNoStreams = async (...args) => {
+            await mutate(x, source);
+            x.runner.gate.streamDone();
+            return waitForNoStreams(...args);
+          };
+        } else {
+          source.waitForIdle = async () => { await waitForIdle(); await mutate(x, source); };
+        }
+        await assert.rejects(
+          () => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }),
+          (error) => errorCodes.includes(error.code),
+        );
+        source.waitForIdle = waitForIdle;
+        x.runner.gate.waitForNoStreams = waitForNoStreams;
+        x.runner.runtime.newSession = newSession;
+        assert.deepEqual(recoveryAttackSnapshot(x.runner, x.failed.handoff_id), durableBefore);
+        assert.equal(x.runner.storage.getRunnerSessionBinding(x.failed.handoff_id).status, "ACTIVE");
+        assert.equal(prepareCalls(), 0);
+        assert.equal(replacementAttempts, 0);
+        assert.equal(x.calls, 0);
+        assert.equal(x.networkAttempts, 0);
+        assert.deepEqual(x.runner.storage.getLatch(x.failed.task_id), latchBefore);
+        await restore(x, source);
+
+        if (restartForRetry) {
+          const root = x.root;
+          const failed = x.failed;
+          await x.runner.dispose(); x.restoreFetch();
+          x = await makeRunner({ ...options, existingRoot: root });
+          x.failed = failed;
+        }
+        const recovered = await x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false });
+        assert.equal(recovered.state, "RESUME_READY");
+        assert.equal(recovered.recovery_of_handoff_id, x.failed.handoff_id);
+        assert.equal(x.runner.storage.getRunnerSessionBinding(x.failed.handoff_id).status, "SUPERSEDED");
+        assert.equal(x.networkAttempts, 0);
+      } finally {
+        if (x?.runner) await x.runner.dispose();
+        x?.restoreFetch();
+      }
+    });
+  }
+
+  await runAttack("real PlanPort P1 to P2 drift wins before final coordination", {
+    mutate: async (x) => {
+      x.planBytes = readFileSync(join(x.root, "TASK_PLAN.md"));
+      x.planWriter = prepareRecoveryPlanChange(x.root, "PLAN-DRIFT");
+      x.planWriter.apply();
+    },
+    restore: async (x) => { writeFileSync(join(x.root, "TASK_PLAN.md"), x.planBytes); },
+    errorCodes: ["PLAN_REVISION_MISMATCH"],
+  });
+
+  await runAttack("real PlanPort P1 to P2 drift during waitForNoStreams", {
+    waitKind: "streams",
+    mutate: async (x) => {
+      x.planBytes = readFileSync(join(x.root, "TASK_PLAN.md"));
+      x.planWriter = prepareRecoveryPlanChange(x.root, "PLAN-STREAM-DRIFT");
+      x.planWriter.apply();
+    },
+    restore: async (x) => { writeFileSync(join(x.root, "TASK_PLAN.md"), x.planBytes); },
+    errorCodes: ["PLAN_REVISION_MISMATCH"],
+  });
+
+  await runAttack("real Git G1 to G2 drift", {
+    mutate: async (x) => { x.driftPath = join(x.root, "drift.txt"); writeFileSync(x.driftPath, "M-07 drift\n"); },
+    restore: async (x) => { unlinkSync(x.driftPath); },
+    errorCodes: ["GIT_STATE_MISMATCH"],
+  });
+
+  await runAttack("actual AgentSession.setModel model drift", {
+    mutate: async (x, source) => {
+      x.originalModel = source.model;
+      await source.setModel({ ...source.model, id: "offline-fake-m07" });
+    },
+    restore: async (x, source) => { await source.setModel(x.originalModel); },
+    errorCodes: ["MODEL_POLICY_MISMATCH"],
+  });
+
+  await runAttack("actual AgentSession.setThinkingLevel reasoning drift", {
+    options: { modelReasoning: true, reasoningPolicy: "low" },
+    mutate: async (_x, source) => { source.setThinkingLevel("high"); },
+    restore: async (_x, source) => { source.setThinkingLevel("low"); },
+    errorCodes: ["REASONING_POLICY_MISMATCH"],
+  });
+
+  await runAttack("actual SessionManager.appendMessage history drift", {
+    mutate: async (_x, source) => {
+      source.sessionManager.appendMessage({ role: "user", content: "M-07 history drift", timestamp: Date.now() });
+    },
+    restore: async () => {},
+    errorCodes: ["CONTINUITY_RECOVERY_SOURCE_INVALID"],
+    restartForRetry: true,
+  });
+
+  for (const kind of ["checkpoint", "manifest"]) {
+    await runAttack(`real sealed ${kind} tamper`, {
+      mutate: async (x) => {
+        const id = kind === "checkpoint" ? x.failed.checkpoint_id : x.failed.resume_manifest_id;
+        const index = x.runner.storage.getArtifact(kind, id);
+        x.artifactPath = index.path;
+        x.artifactBytes = readFileSync(index.path);
+        writeFileSync(index.path, Buffer.concat([x.artifactBytes, Buffer.from(" ")]));
+      },
+      restore: async (x) => { writeFileSync(x.artifactPath, x.artifactBytes); },
+      errorCodes: [kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH"],
+    });
+  }
+
+  await t.test("preparation and recovery-child reservation roll back as one SQLite arbitration", async () => {
+    const x = await makeContinuityRecoveryFixture();
+    try {
+      const before = recoveryAttackSnapshot(x.runner, x.failed.handoff_id);
+      const append = x.runner.storage.appendEvent.bind(x.runner.storage);
+      let replacementAttempts = 0;
+      const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+      x.runner.runtime.newSession = (...args) => { replacementAttempts += 1; return newSession(...args); };
+      x.runner.storage.appendEvent = (type, ...args) => {
+        if (type === "HANDOFF_STARTED") throw new Error("forced recovery child journal failure");
+        return append(type, ...args);
+      };
+      await assert.rejects(() => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }), /forced recovery child journal failure/);
+      assert.deepEqual(recoveryAttackSnapshot(x.runner, x.failed.handoff_id), before);
+      assert.equal(x.runner.storage.getRunnerSessionBinding(x.failed.handoff_id).status, "ACTIVE");
+      assert.equal(replacementAttempts, 0);
+      assert.equal(x.calls, 0);
+      assert.equal(x.networkAttempts, 0);
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
+
+  for (const race of ["failed handoff state", "failed binding", "durable authorization evidence"]) {
+    await t.test(`${race} movement during SafePoint fails without a recovery child`, async () => {
+      const x = await makeContinuityRecoveryFixture();
+      try {
+        const source = x.runner.runtime.session;
+        const initialChildren = recoveryAttackSnapshot(x.runner, x.failed.handoff_id).recoveryChildren;
+        let replacementAttempts = 0;
+        const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+        x.runner.runtime.newSession = (...args) => { replacementAttempts += 1; return newSession(...args); };
+        const waitForIdle = source.waitForIdle.bind(source);
+        source.waitForIdle = async () => {
+          await waitForIdle();
+          if (race === "failed handoff state") {
+            const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
+            failed.state = "HANDOFF_FAILED";
+            x.runner.storage.saveHandoff(failed);
+          } else if (race === "failed binding") {
+            x.runner.storage.supersedeRunnerSessionBinding(x.failed.handoff_id, "authorized concurrent reconciliation test");
+          } else {
+            x.runner.storage.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+              .run(x.failed.resume_prompt_id, x.failed.handoff_id, "human:concurrent", x.failed.latch_generation, "2026-08-22T23:59:59.000Z");
+          }
+        };
+        await assert.rejects(
+          () => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }),
+          (error) => ["CONTINUITY_RECOVERY_NOT_ALLOWED", "CONTINUITY_RECOVERY_SOURCE_INVALID", "CONTINUITY_RECOVERY_UNSAFE"].includes(error.code),
+        );
+        assert.equal(recoveryAttackSnapshot(x.runner, x.failed.handoff_id).recoveryChildren, initialChildren);
+        assert.equal(x.runner.storage.events(x.failed.handoff_id).some((event) => event.event_type === "CONTINUITY_RECOVERY_STARTED"), false);
+        assert.equal(replacementAttempts, 0);
+        assert.equal(x.calls, 0);
+        assert.equal(x.networkAttempts, 0);
+      } finally { await x.runner.dispose(); x.restoreFetch(); }
+    });
+  }
+});
+
+test("M-07 recovery-first final coordination reserves immutable R-star provenance before later P2/G2/M2", async () => {
+  const x = await makeContinuityRecoveryFixture();
+  try {
+    const p1 = x.runner.ledger.read();
+    const g1 = observeGitState(x.root);
+    const m1 = `${x.runner.runtime.session.model.provider}/${x.runner.runtime.session.model.id}`;
+    const writer = prepareRecoveryPlanChange(x.root, "AFTER-R-STAR");
+    const source = x.runner.runtime.session;
+    const prepare = x.runner.storage.prepareContinuityRecovery.bind(x.runner.storage);
+    let writerWhileRecoveryHeldCode = null;
+    x.runner.storage.prepareContinuityRecovery = (...args) => {
+      try { writer.apply(); } catch (error) { writerWhileRecoveryHeldCode = error.code; }
+      return prepare(...args);
+    };
+    x.runner.handoffService.testHooks = {
+      async afterReservation({ handoff }) {
+        x.reservedChild = structuredClone(handoff);
+        writer.apply();
+        writeFileSync(join(x.root, "post-attestation-drift.txt"), "G2\n");
+        await source.setModel({ ...source.model, id: "offline-fake-after-r-star" });
+      },
+    };
+    await assert.rejects(
+      () => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }),
+      (error) => ["PLAN_REVISION_MISMATCH", "GIT_STATE_MISMATCH"].includes(error.code),
+    );
+    const child = x.runner.storage.getHandoff(x.reservedChild.handoff_id);
+    assert.equal(writerWhileRecoveryHeldCode, "PLAN_WRITE_LOCKED", "the compliant P2 writer cannot interleave while recovery holds final plan coordination");
+    assert.equal(child.task_plan_revision, p1.plan_revision_id);
+    assert.equal(child.task_plan_digest, p1.content_digest);
+    assert.equal(child.current_item, p1.current_item);
+    assert.equal(child.next_item, p1.next_item);
+    assert.equal(child.next_step, p1.next_step);
+    assert.equal(child.model_policy, m1);
+    assert.equal(child.reasoning_policy, "off");
+    assert.equal(child.recovery_of_handoff_id, x.failed.handoff_id);
+    assert.equal(child.expected_git_state.index_digest, g1.index_digest);
+    assert.equal(child.expected_git_state.worktree_digest, g1.worktree_digest);
+    assert.notEqual(x.runner.ledger.read().plan_revision_id, child.task_plan_revision);
+    assert.equal(child.expected_git_state.status_entries.includes("?? post-attestation-drift.txt"), false);
+    assert.equal(x.runner.storage.events(x.failed.handoff_id).filter((event) => event.event_type === "CONTINUITY_RECOVERY_STARTED").length, 1);
+    assert.equal(x.runner.storage.events(child.handoff_id).filter((event) => event.event_type === "HANDOFF_STARTED").length, 1);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
 test("Pi E2E: explicit /aio resume confirmation NO keeps the target paused and YES resumes once", async () => {
