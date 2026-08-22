@@ -11,7 +11,7 @@
 | **0.2-B — Plan Proposal Foundation** | Plan Port mutating, proposal, compare-and-swap, validazione/materializzazione, diff e provenance minima | **CLOSED / ACCEPTED**; due round indipendenti CLEAN sul candidate `7d53b6e5c99557c70f9e2aa89039618ca0ca7fe6` |
 | **0.2-C — Intent Adapter minimo** | `plan.observe/propose/validate/diff/apply` | **CLOSED / ACCEPTED**; candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70`, independent gate 2/2 CLEAN, merge `488c4fd696003a6987ea50996bbab644e63ab56c` |
 | **0.2-D — Start da obiettivo** | `aio start <obiettivo>` con planning agent-driven e autorizzazione | **CLOSED / ACCEPTED**; candidate `95b0c93baab323c4cddd12b030d62798f035ed37`, independent gate 2/2 CLEAN, merge `f670b6ea81980cdfd33b69d2f4817964a47d878a` |
-| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | **READY FOR INDEPENDENT REVIEW**; issue #30, independent gate 0/2 |
+| **0.2-E — UX interattiva unificata** | Projection condivisa nel TUI e handoff umano semplificato | **READY FOR INDEPENDENT REVIEW**; issue #30, draft PR #31, independent gate 0/2 |
 | **0.2-F — Stop e ripresa durable** | Sospensione distinta dal takeover e continuity cross-process | **NOT STARTED / BLOCKED** da acceptance 0.2-E; richiede protocollo core dedicato |
 | **0.2-G — Block/unblock umano** | Human Action Broker minimo e blocker strutturati | Nessuna inferenza autonoma di completion |
 | **0.2-H — Completamento guidato** | Verifica criteria/evidence e chiusura confermata | `DONE` non implica acceptance esterna |
@@ -24,7 +24,7 @@ Gate vincolante dopo 0.2-A:
 2. **0.2-B Plan Proposal Foundation: CLOSED / ACCEPTED** dopo due round indipendenti CLEAN;
 3. **0.2-C Intent Adapter minimo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN;
 4. **0.2-D Start da obiettivo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN; PR #28 merged e issue #27 completed;
-5. **0.2-E UX interattiva unificata: READY FOR INDEPENDENT REVIEW**, issue #30, branch dedicato `feat/unified-human-ux-0.2-e`; independent gate 0/2.
+5. **0.2-E UX interattiva unificata: READY FOR INDEPENDENT REVIEW**, issue #30, draft PR #31, branch dedicato `feat/unified-human-ux-0.2-e`; independent gate 0/2.
 
 La migration di nome e le slice 0.2-A, 0.2-B, 0.2-C e 0.2-D restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti. 0.2-E unifica ora la projection read-only usata da CLI e Pi e adatta il consenso handoff alla use case esistente; non cambia autorità plan/latch/handoff/resume. 0.2-F resta non iniziata e bloccata dall’acceptance 0.2-E.
 
