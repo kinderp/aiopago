@@ -128,6 +128,54 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   return { root, runner, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
 }
 
+async function makeContinuityRecoveryFixture() {
+  let previous = await makeRunner();
+  try {
+    previous.runner.handoffService.continuity = () => {
+      const error = new Error("forced M-06 continuity failure fixture");
+      error.code = "CONTINUITY_FAILED";
+      throw error;
+    };
+    await assert.rejects(
+      () => previous.runner.handoffDirect({ mode: "manual", confirm: false }),
+      (error) => error.code === "CONTINUITY_FAILED",
+    );
+    const failed = previous.runner.storage.latestHandoffForTask("TASK-E2E");
+    assert.equal(previous.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+    const root = previous.root;
+    await previous.runner.dispose();
+    previous.restoreFetch();
+    previous = null;
+    const current = await makeRunner({ existingRoot: root });
+    return { ...current, failed };
+  } catch (error) {
+    if (previous) {
+      await previous.runner.dispose();
+      previous.restoreFetch();
+    }
+    throw error;
+  }
+}
+
+function recoveryDurableSnapshot(runner, failedHandoffId) {
+  return {
+    handoffs: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count,
+    recoveryStarted: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(failedHandoffId).count,
+    bindingSuperseded: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='RUNNER_SESSION_BINDING_SUPERSEDED'").get(failedHandoffId).count,
+    bindingStatus: runner.storage.getRunnerSessionBinding(failedHandoffId).status,
+  };
+}
+
+function instrumentRecoveryPreparation(runner) {
+  const prepare = runner.storage.prepareContinuityRecovery.bind(runner.storage);
+  let calls = 0;
+  runner.storage.prepareContinuityRecovery = (...args) => {
+    calls += 1;
+    return prepare(...args);
+  };
+  return () => calls;
+}
+
 function convertFailedManifestToLegacyV1(runner, failed) {
   const index = runner.storage.getArtifact("manifest", failed.resume_manifest_id);
   const envelope = JSON.parse(readFileSync(index.path, "utf8"));
@@ -269,6 +317,104 @@ test("Pi SDK lifecycle: registered session_shutdown during SafePoint invalidates
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-06 Pi recovery revalidates the actual registered source lifecycle before durable preparation", async (t) => {
+  for (const waitKind of ["waitForIdle", "waitForNoStreams", "lifecycle ABA"]) {
+    await t.test(waitKind, async () => {
+      const x = await makeContinuityRecoveryFixture();
+      try {
+        const source = x.runner.runtime.session;
+        const lifecycleBefore = x.runner.sessionLifecycle;
+        const durableBefore = recoveryDurableSnapshot(x.runner, x.failed.handoff_id);
+        const latchBefore = x.runner.storage.getLatch(x.failed.task_id);
+        const prepareCalls = instrumentRecoveryPreparation(x.runner);
+        let replacementAttempts = 0;
+        const ctx = {
+          async newSession() { replacementAttempts += 1; throw new Error("replacement must not start"); },
+          ui: { async confirm() { return false; }, notify() {}, setEditorText() {} },
+        };
+        let release;
+        let entered;
+        const waiting = new Promise((resolve) => { entered = resolve; });
+        const blocked = new Promise((resolve) => { release = resolve; });
+        if (waitKind === "waitForNoStreams") {
+          x.runner.gate.activeStreams = 1;
+          const waitForNoStreams = x.runner.gate.waitForNoStreams.bind(x.runner.gate);
+          x.runner.gate.waitForNoStreams = (...args) => {
+            entered();
+            return waitForNoStreams(...args);
+          };
+        } else {
+          source.waitForIdle = async () => { entered(); await blocked; };
+        }
+
+        const pending = x.runner.recoverHandoffFromCommand(ctx, x.failed.handoff_id);
+        await waiting;
+        await source.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        assert.equal(x.runner.sessionLifecycle.active, false);
+        assert.ok(x.runner.sessionLifecycle.epoch > lifecycleBefore.epoch);
+        if (waitKind === "lifecycle ABA") {
+          await source.extensionRunner.emit({ type: "session_start", reason: "reload" });
+          assert.equal(x.runner.sessionLifecycle.active, true);
+          assert.ok(x.runner.sessionLifecycle.epoch > lifecycleBefore.epoch);
+        }
+        if (waitKind === "waitForNoStreams") x.runner.gate.streamDone();
+        else release();
+
+        await assert.rejects(() => pending, (error) => error.code === "HANDOFF_SOURCE_CHANGED");
+        assert.deepEqual(recoveryDurableSnapshot(x.runner, x.failed.handoff_id), durableBefore);
+        assert.equal(x.runner.storage.getRunnerSessionBinding(x.failed.handoff_id).status, "ACTIVE");
+        assert.equal(prepareCalls(), 0);
+        assert.equal(replacementAttempts, 0);
+        assert.equal(x.calls, 0);
+        assert.equal(x.networkAttempts, 0);
+        assert.deepEqual(x.runner.storage.getLatch(x.failed.task_id), latchBefore, "the existing recovery latch remains engaged and unchanged");
+
+        if (waitKind === "lifecycle ABA") {
+          const recovered = await x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false });
+          assert.equal(recovered.state, "RESUME_READY");
+          assert.equal(recovered.recovery_of_handoff_id, x.failed.handoff_id);
+          assert.equal(prepareCalls(), 1, "a fresh lifecycle capture remains retryable after the rejected stale attempt");
+          const durableAfterRetry = recoveryDurableSnapshot(x.runner, x.failed.handoff_id);
+          assert.equal(durableAfterRetry.handoffs, durableBefore.handoffs + 1);
+          assert.equal(durableAfterRetry.recoveryStarted, durableBefore.recoveryStarted + 1);
+          assert.equal(durableAfterRetry.bindingSuperseded, durableBefore.bindingSuperseded + 1);
+          assert.equal(durableAfterRetry.bindingStatus, "SUPERSEDED");
+          assert.equal(x.calls, 0);
+          assert.equal(x.networkAttempts, 0);
+        }
+      } finally { await x.runner.dispose(); x.restoreFetch(); }
+    });
+  }
+
+  await t.test("authoritative unrelated shutdown does not invalidate S1 and normal recovery prepares once", async () => {
+    const x = await makeContinuityRecoveryFixture();
+    try {
+      const handlers = new Map();
+      createGuardianExtension(x.runner)({ registerCommand() {}, on(name, handler) { handlers.set(name, handler); } });
+      const source = x.runner.runtime.session;
+      const lifecycleBefore = x.runner.sessionLifecycle;
+      const durableBefore = recoveryDurableSnapshot(x.runner, x.failed.handoff_id);
+      const prepareCalls = instrumentRecoveryPreparation(x.runner);
+      handlers.get("session_shutdown")(
+        { type: "session_shutdown", reason: "quit" },
+        { sessionManager: { getSessionId: () => "SESSION-UNRELATED" } },
+      );
+      assert.equal(x.runner.runtime.session, source);
+      assert.deepEqual(x.runner.sessionLifecycle, lifecycleBefore);
+      const recovered = await x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false });
+      assert.equal(recovered.state, "RESUME_READY");
+      assert.equal(prepareCalls(), 1);
+      const durableAfter = recoveryDurableSnapshot(x.runner, x.failed.handoff_id);
+      assert.equal(durableAfter.handoffs, durableBefore.handoffs + 1);
+      assert.equal(durableAfter.recoveryStarted, durableBefore.recoveryStarted + 1);
+      assert.equal(durableAfter.bindingSuperseded, durableBefore.bindingSuperseded + 1);
+      assert.equal(durableAfter.bindingStatus, "SUPERSEDED");
+      assert.equal(x.calls, 0);
+      assert.equal(x.networkAttempts, 0);
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
 });
 
 test("Pi E2E: explicit /aio resume confirmation NO keeps the target paused and YES resumes once", async () => {
@@ -665,16 +811,19 @@ test("CONTINUITY_FAILED recovery fails closed when HUMAN_TAKEOVER races its Safe
     const waiting = new Promise((resolve) => { waitStarted = resolve; });
     const release = new Promise((resolve) => { releaseIdle = resolve; });
     fresh.waitForIdle = async () => { waitStarted(); await release; };
-    const rowsBefore = runnerB.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count;
+    const durableBefore = recoveryDurableSnapshot(runnerB.runner, failed.handoff_id);
+    const prepareCalls = instrumentRecoveryPreparation(runnerB.runner);
     const pending = runnerB.runner.recoverHandoffDirect(failed.handoff_id, { confirm: true });
     const rejected = assert.rejects(pending, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
     await waiting;
     takeover.engageLatch(failed.task_id, "HUMAN_TAKEOVER", "human:/aio-takeover");
     releaseIdle();
     await rejected;
-    assert.equal(runnerB.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, rowsBefore);
+    assert.deepEqual(recoveryDurableSnapshot(runnerB.runner, failed.handoff_id), durableBefore);
+    assert.equal(runnerB.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+    assert.equal(prepareCalls(), 0);
     assert.equal(runnerB.runner.storage.getLatch(failed.task_id).reason, "HUMAN_TAKEOVER");
-    assert.equal(runnerB.runner.storage.events(failed.handoff_id).some((event) => event.event_type === "CONTINUITY_RECOVERY_STARTED"), false);
+    assert.equal(runnerB.runner.storage.events(failed.handoff_id).some((event) => ["CONTINUITY_RECOVERY_STARTED", "RUNNER_SESSION_BINDING_SUPERSEDED"].includes(event.event_type)), false);
     assert.equal(runnerB.runner.runtime.session.sessionId, fresh.sessionId);
     assert.equal(runnerB.calls, 0);
   } finally {

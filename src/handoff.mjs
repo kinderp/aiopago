@@ -422,6 +422,7 @@ export class HandoffService {
     invariant(latch?.state === "ENGAGED" && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
     invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
     await this.safePoint.request(sourceSession, actor, latch.reason, { expectedLatch: { task_id: failed.task_id, state: latch.state, generation: latch.generation, reason: latch.reason } });
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: true });
     this.storage.prepareContinuityRecovery(failedHandoffId, {
       sourceSessionId: sourceSession.sessionId,
       runnerInstanceId: this.runnerInstanceId,
