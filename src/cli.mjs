@@ -137,12 +137,16 @@ export async function runCli(argv = process.argv.slice(2), options = {}) {
       if (parsed.planOption === "raw") {
         if (!observation.plan?.exists || observation.plan?.error || typeof observation.plan?.text !== "string") throw observation.plan?.error?.source ?? new GuardianError("LEDGER_NOT_FOUND", "Authoritative TASK_PLAN.md is unavailable");
         rawStdout(observation.plan.text);
-      } else if (parsed.planOption === "check") {
+        return { action: "plan", mode: "raw", observation };
+      }
+      if (parsed.planOption === "check") {
         if (!observation.plan?.valid) throw observation.plan?.error?.source ?? new GuardianError("LEDGER_READ_FAILED", "TASK_PLAN.md is invalid");
         stdout(`TASK_PLAN.md valido — revisione ${observation.plan.plan.plan_revision_id}`);
-      } else if (parsed.planOption === "technical") stdout(workflow.formatPlanTechnical(observation));
-      else stdout(workflow.formatPlan(observation));
-      return { action: "plan", mode: parsed.planOption ?? "summary", observation };
+        return { action: "plan", mode: "check", observation };
+      }
+      const view = workflow.projectHumanWorkflow(observation);
+      stdout(parsed.planOption === "technical" ? workflow.formatPlanTechnical(view) : workflow.formatPlan(view));
+      return { action: "plan", mode: parsed.planOption ?? "summary", observation, view };
     }
     const view = workflow.projectHumanWorkflow(observation);
     const format = parsed.command === "status" ? workflow.formatHumanStatus : parsed.command === "why" ? workflow.formatHumanWhy : workflow.formatHumanNext;

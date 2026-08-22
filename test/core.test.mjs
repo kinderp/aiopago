@@ -52,7 +52,7 @@ test("context threshold environment uses Aiopago canonically and fails on incomp
   );
 });
 
-test("Context Handoff Advisor prepares the canonical command only after user consent", async () => {
+test("Context Handoff Advisor invokes the trusted handoff use case once only after user consent", async () => {
   const handlers = new Map();
   const pi = {
     registerCommand() {},
@@ -79,7 +79,7 @@ test("Context Handoff Advisor prepares the canonical command only after user con
     hasUI: true,
     getContextUsage: () => ({ percent, tokens: percent, contextWindow: 100 }),
     ui: {
-      async confirm(_title, proposal) { confirmations += 1; assert.match(proposal, /Context: 52%/); return decisions.shift(); },
+      async confirm(_title, proposal) { confirmations += 1; assert.match(proposal, /Contesto al 52%/); return decisions.shift(); },
       setEditorText(value) { prepared = value; },
       notify() {},
     },
@@ -96,8 +96,8 @@ test("Context Handoff Advisor prepares the canonical command only after user con
   percent = 52;
   await handlers.get("turn_end")({}, ctx);
   assert.equal(confirmations, 2);
-  assert.equal(prepared, "/aio handoff confirm");
-  assert.equal(automaticHandoffs, 0);
+  assert.equal(prepared, null, "guided consent must not insert command text into the editor");
+  assert.equal(automaticHandoffs, 1, "affirmative consent invokes the existing handoff use case exactly once");
 });
 
 function minimalTask(overrides = {}) {
@@ -291,7 +291,13 @@ test("invalid Ledger event hooks fail closed with bounded diagnostics and recove
   await assert.doesNotReject(() => commands.get("aio").handler("handoff confirm", ctx));
   assert.equal(handoffStarts, 0);
   assert.equal(notifications.length, 8);
-  for (const notification of notifications) {
+  const projectedStatus = notifications.filter((notification) => notification.text.startsWith("Aiopago —"));
+  assert.equal(projectedStatus.length, 1);
+  assert.match(projectedStatus[0].text, /TASK_PLAN\.md non è valido/);
+  assert.match(projectedStatus[0].text, /aio plan --check/);
+  const hookDiagnostics = notifications.filter((notification) => notification.text.startsWith("Aiopago Ledger invalid:"));
+  assert.equal(hookDiagnostics.length, 7);
+  for (const notification of hookDiagnostics) {
     assert.match(notification.text, /^Aiopago Ledger invalid:\nLEDGER_LIFECYCLE_INVALID — current_item and next_item must differ\.\nRepair TASK_PLAN\.md before continuing\.$/);
     assert.doesNotMatch(notification.text, /\n\s+at |Extension \"inline:aiopago\" error/);
     assert.ok(notification.text.length < 500);

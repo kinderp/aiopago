@@ -162,6 +162,72 @@ test("Pi E2E: a Pi-selected model becomes effective handoff policy when the Ledg
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
+test("Pi SDK E2E: /aio status, why, next and plan use the shared read-only projection with zero model calls", async () => {
+  const x = await makeRunner();
+  try {
+    const notifications = [];
+    const uiContext = {
+      notify(text, type) { notifications.push({ text, type }); },
+      async confirm() { throw new Error("projection commands must not ask for authorization"); },
+      setEditorText() { throw new Error("projection commands must not edit the command line"); },
+    };
+    const commandContextActions = {
+      waitForIdle: () => x.runner.runtime.session.waitForIdle(),
+      newSession: (options) => x.runner.runtime.newSession(options),
+      fork: (entryId, options) => x.runner.runtime.fork(entryId, options),
+      navigateTree: (targetId, options) => x.runner.runtime.session.navigateTree(targetId, options),
+      switchSession: (path, options) => x.runner.runtime.switchSession(path, options),
+      reload: async () => {},
+    };
+    await x.runner.runtime.session.bindExtensions({ mode: "print", uiContext, commandContextActions });
+    const planBefore = readFileSync(join(x.root, "TASK_PLAN.md"));
+    const countersBefore = x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get();
+    const latchBefore = x.runner.storage.getLatch("TASK-E2E");
+
+    for (const command of ["/aio status", "/aio why", "/aio next", "/aio plan"]) await x.runner.runtime.session.prompt(command);
+
+    assert.equal(notifications.length, 4);
+    assert.match(notifications[0].text, /^Aiopago — /);
+    assert.match(notifications[0].text, /Pi real runtime handoff/);
+    assert.match(notifications[1].text, /^Perché/);
+    assert.match(notifications[2].text, /^Prossima azione:/);
+    assert.match(notifications[3].text, /^Piano autorevole: E2E/);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+    assert.deepEqual(readFileSync(join(x.root, "TASK_PLAN.md")), planBefore);
+    assert.deepEqual(x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get(), countersBefore);
+    assert.deepEqual(x.runner.storage.getLatch("TASK-E2E"), latchBefore);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("Pi E2E: explicit /aio resume confirmation NO keeps the target paused and YES resumes once", async () => {
+  const x = await makeRunner();
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(ready.state, "RESUME_READY");
+    assert.equal(x.runner.storage.getLatch(ready.task_id).state, "ENGAGED");
+    let decision = false;
+    const ctx = {
+      ui: {
+        async confirm() { return decision; },
+        notify() {},
+      },
+    };
+    const declined = await x.runner.resumeFromCommand(ctx, ready.handoff_id);
+    assert.equal(declined.state, "RESUME_READY");
+    assert.equal(x.runner.storage.getLatch(ready.task_id).state, "ENGAGED");
+    assert.equal(x.runner.storage.events(ready.handoff_id).some((event) => event.event_type === "RESUME_AUTHORIZED"), false);
+    assert.equal(x.calls, 0);
+
+    decision = true;
+    const resumed = await x.runner.resumeFromCommand(ctx, ready.handoff_id);
+    assert.equal(resumed.state, "RESUMED");
+    assert.equal(x.runner.storage.events(ready.handoff_id).filter((event) => event.event_type === "RESUME_AUTHORIZED").length, 1);
+    assert.equal(x.calls, 1);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
 test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", async () => {
   const x = await makeRunner();
   try {
