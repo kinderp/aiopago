@@ -13,6 +13,13 @@ import {
 } from "./handoff-consent.mjs";
 import { canonicalRequiredLocalPaths, validateRequiredLocalPaths } from "./ledger.mjs";
 import { measureHandoffArtifacts } from "./metrics.mjs";
+import {
+  assertPlanSemanticSubset,
+  canonicalPlanSemantics,
+  planSemanticDigest,
+  sameCanonicalJson,
+  samePlanSemantics,
+} from "./plan-semantics-internal.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
@@ -25,69 +32,114 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
-function planList(plan, field) {
-  return Array.isArray(plan[field]) ? structuredClone(plan[field]) : [];
+const HANDOFF_PLAN_FIELD_MAP = Object.freeze({
+  task_id: "task_id",
+  current_item: "current_item",
+  next_item: "next_item",
+  next_step: "next_step",
+  task_plan_revision: "plan_revision_id",
+  task_plan_digest: "content_digest",
+  requirements_version: "requirements_version",
+  model_policy: "model_policy",
+  reasoning_policy: "reasoning_policy",
+});
+
+const CHECKPOINT_PLAN_FIELD_MAP = Object.freeze({
+  task_id: "task_id",
+  plan_revision_id: "plan_revision_id",
+  plan_content_digest: "content_digest",
+  requirements_version: "requirements_version",
+  next_step: "next_step",
+  tests: "relevant_tests",
+  decisions: "relevant_decisions",
+});
+
+const MANIFEST_PLAN_FIELD_MAP = Object.freeze({
+  task_id: "task_id",
+  objective: "objective",
+  current_item: "current_item",
+  next_item: "next_item",
+  next_step: "next_step",
+  task_plan_revision: "plan_revision_id",
+  task_plan_digest: "content_digest",
+  requirements_version: "requirements_version",
+  relevant_decisions: "relevant_decisions",
+  relevant_tests: "relevant_tests",
+  evidence_references: "evidence_references",
+  minimal_reads: "minimal_reads",
+  required_local_paths: "required_local_paths",
+  model_policy: "model_policy",
+  reasoning_policy: "reasoning_policy",
+});
+
+function manifestGitState(manifest) {
+  return {
+    repository_id: manifest?.repository,
+    workdir: manifest?.worktree,
+    branch: manifest?.branch,
+    head_sha: manifest?.head_sha,
+    base_sha: manifest?.base_sha,
+    index_digest: manifest?.index_digest,
+    worktree_digest: manifest?.worktree_digest,
+    status_entries: manifest?.git_status_summary,
+  };
 }
 
-function captureReservedPlanSnapshot(plan) {
-  return deepFreeze({
-    task_id: plan.task_id,
-    objective: plan.objective,
-    current_item: plan.current_item,
-    next_item: plan.next_item,
-    next_step: plan.next_step,
-    plan_revision_id: plan.plan_revision_id,
-    content_digest: plan.content_digest,
-    requirements_version: plan.requirements_version,
-    completion_criteria: planList(plan, "completion_criteria"),
-    relevant_decisions: planList(plan, "relevant_decisions"),
-    relevant_tests: planList(plan, "relevant_tests"),
-    evidence_references: planList(plan, "evidence_references"),
-    minimal_reads: planList(plan, "minimal_reads"),
-    required_local_paths: planList(plan, "required_local_paths"),
-    model_policy: plan.model_policy ?? null,
-    reasoning_policy: plan.reasoning_policy ?? null,
-  });
+function captureReservedPlanSnapshot(plan, { modelPolicy = undefined, reasoningPolicy = undefined } = {}) {
+  return deepFreeze(canonicalPlanSemantics(plan, { modelPolicy, reasoningPolicy }));
 }
 
 function assertReservedPlanConsistency(handoff, plan) {
-  invariant(plan && handoff.task_id === plan.task_id
-    && handoff.task_plan_revision === plan.plan_revision_id
-    && handoff.task_plan_digest === plan.content_digest
-    && handoff.requirements_version === plan.requirements_version
-    && handoff.current_item === plan.current_item
-    && handoff.next_item === plan.next_item
-    && handoff.next_step === plan.next_step,
-  "HANDOFF_PLAN_PROVENANCE_MISMATCH", "Reserved handoff and immutable plan snapshot disagree");
-  return plan;
+  const canonicalPlan = canonicalPlanSemantics(plan, { requireAll: true });
+  invariant(samePlanSemantics(handoff?.reserved_plan_snapshot, canonicalPlan, { leftRequireAll: true, rightRequireAll: true }),
+    "HANDOFF_PLAN_PROVENANCE_MISMATCH", "Reserved handoff snapshot conflicts with canonical plan semantics");
+  assertPlanSemanticSubset(canonicalPlan, handoff, HANDOFF_PLAN_FIELD_MAP, {
+    code: "HANDOFF_PLAN_PROVENANCE_MISMATCH",
+    label: "handoff top-level provenance",
+  });
+  return canonicalPlan;
 }
 
 function assertCheckpointPlanConsistency(handoff, plan, checkpoint) {
-  assertReservedPlanConsistency(handoff, plan);
+  const canonicalPlan = assertReservedPlanConsistency(handoff, plan);
+  assertPlanSemanticSubset(canonicalPlan, checkpoint, CHECKPOINT_PLAN_FIELD_MAP, {
+    code: "CHECKPOINT_MISMATCH",
+    label: "checkpoint",
+  });
+  const expectedCriteria = canonicalPlan.completion_criteria.map((criterion) => ({ criterion, status: "IN_PROGRESS" }));
+  const expectedItems = canonicalPlan.current_item === null ? [] : [canonicalPlan.current_item];
   invariant(checkpoint?.checkpoint_id === handoff.checkpoint_id
-    && checkpoint.task_id === plan.task_id
-    && checkpoint.plan_revision_id === plan.plan_revision_id
-    && checkpoint.plan_content_digest === plan.content_digest
-    && checkpoint.requirements_version === plan.requirements_version,
-  "CHECKPOINT_MISMATCH", "Checkpoint and reserved plan snapshot disagree");
+    && checkpoint.parent_checkpoint_id === (handoff.parent_checkpoint_id ?? null)
+    && sameCanonicalJson(checkpoint.task_item_ids, expectedItems)
+    && sameCanonicalJson(checkpoint.session_lineage, [handoff.source_session_id])
+    && sameCanonicalJson(checkpoint.completion_criteria, expectedCriteria)
+    && sameGitState(handoff.expected_git_state, checkpoint.git_state),
+  "CHECKPOINT_MISMATCH", "Checkpoint and canonical handoff provenance disagree");
+  return canonicalPlan;
 }
 
-function assertManifestPlanConsistency(handoff, plan, manifest) {
-  assertReservedPlanConsistency(handoff, plan);
-  invariant(manifest?.task_id === plan.task_id
-    && manifest.task_plan_revision === plan.plan_revision_id
-    && manifest.task_plan_digest === plan.content_digest
-    && manifest.requirements_version === plan.requirements_version
-    && manifest.objective === plan.objective
-    && manifest.current_item === plan.current_item
-    && manifest.next_item === plan.next_item
-    && manifest.next_step === plan.next_step
-    && JSON.stringify(manifest.relevant_decisions) === JSON.stringify(plan.relevant_decisions)
-    && JSON.stringify(manifest.relevant_tests) === JSON.stringify(plan.relevant_tests)
-    && JSON.stringify(manifest.evidence_references) === JSON.stringify(plan.evidence_references)
-    && JSON.stringify(manifest.minimal_reads) === JSON.stringify(plan.minimal_reads)
-    && JSON.stringify(manifest.required_local_paths) === JSON.stringify(canonicalRequiredLocalPaths(plan.required_local_paths)),
-  "MANIFEST_MISMATCH", "Manifest and reserved plan snapshot disagree");
+function assertManifestPlanConsistency(handoff, plan, manifest, { allowLegacyRequiredPathsOmission = false } = {}) {
+  const canonicalPlan = assertReservedPlanConsistency(handoff, plan);
+  assertPlanSemanticSubset(canonicalPlan, manifest, MANIFEST_PLAN_FIELD_MAP, {
+    code: "MANIFEST_MISMATCH",
+    label: "manifest",
+    optionalFields: allowLegacyRequiredPathsOmission ? ["required_local_paths"] : [],
+  });
+  invariant(manifest?.resume_manifest_id === handoff.resume_manifest_id
+    && manifest.handoff_id === handoff.handoff_id
+    && manifest.resume_prompt_id === handoff.resume_prompt_id
+    && manifest.checkpoint_id === handoff.checkpoint_id
+    && manifest.checkpoint_digest === handoff.checkpoint_digest
+    && manifest.source_session_id === handoff.source_session_id
+    && manifest.replacement_session_id === handoff.target_session_id
+    && manifest.runner_instance_id === handoff.runner_instance_id
+    && manifest.session_binding_id === handoff.session_binding_id
+    && manifest.parent_session_id === handoff.parent_session_id
+    && manifest.parent_checkpoint_id === (handoff.parent_checkpoint_id ?? null)
+    && sameCanonicalJson(manifest.session_lineage, [handoff.source_session_id, handoff.target_session_id])
+    && sameGitState(handoff.expected_git_state, manifestGitState(manifest)),
+  "MANIFEST_MISMATCH", "Manifest identity, Git, or session lineage conflicts with canonical handoff provenance");
+  return canonicalPlan;
 }
 
 function conversationHistory(session) {
@@ -189,7 +241,7 @@ export class HandoffService {
   #captureRecoveryAttestation({ failedHandoffId, expectedFailed, sourceSession, currentSourceVerifier, sourceAttestation, plan, expectedLatch, safe = null }) {
     const failed = this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
-    invariant(JSON.stringify(failed) === JSON.stringify(expectedFailed),
+    invariant(sameCanonicalJson(failed, expectedFailed),
       "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed handoff authority changed during recovery");
     const lifecycle = this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: true });
     invariant(sourceAttestation?.session_id === sourceSession?.sessionId && sourceAttestation?.runner_instance_id === this.runnerInstanceId,
@@ -204,19 +256,21 @@ export class HandoffService {
       && sourceSession.isRetrying !== true
       && sourceSession.isCompacting !== true,
     "CONTINUITY_RECOVERY_SOURCE_INVALID", "The current Runner source must remain idle, quiescent, and at zero conversation history");
-    invariant(plan.task_id === failed.task_id
-      && plan.plan_revision_id === failed.task_plan_revision
-      && plan.content_digest === failed.task_plan_digest
-      && plan.requirements_version === failed.requirements_version,
-    "PLAN_REVISION_MISMATCH", "current Ledger does not match failed handoff provenance");
-    invariant(plan.current_item === failed.current_item && plan.next_item === failed.next_item && plan.next_step === failed.next_step,
-      "CONTINUITY_RECOVERY_SOURCE_INVALID", "current Ledger task position differs from failed handoff");
+    const planSnapshot = captureReservedPlanSnapshot(plan, {
+      modelPolicy: this.modelPolicy ?? plan.model_policy ?? null,
+      reasoningPolicy: this.reasoningPolicy ?? plan.reasoning_policy ?? null,
+    });
+    invariant(planSnapshot.task_id === failed.task_id
+      && planSnapshot.plan_revision_id === failed.task_plan_revision
+      && planSnapshot.content_digest === failed.task_plan_digest,
+    "PLAN_REVISION_MISMATCH", "current Ledger does not match failed handoff plan identity");
+    assertReservedPlanConsistency(failed, planSnapshot);
     const actualModel = sourceSession.model ? `${sourceSession.model.provider}/${sourceSession.model.id}` : null;
     invariant(actualModel === failed.model_policy, "MODEL_POLICY_MISMATCH", `${actualModel} != ${failed.model_policy}`);
     invariant(sourceSession.thinkingLevel === failed.reasoning_policy, "REASONING_POLICY_MISMATCH", `${sourceSession.thinkingLevel} != ${failed.reasoning_policy}`);
     const checkpoint = this.artifacts.verify("checkpoint", failed.checkpoint_id, failed.checkpoint_digest);
     const manifest = this.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest);
-    this.verifyRecoveryEvidence(failed, checkpoint.payload, manifest.payload);
+    this.verifyRecoveryEvidence(failed, planSnapshot, checkpoint.payload, manifest.payload);
     const git = this.observeGit();
     invariant(git && typeof git === "object" && typeof git.then !== "function", "GIT_STATE_MISMATCH", "Git observation must be synchronous");
     invariant(sameGitState(failed.expected_git_state, git), "GIT_STATE_MISMATCH", "recovery source differs from failed handoff Git state");
@@ -233,7 +287,7 @@ export class HandoffService {
       && binding.runner_instance_id === failed.runner_instance_id
       && binding.session_binding_id === failed.session_binding_id,
     "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed target binding is not active and coherent");
-    const planSnapshot = captureReservedPlanSnapshot(plan);
+    const semanticDigest = planSemanticDigest(planSnapshot, { requireAll: true });
     return deepFreeze(structuredClone({
       schema: "aiopago.internal-recovery-attestation/1",
       failedHandoff: failed,
@@ -252,6 +306,7 @@ export class HandoffService {
         idle: true,
       },
       plan: planSnapshot,
+      plan_semantic_digest: semanticDigest,
       model_policy: failed.model_policy,
       reasoning_policy: failed.reasoning_policy,
       git,
@@ -312,7 +367,10 @@ export class HandoffService {
       plan = this.ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor, expected: ownerGateExpected });
       await this.testHooks?.afterOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
     }
-    plan = captureReservedPlanSnapshot(plan);
+    plan = captureReservedPlanSnapshot(plan, {
+      modelPolicy: this.modelPolicy ?? plan.model_policy ?? null,
+      reasoningPolicy: this.reasoningPolicy ?? plan.reasoning_policy ?? null,
+    });
     const trustedPlanIdentity = Object.freeze({
       taskId: plan.task_id,
       planRevisionId: plan.plan_revision_id,
@@ -551,6 +609,7 @@ export class HandoffService {
             runnerInstanceId: attestation.source.runner_instance_id,
             actor,
             expectedFailed: attestation.failedHandoff,
+            expectedFailedPlanSemanticDigest: attestation.plan_semantic_digest,
             expectedBinding: attestation.failedBinding,
             expectedLatch: attestation.latch,
           },
@@ -585,28 +644,12 @@ export class HandoffService {
     });
   }
 
-  verifyRecoveryEvidence(failed, checkpoint, manifest) {
-    invariant(["1.0.0", "1.1.0"].includes(manifest.manifest_version), "MANIFEST_MISMATCH", "unsupported recovery evidence manifest version");
-    invariant(checkpoint.checkpoint_id === failed.checkpoint_id
-      && checkpoint.task_id === failed.task_id
-      && checkpoint.plan_revision_id === failed.task_plan_revision
-      && checkpoint.plan_content_digest === failed.task_plan_digest
-      && checkpoint.requirements_version === failed.requirements_version
-      && JSON.stringify(checkpoint.session_lineage) === JSON.stringify([failed.source_session_id]),
-    "CHECKPOINT_MISMATCH", "recovery provenance");
-    invariant(manifest.resume_manifest_id === failed.resume_manifest_id && manifest.handoff_id === failed.handoff_id && manifest.resume_prompt_id === failed.resume_prompt_id, "MANIFEST_MISMATCH", "recovery identity");
-    invariant(manifest.checkpoint_id === failed.checkpoint_id && manifest.checkpoint_digest === failed.checkpoint_digest && manifest.task_id === failed.task_id, "MANIFEST_MISMATCH", "recovery checkpoint/task provenance");
-    invariant(manifest.source_session_id === failed.source_session_id && manifest.replacement_session_id === failed.target_session_id && manifest.parent_session_id === failed.source_session_id, "MANIFEST_MISMATCH", "recovery session provenance");
-    invariant(manifest.runner_instance_id === failed.runner_instance_id && manifest.session_binding_id === failed.session_binding_id, "MANIFEST_MISMATCH", "recovery binding provenance");
-    invariant(manifest.task_plan_revision === failed.task_plan_revision
-      && manifest.task_plan_digest === failed.task_plan_digest
-      && manifest.requirements_version === failed.requirements_version
-      && manifest.current_item === failed.current_item
-      && manifest.next_item === failed.next_item
-      && manifest.next_step === failed.next_step
-      && manifest.model_policy === failed.model_policy
-      && manifest.reasoning_policy === failed.reasoning_policy,
-    "MANIFEST_MISMATCH", "recovery plan/model provenance");
+  verifyRecoveryEvidence(failed, canonicalPlan, checkpoint, manifest) {
+    invariant(["1.0.0", "1.1.0"].includes(manifest?.manifest_version), "MANIFEST_MISMATCH", "unsupported recovery evidence manifest version");
+    assertCheckpointPlanConsistency(failed, canonicalPlan, checkpoint);
+    assertManifestPlanConsistency(failed, canonicalPlan, manifest, {
+      allowLegacyRequiredPathsOmission: manifest.manifest_version === "1.0.0",
+    });
   }
 
   continuity(handoffId, targetSession) {

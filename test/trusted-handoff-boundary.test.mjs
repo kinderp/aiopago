@@ -744,8 +744,11 @@ test("M-05 real tarball keeps TaskLedger public but exposes no plan coordination
     const names = Object.getOwnPropertyNames(TaskLedger.prototype);
     assert.deepEqual(names.sort(), ["constructor", "read", "satisfyOwnerGate", "validate"].sort());
     await assert.rejects(import("aiopago/src/handoff-plan-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
+    await assert.rejects(import("aiopago/src/plan-semantics-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     const root = await import("aiopago");
     assert.equal(Object.hasOwn(root, "PlanRevisionWriter"), false);
+    assert.equal(Object.hasOwn(root, "canonicalPlanSemantics"), false);
+    assert.equal(Object.hasOwn(root, "planSemanticDigest"), false);
     assert.equal(Object.keys(root).some((name) => /coordinate|plan.*lock/i.test(name)), false);
   `;
   writeFileSync(join(consumer, "verify.mjs"), script);

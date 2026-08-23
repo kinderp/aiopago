@@ -5,6 +5,7 @@ import { opaqueId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { handoffConsentIdentity } from "./handoff-consent.mjs";
 import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal.mjs";
+import { planSemanticDigest, sameCanonicalJson } from "./plan-semantics-internal.mjs";
 
 const TERMINAL_HANDOFF = new Set(["RESUMED", "RESUME_DISPATCH_UNKNOWN", "HUMAN_DECISION_REQUIRED", "HANDOFF_FAILED", "CONTINUITY_FAILED"]);
 const TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
@@ -49,12 +50,24 @@ const RECOVERY_FAILED_IDENTITY_FIELDS = Object.freeze([
   "model_policy", "reasoning_policy", "authorization_state", "admission_state", "dispatch_state",
 ]);
 
-function sameRecoveryFailedIdentity(actual, expected) {
-  return Boolean(actual && expected) && RECOVERY_FAILED_IDENTITY_FIELDS.every((field) => {
+function sameRecoveryFailedIdentity(actual, expected, expectedPlanSemanticDigest) {
+  if (!actual || !expected || typeof expectedPlanSemanticDigest !== "string") return false;
+  let actualPlanSemanticDigest;
+  let expectedSnapshotDigest;
+  try {
+    actualPlanSemanticDigest = planSemanticDigest(actual.reserved_plan_snapshot, { requireAll: true });
+    expectedSnapshotDigest = planSemanticDigest(expected.reserved_plan_snapshot, { requireAll: true });
+  } catch {
+    return false;
+  }
+  return RECOVERY_FAILED_IDENTITY_FIELDS.every((field) => {
     const left = actual[field] ?? null;
     const right = expected[field] ?? null;
     return left === right;
-  }) && JSON.stringify(actual.expected_git_state) === JSON.stringify(expected.expected_git_state);
+  })
+    && sameCanonicalJson(actual.expected_git_state, expected.expected_git_state)
+    && expectedSnapshotDigest === expectedPlanSemanticDigest
+    && actualPlanSemanticDigest === expectedPlanSemanticDigest;
 }
 
 function reserveHandoffInTransaction(storage, projection, precondition) {
@@ -91,11 +104,23 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
 }
 
 function prepareContinuityRecoveryInTransaction(storage, handoffId, request) {
-  const { sourceSessionId, runnerInstanceId, actor, expectedFailed = null, expectedBinding = null, expectedLatch = null } = request;
+  const {
+    sourceSessionId,
+    runnerInstanceId,
+    actor,
+    expectedFailed = null,
+    expectedFailedPlanSemanticDigest = null,
+    expectedBinding = null,
+    expectedLatch = null,
+  } = request;
   invariant(typeof sourceSessionId === "string" && typeof runnerInstanceId === "string" && actor?.startsWith("human:"), "CONTINUITY_RECOVERY_AUTHORITY_INVALID");
   const handoff = storage.getHandoff(handoffId);
   invariant(handoff?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", handoff?.state ?? "HANDOFF_NOT_FOUND");
-  if (expectedFailed) invariant(sameRecoveryFailedIdentity(handoff, expectedFailed), "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed handoff changed after final recovery attestation");
+  if (expectedFailed) invariant(
+    sameRecoveryFailedIdentity(handoff, expectedFailed, expectedFailedPlanSemanticDigest),
+    "CONTINUITY_RECOVERY_SOURCE_INVALID",
+    "failed handoff plan semantics changed after final recovery attestation",
+  );
   invariant(sourceSessionId !== handoff.source_session_id && sourceSessionId !== handoff.target_session_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "recovery requires a distinct fresh source session");
   invariant(handoff.authorization_state === "NOT_AUTHORIZED" && handoff.admission_state === "NOT_COMMITTED" && handoff.dispatch_state === "NOT_STARTED", "CONTINUITY_RECOVERY_UNSAFE", "authorization/admission/dispatch state is not provably empty");
   const authorization = storage.db.prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? LIMIT 1").get(handoffId);

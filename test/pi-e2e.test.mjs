@@ -207,16 +207,72 @@ function recoveryAttackSnapshot(runner, failedHandoffId) {
   };
 }
 
+function resealArtifactMutation(runner, kind, id, mutate) {
+  const index = structuredClone(runner.storage.getArtifact(kind, id));
+  const originalBytes = readFileSync(index.path);
+  const envelope = JSON.parse(originalBytes.toString("utf8"));
+  mutate(envelope.payload);
+  envelope.payload.content_digest = null;
+  envelope.payload.content_digest = digestObject(envelope.payload);
+  const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
+  const digest = sha256(bytes);
+  writeFileSync(index.path, bytes);
+  runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
+    .run(digest, envelope.payload.content_digest, kind, id);
+  return {
+    bytes,
+    digest,
+    contentDigest: envelope.payload.content_digest,
+    restore() {
+      writeFileSync(index.path, originalBytes);
+      runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
+        .run(index.digest, index.content_digest, kind, id);
+    },
+  };
+}
+
+function installFailedManifestMutation(runner, failedHandoffId, mutate) {
+  const originalFailed = runner.storage.getHandoff(failedHandoffId);
+  const sealed = resealArtifactMutation(runner, "manifest", originalFailed.resume_manifest_id, mutate);
+  const changed = runner.storage.getHandoff(failedHandoffId);
+  changed.resume_manifest_digest = sealed.digest;
+  runner.storage.saveHandoff(changed);
+  return {
+    sealed,
+    restore() {
+      sealed.restore();
+      runner.storage.saveHandoff(structuredClone(originalFailed));
+    },
+  };
+}
+
+function installFailedCheckpointMutation(runner, failedHandoffId, mutate) {
+  const originalFailed = runner.storage.getHandoff(failedHandoffId);
+  const checkpoint = resealArtifactMutation(runner, "checkpoint", originalFailed.checkpoint_id, mutate);
+  const manifest = resealArtifactMutation(runner, "manifest", originalFailed.resume_manifest_id, (payload) => {
+    payload.checkpoint_digest = checkpoint.digest;
+  });
+  const changed = runner.storage.getHandoff(failedHandoffId);
+  changed.checkpoint_digest = checkpoint.digest;
+  changed.resume_manifest_digest = manifest.digest;
+  runner.storage.saveHandoff(changed);
+  return {
+    checkpoint,
+    manifest,
+    restore() {
+      checkpoint.restore();
+      manifest.restore();
+      runner.storage.saveHandoff(structuredClone(originalFailed));
+    },
+  };
+}
+
 function convertFailedManifestToLegacyV1(runner, failed) {
   const index = runner.storage.getArtifact("manifest", failed.resume_manifest_id);
   const envelope = JSON.parse(readFileSync(index.path, "utf8"));
   envelope.payload.manifest_version = "1.0.0";
   delete envelope.payload.required_local_paths;
-  envelope.payload.minimal_reads = [
-    ...REAL_MINIMAL_READS,
-    `.guardian/checkpoints/${failed.checkpoint_id}.json`,
-    `.guardian/manifests/${failed.resume_manifest_id}.json`,
-  ];
+  envelope.payload.minimal_reads = [...REAL_MINIMAL_READS];
   envelope.payload.content_digest = null;
   envelope.payload.content_digest = digestObject(envelope.payload);
   const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
@@ -629,6 +685,244 @@ test("M-07 actual Pi recovery re-attests every mutable SafePoint precondition be
       } finally { await x.runner.dispose(); x.restoreFetch(); }
     });
   }
+});
+
+test("M-08 reviewer exact valid-envelope manifest semantic conflict rejects before recovery arbitration", async () => {
+  const x = await makeContinuityRecoveryFixture();
+  try {
+    const attack = installFailedManifestMutation(x.runner, x.failed.handoff_id, (manifest) => {
+      manifest.objective = "Reviewer-conflicting objective X";
+      manifest.relevant_decisions = ["Reviewer-conflicting decision X"];
+      manifest.minimal_reads = ["Reviewer-conflicting minimal read X"];
+    });
+    const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
+    const verified = x.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest);
+    assert.equal(verified.digest, attack.sealed.digest, "the cryptographically recomputed artifact envelope must verify");
+    const before = recoveryAttackSnapshot(x.runner, failed.handoff_id);
+    const activeBefore = x.runner.storage.db.prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all();
+    const prepareCalls = instrumentRecoveryPreparation(x.runner);
+    let replacementAttempts = 0;
+    const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+    x.runner.runtime.newSession = (...args) => { replacementAttempts += 1; return newSession(...args); };
+
+    await assert.rejects(
+      () => x.runner.recoverHandoffDirect(failed.handoff_id, { confirm: false }),
+      (error) => error.code === "MANIFEST_MISMATCH",
+    );
+
+    assert.deepEqual(recoveryAttackSnapshot(x.runner, failed.handoff_id), before);
+    assert.deepEqual(x.runner.storage.db.prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all(), activeBefore);
+    assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+    assert.equal(prepareCalls(), 0);
+    assert.equal(replacementAttempts, 0);
+    assert.equal(x.runner.storage.events(failed.handoff_id).some((event) => ["CONTINUITY_RECOVERY_STARTED", "RUNNER_SESSION_BINDING_SUPERSEDED"].includes(event.event_type)), false);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-08 cryptographically valid manifest field matrix binds plan, Git, session, parent, and model semantics", async (t) => {
+  const x = await makeContinuityRecoveryFixture();
+  const mutations = [
+    ["task_id", (m) => { m.task_id = "TASK-CONFLICT"; }],
+    ["objective", (m) => { m.objective = "conflicting objective"; }],
+    ["current_item", (m) => { m.current_item = null; }],
+    ["next_item", (m) => { m.next_item = "ITEM-CONFLICT"; }],
+    ["next_step", (m) => { m.next_step = "conflicting next step"; }],
+    ["task_plan_revision", (m) => { m.task_plan_revision = "PLAN-CONFLICT"; }],
+    ["task_plan_digest", (m) => { m.task_plan_digest = `sha256:${"9".repeat(64)}`; }],
+    ["requirements_version", (m) => { m.requirements_version = "REQ-CONFLICT"; }],
+    ["relevant_decisions", (m) => { m.relevant_decisions = ["conflicting decision"]; }],
+    ["relevant_tests", (m) => { m.relevant_tests = ["conflicting test"]; }],
+    ["evidence_references", (m) => { m.evidence_references = ["conflicting evidence"]; }],
+    ["minimal_reads", (m) => { m.minimal_reads = ["conflicting read"]; }],
+    ["required_local_paths", (m) => { m.required_local_paths = ["TASK_PLAN.md", "docs/adr.md"]; }],
+    ["model_policy", (m) => { m.model_policy = "offline-fake/conflicting"; }],
+    ["reasoning_policy", (m) => { m.reasoning_policy = "high"; }],
+    ["repository", (m) => { m.repository = "conflicting-repository"; }],
+    ["branch", (m) => { m.branch = "conflicting-branch"; }],
+    ["worktree", (m) => { m.worktree = "/conflicting/worktree"; }],
+    ["base_sha", (m) => { m.base_sha = "b".repeat(40); }],
+    ["head_sha", (m) => { m.head_sha = "c".repeat(40); }],
+    ["index_digest", (m) => { m.index_digest = `sha256:${"d".repeat(64)}`; }],
+    ["worktree_digest", (m) => { m.worktree_digest = `sha256:${"e".repeat(64)}`; }],
+    ["git_status_summary", (m) => { m.git_status_summary = ["?? semantic-conflict.txt"]; }],
+    ["session_lineage", (m) => { m.session_lineage = [m.replacement_session_id, m.source_session_id]; }],
+    ["parent_checkpoint_id", (m) => { m.parent_checkpoint_id = "CP-CONFLICT"; }],
+    ["parent_session_id", (m) => { m.parent_session_id = "SESSION-CONFLICT"; }],
+    ["source_session_id", (m) => { m.source_session_id = "SESSION-CONFLICT"; }],
+    ["replacement_session_id", (m) => { m.replacement_session_id = "SESSION-CONFLICT"; }],
+    ["runner_instance_id", (m) => { m.runner_instance_id = "RUNNER-CONFLICT"; }],
+    ["session_binding_id", (m) => { m.session_binding_id = "BIND-CONFLICT"; }],
+    ["checkpoint_id", (m) => { m.checkpoint_id = "CP-CONFLICT"; }],
+    ["checkpoint_digest", (m) => { m.checkpoint_digest = `sha256:${"f".repeat(64)}`; }],
+    ["handoff_id", (m) => { m.handoff_id = "HO-CONFLICT"; }],
+    ["resume_manifest_id", (m) => { m.resume_manifest_id = "RM-CONFLICT"; }],
+    ["resume_prompt_id", (m) => { m.resume_prompt_id = "RP-CONFLICT"; }],
+    ["missing objective", (m) => { delete m.objective; }],
+  ];
+  try {
+    let replacementAttempts = 0;
+    const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+    x.runner.runtime.newSession = (...args) => { replacementAttempts += 1; return newSession(...args); };
+    for (const [name, mutate] of mutations) {
+      await t.test(name, async () => {
+        const attack = installFailedManifestMutation(x.runner, x.failed.handoff_id, mutate);
+        try {
+          const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
+          assert.equal(x.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest).digest, attack.sealed.digest);
+          const before = recoveryAttackSnapshot(x.runner, failed.handoff_id);
+          await assert.rejects(
+            () => x.runner.recoverHandoffDirect(failed.handoff_id, { confirm: false }),
+            (error) => error.code === "MANIFEST_MISMATCH",
+          );
+          assert.deepEqual(recoveryAttackSnapshot(x.runner, failed.handoff_id), before);
+          assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+        } finally { attack.restore(); }
+      });
+    }
+    assert.equal(replacementAttempts, 0);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-08 failed reserved snapshot semantic matrix rejects top-level P1 claims with conflicting P1 content", async (t) => {
+  const x = await makeContinuityRecoveryFixture();
+  const mutations = [
+    ["reviewer exact objective/decisions/minimal reads", (p) => {
+      p.objective = "reviewer conflicting objective";
+      p.relevant_decisions = ["reviewer conflicting decision"];
+      p.minimal_reads = ["reviewer conflicting read"];
+    }],
+    ["task_id", (p) => { p.task_id = "TASK-CONFLICT"; }],
+    ["objective", (p) => { p.objective = "conflicting objective"; }],
+    ["current_item", (p) => { p.current_item = null; }],
+    ["next_item", (p) => { p.next_item = "ITEM-CONFLICT"; }],
+    ["next_step", (p) => { p.next_step = "conflicting next step"; }],
+    ["plan_revision_id", (p) => { p.plan_revision_id = "PLAN-CONFLICT"; }],
+    ["content_digest", (p) => { p.content_digest = `sha256:${"8".repeat(64)}`; }],
+    ["requirements_version", (p) => { p.requirements_version = "REQ-CONFLICT"; }],
+    ["completion_criteria", (p) => { p.completion_criteria = ["conflicting criterion"]; }],
+    ["relevant_decisions", (p) => { p.relevant_decisions = ["conflicting decision"]; }],
+    ["relevant_tests", (p) => { p.relevant_tests = ["conflicting test"]; }],
+    ["evidence_references", (p) => { p.evidence_references = ["conflicting evidence"]; }],
+    ["minimal_reads", (p) => { p.minimal_reads = ["conflicting read"]; }],
+    ["required_local_paths", (p) => { p.required_local_paths = ["TASK_PLAN.md", "docs/adr.md"]; }],
+    ["model_policy", (p) => { p.model_policy = "offline-fake/conflicting"; }],
+    ["reasoning_policy", (p) => { p.reasoning_policy = "high"; }],
+    ["missing objective", (p) => { delete p.objective; }],
+  ];
+  try {
+    const baseline = x.runner.storage.getHandoff(x.failed.handoff_id);
+    for (const [name, mutate] of mutations) {
+      await t.test(name, async () => {
+        const changed = x.runner.storage.getHandoff(x.failed.handoff_id);
+        mutate(changed.reserved_plan_snapshot);
+        x.runner.storage.saveHandoff(changed);
+        const before = recoveryAttackSnapshot(x.runner, changed.handoff_id);
+        await assert.rejects(
+          () => x.runner.recoverHandoffDirect(changed.handoff_id, { confirm: false }),
+          (error) => error.code === "HANDOFF_PLAN_PROVENANCE_MISMATCH",
+        );
+        assert.deepEqual(recoveryAttackSnapshot(x.runner, changed.handoff_id), before);
+        assert.equal(x.runner.storage.getRunnerSessionBinding(changed.handoff_id).status, "ACTIVE");
+        x.runner.storage.saveHandoff(structuredClone(baseline));
+      });
+    }
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-08 sealed checkpoint semantic matrix rejects conflicting duplicated plan, Git, and lineage fields", async (t) => {
+  const x = await makeContinuityRecoveryFixture();
+  const mutations = [
+    ["checkpoint_id", (c) => { c.checkpoint_id = "CP-CONFLICT"; }],
+    ["task_id", (c) => { c.task_id = "TASK-CONFLICT"; }],
+    ["plan_revision_id", (c) => { c.plan_revision_id = "PLAN-CONFLICT"; }],
+    ["requirements_version", (c) => { c.requirements_version = "REQ-CONFLICT"; }],
+    ["completion_criteria", (c) => { c.completion_criteria = [{ criterion: "conflicting criterion", status: "IN_PROGRESS" }]; }],
+    ["tests", (c) => { c.tests = ["conflicting test"]; }],
+    ["decisions", (c) => { c.decisions = ["conflicting decision"]; }],
+    ["next_step", (c) => { c.next_step = "conflicting next step"; }],
+    ["task_item_ids", (c) => { c.task_item_ids = ["ITEM-CONFLICT"]; }],
+    ["session_lineage", (c) => { c.session_lineage = ["SESSION-CONFLICT"]; }],
+    ["parent_checkpoint_id", (c) => { c.parent_checkpoint_id = "CP-CONFLICT"; }],
+    ["plan_content_digest", (c) => { c.plan_content_digest = `sha256:${"a".repeat(64)}`; }],
+    ["git_state", (c) => { c.git_state.head_sha = "b".repeat(40); }],
+    ["missing tests", (c) => { delete c.tests; }],
+  ];
+  try {
+    for (const [name, mutate] of mutations) {
+      await t.test(name, async () => {
+        const attack = installFailedCheckpointMutation(x.runner, x.failed.handoff_id, mutate);
+        try {
+          const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
+          assert.equal(x.runner.artifacts.verify("checkpoint", failed.checkpoint_id, failed.checkpoint_digest).digest, attack.checkpoint.digest);
+          assert.equal(x.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest).digest, attack.manifest.digest);
+          const before = recoveryAttackSnapshot(x.runner, failed.handoff_id);
+          await assert.rejects(
+            () => x.runner.recoverHandoffDirect(failed.handoff_id, { confirm: false }),
+            (error) => error.code === "CHECKPOINT_MISMATCH",
+          );
+          assert.deepEqual(recoveryAttackSnapshot(x.runner, failed.handoff_id), before);
+          assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
+        } finally { attack.restore(); }
+      });
+    }
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-08 storage transaction revalidates reserved snapshot semantics after valid R-star capture", async () => {
+  const x = await makeContinuityRecoveryFixture();
+  try {
+    const before = recoveryAttackSnapshot(x.runner, x.failed.handoff_id);
+    const original = x.runner.storage.getHandoff(x.failed.handoff_id);
+    const prepare = x.runner.storage.prepareContinuityRecovery.bind(x.runner.storage);
+    let movementInstalled = false;
+    x.runner.storage.prepareContinuityRecovery = (...args) => {
+      const moved = x.runner.storage.getHandoff(x.failed.handoff_id);
+      moved.reserved_plan_snapshot.objective = "semantic movement after R-star";
+      x.runner.storage.saveHandoff(moved);
+      movementInstalled = true;
+      return prepare(...args);
+    };
+    await assert.rejects(
+      () => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }),
+      (error) => error.code === "CONTINUITY_RECOVERY_SOURCE_INVALID",
+    );
+    assert.equal(movementInstalled, true, "the deterministic seam is reached only after a valid final R-star capture");
+    assert.deepEqual(recoveryAttackSnapshot(x.runner, x.failed.handoff_id), before);
+    assert.equal(x.runner.storage.getRunnerSessionBinding(x.failed.handoff_id).status, "ACTIVE");
+    assert.equal(x.runner.storage.events(x.failed.handoff_id).some((event) => ["CONTINUITY_RECOVERY_STARTED", "RUNNER_SESSION_BINDING_SUPERSEDED"].includes(event.event_type)), false);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+    x.runner.storage.saveHandoff(original);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("M-08 canonical required-path equivalence is accepted and child snapshot remains canonical P1", async () => {
+  const x = await makeContinuityRecoveryFixture();
+  try {
+    const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
+    failed.reserved_plan_snapshot.required_local_paths = ["TASK_PLAN.md", "TASK_PLAN.md"];
+    x.runner.storage.saveHandoff(failed);
+    const recovered = await x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false });
+    assert.equal(recovered.state, "RESUME_READY");
+    assert.deepEqual(recovered.reserved_plan_snapshot.required_local_paths, ["TASK_PLAN.md"]);
+    assert.equal(recovered.reserved_plan_snapshot.objective, x.runner.ledger.read().objective);
+    const children = recoveryAttackSnapshot(x.runner, x.failed.handoff_id).recoveryChildren;
+    await assert.rejects(
+      () => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }),
+      (error) => error.code === "CONTINUITY_RECOVERY_SOURCE_INVALID",
+    );
+    assert.equal(recoveryAttackSnapshot(x.runner, x.failed.handoff_id).recoveryChildren, children, "double recovery creates at most one child");
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
 test("M-07 recovery-first final coordination reserves immutable R-star provenance before later P2/G2/M2", async () => {
