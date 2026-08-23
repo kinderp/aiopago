@@ -4,7 +4,12 @@ import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
-import { authorizeTrustedResume, prepareTrustedContinuityRecovery, reserveTrustedHandoffPlan } from "./handoff-plan-internal.mjs";
+import {
+  authorizeTrustedResume,
+  prepareTrustedContinuityRecovery,
+  reserveTrustedHandoffPlan,
+  satisfyTrustedHandoffOwnerGate,
+} from "./handoff-plan-internal.mjs";
 import {
   assertGuidedHandoffEligibilityIdentity,
   assertHandoffConsentIdentity,
@@ -386,7 +391,14 @@ export class HandoffService {
     }
     if (mode === "confirm" && recoveryOf === null) {
       await this.testHooks?.beforeOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
-      plan = this.ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor, expected: ownerGateExpected });
+      plan = satisfyTrustedHandoffOwnerGate(this.ledger, {
+        storage: this.storage,
+        expected: ownerGateExpected,
+        taskId: plan.task_id,
+        expectedHandoff,
+        command: "/aio handoff confirm",
+        actor,
+      });
       await this.testHooks?.afterOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
     }
     plan = captureReservedPlanSnapshot(plan, {

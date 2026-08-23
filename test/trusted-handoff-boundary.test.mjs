@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -158,6 +158,80 @@ function assertNoPreparation(x) {
   assert.equal(x.newSessions(), 0);
   const checkpointRoot = join(x.root, ".guardian", "checkpoints");
   try { assert.equal(readdirSync(checkpointRoot).length, 0); } catch (error) { assert.equal(error.code, "ENOENT"); }
+}
+
+function planMutationSnapshot(x) {
+  const bytes = readFileSync(x.ledgerPath);
+  const historyRoot = join(x.root, ".guardian", "plan-history");
+  let history = [];
+  try {
+    history = readdirSync(historyRoot).sort().map((name) => ({ name, bytes: readFileSync(join(historyRoot, name)) }));
+  } catch (error) { assert.equal(error.code, "ENOENT"); }
+  return {
+    bytes,
+    digest: x.ledger.read().content_digest,
+    revision: x.ledger.read().plan_revision_id,
+    gate: x.ledger.read().owner_gate?.status ?? null,
+    mtimeNs: statSync(x.ledgerPath, { bigint: true }).mtimeNs,
+    history,
+  };
+}
+
+function assertPlanMutationSnapshotEqual(actual, expected) {
+  assert.deepEqual(actual.bytes, expected.bytes);
+  assert.equal(actual.digest, expected.digest);
+  assert.equal(actual.revision, expected.revision);
+  assert.equal(actual.gate, expected.gate);
+  assert.equal(actual.mtimeNs, expected.mtimeNs);
+  assert.deepEqual(actual.history, expected.history);
+}
+
+function seedBlockingTaskOperation(x, state, suffix = state) {
+  const latch = x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:first-operation");
+  const projection = {
+    handoff_id: `HO-C1-${suffix}`, source_session_id: `SESSION-C1-${suffix}`, target_session_id: null,
+    task_id: "TASK-TRUSTED", state, latch_generation: latch.generation,
+  };
+  x.storage.reserveHandoff(projection, { latch, expectedHandoff: null });
+  return x.storage.getHandoff(projection.handoff_id);
+}
+
+function runTrustedReservationProcess(x, { suffix, expectedHandoff = null }) {
+  const childPath = join(x.root, `trusted-reservation-${suffix}.mjs`);
+  const ledgerModule = new URL("../src/ledger.mjs", import.meta.url).href;
+  const storageModule = new URL("../src/storage.mjs", import.meta.url).href;
+  const internalModule = new URL("../src/handoff-plan-internal.mjs", import.meta.url).href;
+  writeFileSync(childPath, `
+    import { TaskLedger } from ${JSON.stringify(ledgerModule)};
+    import { GuardianStorage } from ${JSON.stringify(storageModule)};
+    import { reserveTrustedHandoffPlan } from ${JSON.stringify(internalModule)};
+    const ledger = new TaskLedger(${JSON.stringify(x.ledgerPath)});
+    const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
+    try {
+      const plan = ledger.read();
+      const latch = storage.getLatch(plan.task_id);
+      const projection = {
+        handoff_id: ${JSON.stringify(`HO-PROCESS-${suffix}`)},
+        source_session_id: ${JSON.stringify(`SESSION-PROCESS-${suffix}`)},
+        target_session_id: null,
+        task_id: plan.task_id,
+        task_plan_revision: plan.plan_revision_id,
+        task_plan_digest: plan.content_digest,
+        state: "SAFE_TO_HANDOFF",
+        latch_generation: latch.generation,
+      };
+      const result = reserveTrustedHandoffPlan(ledger, {
+        expected: { taskId: plan.task_id, planRevisionId: plan.plan_revision_id, contentDigest: plan.content_digest },
+        storage,
+        projection,
+        precondition: { latch, expectedHandoff: ${JSON.stringify(expectedHandoff)} },
+      });
+      process.stdout.write(JSON.stringify({ ok: true, created: result.created, handoffId: result.handoff.handoff_id }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null, message: error.message }));
+    } finally { storage.close(); }
+  `);
+  return JSON.parse(execFileSync(process.execPath, [childPath], { encoding: "utf8" }));
 }
 
 function installPausedReplacement(x, { targetId = "SESSION-TARGET" } = {}) {
@@ -403,6 +477,147 @@ test("M-01 owner-gate P1 CAS wins and a stale real P2 proposal cannot replace re
     assert.notEqual(reserved.task_plan_revision, "PLAN-EXTERNAL-12");
     assert.equal(x.counters().handoffs, 1);
   } finally { x.close(); }
+});
+
+test("R1-M-01 unresolved task ownership rejects confirm before owner-gate bytes, revision, mtime, or history mutate", async (t) => {
+  for (const state of [
+    "REPLACEMENT_SESSION_CREATING", "MANIFEST_PERSISTING", "RESUME_READY", "RESUME_DISPATCH_UNKNOWN", "HANDOFF_FAILED",
+  ]) {
+    await t.test(state, async () => {
+      const x = fixture({ planValue: blockedTask() });
+      try {
+        const c1 = seedBlockingTaskOperation(x, state);
+        const before = planMutationSnapshot(x);
+        await assert.rejects(
+          () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+          (error) => error.code === "TASK_OPERATION_CONFLICT",
+        );
+        assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+        assert.equal(x.storage.getHandoff(c1.handoff_id).state, state);
+        assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-TRUSTED'").get().count, 1);
+        assert.equal(x.newSessions(), 0);
+      } finally { x.close(); }
+    });
+  }
+
+  await t.test("CONTINUITY_FAILED requires explicit recovery without owner mutation", async () => {
+    const x = fixture({ planValue: blockedTask() });
+    try {
+      const c1 = seedBlockingTaskOperation(x, "CONTINUITY_FAILED", "continuity");
+      const before = planMutationSnapshot(x);
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error.code === "CONTINUITY_RECOVERY_REQUIRED",
+      );
+      assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+      assert.equal(x.storage.getHandoff(c1.handoff_id).state, "CONTINUITY_FAILED");
+    } finally { x.close(); }
+  });
+
+  await t.test("already-satisfied owner gate still enforces task ownership", async () => {
+    const x = fixture({ planValue: blockedTask() });
+    try {
+      x.ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:fixture" });
+      const c1 = seedBlockingTaskOperation(x, "RESUME_READY", "satisfied");
+      const before = planMutationSnapshot(x);
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error.code === "TASK_OPERATION_CONFLICT",
+      );
+      assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+      assert.equal(x.storage.getHandoff(c1.handoff_id).state, "RESUME_READY");
+    } finally { x.close(); }
+  });
+});
+
+test("R1-M-01 cross-process task-operation and owner-gate critical-section orderings are serialized by exact plan coordination", async (t) => {
+  await t.test("task operation wins first", async () => {
+    const x = fixture({ planValue: blockedTask() });
+    try {
+      x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+      const child = runTrustedReservationProcess(x, { suffix: "FIRST" });
+      assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-FIRST" });
+      const before = planMutationSnapshot(x);
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error.code === "TASK_OPERATION_CONFLICT",
+      );
+      assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+    } finally { x.close(); }
+  });
+
+  await t.test("task operation wins after service preflight but before owner critical section", async () => {
+    let x;
+    let child = null;
+    const hooks = {
+      beforeOwnerGate() {
+        x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+        child = runTrustedReservationProcess(x, { suffix: "BEFORE-CRITICAL" });
+      },
+    };
+    x = fixture({ planValue: blockedTask(), testHooks: hooks });
+    try {
+      const before = planMutationSnapshot(x);
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error.code === "TASK_OPERATION_CONFLICT",
+      );
+      assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-BEFORE-CRITICAL" });
+      assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+    } finally { x.close(); }
+  });
+
+  await t.test("owner critical section wins first", async () => {
+    const stop = new Error("stop after owner transition");
+    let x;
+    let child = null;
+    const serviceHooks = { afterOwnerGate() { throw stop; } };
+    const writerHooks = {
+      afterPreparation() {
+        child = runTrustedReservationProcess(x, { suffix: "LOCKED" });
+      },
+    };
+    x = fixture({
+      planValue: blockedTask(),
+      testHooks: serviceHooks,
+      ledgerOptions: { writerOptions: { testHooks: writerHooks } },
+    });
+    try {
+      x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error === stop,
+      );
+      assert.equal(child.ok, false);
+      assert.equal(child.code, "PLAN_WRITE_LOCKED");
+      assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
+      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+    } finally { x.close(); }
+  });
+
+  await t.test("post-owner pre-reservation operation wins one lifecycle only", async () => {
+    let x;
+    let child = null;
+    const hooks = {
+      afterSafePoint() {
+        child = runTrustedReservationProcess(x, { suffix: "POST-OWNER" });
+      },
+    };
+    x = fixture({ planValue: blockedTask(), testHooks: hooks });
+    try {
+      await assert.rejects(
+        () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+        (error) => error.code === "HANDOFF_CONSENT_STALE",
+      );
+      assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-POST-OWNER" });
+      assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
+      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(x.storage.latestHandoffForTask("TASK-TRUSTED").handoff_id, "HO-PROCESS-POST-OWNER");
+      assert.equal(x.newSessions(), 0);
+    } finally { x.close(); }
+  });
 });
 
 test("M-01 owner-gate commit failure is atomic and creates no handoff artifacts or replacement", async () => {

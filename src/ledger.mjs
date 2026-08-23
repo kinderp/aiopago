@@ -338,6 +338,7 @@ export class TaskLedger {
       attestResume: (expected, capture) => coordinateExactPlan(
         expected, capture, "RESUME_EXPECTATION_STALE", "The authoritative plan changed after resume confirmation was displayed",
       ),
+      satisfyOwnerGate: (request, assertEligible) => this.#satisfyOwnerGate(request, assertEligible),
     });
   }
 
@@ -346,12 +347,15 @@ export class TaskLedger {
     return ledgerResult(observed.task, observed.contentDigest, this.path);
   }
 
-  satisfyOwnerGate({ command, actor, expected = null }) {
+  #satisfyOwnerGate({ command, actor, expected = null }, assertEligible = null) {
     return this.writer.commit({
       expected,
       validate: validateTaskLedger,
       prepare: (observed) => {
         const task = structuredClone(observed.task);
+        const eligibility = assertEligible?.();
+        invariant(!eligibility || typeof eligibility.then !== "function",
+          "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Task ownership eligibility must remain synchronous under plan coordination");
         const gate = task.owner_gate;
         if (!gate || gate.status === "SATISFIED") return { noWrite: true, result: ledgerResult(task, observed.contentDigest, this.path) };
         invariant(gate.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "OWNER_GATE_INVALID");
@@ -391,6 +395,10 @@ export class TaskLedger {
         return { bytes, result: ledgerResult(task, sha256(bytes), this.path) };
       },
     });
+  }
+
+  satisfyOwnerGate(request) {
+    return this.#satisfyOwnerGate(request);
   }
 
   validate(task) {

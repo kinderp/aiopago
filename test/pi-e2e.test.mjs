@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -157,6 +157,28 @@ async function makeContinuityRecoveryFixture(options = {}) {
     }
     throw error;
   }
+}
+
+function planDiskSnapshot(root, runner) {
+  const path = join(root, "TASK_PLAN.md");
+  const bytes = readFileSync(path);
+  const plan = runner.ledger.read();
+  const historyRoot = join(root, ".guardian", "plan-history");
+  let history = [];
+  try {
+    history = readdirSync(historyRoot).sort().map((name) => {
+      const value = readFileSync(join(historyRoot, name));
+      return { name, digest: sha256(value), bytes: value };
+    });
+  } catch (error) { assert.equal(error.code, "ENOENT"); }
+  return {
+    bytes,
+    contentDigest: sha256(bytes),
+    revision: plan.plan_revision_id,
+    gate: plan.owner_gate?.status ?? null,
+    mtimeNs: statSync(path, { bigint: true }).mtimeNs,
+    history,
+  };
 }
 
 function recoveryDurableSnapshot(runner, failedHandoffId) {
@@ -1483,6 +1505,73 @@ test("Pi E2E: source -> checkpoint -> paused/no-history target -> one resume", a
     assert.equal(x.calls, 2);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R1-M-01 actual Pi /aio handoff confirm cannot mutate P1 owned by C1 and C1 later resumes once", async () => {
+  const x = await makeRunner({ ownerGate: true });
+  let fresh = null;
+  try {
+    const c1 = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(c1.state, "RESUME_READY");
+    assert.equal(c1.task_plan_revision, "PLAN-E2E-GATE-1");
+    const c1Session = x.runner.runtime.session;
+    const before = planDiskSnapshot(x.root, x.runner);
+    const rowsBefore = x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count;
+    assert.equal(rowsBefore, 1);
+
+    fresh = await makeRunner({ ownerGate: true, existingRoot: x.root });
+    assert.notEqual(fresh.runner.runtime.session.sessionId, c1.source_session_id);
+    assert.notEqual(fresh.runner.runtime.session.sessionId, c1.target_session_id);
+    let replacements = 0;
+    const originalNewSession = fresh.runner.runtime.newSession.bind(fresh.runner.runtime);
+    fresh.runner.runtime.newSession = (...args) => { replacements += 1; return originalNewSession(...args); };
+    const notices = [];
+    await fresh.runner.runtime.session.bindExtensions({
+      mode: "print",
+      uiContext: {
+        notify(text, type) { notices.push({ text, type }); },
+        async confirm() { throw new Error("owner conflict must reject before any prompt"); },
+        setEditorText() { throw new Error("owner conflict must not edit the command line"); },
+      },
+      commandContextActions: {
+        waitForIdle: () => fresh.runner.runtime.session.waitForIdle(),
+        newSession: (options) => fresh.runner.runtime.newSession(options),
+        fork: (entryId, options) => fresh.runner.runtime.fork(entryId, options),
+        navigateTree: (targetId, options) => fresh.runner.runtime.session.navigateTree(targetId, options),
+        switchSession: (path, options) => fresh.runner.runtime.switchSession(path, options),
+        reload: async () => {},
+      },
+    });
+    await fresh.runner.runtime.session.prompt("/aio handoff confirm");
+
+    const after = planDiskSnapshot(x.root, fresh.runner);
+    assert.deepEqual(after.bytes, before.bytes, "TASK_PLAN.md bytes remain exact");
+    assert.equal(after.contentDigest, before.contentDigest);
+    assert.equal(after.revision, before.revision);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(after.gate, "BLOCKED");
+    assert.deepEqual(after.history, before.history);
+    assert.match(notices.at(-1)?.text ?? "", /TASK_OPERATION_CONFLICT/);
+    assert.equal(fresh.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count, 1);
+    assert.equal(fresh.runner.storage.getHandoff(c1.handoff_id).state, "RESUME_READY");
+    assert.equal(replacements, 0);
+    assert.equal(x.calls, 0);
+    assert.equal(fresh.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+    assert.equal(fresh.networkAttempts, 0);
+
+    await fresh.runner.dispose(); fresh.restoreFetch(); fresh = null;
+    assert.equal(x.runner.runtime.session, c1Session);
+    assert.equal(x.runner.handoffService.continuity(c1.handoff_id, c1Session).state, "RESUME_READY");
+    const resumed = await x.runner.resumeFromCommand({ ui: { async confirm() { return true; }, notify() {} } }, c1.handoff_id);
+    assert.equal(resumed.state, "RESUMED");
+    assert.equal(x.calls, 1);
+    assert.equal((await x.runner.handoffService.resume(c1.handoff_id, { actor: "human:idempotent" })).state, "RESUMED");
+    assert.equal(x.calls, 1);
+  } finally {
+    if (fresh) { await fresh.runner.dispose(); fresh.restoreFetch(); }
+    await x.runner.dispose(); x.restoreFetch();
+  }
 });
 
 test("Pi E2E confirmed owner gate advances H1-02 before checkpoint and manifest seal", async () => {

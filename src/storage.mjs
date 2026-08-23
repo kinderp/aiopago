@@ -95,6 +95,27 @@ function blockingTaskOperation(storage, taskId, excludingHandoffId = null) {
   return null;
 }
 
+function assertOwnerGateEligibilityInTransaction(storage, request) {
+  const { taskId, expectedHandoff } = request ?? {};
+  invariant(typeof taskId === "string" && taskId.length > 0 && Object.hasOwn(request ?? {}, "expectedHandoff"),
+    "HANDOFF_OWNER_GATE_AUTHORITY_INVALID");
+  const conflict = blockingTaskOperation(storage, taskId);
+  if (conflict) {
+    const code = conflict.disposition === "RECOVERY_REQUIRED" ? "CONTINUITY_RECOVERY_REQUIRED" : "TASK_OPERATION_CONFLICT";
+    throw new GuardianError(code, `Task ${taskId} already has unresolved handoff ${conflict.handoff.handoff_id} in ${conflict.handoff.state}; reconcile it explicitly before mutating owner authority`, {
+      task_id: taskId,
+      existing_handoff_id: conflict.handoff.handoff_id,
+      existing_state: conflict.handoff.state,
+      disposition: conflict.disposition,
+    });
+  }
+  const latestRow = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(taskId);
+  const latest = latestRow ? storage.getHandoff(latestRow.handoff_id) : null;
+  invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(expectedHandoff),
+    "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before owner-gate mutation");
+  return { task_id: taskId, eligible: true };
+}
+
 function isExactRecoveryTransfer(storage, conflict, projection, precondition) {
   if (projection.recovery_of_handoff_id !== conflict?.handoff?.handoff_id
     || conflict.disposition !== "RECOVERY_REQUIRED"
@@ -226,6 +247,7 @@ export class GuardianStorage {
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
       authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
+      assertOwnerGateEligibility: (request) => this.transaction(() => assertOwnerGateEligibilityInTransaction(this, request)),
     });
   }
 
