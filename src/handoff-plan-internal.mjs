@@ -7,15 +7,29 @@ const handoffPlanCapabilities = new WeakMap();
 const handoffStorageCapabilities = new WeakMap();
 
 export function registerTrustedHandoffPlanCapability(ledger, capability) {
-  invariant(ledger && typeof capability?.attest === "function" && typeof capability?.attestRecovery === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
+  invariant(ledger
+    && typeof capability?.attest === "function"
+    && typeof capability?.attestRecovery === "function"
+    && typeof capability?.attestResume === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
   invariant(!handoffPlanCapabilities.has(ledger), "HANDOFF_PLAN_CAPABILITY_DUPLICATE");
-  handoffPlanCapabilities.set(ledger, Object.freeze({ attest: capability.attest, attestRecovery: capability.attestRecovery }));
+  handoffPlanCapabilities.set(ledger, Object.freeze({
+    attest: capability.attest,
+    attestRecovery: capability.attestRecovery,
+    attestResume: capability.attestResume,
+  }));
 }
 
 export function registerTrustedHandoffStorageCapability(storage, capability) {
-  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.prepareRecovery === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+  invariant(storage
+    && typeof capability?.reserve === "function"
+    && typeof capability?.prepareRecovery === "function"
+    && typeof capability?.authorizeResume === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
-  handoffStorageCapabilities.set(storage, Object.freeze({ reserve: capability.reserve, prepareRecovery: capability.prepareRecovery }));
+  handoffStorageCapabilities.set(storage, Object.freeze({
+    reserve: capability.reserve,
+    prepareRecovery: capability.prepareRecovery,
+    authorizeResume: capability.authorizeResume,
+  }));
 }
 
 export function reserveTrustedHandoffPlan(ledger, request) {
@@ -45,5 +59,21 @@ export function prepareTrustedContinuityRecovery(ledger, request) {
     const captured = request.capture(plan);
     invariant(captured && !captured?.then, "CONTINUITY_RECOVERY_ATTESTATION_INVALID", "Final recovery attestation must be synchronous");
     return storageCapability.prepareRecovery(captured);
+  });
+}
+
+// Human YES is bound to one invocation-local expectation. Final plan
+// attestation, synchronous runtime/Git capture and durable SQLite admission are
+// one bounded package-private operation. No lock spans UI or transport.
+export function authorizeTrustedResume(ledger, request) {
+  const planCapability = handoffPlanCapabilities.get(ledger);
+  const storageCapability = handoffStorageCapabilities.get(request?.storage);
+  invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted resume requires an internally constructed TaskLedger");
+  invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted resume requires an internally constructed GuardianStorage");
+  invariant(typeof request?.capture === "function", "RESUME_ATTESTATION_REQUIRED");
+  return planCapability.attestResume(request.expectedPlan, (plan) => {
+    const captured = request.capture(plan);
+    invariant(captured && !captured?.then, "RESUME_ATTESTATION_INVALID", "Final resume attestation must be synchronous");
+    return storageCapability.authorizeResume(captured);
   });
 }

@@ -569,7 +569,7 @@ test("sealed artifacts are immutable, indexed, and detect byte tampering", () =>
   storage.close();
 });
 
-test("SQLite linearizes latch release and one resume admission", () => {
+test("direct SQLite resume admission cannot bypass package-private final attestation", () => {
   const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
   storage.ensureLatch("TASK-T");
   const latch = storage.engageLatch("TASK-T", "INTEGRITY", "human:test");
@@ -579,16 +579,13 @@ test("SQLite linearizes latch release and one resume admission", () => {
     resume_prompt_id: "RP-one", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
   };
   storage.reserveHandoff(h, { latch, expectedHandoff: null });
-  const first = storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one");
-  const second = storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one");
-  assert.equal(first.admission_id, second.admission_id);
-  assert.equal(second.idempotent, true);
-  assert.equal(storage.events("HO-one").filter((event) => event.event_type === "RESUME_ADMISSION_COMMITTED").length, 1);
-  assert.equal(storage.getLatch("TASK-T").state, "RELEASED");
-  const intent = storage.beginDispatch("HO-one", "DSP-one", 1);
-  assert.equal(intent.idempotent, false);
-  storage.finishDispatch("HO-one", "UNKNOWN", "ambiguous transport");
-  assert.throws(() => storage.beginDispatch("HO-one", "DSP-two", 2), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+  assert.throws(
+    () => storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one"),
+    (error) => error.code === "RESUME_ATTESTATION_REQUIRED",
+  );
+  assert.equal(storage.getLatch("TASK-T").state, "ENGAGED");
+  assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations").get().count, 0);
+  assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM admissions").get().count, 0);
   storage.close();
 });
 
@@ -604,7 +601,7 @@ test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
   storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
   assert.throws(
     () => storage.authorizeAndAdmit("HO-stale-confirm", "human:stale-confirm", "resume:RP-stale-confirm", "ADM-stale-confirm"),
-    (error) => error.code === "HUMAN_TAKEOVER_ACTIVE",
+    (error) => error.code === "RESUME_ATTESTATION_REQUIRED",
   );
   const blocked = storage.getHandoff("HO-stale-confirm");
   const takeover = storage.getLatch("TASK-T");

@@ -182,6 +182,17 @@ export class GuardianRunner {
     return this.sessionLifecycle;
   }
 
+  verifyCurrentTarget(targetSession) {
+    invariant(this.runtime?.session === targetSession && targetSession?.sessionId,
+      "RESUME_EXPECTATION_STALE", "The current Runner target changed after resume confirmation was displayed");
+    invariant(this.runnerInstanceId === this.handoffService.runnerInstanceId,
+      "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Runner identity changed after resume confirmation was displayed");
+    const lifecycle = this.sessionLifecycle;
+    invariant(lifecycle?.active === true && lifecycle.sessionId === targetSession.sessionId,
+      "RESUME_EXPECTATION_STALE", "The current target lifecycle is no longer ACTIVE");
+    return Object.freeze({ sessionId: targetSession.sessionId, runnerInstanceId: this.runnerInstanceId, lifecycleEpoch: lifecycle.epoch });
+  }
+
   currentRecoverySourceAttestation() {
     const session = this.runtime?.session;
     invariant(session && session === this.recoverySourceSession, "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery must start from the fresh session created by the current Runner");
@@ -270,6 +281,7 @@ export class GuardianRunner {
         } finally { this.revokeReplacementPermit(); }
       },
       confirmResume: async (target, h) => target.confirm(h),
+      verifyCurrentTarget: (session) => this.verifyCurrentTarget(session),
     });
   }
 
@@ -299,6 +311,7 @@ export class GuardianRunner {
         } finally { this.revokeReplacementPermit(); }
       },
       confirmResume: async (target, h) => target.confirm(h),
+      verifyCurrentTarget: (session) => this.verifyCurrentTarget(session),
     });
   }
 
@@ -313,9 +326,20 @@ export class GuardianRunner {
     const h = handoffId ? this.storage.getHandoff(handoffId) : this.storage.findHandoffByTarget(current.sessionId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUME_READY") this.handoffService.continuity(h.handoff_id, current);
+    const expectedResume = this.handoffService.prepareResumeConfirmation(h.handoff_id, current, {
+      currentTargetVerifier: () => this.verifyCurrentTarget(current),
+    });
     const confirmed = await ctx.ui.confirm("Aiopago resume", `Authorize resume for ${h.handoff_id}?`);
-    if (!confirmed) return h;
-    const result = await this.handoffService.resume(h.handoff_id, { actor: "human:/aio-resume", sendResume: (prompt) => current.sendUserMessage(prompt) });
+    if (!confirmed) {
+      this.handoffService.discardResumeConfirmation(expectedResume);
+      return this.storage.getHandoff(h.handoff_id);
+    }
+    const result = await this.handoffService.resume(h.handoff_id, {
+      actor: "human:/aio-resume",
+      sendResume: (prompt) => current.sendUserMessage(prompt),
+      expectedResume,
+      targetSession: current,
+    });
     ctx.ui.notify(`Aiopago ${result.state}`, "info");
     return result;
   }
@@ -339,7 +363,7 @@ export class GuardianRunner {
           const target = {
             session: this.runtime.session,
             setEditor: () => {},
-            confirm: async () => confirm,
+            confirm: async (handoff) => typeof confirm === "function" ? confirm(handoff, this.runtime.session) : confirm,
             sendResume: (prompt) => this.runtime.session.sendUserMessage(prompt),
           };
           const pausedResult = await onPaused(target);
@@ -347,6 +371,7 @@ export class GuardianRunner {
         } finally { this.revokeReplacementPermit(); }
       },
       confirmResume: (target, h) => target.confirm(h),
+      verifyCurrentTarget: (session) => this.verifyCurrentTarget(session),
     });
   }
 
@@ -378,6 +403,7 @@ export class GuardianRunner {
         } finally { this.revokeReplacementPermit(); }
       },
       confirmResume: (target, h) => target.confirm(h),
+      verifyCurrentTarget: (session) => this.verifyCurrentTarget(session),
     });
   }
 

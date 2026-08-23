@@ -335,6 +335,9 @@ export class TaskLedger {
       attestRecovery: (expected, capture) => coordinateExactPlan(
         expected, capture, "PLAN_REVISION_MISMATCH", "The authoritative plan no longer matches the failed handoff recovery provenance",
       ),
+      attestResume: (expected, capture) => coordinateExactPlan(
+        expected, capture, "RESUME_EXPECTATION_STALE", "The authoritative plan changed after resume confirmation was displayed",
+      ),
     });
   }
 

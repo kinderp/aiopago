@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ArtifactStore } from "../src/artifact-store.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
-import { guidedHandoffEligibilityIdentityFromAuthority } from "../src/handoff-consent.mjs";
+import { guidedHandoffEligibilityIdentityFromAuthority, handoffConsentIdentity } from "../src/handoff-consent.mjs";
 import { HandoffService } from "../src/handoff.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
@@ -727,6 +727,103 @@ test("M-04 active-source reservation reuse requires exact idempotent identity an
   });
 });
 
+test("R2-L-01 post-arbitration failures persist bounded identity and reconciliation guidance", async (t) => {
+  await t.test("checkpoint persistence", async () => {
+    const x = fixture();
+    try {
+      x.artifacts.persist = () => { throw Object.assign(new Error("checkpoint disk unavailable"), { code: "DISK_UNAVAILABLE" }); };
+      await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual"), /checkpoint disk unavailable/);
+      const failed = x.storage.latestHandoffForTask("TASK-TRUSTED");
+      assert.equal(failed.state, "CHECKPOINT_PERSIST_FAILED");
+      assert.deepEqual(failed.failure, { code: "DISK_UNAVAILABLE", message: "checkpoint disk unavailable" });
+      assert.match(failed.manual_recovery.join("\n"), /reconcile.*before any new handoff|Do not.*retry/i);
+    } finally { x.close(); }
+  });
+
+  await t.test("manifest persistence", async () => {
+    const x = fixture();
+    installPausedReplacement(x);
+    try {
+      const persist = x.artifacts.persist.bind(x.artifacts);
+      x.artifacts.persist = (kind, ...args) => {
+        if (kind === "manifest") throw Object.assign(new Error("manifest disk unavailable"), { code: "MANIFEST_IO" });
+        return persist(kind, ...args);
+      };
+      await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual"), /manifest disk unavailable/);
+      const failed = x.storage.latestHandoffForTask("TASK-TRUSTED");
+      assert.equal(failed.state, "MANIFEST_PERSIST_FAILED");
+      assert.deepEqual(failed.failure, { code: "MANIFEST_IO", message: "manifest disk unavailable" });
+      assert.match(failed.manual_recovery.join("\n"), /Keep target.*paused|Do not.*retry/i);
+    } finally { x.close(); }
+  });
+});
+
+test("R2-M-01 task-operation arbitration blocks representative unresolved and ambiguous states across connections", async (t) => {
+  const states = [
+    "CHECKPOINT_PERSISTING", "CHECKPOINT_PERSISTED", "REPLACEMENT_SESSION_CREATING",
+    "REPLACEMENT_SESSION_CREATED_PAUSED", "MANIFEST_PERSISTING", "MANIFEST_PERSISTED",
+    "RESUME_READY", "RESUME_ADMISSION_COMMITTED", "RESUME_DISPATCHING",
+    "RESUME_DISPATCH_UNKNOWN", "HANDOFF_FAILED", "HUMAN_DECISION_REQUIRED",
+  ];
+  for (const [index, state] of states.entries()) {
+    await t.test(state, () => {
+      const root = mkdtempSync(join(tmpdir(), "aiopago-task-operation-state-"));
+      const path = join(root, "guardian.sqlite");
+      const a = new GuardianStorage(path);
+      const b = new GuardianStorage(path);
+      const taskId = `TASK-STATE-${index}`;
+      try {
+        a.ensureLatch(taskId);
+        const latch = a.engageLatch(taskId, "INTEGRITY", "human:first");
+        a.reserveHandoff({ handoff_id: `HO-C1-${index}`, source_session_id: `SESSION-C1-${index}`, task_id: taskId, state, latch_generation: latch.generation }, { latch, expectedHandoff: null });
+        const latest = a.latestHandoffForTask(taskId);
+        assert.throws(
+          () => b.reserveHandoff({ handoff_id: `HO-C2-${index}`, source_session_id: `SESSION-S2-${index}`, task_id: taskId, state: "SAFE_TO_HANDOFF", latch_generation: latch.generation }, {
+            latch,
+            expectedHandoff: handoffConsentIdentity(latest),
+          }),
+          (error) => error.code === "TASK_OPERATION_CONFLICT",
+        );
+        assert.equal(b.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id=?").get(taskId).count, 1);
+      } finally { b.close(); a.close(); }
+    });
+  }
+});
+
+test("R2-M-01 guided and explicit command paths cannot fork an unresolved task operation", async (t) => {
+  for (const intent of ["guided", "explicit"]) {
+    await t.test(intent, async () => {
+      const x = fixture();
+      try {
+        const latch = x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:first");
+        x.storage.reserveHandoff({
+          handoff_id: "HO-C1", source_session_id: "SESSION-OTHER", task_id: "TASK-TRUSTED",
+          state: "REPLACEMENT_SESSION_CREATING", latch_generation: latch.generation,
+        }, { latch, expectedHandoff: null });
+        if (intent === "guided") {
+          const handlers = new Map();
+          createGuardianExtension(x.runner)({ registerCommand() {}, on(name, handler) { handlers.set(name, handler); } });
+          x.runner.contextAdvisor = { thresholdPercent: 50, reset() {}, observe: () => ({ percent: 60, thresholdPercent: 50 }) };
+          let prompts = 0;
+          await handlers.get("turn_end")({}, {
+            hasUI: true,
+            getContextUsage: () => ({ percent: 60, tokens: 60, contextWindow: 100 }),
+            ui: { async confirm() { prompts += 1; return true; }, notify() {} },
+          });
+          assert.equal(prompts, 0, "guided advice must not offer consent while an unresolved task operation owns the latch");
+        } else {
+          await assert.rejects(
+            () => x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" }),
+            (error) => error.code === "TASK_OPERATION_CONFLICT",
+          );
+        }
+        assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+        assert.equal(x.newSessions(), 0);
+      } finally { x.close(); }
+    });
+  }
+});
+
 test("M-05 real tarball keeps TaskLedger public but exposes no plan coordination capability", () => {
   const packRoot = mkdtempSync(join(tmpdir(), "aiopago-package-boundary-"));
   const consumer = join(packRoot, "consumer");
@@ -745,10 +842,13 @@ test("M-05 real tarball keeps TaskLedger public but exposes no plan coordination
     assert.deepEqual(names.sort(), ["constructor", "read", "satisfyOwnerGate", "validate"].sort());
     await assert.rejects(import("aiopago/src/handoff-plan-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     await assert.rejects(import("aiopago/src/plan-semantics-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
+    await assert.rejects(import("aiopago/src/task-operation-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     const root = await import("aiopago");
     assert.equal(Object.hasOwn(root, "PlanRevisionWriter"), false);
     assert.equal(Object.hasOwn(root, "canonicalPlanSemantics"), false);
     assert.equal(Object.hasOwn(root, "planSemanticDigest"), false);
+    assert.equal(Object.hasOwn(root, "authorizeTrustedResume"), false);
+    assert.equal(Object.hasOwn(root, "taskOperationDisposition"), false);
     assert.equal(Object.keys(root).some((name) => /coordinate|plan.*lock/i.test(name)), false);
   `;
   writeFileSync(join(consumer, "verify.mjs"), script);

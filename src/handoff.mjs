@@ -4,7 +4,7 @@ import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
-import { prepareTrustedContinuityRecovery, reserveTrustedHandoffPlan } from "./handoff-plan-internal.mjs";
+import { authorizeTrustedResume, prepareTrustedContinuityRecovery, reserveTrustedHandoffPlan } from "./handoff-plan-internal.mjs";
 import {
   assertGuidedHandoffEligibilityIdentity,
   assertHandoffConsentIdentity,
@@ -157,7 +157,29 @@ export function verifyRequiredLocalPaths(repositoryRoot, paths) {
   }
 }
 
+function gitAuthority(git) {
+  return {
+    repository_id: git?.repository_id ?? null,
+    workdir: git?.workdir ?? null,
+    branch: git?.branch ?? null,
+    head_sha: git?.head_sha ?? null,
+    base_sha: git?.base_sha ?? null,
+    index_digest: git?.index_digest ?? null,
+    worktree_digest: git?.worktree_digest ?? null,
+    status_entries: structuredClone(git?.status_entries ?? []),
+  };
+}
+
+function boundedFailure(error, fallback) {
+  return {
+    code: String(error?.code ?? fallback).slice(0, 128),
+    message: String(error?.message ?? error).replace(/\s+/g, " ").trim().slice(0, 1024),
+  };
+}
+
 export class HandoffService {
+  #resumeExpectations = new WeakMap();
+
   constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null }) {
     invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
     this.storage = storage;
@@ -317,7 +339,7 @@ export class HandoffService {
     }));
   }
 
-  async handoff({ sourceSession, currentSourceVerifier = null, expectedEligibility = null, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null }) {
+  async handoff({ sourceSession, currentSourceVerifier = null, expectedEligibility = null, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null, verifyCurrentTarget = null }) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
     const guided = expectedEligibility !== null;
     if (guided) assertGuidedHandoffEligibilityIdentity(expectedEligibility);
@@ -397,10 +419,10 @@ export class HandoffService {
       projection: base,
       precondition: { latch: safe.latch, expectedHandoff },
     });
-    return this.#continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume });
+    return this.#continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget });
   }
 
-  async #continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume }) {
+  async #continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget = null }) {
     let handoff = reserved.handoff;
     if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
     assertReservedPlanConsistency(handoff, plan);
@@ -436,7 +458,13 @@ export class HandoffService {
       });
     } catch (error) {
       handoff.state = "CHECKPOINT_PERSIST_FAILED";
-      this.storage.saveHandoff(handoff, "CHECKPOINT_PERSIST_FAILED", { error: error.message, event_key: `checkpoint-failed:${checkpointId}` });
+      handoff.failure = boundedFailure(error, "CHECKPOINT_PERSIST_FAILED");
+      handoff.manual_recovery = [
+        `Checkpoint persistence for handoff ${handoffId} has an unknown or failed durable outcome.`,
+        `Preserve and inspect checkpoint ${checkpointId}; reconcile handoff ${handoffId} before any new handoff.`,
+        "Do not rewrite the artifact or retry handoff automatically.",
+      ];
+      this.storage.saveHandoff(handoff, "CHECKPOINT_PERSIST_FAILED", { code: handoff.failure.code, error: handoff.failure.message, manual_recovery: handoff.manual_recovery, event_key: `checkpoint-failed:${checkpointId}` });
       throw error;
     }
 
@@ -466,7 +494,7 @@ export class HandoffService {
         runner_instance_id: handoff.runner_instance_id,
         session_binding_id: handoff.session_binding_id,
       };
-      replacementResult = await replacePaused(sourceFile, expectedBinding, async (target) => this.finishPausedHandoff(handoffId, target, { mode, actor, confirmResume, sendResume }));
+      replacementResult = await replacePaused(sourceFile, expectedBinding, async (target) => this.finishPausedHandoff(handoffId, target, { mode, actor, confirmResume, sendResume, verifyCurrentTarget }));
     } catch (error) {
       handoff = this.storage.getHandoff(handoffId);
       if (handoff.target_session_id) throw error;
@@ -518,7 +546,13 @@ export class HandoffService {
     } catch (error) {
       h = this.storage.getHandoff(handoffId);
       h.state = "RUNNER_OWNERSHIP_ATTESTATION_FAILED";
-      this.storage.saveHandoff(h, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", { error: error.message });
+      h.failure = boundedFailure(error, "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+      h.manual_recovery = [
+        `The paused target for handoff ${handoffId} could not prove exact Runner ownership.`,
+        "Keep the target paused and reconcile its session header and durable binding before any new handoff.",
+        "Do not install a replacement binding or retry automatically.",
+      ];
+      this.storage.saveHandoff(h, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery });
       throw error;
     }
 
@@ -537,7 +571,13 @@ export class HandoffService {
       this.storage.saveHandoff(h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
     } catch (error) {
       h.state = "MANIFEST_PERSIST_FAILED";
-      this.storage.saveHandoff(h, "MANIFEST_PERSIST_FAILED", { error: error.message, event_key: `manifest-failed:${h.resume_manifest_id}` });
+      h.failure = boundedFailure(error, "MANIFEST_PERSIST_FAILED");
+      h.manual_recovery = [
+        `Manifest persistence for handoff ${handoffId} has an unknown or failed durable outcome.`,
+        `Keep target ${h.target_session_id} paused and reconcile manifest ${h.resume_manifest_id} before any new handoff.`,
+        "Do not rewrite the artifact, recreate the target, or retry automatically.",
+      ];
+      this.storage.saveHandoff(h, "MANIFEST_PERSIST_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery, event_key: `manifest-failed:${h.resume_manifest_id}` });
       throw error;
     }
 
@@ -551,13 +591,22 @@ export class HandoffService {
     }
     target.setEditor?.(h.resume_prompt);
     if (options.mode === "confirm") {
+      const expectedResume = this.prepareResumeConfirmation(handoffId, session, {
+        currentTargetVerifier: options.verifyCurrentTarget ? () => options.verifyCurrentTarget(session) : null,
+      });
       const confirmed = await options.confirmResume(target, h);
-      if (confirmed) return this.resume(handoffId, { actor: options.actor, sendResume: options.sendResume ?? target.sendResume });
+      if (confirmed) return this.resume(handoffId, {
+        actor: options.actor,
+        sendResume: options.sendResume ?? target.sendResume,
+        expectedResume,
+        targetSession: session,
+      });
+      this.discardResumeConfirmation(expectedResume);
     }
     return h;
   }
 
-  async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume }) {
+  async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume, verifyCurrentTarget = null }) {
     const failed = this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
     const initial = this.#captureRecoveryAttestation({
@@ -641,6 +690,7 @@ export class HandoffService {
       actor,
       confirmResume,
       sendResume,
+      verifyCurrentTarget,
     });
   }
 
@@ -691,8 +741,15 @@ export class HandoffService {
     const latch = this.storage.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
     this.assertModelPolicy(plan, targetSession);
-    h.resume_prompt = this.buildPrompt(h, m);
-    h.resume_prompt_digest = sha256(Buffer.from(h.resume_prompt, "utf8"));
+    const resumePrompt = this.buildPrompt(h, m);
+    const resumePromptDigest = sha256(Buffer.from(resumePrompt, "utf8"));
+    if (h.state === "RESUME_READY") {
+      invariant(h.resume_prompt === resumePrompt && h.resume_prompt_digest === resumePromptDigest,
+        "RESUME_EXPECTATION_STALE", "Existing resume prompt no longer equals current continuity evidence");
+      return h;
+    }
+    h.resume_prompt = resumePrompt;
+    h.resume_prompt_digest = resumePromptDigest;
     h.state = "RESUME_READY";
     this.storage.saveHandoff(h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
     const ready = this.storage.getHandoff(handoffId);
@@ -736,23 +793,197 @@ export class HandoffService {
     });
   }
 
-  async resume(handoffId, { actor = "human:resume", sendResume }) {
+  #captureResumeAuthority(handoffId, targetSession, coordinatedPlan, expectedAuthority = null) {
+    const h = this.storage.getHandoff(handoffId);
+    invariant(h?.state === "RESUME_READY", "RESUME_NOT_READY", h?.state ?? "HANDOFF_NOT_FOUND");
+    invariant(targetSession && typeof targetSession === "object" && targetSession.sessionId === h.target_session_id,
+      "RESUME_EXPECTATION_STALE", "The confirmed target session no longer matches the handoff");
+    invariant(normalizePath(targetSession.sessionFile) === h.target_session_file,
+      "RESUME_EXPECTATION_STALE", "The target session file changed after confirmation was displayed");
+    const plan = captureReservedPlanSnapshot(coordinatedPlan, {
+      modelPolicy: this.modelPolicy ?? coordinatedPlan.model_policy ?? null,
+      reasoningPolicy: this.reasoningPolicy ?? coordinatedPlan.reasoning_policy ?? null,
+    });
+    const semanticPlan = assertReservedPlanConsistency(h, plan);
+    const semanticDigest = planSemanticDigest(semanticPlan, { requireAll: true });
+    const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
+    const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
+    assertCheckpointPlanConsistency(h, semanticPlan, checkpoint.payload);
+    assertManifestPlanConsistency(h, semanticPlan, manifest.payload);
+    invariant(manifest.payload.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
+    const git = this.observeGit();
+    invariant(git && typeof git === "object" && typeof git.then !== "function", "GIT_STATE_MISMATCH", "Git observation must be synchronous");
+    invariant(sameGitState(h.expected_git_state, git), "GIT_STATE_MISMATCH", "Git changed after resume confirmation was displayed");
+    const header = targetSession.sessionManager.getHeader();
+    const entries = targetSession.sessionManager.getEntries();
+    const history = entries.filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
+    invariant(targetSession.sessionManager.getSessionId() === targetSession.sessionId
+      && history.length === 0
+      && targetSession.isIdle === true
+      && targetSession.isStreaming !== true
+      && targetSession.pendingMessageCount === 0
+      && targetSession.isRetrying !== true
+      && targetSession.isCompacting !== true,
+    "REPLACEMENT_NOT_PAUSED_NO_HISTORY", "The confirmed target is no longer paused, idle, and free of conversation history");
+    invariant(normalizePath(header.parentSession) === h.parent_session_file, "PARENT_LINEAGE_MISMATCH");
+    const runtimeBinding = readRuntimeRunnerBinding(targetSession);
+    this.attestRunnerOwnership(h, targetSession, manifest.payload);
+    this.assertModelPolicy(semanticPlan, targetSession);
+    const actualModel = targetSession.model ? `${targetSession.model.provider}/${targetSession.model.id}` : null;
+    validateRequiredLocalPaths(manifest.payload.required_local_paths, "REQUIRED_LOCAL_PATH_INVALID");
+    verifyRequiredLocalPaths(dirname(this.ledger.path), manifest.payload.required_local_paths);
+    invariant(typeof h.resume_prompt === "string" && h.resume_prompt.length > 0
+      && sha256(Buffer.from(h.resume_prompt, "utf8")) === h.resume_prompt_digest
+      && h.resume_prompt === this.buildPrompt(h, manifest.payload),
+    "RESUME_EXPECTATION_STALE", "Resume prompt identity changed after confirmation was displayed");
+    const binding = this.storage.getRunnerSessionBinding(handoffId);
+    invariant(binding?.status === "ACTIVE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding is not ACTIVE");
+    const latch = this.storage.getLatch(h.task_id);
+    invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation && latch.reason !== "HUMAN_TAKEOVER",
+      latch?.reason === "HUMAN_TAKEOVER" ? "HUMAN_TAKEOVER_ACTIVE" : "LATCH_GENERATION_MISMATCH");
+    invariant(h.authorization_state === "NOT_AUTHORIZED" && h.admission_state === "NOT_COMMITTED" && h.dispatch_state === "NOT_STARTED",
+      "RESUME_EXPECTATION_STALE", "Resume authorization, admission, or dispatch is no longer empty");
+    const latest = this.storage.latestHandoffForTask(h.task_id);
+    invariant(latest?.handoff_id === h.handoff_id, "TASK_OPERATION_CONFLICT", "The handoff no longer owns the task operation");
+    const durableCounts = {
+      authorizations: this.storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
+      admissions: this.storage.db.prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
+      dispatch_attempts: this.storage.db.prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
+    };
+    invariant(Object.values(durableCounts).every((count) => count === 0), "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
+    const authority = deepFreeze(structuredClone({
+      schema: "aiopago.internal-resume-attestation/1",
+      handoff: h,
+      plan: semanticPlan,
+      plan_semantic_digest: semanticDigest,
+      git: gitAuthority(git),
+      target: {
+        session_id: targetSession.sessionId,
+        session_file: normalizePath(targetSession.sessionFile),
+        parent_session_file: normalizePath(header.parentSession),
+        runner_binding: runtimeBinding,
+        model_policy: actualModel,
+        reasoning_policy: targetSession.thinkingLevel ?? null,
+        history_length: history.length,
+        entry_count: entries.length,
+        idle: targetSession.isIdle === true,
+        streaming: targetSession.isStreaming === true,
+        pending_messages: targetSession.pendingMessageCount,
+        retrying: targetSession.isRetrying === true,
+        compacting: targetSession.isCompacting === true,
+      },
+      binding: {
+        handoff_id: binding.handoff_id,
+        replacement_session_id: binding.replacement_session_id,
+        runner_instance_id: binding.runner_instance_id,
+        session_binding_id: binding.session_binding_id,
+        status: binding.status,
+      },
+      checkpoint: { id: h.checkpoint_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+      manifest: { id: h.resume_manifest_id, digest: manifest.digest, content_digest: manifest.content_digest },
+      resume_prompt: { id: h.resume_prompt_id, digest: h.resume_prompt_digest, text: h.resume_prompt },
+      latch: { task_id: h.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
+      authorization: { state: h.authorization_state, admission: h.admission_state, dispatch: h.dispatch_state, durable_counts: durableCounts },
+      task_operation_handoff_id: latest.handoff_id,
+    }));
+    if (expectedAuthority) {
+      const changed = Object.keys(authority).filter((field) => !sameCanonicalJson(authority[field], expectedAuthority[field]));
+      invariant(changed.length === 0,
+        "RESUME_EXPECTATION_STALE", `The exact operation shown before human confirmation is no longer current (${changed.join(", ")})`);
+    }
+    return authority;
+  }
+
+  prepareResumeConfirmation(handoffId, targetSession, { currentTargetVerifier = null } = {}) {
+    const targetAttestation = currentTargetVerifier?.();
+    invariant(!targetAttestation || typeof targetAttestation.then !== "function", "RESUME_ATTESTATION_INVALID", "Current target attestation must be synchronous");
+    const h = this.storage.getHandoff(handoffId);
+    invariant(h?.state === "RESUME_READY", "RESUME_NOT_READY", h?.state ?? "HANDOFF_NOT_FOUND");
+    const authority = this.#captureResumeAuthority(handoffId, targetSession, this.ledger.read());
+    const expectation = deepFreeze({
+      schema: "aiopago.resume-expectation/1",
+      expectation_id: opaqueId("RE"),
+      handoff_id: h.handoff_id,
+      state: h.state,
+      task_id: h.task_id,
+      task_plan_revision: h.task_plan_revision,
+      task_plan_digest: h.task_plan_digest,
+      plan_semantic_digest: authority.plan_semantic_digest,
+      expected_git_state: authority.git,
+      target_session_id: h.target_session_id,
+      target_session_file: h.target_session_file,
+      runner_instance_id: h.runner_instance_id,
+      session_binding_id: h.session_binding_id,
+      checkpoint_id: h.checkpoint_id,
+      checkpoint_digest: h.checkpoint_digest,
+      resume_manifest_id: h.resume_manifest_id,
+      resume_manifest_digest: h.resume_manifest_digest,
+      resume_prompt_id: h.resume_prompt_id,
+      resume_prompt_digest: h.resume_prompt_digest,
+      model_policy: h.model_policy,
+      reasoning_policy: h.reasoning_policy,
+      latch: authority.latch,
+      authorization_state: h.authorization_state,
+      admission_state: h.admission_state,
+      dispatch_state: h.dispatch_state,
+    });
+    this.#resumeExpectations.set(expectation, { targetSession, authority, currentTargetVerifier, targetAttestation });
+    return expectation;
+  }
+
+  discardResumeConfirmation(expectation) {
+    return this.#resumeExpectations.delete(expectation);
+  }
+
+  async resume(handoffId, { actor = "human:resume", sendResume, expectedResume = null, targetSession = null } = {}) {
     let h = this.storage.getHandoff(handoffId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUMED") return h;
     if (h.state === "CONTINUITY_FAILED") throw new GuardianError("CONTINUITY_RECOVERY_REQUIRED", `Use /aio handoff recover ${h.handoff_id}`);
     if (h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Automatic redispatch is forbidden");
     invariant(typeof sendResume === "function", "RESUME_TRANSPORT_REQUIRED");
+    const prepared = expectedResume && typeof expectedResume === "object" ? this.#resumeExpectations.get(expectedResume) : null;
+    invariant(prepared && prepared.targetSession === targetSession && expectedResume.handoff_id === handoffId,
+      "RESUME_ATTESTATION_REQUIRED", "Direct resume requires the invocation-local expectation captured for this exact target and human prompt");
+    this.#resumeExpectations.delete(expectedResume);
     const resumeStarted = performance.now();
+    const admissionId = stableId("ADM", expectedResume.resume_prompt_id);
+    const admission = authorizeTrustedResume(this.ledger, {
+      storage: this.storage,
+      expectedPlan: {
+        taskId: expectedResume.task_id,
+        planRevisionId: expectedResume.task_plan_revision,
+        contentDigest: expectedResume.task_plan_digest,
+      },
+      capture: (coordinatedPlan) => {
+        const targetAttestation = prepared.currentTargetVerifier?.();
+        invariant(!targetAttestation || typeof targetAttestation.then !== "function", "RESUME_ATTESTATION_INVALID", "Final current target attestation must be synchronous");
+        invariant(sameCanonicalJson(targetAttestation ?? null, prepared.targetAttestation ?? null),
+          "RESUME_EXPECTATION_STALE", "Current Runner target ownership changed after resume confirmation was displayed");
+        const authority = this.#captureResumeAuthority(handoffId, targetSession, coordinatedPlan, prepared.authority);
+        return {
+          handoffId,
+          actor,
+          idempotencyKey: `resume:${authority.resume_prompt.id}`,
+          admissionId,
+          expected: {
+            handoff: authority.handoff,
+            binding: authority.binding,
+            latch: authority.latch,
+            planSemanticDigest: authority.plan_semantic_digest,
+            taskOperationHandoffId: authority.task_operation_handoff_id,
+          },
+          attestation: authority,
+        };
+      },
+    });
+    h = admission.handoff;
     this.metric("RESUME_STARTED", {
       handoff: h,
       session_id: h.target_session_id,
       checkpoint_id: h.checkpoint_id,
       reason: "HUMAN_RESUME_AUTHORIZED",
     });
-    const admissionId = stableId("ADM", h.resume_prompt_id);
-    const admission = this.storage.authorizeAndAdmit(handoffId, actor, `resume:${h.resume_prompt_id}`, admissionId);
-    h = admission.handoff;
     const attemptId = stableId("DSP", admissionId, "1");
     const dispatch = this.storage.beginDispatch(handoffId, attemptId, 1);
     if (dispatch.idempotent) {
@@ -780,10 +1011,19 @@ export class HandoffService {
 
   async resumeExisting(h, options) {
     if (h.state === "RESUMED") return h;
-    if (h.state === "RESUME_READY" || h.admission_state === "COMMITTED") {
-      if (options.mode === "confirm" && await options.confirmResume(null, h)) return this.resume(h.handoff_id, options);
+    if (h.state === "RESUME_READY") {
+      if (options.mode !== "confirm") return h;
+      invariant(options.targetSession, "RESUME_ATTESTATION_REQUIRED", "Existing handoff confirmation requires the exact paused target runtime");
+      const expectedResume = this.prepareResumeConfirmation(h.handoff_id, options.targetSession, {
+        currentTargetVerifier: options.currentTargetVerifier ?? null,
+      });
+      if (await options.confirmResume(options.targetSession, h)) {
+        return this.resume(h.handoff_id, { ...options, expectedResume, targetSession: options.targetSession });
+      }
+      this.discardResumeConfirmation(expectedResume);
       return h;
     }
+    if (h.admission_state === "COMMITTED") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Committed admission cannot be reconfirmed or replayed");
     throw new GuardianError("ACTIVE_HANDOFF_EXISTS", `Existing handoff is ${h.state}`, { handoff_id: h.handoff_id });
   }
 

@@ -21,6 +21,9 @@ const PREPARING_HANDOFF_STATES = new Set([
   "MANIFEST_PERSISTING", "MANIFEST_PERSISTED", "RESUME_ADMISSION_COMMITTED",
   "RESUME_DISPATCHING", "RESUME_DISPATCHED",
 ]);
+const CRASH_INTENT_STATES = new Set([
+  "CHECKPOINT_PERSISTING", "REPLACEMENT_SESSION_CREATING", "MANIFEST_PERSISTING",
+]);
 const KNOWN_HANDOFF_STATES = new Set([
   ...PREPARING_HANDOFF_STATES,
   ...FAILED_HANDOFF_STATES,
@@ -594,6 +597,19 @@ export function projectHumanWorkflow(observation) {
       "La continuità è verificata, ma il resume non è ancora autorizzato dall’essere umano.",
       "usa “/aio resume” e conferma esplicitamente solo se vuoi autorizzare una singola ripresa.",
       { handoff: { actionability: "resume-confirmation" } });
+  }
+  if (CRASH_INTENT_STATES.has(handoff?.state)
+    && handoff.runner_instance_id !== runtime.session.runnerInstanceId) {
+    return project("NEEDS_ATTENTION", "error", "richiede riconciliazione", observation,
+      `L’handoff ${handoff.handoff_id} è rimasto in ${handoff.state} dopo il cambio di Runner; l’esito dell’operazione è sconosciuto.`,
+      `riconcilia manualmente l’handoff ${handoff.handoff_id} e gli eventuali artifact/target; non avviare un secondo handoff e non ritentare automaticamente.`,
+      { handoff: {
+        actionability: "manual-recovery",
+        recovery: [
+          "Il cambio di Runner rende sconosciuto l’esito dell’intent persistito.",
+          "Conserva il latch e riconcilia l’operazione esistente prima di altro lavoro.",
+        ],
+      } });
   }
   if (PREPARING_HANDOFF_STATES.has(handoff?.state)) {
     return project("PAUSED", "attention", "handoff in preparazione", observation,

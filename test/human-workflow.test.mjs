@@ -139,6 +139,31 @@ function seedResumeReady(storage, plan, suffix = "one") {
   return storage.getHandoff(handoffId);
 }
 
+function seedCommittedAdmission(storage, handoff, suffix = handoff.handoff_id) {
+  return storage.transaction(() => {
+    const h = storage.getHandoff(handoff.handoff_id);
+    const latch = storage.getLatch(h.task_id);
+    const generation = latch.generation + 1;
+    const actor = "human:test";
+    const released = storage.appendEvent("LATCH_RELEASED", { task_id: h.task_id, generation, actor }, { handoffId: h.handoff_id, eventKey: `latch-release:${h.task_id}:${generation}` });
+    storage.db.prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?")
+      .run(generation, released.occurred_at, actor, released.event_id, h.task_id);
+    const admissionId = `ADM-${suffix}`;
+    storage.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      .run(h.resume_prompt_id, h.handoff_id, actor, generation, released.occurred_at);
+    storage.db.prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+      .run(admissionId, h.resume_prompt_id, `resume:${h.resume_prompt_id}`, h.handoff_id, released.occurred_at);
+    h.authorization_state = "AUTHORIZED";
+    h.admission_state = "COMMITTED";
+    h.admission_id = admissionId;
+    h.state = "RESUME_ADMISSION_COMMITTED";
+    storage.db.prepare("UPDATE handoffs SET state=?,projection_json=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), h.handoff_id);
+    storage.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor }, { handoffId: h.handoff_id, eventKey: `authorization:${h.resume_prompt_id}` });
+    storage.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admissionId, idempotency_key: `resume:${h.resume_prompt_id}` }, { handoffId: h.handoff_id, eventKey: `admission:${h.resume_prompt_id}` });
+    return storage.getHandoff(h.handoff_id);
+  });
+}
+
 function assertUnchanged(before, after) {
   assert.deepEqual(after.runtimeEntries, before.runtimeEntries);
   assert.equal(after.files.length, before.files.length);
@@ -335,21 +360,21 @@ test("review regressions fail closed at the architectural boundary without prese
     }],
     ["authorization actor is not human", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "actor");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-actor");
+      seedCommittedAdmission(storage, handoff, "actor");
       storage.beginDispatch(handoff.handoff_id, "DSP-actor", 1);
       storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
       storage.db.prepare("UPDATE authorizations SET actor='future:machine' WHERE handoff_id=?").run(handoff.handoff_id);
     }],
     ["RESUME_ADMISSION_COMMITTED event is missing", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "missing-admission-event");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-missing-event");
+      seedCommittedAdmission(storage, handoff, "missing-event");
       storage.beginDispatch(handoff.handoff_id, "DSP-missing-event", 1);
       storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
       storage.db.prepare("DELETE FROM journal WHERE handoff_id=? AND event_type='RESUME_ADMISSION_COMMITTED'").run(handoff.handoff_id);
     }],
     ["authorization/admission/dispatch journal sequence is incomplete", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "incomplete-sequence");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-incomplete");
+      seedCommittedAdmission(storage, handoff, "incomplete");
       storage.beginDispatch(handoff.handoff_id, "DSP-incomplete", 1);
       storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
       storage.db.prepare("DELETE FROM journal WHERE handoff_id=? AND event_type IN ('RESUME_AUTHORIZED','RESUME_DISPATCH_INTENT')").run(handoff.handoff_id);
@@ -377,28 +402,28 @@ test("review regressions fail closed at the architectural boundary without prese
 test("all persisted authorization/admission/dispatch states remain unverified without the Core Observation Port", async (t) => {
   const cases = [
     ["RESUME_READY", (storage, h) => h],
-    ["RESUME_ADMISSION_COMMITTED", (storage, h) => storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`).handoff],
+    ["RESUME_ADMISSION_COMMITTED", (storage, h) => seedCommittedAdmission(storage, h)],
     ["RESUME_DISPATCHING", (storage, h) => {
-      const admitted = storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`).handoff;
+      const admitted = seedCommittedAdmission(storage, h);
       return storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1).handoff;
     }],
     ["RESUME_DISPATCHED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
+      seedCommittedAdmission(storage, h);
       storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
       return storage.finishDispatch(h.handoff_id, "DISPATCHED");
     }],
     ["RESUME_DISPATCH_FAILED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
+      seedCommittedAdmission(storage, h);
       storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
       return storage.finishDispatch(h.handoff_id, "FAILED", "known failure");
     }],
     ["RESUME_DISPATCH_UNKNOWN", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
+      seedCommittedAdmission(storage, h);
       storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
       return storage.finishDispatch(h.handoff_id, "UNKNOWN", "ambiguous");
     }],
     ["RESUMED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
+      seedCommittedAdmission(storage, h);
       storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
       return storage.finishDispatch(h.handoff_id, "ACKNOWLEDGED");
     }],
@@ -447,18 +472,16 @@ test("takeover authority from the prior task survives a direct plan task_id chan
   assert.doesNotMatch(status.output, /pronto a continuare/);
 });
 
-test("a prior dispatch ambiguity is not hidden by a later acknowledged handoff", async () => {
+test("a prior dispatch ambiguity transactionally blocks a later handoff lifecycle", async () => {
   const root = await fixture();
   const storage = new GuardianStorage(join(root, ".guardian", "runtime", "guardian.sqlite"));
   const plan = planAuthority(root);
   const first = seedResumeReady(storage, plan, "ambiguous-first");
-  storage.authorizeAndAdmit(first.handoff_id, "human:test", `resume:${first.resume_prompt_id}`, "ADM-first");
+  seedCommittedAdmission(storage, first, "first");
   storage.beginDispatch(first.handoff_id, "DSP-first", 1);
   storage.finishDispatch(first.handoff_id, "UNKNOWN", "transport ambiguous");
-  const second = seedResumeReady(storage, plan, "successful-second");
-  storage.authorizeAndAdmit(second.handoff_id, "human:test", `resume:${second.resume_prompt_id}`, "ADM-second");
-  storage.beginDispatch(second.handoff_id, "DSP-second", 1);
-  storage.finishDispatch(second.handoff_id, "ACKNOWLEDGED");
+  assert.throws(() => seedResumeReady(storage, plan, "forbidden-second"), (error) => error.code === "TASK_OPERATION_CONFLICT");
+  assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
   storage.close();
   const observed = readRuntimeProjection(join(root, ".guardian", "runtime", "guardian.sqlite"), plan);
   assert.equal(observed.workflow, "NEEDS_ATTENTION");

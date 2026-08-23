@@ -6,8 +6,9 @@ import { GuardianError, invariant } from "./errors.mjs";
 import { handoffConsentIdentity } from "./handoff-consent.mjs";
 import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal.mjs";
 import { planSemanticDigest, sameCanonicalJson } from "./plan-semantics-internal.mjs";
+import { taskOperationBlocksNewHandoff, taskOperationDisposition } from "./task-operation-internal.mjs";
 
-const TERMINAL_HANDOFF = new Set(["RESUMED", "RESUME_DISPATCH_UNKNOWN", "HUMAN_DECISION_REQUIRED", "HANDOFF_FAILED", "CONTINUITY_FAILED"]);
+const TERMINAL_HANDOFF = new Set(["RESUMED"]);
 const TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
 
 const HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
@@ -70,8 +71,50 @@ function sameRecoveryFailedIdentity(actual, expected, expectedPlanSemanticDigest
     && actualPlanSemanticDigest === expectedPlanSemanticDigest;
 }
 
+function recoveryStarted(storage, handoffId) {
+  return Boolean(storage.db.prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(handoffId));
+}
+
+function recoveryChildExists(storage, handoffId) {
+  const rows = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=(SELECT task_id FROM handoffs WHERE handoff_id=?)").all(handoffId);
+  return rows.some((row) => storage.getHandoff(row.handoff_id)?.recovery_of_handoff_id === handoffId);
+}
+
+function blockingTaskOperation(storage, taskId, excludingHandoffId = null) {
+  const rows = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at, rowid").all(taskId);
+  for (const row of rows) {
+    if (row.handoff_id === excludingHandoffId) continue;
+    const handoff = storage.getHandoff(row.handoff_id);
+    const disposition = taskOperationDisposition(handoff, {
+      binding: storage.getRunnerSessionBinding(handoff.handoff_id),
+      recoveryStarted: recoveryStarted(storage, handoff.handoff_id),
+      recoveryChildExists: recoveryChildExists(storage, handoff.handoff_id),
+    });
+    if (taskOperationBlocksNewHandoff(disposition)) return { handoff, disposition };
+  }
+  return null;
+}
+
+function isExactRecoveryTransfer(storage, conflict, projection, precondition) {
+  if (projection.recovery_of_handoff_id !== conflict?.handoff?.handoff_id
+    || conflict.disposition !== "RECOVERY_REQUIRED"
+    || JSON.stringify(handoffConsentIdentity(conflict.handoff)) !== JSON.stringify(precondition.expectedHandoff)) return false;
+  const binding = storage.getRunnerSessionBinding(conflict.handoff.handoff_id);
+  const event = storage.db.prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(conflict.handoff.handoff_id);
+  const data = event ? JSON.parse(event.data_json) : null;
+  return binding?.status === "SUPERSEDED"
+    && data?.current_source_session_id === projection.source_session_id
+    && data?.current_runner_instance_id === projection.runner_instance_id
+    && !recoveryChildExists(storage, conflict.handoff.handoff_id);
+}
+
 function reserveHandoffInTransaction(storage, projection, precondition) {
   invariant(precondition && precondition.latch && Object.hasOwn(precondition, "expectedHandoff"), "HANDOFF_RESERVATION_PRECONDITION_REQUIRED");
+  const exact = storage.getHandoff(projection.handoff_id);
+  if (exact) {
+    if (sameHandoffReservationIdentity(exact, projection)) return { created: false, handoff: exact };
+    throw new GuardianError("TASK_OPERATION_CONFLICT", "The requested handoff identity already belongs to a different durable operation", { handoff_id: projection.handoff_id });
+  }
   const latch = storage.getLatch(projection.task_id);
   if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
     throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover won before durable handoff reservation");
@@ -95,6 +138,16 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
   const latest = latestRow ? storage.getHandoff(latestRow.handoff_id) : null;
   invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(precondition.expectedHandoff),
     "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before durable reservation");
+  const conflict = blockingTaskOperation(storage, projection.task_id);
+  if (conflict && !isExactRecoveryTransfer(storage, conflict, projection, precondition)) {
+    const code = conflict.disposition === "RECOVERY_REQUIRED" ? "CONTINUITY_RECOVERY_REQUIRED" : "TASK_OPERATION_CONFLICT";
+    throw new GuardianError(code, `Task ${projection.task_id} already has unresolved handoff ${conflict.handoff.handoff_id} in ${conflict.handoff.state}; reconcile it explicitly before another handoff`, {
+      task_id: projection.task_id,
+      existing_handoff_id: conflict.handoff.handoff_id,
+      existing_state: conflict.handoff.state,
+      disposition: conflict.disposition,
+    });
+  }
   const now = utcNow();
   storage.db.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
     .run(projection.handoff_id, projection.source_session_id, null, projection.task_id, projection.state, projection.latch_generation, JSON.stringify(projection), now, now);
@@ -172,6 +225,7 @@ export class GuardianStorage {
       prepareRecovery: ({ failedHandoffId, preparation, reservation, attestation }) => this.prepareContinuityRecovery(
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
+      authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
     });
   }
 
@@ -564,21 +618,62 @@ export class GuardianStorage {
     });
   }
 
-  authorizeAndAdmit(id, actor, idempotencyKey, admissionId) {
+  #authorizeAndAdmitTrustedResume(request) {
+    const { handoffId: id, actor, idempotencyKey, admissionId, expected } = request ?? {};
+    invariant(expected?.handoff && expected?.binding && expected?.latch
+      && typeof expected?.planSemanticDigest === "string", "RESUME_ATTESTATION_REQUIRED");
     return this.transaction(() => {
       const h = this.getHandoff(id);
       invariant(h, "HANDOFF_NOT_FOUND");
-      const prior = h.resume_prompt_id ? this.db.prepare("SELECT * FROM admissions WHERE resume_prompt_id=?").get(h.resume_prompt_id) : null;
-      if (prior) return { idempotent: true, admission_id: prior.admission_id, handoff: h };
-      invariant(h.state === "RESUME_READY", "RESUME_NOT_READY", h.state);
-      invariant(actor.startsWith("human:"), "HUMAN_AUTHORIZATION_REQUIRED");
+      invariant(h.state === "RESUME_READY" && sameCanonicalJson(h, expected.handoff),
+        "RESUME_EXPECTATION_STALE", "Durable handoff identity changed before resume admission");
+      invariant(h.handoff_id === expected.handoff.handoff_id
+        && h.task_id === expected.handoff.task_id
+        && h.target_session_id === expected.handoff.target_session_id
+        && h.runner_instance_id === expected.handoff.runner_instance_id
+        && h.session_binding_id === expected.handoff.session_binding_id
+        && h.resume_prompt_id === expected.handoff.resume_prompt_id
+        && h.resume_prompt_digest === expected.handoff.resume_prompt_digest
+        && h.checkpoint_id === expected.handoff.checkpoint_id
+        && h.checkpoint_digest === expected.handoff.checkpoint_digest
+        && h.resume_manifest_id === expected.handoff.resume_manifest_id
+        && h.resume_manifest_digest === expected.handoff.resume_manifest_digest,
+      "RESUME_EXPECTATION_STALE", "Durable resume identity no longer matches the confirmed operation");
+      invariant(planSemanticDigest(h.reserved_plan_snapshot, { requireAll: true }) === expected.planSemanticDigest,
+        "RESUME_EXPECTATION_STALE", "Durable handoff plan semantics changed before resume admission");
+      const binding = this.getRunnerSessionBinding(id);
+      invariant(binding?.status === "ACTIVE"
+        && binding.replacement_session_id === expected.binding.replacement_session_id
+        && binding.runner_instance_id === expected.binding.runner_instance_id
+        && binding.session_binding_id === expected.binding.session_binding_id
+        && binding.handoff_id === expected.binding.handoff_id,
+      "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding changed before resume admission");
       const latch = this.getLatch(h.task_id);
-      invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
+      invariant(latch?.state === expected.latch.state
+        && latch.generation === expected.latch.generation
+        && latch.reason === expected.latch.reason
+        && latch.state === "ENGAGED"
+        && latch.generation === h.latch_generation,
+      "LATCH_GENERATION_MISMATCH", "Durable latch changed before resume admission");
       invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE", "A pending handoff confirmation cannot release a human takeover");
+      invariant(actor?.startsWith("human:"), "HUMAN_AUTHORIZATION_REQUIRED");
+      invariant(h.authorization_state === "NOT_AUTHORIZED"
+        && h.admission_state === "NOT_COMMITTED"
+        && h.dispatch_state === "NOT_STARTED",
+      "RESUME_EXPECTATION_STALE", "Resume already has competing authorization, admission, or dispatch state");
+      const authorization = this.db.prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
+      const admission = this.db.prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
+      const dispatch = this.db.prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(id);
+      invariant(!authorization && !admission && !dispatch, "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
+      const latest = this.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(h.task_id);
+      invariant(latest?.handoff_id === id && expected.taskOperationHandoffId === id,
+        "TASK_OPERATION_CONFLICT", "The confirmed handoff no longer owns the task operation");
+
       const releaseGeneration = latch.generation + 1;
       const release = this.appendEvent("LATCH_RELEASED", { task_id: h.task_id, generation: releaseGeneration, actor }, { handoffId: id, eventKey: `latch-release:${h.task_id}:${releaseGeneration}` });
-      this.db.prepare("UPDATE latches SET state='RELEASED',generation=?,released_at=?,released_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=?")
-        .run(releaseGeneration, release.occurred_at, actor, release.event_id, h.task_id, latch.generation);
+      const released = this.db.prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
+        .run(releaseGeneration, release.occurred_at, actor, release.event_id, h.task_id, latch.generation, latch.reason);
+      invariant(released.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch release raced final resume admission");
       const now = utcNow();
       this.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
         .run(h.resume_prompt_id, id, actor, releaseGeneration, now);
@@ -594,12 +689,16 @@ export class GuardianStorage {
       h.admission_id = admissionId;
       h.state = "RESUME_ADMISSION_COMMITTED";
       h.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?")
+      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=? AND state='RESUME_READY'")
         .run(h.state, JSON.stringify(h), now, id);
       this.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor }, { handoffId: id, eventKey: `authorization:${h.resume_prompt_id}` });
       this.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admissionId, idempotency_key: idempotencyKey }, { handoffId: id, eventKey: `admission:${h.resume_prompt_id}` });
       return { idempotent: false, admission_id: admissionId, handoff: this.getHandoff(id) };
     });
+  }
+
+  authorizeAndAdmit() {
+    throw new GuardianError("RESUME_ATTESTATION_REQUIRED", "Direct durable resume admission is package-private and requires final runtime, Git, plan, and ownership attestation");
   }
 
   beginDispatch(id, attemptId, attemptNo = 1) {

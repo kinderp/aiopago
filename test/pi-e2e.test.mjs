@@ -9,6 +9,7 @@ import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState } from "../src/git-state.mjs";
 import { guidedHandoffEligibilityIdentityFromAuthority } from "../src/handoff-consent.mjs";
 import { HandoffService } from "../src/handoff.mjs";
+import { observeRunnerHumanWorkflow, projectHumanWorkflow } from "../src/human-workflow.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
@@ -970,6 +971,389 @@ test("M-07 recovery-first final coordination reserves immutable R-star provenanc
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+function resumeDurableCounts(runner, handoffId) {
+  return {
+    authorizations: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
+    admissions: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
+    dispatches: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
+  };
+}
+
+test("R2-H-01 actual Runner resume YES rejects combined P2, G2, and SUPERSEDED binding drift", async () => {
+  const x = await makeRunner();
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    const before = resumeDurableCounts(x.runner, ready.handoff_id);
+    const latchBefore = x.runner.storage.getLatch(ready.task_id);
+    let confirms = 0;
+    const ctx = {
+      ui: {
+        async confirm() {
+          confirms += 1;
+          prepareRecoveryPlanChange(x.root, "R2-COMBINED").apply();
+          writeFileSync(join(x.root, "r2-git-drift.txt"), "G2\n");
+          x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 combined prompt drift");
+          return true;
+        },
+        notify() {},
+      },
+    };
+    await assert.rejects(
+      () => x.runner.resumeFromCommand(ctx, ready.handoff_id),
+      (error) => ["RESUME_EXPECTATION_STALE", "PLAN_CAS_CONFLICT"].includes(error.code),
+    );
+    assert.equal(confirms, 1);
+    assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), before);
+    assert.deepEqual(x.runner.storage.getLatch(ready.task_id), latchBefore);
+    assert.equal(x.runner.storage.getHandoff(ready.handoff_id).state, "RESUME_READY");
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-H-01 stale resume authority matrix rejects before durable admission and send", async (t) => {
+  const attacks = [
+    ["plan", async (x) => { prepareRecoveryPlanChange(x.root, "R2-PLAN").apply(); }],
+    ["Git", async (x) => { writeFileSync(join(x.root, "r2-git-only.txt"), "G2\n"); }],
+    ["binding", async (x, ready) => { x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 binding drift"); }],
+    ["takeover", async (x, ready) => { x.runner.storage.engageLatch(ready.task_id, "HUMAN_TAKEOVER", "human:r2"); }],
+    ["ownership header", async (x) => {
+      const target = x.runner.runtime.session;
+      const binding = readRuntimeRunnerBinding(target);
+      target.sessionManager.appendCustomEntry(RUNNER_BINDING_CUSTOM_TYPE, binding);
+    }],
+    ["history", async (x) => { x.runner.runtime.session.sessionManager.appendMessage({ role: "user", content: "R2 history", timestamp: Date.now() }); }],
+    ["model", async (x) => { await x.runner.runtime.session.setModel({ ...x.runner.runtime.session.model, id: "offline-fake-r2" }); }],
+    ["reasoning", async (x) => { x.runner.runtime.session.setThinkingLevel("high"); }],
+    ["checkpoint identity", async (x, ready) => {
+      const moved = x.runner.storage.getHandoff(ready.handoff_id);
+      moved.checkpoint_digest = `sha256:${"d".repeat(64)}`;
+      x.runner.storage.saveHandoff(moved);
+    }],
+    ["manifest identity", async (x, ready) => {
+      const moved = x.runner.storage.getHandoff(ready.handoff_id);
+      moved.resume_manifest_digest = `sha256:${"e".repeat(64)}`;
+      x.runner.storage.saveHandoff(moved);
+    }],
+    ["resume prompt identity", async (x, ready) => {
+      const moved = x.runner.storage.getHandoff(ready.handoff_id);
+      moved.resume_prompt_digest = `sha256:${"f".repeat(64)}`;
+      x.runner.storage.saveHandoff(moved);
+    }],
+  ];
+  for (const [name, mutate] of attacks) {
+    await t.test(name, async () => {
+      const x = await makeRunner({ modelReasoning: name === "reasoning", reasoningPolicy: name === "reasoning" ? "low" : "off" });
+      try {
+        const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+        const before = resumeDurableCounts(x.runner, ready.handoff_id);
+        const expectedResume = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, x.runner.runtime.session);
+        await mutate(x, ready);
+        await assert.rejects(
+          () => x.runner.handoffService.resume(ready.handoff_id, {
+            actor: "human:r2-matrix",
+            sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+            expectedResume,
+            targetSession: x.runner.runtime.session,
+          }),
+        );
+        assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), before);
+        assert.equal(x.runner.storage.getHandoff(ready.handoff_id).state, "RESUME_READY");
+        assert.equal(x.calls, 0);
+        assert.equal(x.networkAttempts, 0);
+      } finally { await x.runner.dispose(); x.restoreFetch(); }
+    });
+  }
+});
+
+test("R2-H-01 required local path disappearance after YES rejects with zero send", async () => {
+  const x = await makeRunner({ requiredLocalPaths: [".guardian/required-r2.md"] });
+  try {
+    const required = join(x.root, ".guardian", "required-r2.md");
+    writeFileSync(required, "required\n");
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    const expectedResume = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, x.runner.runtime.session);
+    unlinkSync(required);
+    await assert.rejects(
+      () => x.runner.handoffService.resume(ready.handoff_id, {
+        actor: "human:r2-required-path",
+        sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+        expectedResume,
+        targetSession: x.runner.runtime.session,
+      }),
+      (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING",
+    );
+    assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+    assert.equal(x.calls, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-H-01 current Runner target and Runner identity drift during UI confirmation reject", async (t) => {
+  for (const drift of ["target", "runner"]) {
+    await t.test(drift, async () => {
+      const x = await makeRunner();
+      const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+      const target = x.runner.runtime.session;
+      const runnerId = x.runner.runnerInstanceId;
+      try {
+        await assert.rejects(() => x.runner.resumeFromCommand({
+          ui: {
+            async confirm() {
+              if (drift === "target") await target.extensionRunner.emit({ type: "session_shutdown", reason: "R2 target lifecycle drift" });
+              else x.runner.runnerInstanceId = "RUNNER-R2-OTHER";
+              return true;
+            },
+            notify() {},
+          },
+        }, ready.handoff_id), (error) => ["RESUME_EXPECTATION_STALE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "HANDOFF_SOURCE_CHANGED"].includes(error.code));
+        assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+        assert.equal(x.calls, 0);
+      } finally {
+        x.runner.runnerInstanceId = runnerId;
+        await x.runner.dispose(); x.restoreFetch();
+      }
+    });
+  }
+});
+
+test("R2-H-01 direct resume and resumeExisting confirmation cannot bypass final attestation", async () => {
+  const x = await makeRunner();
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    await assert.rejects(
+      () => x.runner.handoffService.resume(ready.handoff_id, {
+        actor: "human:direct-bypass",
+        sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+      }),
+      (error) => error.code === "RESUME_ATTESTATION_REQUIRED",
+    );
+    await assert.rejects(
+      () => x.runner.handoffService.resumeExisting(ready, {
+        mode: "confirm",
+        actor: "human:existing",
+        targetSession: x.runner.runtime.session,
+        confirmResume: async () => {
+          x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 resumeExisting prompt drift");
+          return true;
+        },
+        sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+      }),
+    );
+    assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+    assert.equal(x.calls, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-H-01 final SQLite binding race and post-release failure both roll back admission", async (t) => {
+  await t.test("binding superseded after final external capture", async () => {
+    const x = await makeRunner();
+    const other = new GuardianStorage(x.runner.storage.path);
+    try {
+      const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+      const expectedResume = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, x.runner.runtime.session);
+      const transaction = x.runner.storage.transaction.bind(x.runner.storage);
+      let intercepted = false;
+      x.runner.storage.transaction = (operation) => {
+        x.runner.storage.transaction = transaction;
+        intercepted = true;
+        other.supersedeRunnerSessionBinding(ready.handoff_id, "R2 final SQLite race");
+        return transaction(operation);
+      };
+      await assert.rejects(
+        () => x.runner.handoffService.resume(ready.handoff_id, {
+          actor: "human:r2-binding-race",
+          sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+          expectedResume,
+          targetSession: x.runner.runtime.session,
+        }),
+        (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED",
+      );
+      assert.equal(intercepted, true);
+      assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+      assert.equal(x.runner.storage.getLatch(ready.task_id).state, "ENGAGED");
+      assert.equal(x.calls, 0);
+    } finally { other.close(); await x.runner.dispose(); x.restoreFetch(); }
+  });
+
+  await t.test("failure after latch release rolls the whole transaction back", async () => {
+    const x = await makeRunner();
+    try {
+      const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+      const expectedResume = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, x.runner.runtime.session);
+      const append = x.runner.storage.appendEvent.bind(x.runner.storage);
+      x.runner.storage.appendEvent = (type, ...args) => {
+        if (type === "RESUME_AUTHORIZED") throw new Error("forced post-release admission failure");
+        return append(type, ...args);
+      };
+      await assert.rejects(
+        () => x.runner.handoffService.resume(ready.handoff_id, {
+          actor: "human:r2-rollback",
+          sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+          expectedResume,
+          targetSession: x.runner.runtime.session,
+        }),
+        /forced post-release admission failure/,
+      );
+      assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+      assert.equal(x.runner.storage.getLatch(ready.task_id).state, "ENGAGED");
+      assert.equal(x.runner.storage.getHandoff(ready.handoff_id).state, "RESUME_READY");
+      assert.equal(x.calls, 0);
+    } finally { await x.runner.dispose(); x.restoreFetch(); }
+  });
+});
+
+test("R2-H-01 resume-first plan coordination excludes P2 only through durable admission", async () => {
+  const x = await makeRunner();
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    const expectedResume = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, x.runner.runtime.session);
+    const writer = prepareRecoveryPlanChange(x.root, "R2-RESUME-FIRST");
+    const transaction = x.runner.storage.transaction.bind(x.runner.storage);
+    let writerCode = null;
+    x.runner.storage.transaction = (operation) => {
+      x.runner.storage.transaction = transaction;
+      try { writer.apply(); } catch (error) { writerCode = error.code; }
+      return transaction(operation);
+    };
+    const resumed = await x.runner.handoffService.resume(ready.handoff_id, {
+      actor: "human:r2-resume-first",
+      sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
+      expectedResume,
+      targetSession: x.runner.runtime.session,
+    });
+    assert.equal(resumed.state, "RESUMED");
+    assert.equal(writerCode, "PLAN_WRITE_LOCKED");
+    assert.equal(x.calls, 1);
+    writer.apply();
+    assert.match(x.runner.ledger.read().plan_revision_id, /R2-RESUME-FIRST/);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-H-01 concurrent human YES attempts admit and send at most once", async () => {
+  const x = await makeRunner();
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    const target = x.runner.runtime.session;
+    const firstExpectation = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, target);
+    const secondExpectation = x.runner.handoffService.prepareResumeConfirmation(ready.handoff_id, target);
+    let releaseSend;
+    const blockedSend = new Promise((resolve) => { releaseSend = resolve; });
+    let sends = 0;
+    const first = x.runner.handoffService.resume(ready.handoff_id, {
+      actor: "human:r2-concurrent-1",
+      sendResume: async () => { sends += 1; await blockedSend; },
+      expectedResume: firstExpectation,
+      targetSession: target,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(() => x.runner.handoffService.resume(ready.handoff_id, {
+      actor: "human:r2-concurrent-2",
+      sendResume: async () => { sends += 1; },
+      expectedResume: secondExpectation,
+      targetSession: target,
+    }));
+    assert.equal(sends, 1);
+    releaseSend();
+    assert.equal((await first).state, "RESUMED");
+    assert.deepEqual(resumeDurableCounts(x.runner, ready.handoff_id), { authorizations: 1, admissions: 1, dispatches: 1 });
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-H-01 finishPausedHandoff confirmation is bound before the human prompt", async () => {
+  const x = await makeRunner();
+  try {
+    await assert.rejects(
+      () => x.runner.handoffDirect({
+        mode: "confirm",
+        confirm: async () => {
+          prepareRecoveryPlanChange(x.root, "R2-FINISH").apply();
+          writeFileSync(join(x.root, "r2-finish-git.txt"), "G2\n");
+          const current = x.runner.storage.latestHandoffForTask("TASK-E2E");
+          x.runner.storage.supersedeRunnerSessionBinding(current.handoff_id, "R2 finish prompt drift");
+          return true;
+        },
+      }),
+    );
+    const current = x.runner.storage.latestHandoffForTask("TASK-E2E");
+    assert.deepEqual(resumeDurableCounts(x.runner, current.handoff_id), { authorizations: 0, admissions: 0, dispatches: 0 });
+    assert.equal(x.calls, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R2-M-01 recovered child crash intent blocks manual handoff from a different source after restart", async () => {
+  let x = await makeContinuityRecoveryFixture();
+  let reopened = null;
+  try {
+    const save = x.runner.storage.saveHandoff.bind(x.runner.storage);
+    const crash = Object.assign(new Error("simulated process crash after replacement intent"), { code: "SIMULATED_CRASH" });
+    x.runner.storage.saveHandoff = (handoff, ...args) => {
+      const result = save(handoff, ...args);
+      if (handoff.state === "REPLACEMENT_SESSION_CREATING") throw crash;
+      return result;
+    };
+    await assert.rejects(() => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }), (error) => error === crash);
+    const child = x.runner.storage.latestHandoffForTask("TASK-E2E");
+    assert.equal(child.recovery_of_handoff_id, x.failed.handoff_id);
+    assert.equal(child.state, "REPLACEMENT_SESSION_CREATING");
+    const root = x.root;
+    await x.runner.dispose(); x.restoreFetch(); x = null;
+
+    reopened = await makeRunner({ existingRoot: root });
+    const freshSource = reopened.runner.runtime.session.sessionId;
+    assert.notEqual(freshSource, child.source_session_id);
+    const changesBeforeRead = reopened.runner.storage.db.prepare("SELECT total_changes() AS count").get().count;
+    const stalledView = projectHumanWorkflow(observeRunnerHumanWorkflow(reopened.runner));
+    assert.equal(stalledView.state, "NEEDS_ATTENTION");
+    assert.equal(stalledView.handoff.actionability, "manual-recovery");
+    assert.match(`${stalledView.reason} ${stalledView.nextAction}`, /esito.*sconosciuto|riconcilia.*non.*secondo handoff/i);
+    assert.equal(reopened.runner.storage.db.prepare("SELECT total_changes() AS count").get().count, changesBeforeRead, "crash-stalled projection remains read-only");
+    let replacements = 0;
+    const originalNewSession = reopened.runner.runtime.newSession.bind(reopened.runner.runtime);
+    reopened.runner.runtime.newSession = (...args) => { replacements += 1; return originalNewSession(...args); };
+    await assert.rejects(
+      () => reopened.runner.handoffDirect({ mode: "manual", confirm: false }),
+      (error) => error.code === "TASK_OPERATION_CONFLICT",
+    );
+    assert.equal(reopened.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 2);
+    assert.equal(reopened.runner.storage.latestHandoffForTask("TASK-E2E").handoff_id, child.handoff_id);
+    assert.equal(replacements, 0);
+    assert.equal(reopened.calls, 0);
+    assert.equal(reopened.networkAttempts, 0);
+  } finally {
+    if (x) { await x.runner.dispose(); x.restoreFetch(); }
+    if (reopened) { await reopened.runner.dispose(); reopened.restoreFetch(); }
+  }
+});
+
+test("R2-M-01 explicit multi-generation recovery transfers F1 to C1 to C2 without a task fork", async () => {
+  let x = await makeContinuityRecoveryFixture();
+  let next = null;
+  try {
+    const originalContinuity = x.runner.handoffService.continuity.bind(x.runner.handoffService);
+    x.runner.handoffService.continuity = () => { throw Object.assign(new Error("forced C1 continuity failure"), { code: "CONTINUITY_FAILED" }); };
+    await assert.rejects(() => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }), (error) => error.code === "CONTINUITY_FAILED");
+    x.runner.handoffService.continuity = originalContinuity;
+    const c1 = x.runner.storage.latestHandoffForTask("TASK-E2E");
+    assert.equal(c1.recovery_of_handoff_id, x.failed.handoff_id);
+    assert.equal(c1.state, "CONTINUITY_FAILED");
+    assert.equal(x.runner.storage.getRunnerSessionBinding(c1.handoff_id).status, "ACTIVE");
+    const root = x.root;
+    await x.runner.dispose(); x.restoreFetch(); x = null;
+
+    next = await makeRunner({ existingRoot: root });
+    const c2 = await next.runner.recoverHandoffDirect(c1.handoff_id, { confirm: false });
+    assert.equal(c2.recovery_of_handoff_id, c1.handoff_id);
+    assert.equal(c2.state, "RESUME_READY");
+    assert.equal(next.runner.storage.getRunnerSessionBinding(x?.failed?.handoff_id ?? c1.recovery_of_handoff_id).status, "SUPERSEDED");
+    assert.equal(next.runner.storage.getRunnerSessionBinding(c1.handoff_id).status, "SUPERSEDED");
+    assert.equal(next.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 3);
+    assert.equal(next.calls, 0);
+  } finally {
+    if (x) { await x.runner.dispose(); x.restoreFetch(); }
+    if (next) { await next.runner.dispose(); next.restoreFetch(); }
+  }
 });
 
 test("Pi E2E: explicit /aio resume confirmation NO keeps the target paused and YES resumes once", async () => {
