@@ -26,13 +26,27 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     && typeof capability?.reserve === "function"
     && typeof capability?.prepareRecovery === "function"
     && typeof capability?.authorizeResume === "function"
-    && typeof capability?.assertOwnerGateEligibility === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+    && typeof capability?.assertOwnerGateAuthority === "function"
+    && typeof capability?.claimTakeover === "function"
+    && typeof capability?.claimHandoffLatch === "function"
+    && typeof capability?.saveHandoff === "function"
+    && typeof capability?.bindRunnerSession === "function"
+    && typeof capability?.supersedeRunnerSessionBinding === "function"
+    && typeof capability?.beginDispatch === "function"
+    && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
-    assertOwnerGateEligibility: capability.assertOwnerGateEligibility,
+    assertOwnerGateAuthority: capability.assertOwnerGateAuthority,
+    claimTakeover: capability.claimTakeover,
+    claimHandoffLatch: capability.claimHandoffLatch,
+    saveHandoff: capability.saveHandoff,
+    bindRunnerSession: capability.bindRunnerSession,
+    supersedeRunnerSessionBinding: capability.supersedeRunnerSessionBinding,
+    beginDispatch: capability.beginDispatch,
+    finishDispatch: capability.finishDispatch,
   }));
 }
 
@@ -46,14 +60,73 @@ export function satisfyTrustedHandoffOwnerGate(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed GuardianStorage");
-  const { expected, taskId, expectedHandoff, command, actor } = request;
-  invariant(taskId === expected?.taskId && typeof command === "string" && typeof actor === "string",
+  const { expected, taskId, expectedHandoff, expectedLatch, command, actor } = request;
+  invariant(taskId === expected?.taskId && expectedLatch?.task_id === taskId,
     "HANDOFF_OWNER_GATE_AUTHORITY_INVALID");
   return planCapability.satisfyOwnerGate({ expected, command, actor }, () => {
-    const eligible = storageCapability.assertOwnerGateEligibility({ taskId, expectedHandoff });
-    invariant(!eligible || typeof eligible.then !== "function", "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Task ownership eligibility must be synchronous");
-    return eligible;
+    const authority = storageCapability.assertOwnerGateAuthority({ taskId, expectedHandoff, expectedLatch });
+    invariant(!authority || typeof authority.then !== "function", "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Owner authority attestation must be synchronous");
+    return authority;
   });
+}
+
+// HUMAN_TAKEOVER uses the same global order as owner confirmation and every
+// trusted lifecycle creator: PlanRevisionWriter, then one SQLite authority
+// transaction. The plan lock is released before SafePoint performs any drain.
+export function claimTrustedHumanTakeover(ledger, request) {
+  const planCapability = handoffPlanCapabilities.get(ledger);
+  const storageCapability = handoffStorageCapabilities.get(request?.storage);
+  invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed TaskLedger");
+  invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed GuardianStorage");
+  const { expected, taskId, actor } = request;
+  invariant(taskId === expected?.taskId && typeof actor === "string", "HUMAN_TAKEOVER_AUTHORITY_INVALID");
+  return planCapability.attest(expected, () => {
+    const claimed = storageCapability.claimTakeover({ taskId, actor });
+    invariant(claimed && typeof claimed.then !== "function", "HUMAN_TAKEOVER_AUTHORITY_INVALID", "Takeover claim must be synchronous");
+    return claimed;
+  });
+}
+
+export function claimTrustedHandoffLatch(ledger, request) {
+  const planCapability = handoffPlanCapabilities.get(ledger);
+  const storageCapability = handoffStorageCapabilities.get(request?.storage);
+  invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed TaskLedger");
+  invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed GuardianStorage");
+  const { expected, taskId, reason, actor, expectedLatch } = request;
+  invariant(taskId === expected?.taskId && expectedLatch?.task_id === taskId
+    && typeof reason === "string" && reason !== "HUMAN_TAKEOVER" && typeof actor === "string",
+  "HANDOFF_LATCH_AUTHORITY_INVALID");
+  return planCapability.attest(expected, () => {
+    const claimed = storageCapability.claimHandoffLatch({ taskId, reason, actor, expectedLatch });
+    invariant(claimed && typeof claimed.then !== "function", "HANDOFF_LATCH_AUTHORITY_INVALID", "SafePoint latch claim must be synchronous");
+    return claimed;
+  });
+}
+
+function trustedStorageCapability(storage) {
+  const capability = handoffStorageCapabilities.get(storage);
+  invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted lifecycle mutation requires an internally constructed GuardianStorage");
+  return capability;
+}
+
+export function saveTrustedHandoff(storage, ...args) {
+  return trustedStorageCapability(storage).saveHandoff(...args);
+}
+
+export function bindTrustedRunnerSession(storage, ...args) {
+  return trustedStorageCapability(storage).bindRunnerSession(...args);
+}
+
+export function supersedeTrustedRunnerSessionBinding(storage, ...args) {
+  return trustedStorageCapability(storage).supersedeRunnerSessionBinding(...args);
+}
+
+export function beginTrustedResumeDispatch(storage, ...args) {
+  return trustedStorageCapability(storage).beginDispatch(...args);
+}
+
+export function finishTrustedResumeDispatch(storage, ...args) {
+  return trustedStorageCapability(storage).finishDispatch(...args);
 }
 
 export function reserveTrustedHandoffPlan(ledger, request) {

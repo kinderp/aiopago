@@ -10,9 +10,10 @@ import { guidedHandoffEligibilityIdentityFromAuthority, handoffConsentIdentity }
 import { HandoffService } from "../src/handoff.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
+import { satisfyOwnerGateForTest } from "./trusted-owner-gate-helper.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
 import { AdmissionGate, SafePointCoordinator } from "../src/safety.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
 function deferred() {
   let resolve;
@@ -134,7 +135,7 @@ function fixture({ session = sourceSession(), testHooks = null, planValue = task
   const expected = guidedHandoffEligibilityIdentityFromAuthority({
     plan, sessionId: session.sessionId, runnerInstanceId, latch: storage.getLatch(plan.task_id), handoff: null,
   });
-  const counters = () => storage.db.prepare(`SELECT
+  const counters = () => storageDatabaseForInternalTest(storage).prepare(`SELECT
     (SELECT COUNT(*) FROM handoffs) AS handoffs,
     (SELECT COUNT(*) FROM active_sources) AS active_sources,
     (SELECT COUNT(*) FROM artifacts) AS artifacts`).get();
@@ -187,12 +188,12 @@ function assertPlanMutationSnapshotEqual(actual, expected) {
 }
 
 function seedBlockingTaskOperation(x, state, suffix = state) {
-  const latch = x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:first-operation");
+  const latch = claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:first-operation");
   const projection = {
     handoff_id: `HO-C1-${suffix}`, source_session_id: `SESSION-C1-${suffix}`, target_session_id: null,
     task_id: "TASK-TRUSTED", state, latch_generation: latch.generation,
   };
-  x.storage.reserveHandoff(projection, { latch, expectedHandoff: null });
+  reserveHandoffForInternalTest(x.storage, projection, { latch, expectedHandoff: null });
   return x.storage.getHandoff(projection.handoff_id);
 }
 
@@ -234,6 +235,33 @@ function runTrustedReservationProcess(x, { suffix, expectedHandoff = null }) {
   return JSON.parse(execFileSync(process.execPath, [childPath], { encoding: "utf8" }));
 }
 
+function runTrustedTakeoverProcess(x, suffix) {
+  const childPath = join(x.root, `trusted-takeover-${suffix}.mjs`);
+  const ledgerModule = new URL("../src/ledger.mjs", import.meta.url).href;
+  const storageModule = new URL("../src/storage.mjs", import.meta.url).href;
+  const internalModule = new URL("../src/handoff-plan-internal.mjs", import.meta.url).href;
+  writeFileSync(childPath, `
+    import { TaskLedger } from ${JSON.stringify(ledgerModule)};
+    import { GuardianStorage } from ${JSON.stringify(storageModule)};
+    import { claimTrustedHumanTakeover } from ${JSON.stringify(internalModule)};
+    const ledger = new TaskLedger(${JSON.stringify(x.ledgerPath)});
+    const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
+    try {
+      const plan = ledger.read();
+      const latch = claimTrustedHumanTakeover(ledger, {
+        storage,
+        expected: { taskId: plan.task_id, planRevisionId: plan.plan_revision_id, contentDigest: plan.content_digest },
+        taskId: plan.task_id,
+        actor: ${JSON.stringify(`human:process-${suffix}`)},
+      });
+      process.stdout.write(JSON.stringify({ ok: true, reason: latch.reason, generation: latch.generation }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null, message: error.message }));
+    } finally { storage.close(); }
+  `);
+  return JSON.parse(execFileSync(process.execPath, [childPath], { encoding: "utf8" }));
+}
+
 function installPausedReplacement(x, { targetId = "SESSION-TARGET" } = {}) {
   let replacements = 0;
   x.ctx.newSession = async ({ parentSession, setup, withSession }) => {
@@ -265,7 +293,7 @@ test("H-01 real trusted Runner boundary rejects HUMAN_TAKEOVER engaged after UI 
   const x = fixture();
   const takeover = new GuardianStorage(x.storagePath);
   try {
-    takeover.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover");
+    claimTakeoverForInternalTest(takeover, "TASK-TRUSTED", "human:/aio-takeover");
     await assert.rejects(
       () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "guided-advisor", expectedEligibility: x.expected }),
       (error) => error.code === "HUMAN_TAKEOVER_ACTIVE",
@@ -278,8 +306,13 @@ test("H-01 real trusted Runner boundary rejects HUMAN_TAKEOVER engaged after UI 
 test("SafePoint itself refuses an already active HUMAN_TAKEOVER without downgrading it", async () => {
   const x = fixture();
   try {
-    x.storage.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover");
-    await assert.rejects(() => x.safePoint.request(x.session, "human:handoff"), (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
+    claimTakeoverForInternalTest(x.storage, "TASK-TRUSTED", "human:/aio-takeover");
+    await assert.rejects(async () => {
+      const observed = x.storage.getLatch("TASK-TRUSTED");
+      const expectedLatch = { task_id: "TASK-TRUSTED", state: observed.state, generation: observed.generation, reason: observed.reason };
+      const acquiredLatch = claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:handoff", expectedLatch);
+      return x.safePoint.request(x.session, "human:handoff", "INTEGRITY", { expectedLatch, acquiredLatch });
+    }, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
     assert.equal(x.storage.getLatch("TASK-TRUSTED").reason, "HUMAN_TAKEOVER");
     assertNoPreparation(x);
   } finally { x.close(); }
@@ -298,7 +331,7 @@ test("H-01 SafePoint re-reads the latch after waitForIdle and refuses takeover e
     const pending = x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "guided-advisor", expectedEligibility: x.expected });
     const rejected = assert.rejects(pending, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
     await entered.promise;
-    takeover.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover");
+    claimTakeoverForInternalTest(takeover, "TASK-TRUSTED", "human:/aio-takeover");
     assert.equal(x.storage.getLatch("TASK-TRUSTED").reason, "HUMAN_TAKEOVER");
     release.resolve();
     await rejected;
@@ -313,7 +346,7 @@ test("H-01 SafePoint re-reads the latch after waitForNoStreams", async () => {
   try {
     const pending = x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "guided-advisor", expectedEligibility: x.expected });
     await new Promise((resolve) => setImmediate(resolve));
-    takeover.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover");
+    claimTakeoverForInternalTest(takeover, "TASK-TRUSTED", "human:/aio-takeover");
     x.gate.streamDone();
     await assert.rejects(() => pending, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
     assertNoPreparation(x);
@@ -322,7 +355,7 @@ test("H-01 SafePoint re-reads the latch after waitForNoStreams", async () => {
 
 test("H-01 reservation transaction refuses takeover after SafePoint and before reserve", async () => {
   let takeover;
-  const x = fixture({ testHooks: { afterSafePoint() { takeover.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover"); } } });
+  const x = fixture({ testHooks: { afterSafePoint() { claimTakeoverForInternalTest(takeover, "TASK-TRUSTED", "human:/aio-takeover"); } } });
   takeover = new GuardianStorage(x.storagePath);
   try {
     await assert.rejects(
@@ -494,7 +527,7 @@ test("R1-M-01 unresolved task ownership rejects confirm before owner-gate bytes,
         );
         assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
         assert.equal(x.storage.getHandoff(c1.handoff_id).state, state);
-        assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-TRUSTED'").get().count, 1);
+        assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-TRUSTED'").get().count, 1);
         assert.equal(x.newSessions(), 0);
       } finally { x.close(); }
     });
@@ -517,7 +550,7 @@ test("R1-M-01 unresolved task ownership rejects confirm before owner-gate bytes,
   await t.test("already-satisfied owner gate still enforces task ownership", async () => {
     const x = fixture({ planValue: blockedTask() });
     try {
-      x.ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:fixture" });
+      satisfyOwnerGateForTest(x.ledger, { command: "/aio handoff confirm", actor: "human:fixture" });
       const c1 = seedBlockingTaskOperation(x, "RESUME_READY", "satisfied");
       const before = planMutationSnapshot(x);
       await assert.rejects(
@@ -534,7 +567,7 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
   await t.test("task operation wins first", async () => {
     const x = fixture({ planValue: blockedTask() });
     try {
-      x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+      claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:race");
       const child = runTrustedReservationProcess(x, { suffix: "FIRST" });
       assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-FIRST" });
       const before = planMutationSnapshot(x);
@@ -543,7 +576,7 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
         (error) => error.code === "TASK_OPERATION_CONFLICT",
       );
       assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
-      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
     } finally { x.close(); }
   });
 
@@ -552,7 +585,7 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
     let child = null;
     const hooks = {
       beforeOwnerGate() {
-        x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+        claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:race");
         child = runTrustedReservationProcess(x, { suffix: "BEFORE-CRITICAL" });
       },
     };
@@ -561,11 +594,11 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
       const before = planMutationSnapshot(x);
       await assert.rejects(
         () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
-        (error) => error.code === "TASK_OPERATION_CONFLICT",
+        (error) => ["TASK_OPERATION_CONFLICT", "LATCH_GENERATION_MISMATCH"].includes(error.code),
       );
       assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-BEFORE-CRITICAL" });
       assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
-      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
     } finally { x.close(); }
   });
 
@@ -585,7 +618,7 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
       ledgerOptions: { writerOptions: { testHooks: writerHooks } },
     });
     try {
-      x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:race");
+      claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:race");
       await assert.rejects(
         () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
         (error) => error === stop,
@@ -593,7 +626,7 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
       assert.equal(child.ok, false);
       assert.equal(child.code, "PLAN_WRITE_LOCKED");
       assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
-      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+      assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
     } finally { x.close(); }
   });
 
@@ -613,11 +646,88 @@ test("R1-M-01 cross-process task-operation and owner-gate critical-section order
       );
       assert.deepEqual(child, { ok: true, created: true, handoffId: "HO-PROCESS-POST-OWNER" });
       assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
-      assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
       assert.equal(x.storage.latestHandoffForTask("TASK-TRUSTED").handoff_id, "HO-PROCESS-POST-OWNER");
       assert.equal(x.newSessions(), 0);
     } finally { x.close(); }
   });
+});
+
+test("R1-M-02 owner critical section excludes a separate-process takeover until P1-prime wins", async () => {
+  const stop = new Error("stop after owner winner");
+  let x;
+  let during = null;
+  x = fixture({
+    planValue: blockedTask(),
+    testHooks: { afterOwnerGate() { throw stop; } },
+    ledgerOptions: { writerOptions: { testHooks: { afterPreparation() { during = runTrustedTakeoverProcess(x, "DURING-OWNER"); } } } },
+  });
+  try {
+    await assert.rejects(
+      () => x.runner.handoffFromCommand(x.ctx, "confirm", { intent: "explicit-command" }),
+      (error) => error === stop,
+    );
+    assert.equal(during.ok, false);
+    assert.equal(during.code, "PLAN_WRITE_LOCKED");
+    assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
+    assert.equal(x.storage.getLatch("TASK-TRUSTED").reason, null);
+    assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+
+    const after = runTrustedTakeoverProcess(x, "AFTER-OWNER");
+    assert.equal(after.ok, true);
+    assert.equal(after.reason, "HUMAN_TAKEOVER");
+    assert.equal(x.ledger.read().owner_gate.status, "SATISFIED");
+  } finally { x.close(); }
+});
+
+test("R1-M-03 direct HandoffService confirm without exact current-source verifier fails before owner mutation", async () => {
+  const x = fixture({ planValue: blockedTask() });
+  try {
+    const before = planMutationSnapshot(x);
+    await assert.rejects(
+      () => x.service.handoff({ sourceSession: x.session, mode: "confirm", replacePaused: async () => { throw new Error("unreachable"); } }),
+      (error) => error.code === "HANDOFF_SOURCE_ATTESTATION_REQUIRED",
+    );
+    await assert.rejects(
+      () => x.service.handoff({
+        sourceSession: x.session,
+        currentSourceVerifier: () => ({ sessionId: x.session.sessionId, runnerInstanceId: x.runner.runnerInstanceId, lifecycleEpoch: 1, active: true }),
+        mode: "confirm",
+        replacePaused: async () => { throw new Error("unreachable"); },
+      }),
+      (error) => error.code === "HANDOFF_SOURCE_ATTESTATION_REQUIRED",
+    );
+    assertPlanMutationSnapshotEqual(planMutationSnapshot(x), before);
+    assertNoPreparation(x);
+  } finally { x.close(); }
+});
+
+test("R1-M-05 raw public reservation fails closed before every lifecycle row", () => {
+  const x = fixture();
+  try {
+    const latch = claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:test");
+    assert.throws(
+      () => x.storage.reserveHandoff({ handoff_id: "HO-PUBLIC", source_session_id: "SESSION-PUBLIC", task_id: "TASK-TRUSTED", state: "SAFE_TO_HANDOFF", latch_generation: latch.generation }, { latch, expectedHandoff: null }),
+      (error) => error.code === "HANDOFF_RESERVATION_TRUSTED_PATH_REQUIRED",
+    );
+    assert.throws(
+      () => x.storage.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:external"),
+      (error) => error.code === "LATCH_TRUSTED_PATH_REQUIRED",
+    );
+    assert.equal(Object.hasOwn(x.storage, "db"), false, "no root-reachable raw SQLite writer is exposed");
+    for (const [method, args, code] of [
+      ["prepareContinuityRecovery", ["HO-PUBLIC", {}], "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED"],
+      ["saveHandoff", [{ handoff_id: "HO-PUBLIC", state: "RESUMED" }], "HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED"],
+      ["transition", ["HO-PUBLIC", "SAFE_TO_HANDOFF", "RESUMED"], "HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED"],
+      ["bindRunnerSession", ["HO-PUBLIC", {}], "HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED"],
+      ["supersedeRunnerSessionBinding", ["HO-PUBLIC", "external"], "HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED"],
+      ["beginDispatch", ["HO-PUBLIC", "DSP-PUBLIC"], "RESUME_DISPATCH_TRUSTED_PATH_REQUIRED"],
+      ["finishDispatch", ["HO-PUBLIC", "ACKNOWLEDGED"], "RESUME_DISPATCH_TRUSTED_PATH_REQUIRED"],
+    ]) assert.throws(() => x.storage[method](...args), (error) => error.code === code, method);
+    assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+    assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM active_sources").get().count, 0);
+    assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE event_type='HANDOFF_STARTED'").get().count, 0);
+  } finally { x.close(); }
 });
 
 test("M-01 owner-gate commit failure is atomic and creates no handoff artifacts or replacement", async () => {
@@ -804,8 +914,8 @@ test("exact-current guided consent reserves P1/S1 once and leaves the replacemen
     assert.equal(replacements, 1);
     assert.equal(resumeDispatches, 0);
     assert.equal(x.counters().handoffs, 1);
-    assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations").get().count, 0);
-    const persisted = x.storage.db.prepare("SELECT projection_json FROM handoffs").get().projection_json;
+    assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM authorizations").get().count, 0);
+    const persisted = storageDatabaseForInternalTest(x.storage).prepare("SELECT projection_json FROM handoffs").get().projection_json;
     assert.doesNotMatch(persisted, /expectedEligibility|guidedEligibility/i, "guided consent must remain invocation-local");
     assert.equal(x.storage.getLatch("TASK-TRUSTED").state, "ENGAGED");
   } finally { x.close(); }
@@ -813,7 +923,7 @@ test("exact-current guided consent reserves P1/S1 once and leaves the replacemen
 
 test("takeover after reservation but before replacement creates no replacement session", async () => {
   let takeover;
-  const x = fixture({ testHooks: { beforeReplacement() { takeover.engageLatch("TASK-TRUSTED", "HUMAN_TAKEOVER", "human:/aio-takeover"); } } });
+  const x = fixture({ testHooks: { beforeReplacement() { claimTakeoverForInternalTest(takeover, "TASK-TRUSTED", "human:/aio-takeover"); } } });
   takeover = new GuardianStorage(x.storagePath);
   try {
     await assert.rejects(
@@ -835,16 +945,16 @@ test("two SQLite connections linearize takeover versus conditional reservation",
     const taskId = `TASK-RACE-${iteration}`;
     try {
       handoffActor.ensureLatch(taskId);
-      const acquired = handoffActor.claimLatch(taskId, "INTEGRITY", "human:handoff", { task_id: taskId, state: "RELEASED", generation: 0, reason: null });
+      const acquired = claimLatchForInternalTest(handoffActor, taskId, "INTEGRITY", "human:handoff", { task_id: taskId, state: "RELEASED", generation: 0, reason: null });
       const projection = { handoff_id: `HO-${iteration}`, source_session_id: `SESSION-${iteration}`, task_id: taskId, state: "SAFE_TO_HANDOFF", latch_generation: acquired.generation };
       if (iteration % 2 === 0) {
-        takeoverActor.engageLatch(taskId, "HUMAN_TAKEOVER", "human:takeover");
-        assert.throws(() => handoffActor.reserveHandoff(projection, { latch: acquired, expectedHandoff: null }), (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
-        assert.equal(handoffActor.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+        claimTakeoverForInternalTest(takeoverActor, taskId, "human:takeover");
+        assert.throws(() => reserveHandoffForInternalTest(handoffActor, projection, { latch: acquired, expectedHandoff: null }), (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
+        assert.equal(storageDatabaseForInternalTest(handoffActor).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
       } else {
-        assert.equal(handoffActor.reserveHandoff(projection, { latch: acquired, expectedHandoff: null }).created, true);
-        takeoverActor.engageLatch(taskId, "HUMAN_TAKEOVER", "human:takeover");
-        assert.equal(handoffActor.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+        assert.equal(reserveHandoffForInternalTest(handoffActor, projection, { latch: acquired, expectedHandoff: null }).created, true);
+        claimTakeoverForInternalTest(takeoverActor, taskId, "human:takeover");
+        assert.equal(storageDatabaseForInternalTest(handoffActor).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
       }
     } finally { takeoverActor.close(); handoffActor.close(); }
   }
@@ -875,14 +985,14 @@ test("M-04 active-source reservation reuse requires exact idempotent identity an
     try {
       a.ensureLatch("TASK-A");
       b.ensureLatch("TASK-B");
-      const latchA = a.engageLatch("TASK-A", "INTEGRITY", "human:a");
-      const latchB = b.engageLatch("TASK-B", "INTEGRITY", "human:b");
-      a.reserveHandoff(projection({ handoffId: "HO-A", taskId: "TASK-A" }), { latch: latchA, expectedHandoff: null });
+      const latchA = claimLatchForInternalTest(a, "TASK-A", "INTEGRITY", "human:a");
+      const latchB = claimLatchForInternalTest(b, "TASK-B", "INTEGRITY", "human:b");
+      reserveHandoffForInternalTest(a, projection({ handoffId: "HO-A", taskId: "TASK-A" }), { latch: latchA, expectedHandoff: null });
       assert.throws(
-        () => b.reserveHandoff(projection({ handoffId: "HO-B", taskId: "TASK-B" }), { latch: latchB, expectedHandoff: null }),
+        () => reserveHandoffForInternalTest(b, projection({ handoffId: "HO-B", taskId: "TASK-B" }), { latch: latchB, expectedHandoff: null }),
         (error) => error.code === "HANDOFF_ACTIVE_SOURCE_CONFLICT",
       );
-      assert.equal(b.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(b).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
       assert.equal(b.getHandoff("HO-B"), null);
     } finally { b.close(); a.close(); }
   });
@@ -894,13 +1004,13 @@ test("M-04 active-source reservation reuse requires exact idempotent identity an
     const b = new GuardianStorage(path);
     try {
       a.ensureLatch("TASK-A");
-      const latch = a.engageLatch("TASK-A", "INTEGRITY", "human:a");
-      a.reserveHandoff(projection({ handoffId: "HO-A", taskId: "TASK-A" }), { latch, expectedHandoff: null });
+      const latch = claimLatchForInternalTest(a, "TASK-A", "INTEGRITY", "human:a");
+      reserveHandoffForInternalTest(a, projection({ handoffId: "HO-A", taskId: "TASK-A" }), { latch, expectedHandoff: null });
       assert.throws(
-        () => b.reserveHandoff(projection({ handoffId: "HO-B", taskId: "TASK-A", revision: "PLAN-2", digest: `sha256:${"b".repeat(64)}` }), { latch, expectedHandoff: null }),
+        () => reserveHandoffForInternalTest(b, projection({ handoffId: "HO-B", taskId: "TASK-A", revision: "PLAN-2", digest: `sha256:${"b".repeat(64)}` }), { latch, expectedHandoff: null }),
         (error) => error.code === "HANDOFF_ACTIVE_SOURCE_CONFLICT",
       );
-      assert.equal(b.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(b).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
     } finally { b.close(); a.close(); }
   });
 
@@ -909,13 +1019,13 @@ test("M-04 active-source reservation reuse requires exact idempotent identity an
     const storage = new GuardianStorage(join(root, "guardian.sqlite"));
     try {
       storage.ensureLatch("TASK-A");
-      const latch = storage.engageLatch("TASK-A", "INTEGRITY", "human:a");
+      const latch = claimLatchForInternalTest(storage, "TASK-A", "INTEGRITY", "human:a");
       const value = projection({ handoffId: "HO-A", taskId: "TASK-A" });
-      assert.equal(storage.reserveHandoff(value, { latch, expectedHandoff: null }).created, true);
-      const retry = storage.reserveHandoff(structuredClone(value), { latch, expectedHandoff: null });
+      assert.equal(reserveHandoffForInternalTest(storage, value, { latch, expectedHandoff: null }).created, true);
+      const retry = reserveHandoffForInternalTest(storage, structuredClone(value), { latch, expectedHandoff: null });
       assert.equal(retry.created, false);
       assert.equal(retry.handoff.handoff_id, "HO-A");
-      assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+      assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
       assert.equal(storage.events("HO-A").filter((event) => event.event_type === "HANDOFF_STARTED").length, 1);
     } finally { storage.close(); }
   });
@@ -925,19 +1035,19 @@ test("M-04 active-source reservation reuse requires exact idempotent identity an
     const storage = new GuardianStorage(join(root, "guardian.sqlite"));
     try {
       storage.ensureLatch("TASK-A");
-      const latch = storage.engageLatch("TASK-A", "INTEGRITY", "human:a");
+      const latch = claimLatchForInternalTest(storage, "TASK-A", "INTEGRITY", "human:a");
       const append = storage.appendEvent.bind(storage);
       storage.appendEvent = (type, ...args) => {
         if (type === "HANDOFF_STARTED") throw new Error("forced journal failure");
         return append(type, ...args);
       };
       assert.throws(
-        () => storage.reserveHandoff(projection({ handoffId: "HO-ROLLBACK", taskId: "TASK-A" }), { latch, expectedHandoff: null }),
+        () => reserveHandoffForInternalTest(storage, projection({ handoffId: "HO-ROLLBACK", taskId: "TASK-A" }), { latch, expectedHandoff: null }),
         /forced journal failure/,
       );
-      assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
-      assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM active_sources").get().count, 0);
-      assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id IS NOT NULL").get().count, 0);
+      assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+      assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM active_sources").get().count, 0);
+      assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id IS NOT NULL").get().count, 0);
     } finally { storage.close(); }
   });
 });
@@ -989,17 +1099,17 @@ test("R2-M-01 task-operation arbitration blocks representative unresolved and am
       const taskId = `TASK-STATE-${index}`;
       try {
         a.ensureLatch(taskId);
-        const latch = a.engageLatch(taskId, "INTEGRITY", "human:first");
-        a.reserveHandoff({ handoff_id: `HO-C1-${index}`, source_session_id: `SESSION-C1-${index}`, task_id: taskId, state, latch_generation: latch.generation }, { latch, expectedHandoff: null });
+        const latch = claimLatchForInternalTest(a, taskId, "INTEGRITY", "human:first");
+        reserveHandoffForInternalTest(a, { handoff_id: `HO-C1-${index}`, source_session_id: `SESSION-C1-${index}`, task_id: taskId, state, latch_generation: latch.generation }, { latch, expectedHandoff: null });
         const latest = a.latestHandoffForTask(taskId);
         assert.throws(
-          () => b.reserveHandoff({ handoff_id: `HO-C2-${index}`, source_session_id: `SESSION-S2-${index}`, task_id: taskId, state: "SAFE_TO_HANDOFF", latch_generation: latch.generation }, {
+          () => reserveHandoffForInternalTest(b, { handoff_id: `HO-C2-${index}`, source_session_id: `SESSION-S2-${index}`, task_id: taskId, state: "SAFE_TO_HANDOFF", latch_generation: latch.generation }, {
             latch,
             expectedHandoff: handoffConsentIdentity(latest),
           }),
           (error) => error.code === "TASK_OPERATION_CONFLICT",
         );
-        assert.equal(b.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id=?").get(taskId).count, 1);
+        assert.equal(storageDatabaseForInternalTest(b).prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id=?").get(taskId).count, 1);
       } finally { b.close(); a.close(); }
     });
   }
@@ -1010,8 +1120,8 @@ test("R2-M-01 guided and explicit command paths cannot fork an unresolved task o
     await t.test(intent, async () => {
       const x = fixture();
       try {
-        const latch = x.storage.engageLatch("TASK-TRUSTED", "INTEGRITY", "human:first");
-        x.storage.reserveHandoff({
+        const latch = claimLatchForInternalTest(x.storage, "TASK-TRUSTED", "INTEGRITY", "human:first");
+        reserveHandoffForInternalTest(x.storage, {
           handoff_id: "HO-C1", source_session_id: "SESSION-OTHER", task_id: "TASK-TRUSTED",
           state: "REPLACEMENT_SESSION_CREATING", latch_generation: latch.generation,
         }, { latch, expectedHandoff: null });
@@ -1032,7 +1142,7 @@ test("R2-M-01 guided and explicit command paths cannot fork an unresolved task o
             (error) => error.code === "TASK_OPERATION_CONFLICT",
           );
         }
-        assert.equal(x.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
+        assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
         assert.equal(x.newSessions(), 0);
       } finally { x.close(); }
     });
@@ -1048,23 +1158,36 @@ test("M-05 real tarball keeps TaskLedger public but exposes no plan coordination
   const tarball = join(packRoot, packedName);
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "aiopago-boundary-consumer", private: true, type: "module" }));
   execFileSync("npm", ["install", "--offline", "--ignore-scripts", "--omit=peer", "--no-package-lock", tarball], { cwd: consumer, stdio: "pipe", ...npmOptions });
+  const externalPlanPath = join(consumer, "TASK_PLAN.md");
+  writePlan(externalPlanPath, blockedTask());
   const script = `
     import assert from "node:assert/strict";
+    import { readFileSync } from "node:fs";
     import { TaskLedger } from "aiopago";
     assert.equal(typeof TaskLedger, "function");
     assert.equal(typeof TaskLedger.prototype.withAuthorityCoordination, "undefined");
+    assert.equal(typeof TaskLedger.prototype.satisfyOwnerGate, "undefined");
+    const ledger = new TaskLedger(${JSON.stringify(externalPlanPath)});
+    const before = readFileSync(${JSON.stringify(externalPlanPath)});
+    assert.throws(() => ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:external" }), TypeError);
+    assert.deepEqual(readFileSync(${JSON.stringify(externalPlanPath)}), before);
+    assert.equal(ledger.read().owner_gate.status, "BLOCKED");
+    assert.equal(Object.hasOwn(ledger, "writer"), false);
     const names = Object.getOwnPropertyNames(TaskLedger.prototype);
-    assert.deepEqual(names.sort(), ["constructor", "read", "satisfyOwnerGate", "validate"].sort());
+    assert.deepEqual(names.sort(), ["constructor", "read", "validate"].sort());
     await assert.rejects(import("aiopago/src/handoff-plan-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     await assert.rejects(import("aiopago/src/plan-semantics-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     await assert.rejects(import("aiopago/src/task-operation-internal.mjs"), (error) => error.code === "ERR_PACKAGE_PATH_NOT_EXPORTED");
     const root = await import("aiopago");
+    assert.equal(Object.hasOwn(root, "GuardianStorage"), false);
+    assert.equal(Object.hasOwn(root, "reserveHandoffForInternalTest"), false);
+    assert.equal(Object.hasOwn(root, "claimTakeoverForInternalTest"), false);
     assert.equal(Object.hasOwn(root, "PlanRevisionWriter"), false);
     assert.equal(Object.hasOwn(root, "canonicalPlanSemantics"), false);
     assert.equal(Object.hasOwn(root, "planSemanticDigest"), false);
     assert.equal(Object.hasOwn(root, "authorizeTrustedResume"), false);
     assert.equal(Object.hasOwn(root, "taskOperationDisposition"), false);
-    assert.equal(Object.keys(root).some((name) => /coordinate|plan.*lock/i.test(name)), false);
+    assert.equal(Object.keys(root).some((name) => /coordinate|plan.*lock|reserve.*handoff|trusted.*takeover/i.test(name)), false);
   `;
   writeFileSync(join(consumer, "verify.mjs"), script);
   execFileSync(process.execPath, ["verify.mjs"], { cwd: consumer, stdio: "pipe" });

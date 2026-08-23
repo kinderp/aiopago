@@ -14,7 +14,7 @@ import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs
 import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
 import { readRuntimeRunnerBinding, RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8" }).trim(); }
 
@@ -183,9 +183,9 @@ function planDiskSnapshot(root, runner) {
 
 function recoveryDurableSnapshot(runner, failedHandoffId) {
   return {
-    handoffs: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count,
-    recoveryStarted: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(failedHandoffId).count,
-    bindingSuperseded: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='RUNNER_SESSION_BINDING_SUPERSEDED'").get(failedHandoffId).count,
+    handoffs: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count,
+    recoveryStarted: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(failedHandoffId).count,
+    bindingSuperseded: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE handoff_id=? AND event_type='RUNNER_SESSION_BINDING_SUPERSEDED'").get(failedHandoffId).count,
     bindingStatus: runner.storage.getRunnerSessionBinding(failedHandoffId).status,
   };
 }
@@ -225,8 +225,8 @@ function prepareRecoveryPlanChange(root, suffix = "M07") {
 function recoveryAttackSnapshot(runner, failedHandoffId) {
   return {
     ...recoveryDurableSnapshot(runner, failedHandoffId),
-    activeSources: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM active_sources").get().count,
-    recoveryChildren: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE projection_json LIKE ?").get(`%\"recovery_of_handoff_id\":\"${failedHandoffId}\"%`).count,
+    activeSources: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM active_sources").get().count,
+    recoveryChildren: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs WHERE projection_json LIKE ?").get(`%\"recovery_of_handoff_id\":\"${failedHandoffId}\"%`).count,
   };
 }
 
@@ -240,7 +240,7 @@ function resealArtifactMutation(runner, kind, id, mutate) {
   const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
   const digest = sha256(bytes);
   writeFileSync(index.path, bytes);
-  runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
+  storageDatabaseForInternalTest(runner.storage).prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
     .run(digest, envelope.payload.content_digest, kind, id);
   return {
     bytes,
@@ -248,7 +248,7 @@ function resealArtifactMutation(runner, kind, id, mutate) {
     contentDigest: envelope.payload.content_digest,
     restore() {
       writeFileSync(index.path, originalBytes);
-      runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
+      storageDatabaseForInternalTest(runner.storage).prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind=? AND artifact_id=?")
         .run(index.digest, index.content_digest, kind, id);
     },
   };
@@ -259,12 +259,12 @@ function installFailedManifestMutation(runner, failedHandoffId, mutate) {
   const sealed = resealArtifactMutation(runner, "manifest", originalFailed.resume_manifest_id, mutate);
   const changed = runner.storage.getHandoff(failedHandoffId);
   changed.resume_manifest_digest = sealed.digest;
-  runner.storage.saveHandoff(changed);
+  saveHandoffForInternalTest(runner.storage, changed);
   return {
     sealed,
     restore() {
       sealed.restore();
-      runner.storage.saveHandoff(structuredClone(originalFailed));
+      saveHandoffForInternalTest(runner.storage, structuredClone(originalFailed));
     },
   };
 }
@@ -278,14 +278,14 @@ function installFailedCheckpointMutation(runner, failedHandoffId, mutate) {
   const changed = runner.storage.getHandoff(failedHandoffId);
   changed.checkpoint_digest = checkpoint.digest;
   changed.resume_manifest_digest = manifest.digest;
-  runner.storage.saveHandoff(changed);
+  saveHandoffForInternalTest(runner.storage, changed);
   return {
     checkpoint,
     manifest,
     restore() {
       checkpoint.restore();
       manifest.restore();
-      runner.storage.saveHandoff(structuredClone(originalFailed));
+      saveHandoffForInternalTest(runner.storage, structuredClone(originalFailed));
     },
   };
 }
@@ -301,11 +301,11 @@ function convertFailedManifestToLegacyV1(runner, failed) {
   const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
   const digest = sha256(bytes);
   writeFileSync(index.path, bytes);
-  runner.storage.db.prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind='manifest' AND artifact_id=?")
+  storageDatabaseForInternalTest(runner.storage).prepare("UPDATE artifacts SET digest=?,content_digest=? WHERE kind='manifest' AND artifact_id=?")
     .run(digest, envelope.payload.content_digest, failed.resume_manifest_id);
   failed.resume_manifest_digest = digest;
   delete failed.failure;
-  runner.storage.saveHandoff(failed);
+  saveHandoffForInternalTest(runner.storage, failed);
   return { bytes, digest };
 }
 
@@ -341,7 +341,7 @@ test("Pi SDK E2E: /aio status, why, next and plan use the shared read-only proje
     };
     await x.runner.runtime.session.bindExtensions({ mode: "print", uiContext, commandContextActions });
     const planBefore = readFileSync(join(x.root, "TASK_PLAN.md"));
-    const countersBefore = x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get();
+    const countersBefore = storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get();
     const latchBefore = x.runner.storage.getLatch("TASK-E2E");
 
     for (const command of ["/aio status", "/aio why", "/aio next", "/aio plan", "/aio status technical", "/aio plan technical"]) await x.runner.runtime.session.prompt(command);
@@ -358,7 +358,7 @@ test("Pi SDK E2E: /aio status, why, next and plan use the shared read-only proje
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
     assert.deepEqual(readFileSync(join(x.root, "TASK_PLAN.md")), planBefore);
-    assert.deepEqual(x.runner.storage.db.prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get(), countersBefore);
+    assert.deepEqual(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT total_changes() AS changes, (SELECT COUNT(*) FROM journal) AS journal, (SELECT COUNT(*) FROM handoffs) AS handoffs").get(), countersBefore);
     assert.deepEqual(x.runner.storage.getLatch("TASK-E2E"), latchBefore);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
@@ -421,8 +421,8 @@ test("Pi SDK lifecycle: registered session_shutdown during SafePoint invalidates
     await source.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     releaseIdle();
     await assert.rejects(() => pending, (error) => error.code === "HANDOFF_SOURCE_CHANGED");
-    assert.equal(x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
-    assert.equal(x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 0);
+    assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+    assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 0);
     assert.equal(replacements, 0);
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
@@ -688,11 +688,11 @@ test("M-07 actual Pi recovery re-attests every mutable SafePoint precondition be
           if (race === "failed handoff state") {
             const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
             failed.state = "HANDOFF_FAILED";
-            x.runner.storage.saveHandoff(failed);
+            saveHandoffForInternalTest(x.runner.storage, failed);
           } else if (race === "failed binding") {
-            x.runner.storage.supersedeRunnerSessionBinding(x.failed.handoff_id, "authorized concurrent reconciliation test");
+            supersedeRunnerSessionBindingForInternalTest(x.runner.storage, x.failed.handoff_id, "authorized concurrent reconciliation test");
           } else {
-            x.runner.storage.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+            storageDatabaseForInternalTest(x.runner.storage).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
               .run(x.failed.resume_prompt_id, x.failed.handoff_id, "human:concurrent", x.failed.latch_generation, "2026-08-22T23:59:59.000Z");
           }
         };
@@ -722,7 +722,7 @@ test("M-08 reviewer exact valid-envelope manifest semantic conflict rejects befo
     const verified = x.runner.artifacts.verify("manifest", failed.resume_manifest_id, failed.resume_manifest_digest);
     assert.equal(verified.digest, attack.sealed.digest, "the cryptographically recomputed artifact envelope must verify");
     const before = recoveryAttackSnapshot(x.runner, failed.handoff_id);
-    const activeBefore = x.runner.storage.db.prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all();
+    const activeBefore = storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all();
     const prepareCalls = instrumentRecoveryPreparation(x.runner);
     let replacementAttempts = 0;
     const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
@@ -734,7 +734,7 @@ test("M-08 reviewer exact valid-envelope manifest semantic conflict rejects befo
     );
 
     assert.deepEqual(recoveryAttackSnapshot(x.runner, failed.handoff_id), before);
-    assert.deepEqual(x.runner.storage.db.prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all(), activeBefore);
+    assert.deepEqual(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT source_session_id,handoff_id FROM active_sources ORDER BY source_session_id").all(), activeBefore);
     assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
     assert.equal(prepareCalls(), 0);
     assert.equal(replacementAttempts, 0);
@@ -842,7 +842,7 @@ test("M-08 failed reserved snapshot semantic matrix rejects top-level P1 claims 
       await t.test(name, async () => {
         const changed = x.runner.storage.getHandoff(x.failed.handoff_id);
         mutate(changed.reserved_plan_snapshot);
-        x.runner.storage.saveHandoff(changed);
+        saveHandoffForInternalTest(x.runner.storage, changed);
         const before = recoveryAttackSnapshot(x.runner, changed.handoff_id);
         await assert.rejects(
           () => x.runner.recoverHandoffDirect(changed.handoff_id, { confirm: false }),
@@ -850,7 +850,7 @@ test("M-08 failed reserved snapshot semantic matrix rejects top-level P1 claims 
         );
         assert.deepEqual(recoveryAttackSnapshot(x.runner, changed.handoff_id), before);
         assert.equal(x.runner.storage.getRunnerSessionBinding(changed.handoff_id).status, "ACTIVE");
-        x.runner.storage.saveHandoff(structuredClone(baseline));
+        saveHandoffForInternalTest(x.runner.storage, structuredClone(baseline));
       });
     }
     assert.equal(x.calls, 0);
@@ -909,7 +909,7 @@ test("M-08 storage transaction revalidates reserved snapshot semantics after val
     x.runner.storage.prepareContinuityRecovery = (...args) => {
       const moved = x.runner.storage.getHandoff(x.failed.handoff_id);
       moved.reserved_plan_snapshot.objective = "semantic movement after R-star";
-      x.runner.storage.saveHandoff(moved);
+      saveHandoffForInternalTest(x.runner.storage, moved);
       movementInstalled = true;
       return prepare(...args);
     };
@@ -923,7 +923,7 @@ test("M-08 storage transaction revalidates reserved snapshot semantics after val
     assert.equal(x.runner.storage.events(x.failed.handoff_id).some((event) => ["CONTINUITY_RECOVERY_STARTED", "RUNNER_SESSION_BINDING_SUPERSEDED"].includes(event.event_type)), false);
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
-    x.runner.storage.saveHandoff(original);
+    saveHandoffForInternalTest(x.runner.storage, original);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
@@ -932,7 +932,7 @@ test("M-08 canonical required-path equivalence is accepted and child snapshot re
   try {
     const failed = x.runner.storage.getHandoff(x.failed.handoff_id);
     failed.reserved_plan_snapshot.required_local_paths = ["TASK_PLAN.md", "TASK_PLAN.md"];
-    x.runner.storage.saveHandoff(failed);
+    saveHandoffForInternalTest(x.runner.storage, failed);
     const recovered = await x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false });
     assert.equal(recovered.state, "RESUME_READY");
     assert.deepEqual(recovered.reserved_plan_snapshot.required_local_paths, ["TASK_PLAN.md"]);
@@ -997,9 +997,9 @@ test("M-07 recovery-first final coordination reserves immutable R-star provenanc
 
 function resumeDurableCounts(runner, handoffId) {
   return {
-    authorizations: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
-    admissions: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
-    dispatches: runner.storage.db.prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
+    authorizations: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
+    admissions: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
+    dispatches: storageDatabaseForInternalTest(runner.storage).prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
   };
 }
 
@@ -1016,7 +1016,7 @@ test("R2-H-01 actual Runner resume YES rejects combined P2, G2, and SUPERSEDED b
           confirms += 1;
           prepareRecoveryPlanChange(x.root, "R2-COMBINED").apply();
           writeFileSync(join(x.root, "r2-git-drift.txt"), "G2\n");
-          x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 combined prompt drift");
+          supersedeRunnerSessionBindingForInternalTest(x.runner.storage, ready.handoff_id, "R2 combined prompt drift");
           return true;
         },
         notify() {},
@@ -1039,8 +1039,8 @@ test("R2-H-01 stale resume authority matrix rejects before durable admission and
   const attacks = [
     ["plan", async (x) => { prepareRecoveryPlanChange(x.root, "R2-PLAN").apply(); }],
     ["Git", async (x) => { writeFileSync(join(x.root, "r2-git-only.txt"), "G2\n"); }],
-    ["binding", async (x, ready) => { x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 binding drift"); }],
-    ["takeover", async (x, ready) => { x.runner.storage.engageLatch(ready.task_id, "HUMAN_TAKEOVER", "human:r2"); }],
+    ["binding", async (x, ready) => { supersedeRunnerSessionBindingForInternalTest(x.runner.storage, ready.handoff_id, "R2 binding drift"); }],
+    ["takeover", async (x, ready) => { claimTakeoverForInternalTest(x.runner.storage, ready.task_id, "human:r2"); }],
     ["ownership header", async (x) => {
       const target = x.runner.runtime.session;
       const binding = readRuntimeRunnerBinding(target);
@@ -1052,17 +1052,17 @@ test("R2-H-01 stale resume authority matrix rejects before durable admission and
     ["checkpoint identity", async (x, ready) => {
       const moved = x.runner.storage.getHandoff(ready.handoff_id);
       moved.checkpoint_digest = `sha256:${"d".repeat(64)}`;
-      x.runner.storage.saveHandoff(moved);
+      saveHandoffForInternalTest(x.runner.storage, moved);
     }],
     ["manifest identity", async (x, ready) => {
       const moved = x.runner.storage.getHandoff(ready.handoff_id);
       moved.resume_manifest_digest = `sha256:${"e".repeat(64)}`;
-      x.runner.storage.saveHandoff(moved);
+      saveHandoffForInternalTest(x.runner.storage, moved);
     }],
     ["resume prompt identity", async (x, ready) => {
       const moved = x.runner.storage.getHandoff(ready.handoff_id);
       moved.resume_prompt_digest = `sha256:${"f".repeat(64)}`;
-      x.runner.storage.saveHandoff(moved);
+      saveHandoffForInternalTest(x.runner.storage, moved);
     }],
   ];
   for (const [name, mutate] of attacks) {
@@ -1157,7 +1157,7 @@ test("R2-H-01 direct resume and resumeExisting confirmation cannot bypass final 
         actor: "human:existing",
         targetSession: x.runner.runtime.session,
         confirmResume: async () => {
-          x.runner.storage.supersedeRunnerSessionBinding(ready.handoff_id, "R2 resumeExisting prompt drift");
+          supersedeRunnerSessionBindingForInternalTest(x.runner.storage, ready.handoff_id, "R2 resumeExisting prompt drift");
           return true;
         },
         sendResume: (prompt) => x.runner.runtime.session.sendUserMessage(prompt),
@@ -1180,7 +1180,7 @@ test("R2-H-01 final SQLite binding race and post-release failure both roll back 
       x.runner.storage.transaction = (operation) => {
         x.runner.storage.transaction = transaction;
         intercepted = true;
-        other.supersedeRunnerSessionBinding(ready.handoff_id, "R2 final SQLite race");
+        supersedeRunnerSessionBindingForInternalTest(other, ready.handoff_id, "R2 final SQLite race");
         return transaction(operation);
       };
       await assert.rejects(
@@ -1293,7 +1293,7 @@ test("R2-H-01 finishPausedHandoff confirmation is bound before the human prompt"
           prepareRecoveryPlanChange(x.root, "R2-FINISH").apply();
           writeFileSync(join(x.root, "r2-finish-git.txt"), "G2\n");
           const current = x.runner.storage.latestHandoffForTask("TASK-E2E");
-          x.runner.storage.supersedeRunnerSessionBinding(current.handoff_id, "R2 finish prompt drift");
+          supersedeRunnerSessionBindingForInternalTest(x.runner.storage, current.handoff_id, "R2 finish prompt drift");
           return true;
         },
       }),
@@ -1308,13 +1308,8 @@ test("R2-M-01 recovered child crash intent blocks manual handoff from a differen
   let x = await makeContinuityRecoveryFixture();
   let reopened = null;
   try {
-    const save = x.runner.storage.saveHandoff.bind(x.runner.storage);
     const crash = Object.assign(new Error("simulated process crash after replacement intent"), { code: "SIMULATED_CRASH" });
-    x.runner.storage.saveHandoff = (handoff, ...args) => {
-      const result = save(handoff, ...args);
-      if (handoff.state === "REPLACEMENT_SESSION_CREATING") throw crash;
-      return result;
-    };
+    x.runner.handoffService.testHooks = { afterReplacementIntent() { throw crash; } };
     await assert.rejects(() => x.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }), (error) => error === crash);
     const child = x.runner.storage.latestHandoffForTask("TASK-E2E");
     assert.equal(child.recovery_of_handoff_id, x.failed.handoff_id);
@@ -1325,12 +1320,12 @@ test("R2-M-01 recovered child crash intent blocks manual handoff from a differen
     reopened = await makeRunner({ existingRoot: root });
     const freshSource = reopened.runner.runtime.session.sessionId;
     assert.notEqual(freshSource, child.source_session_id);
-    const changesBeforeRead = reopened.runner.storage.db.prepare("SELECT total_changes() AS count").get().count;
+    const changesBeforeRead = storageDatabaseForInternalTest(reopened.runner.storage).prepare("SELECT total_changes() AS count").get().count;
     const stalledView = projectHumanWorkflow(observeRunnerHumanWorkflow(reopened.runner));
     assert.equal(stalledView.state, "NEEDS_ATTENTION");
     assert.equal(stalledView.handoff.actionability, "manual-recovery");
     assert.match(`${stalledView.reason} ${stalledView.nextAction}`, /esito.*sconosciuto|riconcilia.*non.*secondo handoff/i);
-    assert.equal(reopened.runner.storage.db.prepare("SELECT total_changes() AS count").get().count, changesBeforeRead, "crash-stalled projection remains read-only");
+    assert.equal(storageDatabaseForInternalTest(reopened.runner.storage).prepare("SELECT total_changes() AS count").get().count, changesBeforeRead, "crash-stalled projection remains read-only");
     let replacements = 0;
     const originalNewSession = reopened.runner.runtime.newSession.bind(reopened.runner.runtime);
     reopened.runner.runtime.newSession = (...args) => { replacements += 1; return originalNewSession(...args); };
@@ -1338,7 +1333,7 @@ test("R2-M-01 recovered child crash intent blocks manual handoff from a differen
       () => reopened.runner.handoffDirect({ mode: "manual", confirm: false }),
       (error) => error.code === "TASK_OPERATION_CONFLICT",
     );
-    assert.equal(reopened.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 2);
+    assert.equal(storageDatabaseForInternalTest(reopened.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 2);
     assert.equal(reopened.runner.storage.latestHandoffForTask("TASK-E2E").handoff_id, child.handoff_id);
     assert.equal(replacements, 0);
     assert.equal(reopened.calls, 0);
@@ -1370,7 +1365,7 @@ test("R2-M-01 explicit multi-generation recovery transfers F1 to C1 to C2 withou
     assert.equal(c2.state, "RESUME_READY");
     assert.equal(next.runner.storage.getRunnerSessionBinding(x?.failed?.handoff_id ?? c1.recovery_of_handoff_id).status, "SUPERSEDED");
     assert.equal(next.runner.storage.getRunnerSessionBinding(c1.handoff_id).status, "SUPERSEDED");
-    assert.equal(next.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 3);
+    assert.equal(storageDatabaseForInternalTest(next.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 3);
     assert.equal(next.calls, 0);
   } finally {
     if (x) { await x.runner.dispose(); x.restoreFetch(); }
@@ -1516,7 +1511,7 @@ test("R1-M-01 actual Pi /aio handoff confirm cannot mutate P1 owned by C1 and C1
     assert.equal(c1.task_plan_revision, "PLAN-E2E-GATE-1");
     const c1Session = x.runner.runtime.session;
     const before = planDiskSnapshot(x.root, x.runner);
-    const rowsBefore = x.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count;
+    const rowsBefore = storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count;
     assert.equal(rowsBefore, 1);
 
     fresh = await makeRunner({ ownerGate: true, existingRoot: x.root });
@@ -1552,7 +1547,7 @@ test("R1-M-01 actual Pi /aio handoff confirm cannot mutate P1 owned by C1 and C1
     assert.equal(after.gate, "BLOCKED");
     assert.deepEqual(after.history, before.history);
     assert.match(notices.at(-1)?.text ?? "", /TASK_OPERATION_CONFLICT/);
-    assert.equal(fresh.runner.storage.db.prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count, 1);
+    assert.equal(storageDatabaseForInternalTest(fresh.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs WHERE task_id='TASK-E2E'").get().count, 1);
     assert.equal(fresh.runner.storage.getHandoff(c1.handoff_id).state, "RESUME_READY");
     assert.equal(replacements, 0);
     assert.equal(x.calls, 0);
@@ -1571,6 +1566,76 @@ test("R1-M-01 actual Pi /aio handoff confirm cannot mutate P1 owned by C1 and C1
   } finally {
     if (fresh) { await fresh.runner.dispose(); fresh.restoreFetch(); }
     await x.runner.dispose(); x.restoreFetch();
+  }
+});
+
+test("R1-M-02 actual Pi takeoverFromCommand wins before owner mutation with zero plan/history side effects", async () => {
+  const x = await makeRunner({ ownerGate: true });
+  try {
+    const before = planDiskSnapshot(x.root, x.runner);
+    let takeoverCalls = 0;
+    let replacements = 0;
+    const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+    x.runner.runtime.newSession = (...args) => { replacements += 1; return newSession(...args); };
+    x.runner.handoffService.testHooks = {
+      async beforeOwnerGate() {
+        takeoverCalls += 1;
+        await x.runner.takeoverFromCommand({ ui: { notify() {} } });
+      },
+    };
+    await assert.rejects(
+      () => x.runner.handoffDirect({ mode: "confirm", confirm: false }),
+      (error) => error.code === "HUMAN_TAKEOVER_ACTIVE",
+    );
+    assert.equal(takeoverCalls, 1);
+    assert.equal(x.runner.storage.getLatch("TASK-E2E").reason, "HUMAN_TAKEOVER");
+    assert.deepEqual(planDiskSnapshot(x.root, x.runner), before);
+    assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+    assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 0);
+    assert.equal(replacements, 0);
+    assert.equal(x.calls, 0);
+    assert.equal(x.networkAttempts, 0);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("R1-M-03 actual registered session_shutdown immediately before owner authority rejects, including same-ID ABA", async (t) => {
+  for (const restart of [false, true]) {
+    await t.test(restart ? "same-ID shutdown/start ABA then fresh retry" : "shutdown", async () => {
+      const x = await makeRunner({ ownerGate: true });
+      try {
+        const source = x.runner.runtime.session;
+        const before = planDiskSnapshot(x.root, x.runner);
+        let hookCalls = 0;
+        let replacements = 0;
+        const newSession = x.runner.runtime.newSession.bind(x.runner.runtime);
+        x.runner.runtime.newSession = (...args) => { replacements += 1; return newSession(...args); };
+        x.runner.handoffService.testHooks = {
+          async beforeOwnerGate() {
+            hookCalls += 1;
+            await source.extensionRunner.emit({ type: "session_shutdown", reason: "R1-M-03" });
+            if (restart) await source.extensionRunner.emit({ type: "session_start", reason: "R1-M-03-ABA" });
+          },
+        };
+        await assert.rejects(
+          () => x.runner.handoffDirect({ mode: "confirm", confirm: false }),
+          (error) => error.code === "HANDOFF_SOURCE_CHANGED",
+        );
+        assert.equal(hookCalls, 1);
+        assert.deepEqual(planDiskSnapshot(x.root, x.runner), before);
+        assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 0);
+        assert.equal(storageDatabaseForInternalTest(x.runner.storage).prepare("SELECT COUNT(*) AS count FROM artifacts").get().count, 0);
+        assert.equal(replacements, 0);
+        assert.equal(x.calls, 0);
+        assert.equal(x.networkAttempts, 0);
+
+        if (restart) {
+          x.runner.handoffService.testHooks = null;
+          const fresh = await x.runner.handoffDirect({ mode: "confirm", confirm: false });
+          assert.equal(fresh.state, "RESUME_READY");
+          assert.equal(x.runner.ledger.read().owner_gate.status, "SATISFIED");
+        }
+      } finally { await x.runner.dispose(); x.restoreFetch(); }
+    });
   }
 });
 
@@ -1844,7 +1909,7 @@ test("CONTINUITY_FAILED recovery fails closed when HUMAN_TAKEOVER races its Safe
     const pending = runnerB.runner.recoverHandoffDirect(failed.handoff_id, { confirm: true });
     const rejected = assert.rejects(pending, (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
     await waiting;
-    takeover.engageLatch(failed.task_id, "HUMAN_TAKEOVER", "human:/aio-takeover");
+    claimTakeoverForInternalTest(takeover, failed.task_id, "human:/aio-takeover");
     releaseIdle();
     await rejected;
     assert.deepEqual(recoveryDurableSnapshot(runnerB.runner, failed.handoff_id), durableBefore);
@@ -1868,11 +1933,11 @@ test("CONTINUITY_FAILED recovery rejects unknown or durable resume effects and u
       await assert.rejects(() => x.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING");
       const failed = x.runner.storage.latestHandoffForTask("TASK-E2E");
       failed.dispatch_state = "UNKNOWN";
-      x.runner.storage.saveHandoff(failed);
+      saveHandoffForInternalTest(x.runner.storage, failed);
       writeFileSync(join(x.root, "docs", "missing-unknown.md"), "fixed\n");
       assert.throws(
         () => x.runner.storage.prepareContinuityRecovery(failed.handoff_id, { sourceSessionId: "SES-fresh-unknown", runnerInstanceId: "RUNNER-fresh-unknown", actor: "human:test-recovery" }),
-        (error) => error.code === "CONTINUITY_RECOVERY_UNSAFE",
+        (error) => error.code === "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED",
       );
       assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
       assert.equal(x.runner.storage.getLatch(failed.task_id).state, "ENGAGED");
@@ -1883,16 +1948,16 @@ test("CONTINUITY_FAILED recovery rejects unknown or durable resume effects and u
     try {
       await assert.rejects(() => x.runner.handoffDirect({ mode: "manual", confirm: false }), (error) => error.code === "REQUIRED_LOCAL_PATH_MISSING");
       const failed = x.runner.storage.latestHandoffForTask("TASK-E2E");
-      x.runner.storage.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      storageDatabaseForInternalTest(x.runner.storage).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
         .run(failed.resume_prompt_id, failed.handoff_id, "human:simulated", failed.latch_generation, "2026-08-08T00:00:00Z");
-      x.runner.storage.db.prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+      storageDatabaseForInternalTest(x.runner.storage).prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
         .run("ADM-simulated", failed.resume_prompt_id, "resume:simulated", failed.handoff_id, "2026-08-08T00:00:00Z");
-      x.runner.storage.db.prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
+      storageDatabaseForInternalTest(x.runner.storage).prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
         .run("DSP-simulated", "ADM-simulated", failed.handoff_id, 1, "DISPATCHING", "2026-08-08T00:00:00Z");
       writeFileSync(join(x.root, "docs", "missing-durable.md"), "fixed\n");
       assert.throws(
         () => x.runner.storage.prepareContinuityRecovery(failed.handoff_id, { sourceSessionId: "SES-fresh-durable", runnerInstanceId: "RUNNER-fresh-durable", actor: "human:test-recovery" }),
-        (error) => error.code === "CONTINUITY_RECOVERY_UNSAFE",
+        (error) => error.code === "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED",
       );
       assert.equal(x.runner.storage.getRunnerSessionBinding(failed.handoff_id).status, "ACTIVE");
     } finally { await x.runner.dispose(); x.restoreFetch(); }
@@ -1913,7 +1978,7 @@ async function continuityFailureScenario(code, mutate) {
     assert.equal(result.state, "RESUME_READY");
     const handoff = x.runner.storage.getHandoff(result.handoff_id);
     handoff.state = "MANIFEST_PERSISTED";
-    x.runner.storage.saveHandoff(handoff);
+    saveHandoffForInternalTest(x.runner.storage, handoff);
     await mutate({ x, result, target: x.runner.runtime.session });
     assert.throws(
       () => x.runner.handoffService.continuity(result.handoff_id, x.runner.runtime.session),
@@ -1954,6 +2019,6 @@ test("P0-B continuity failure matrix remains fail-closed", async (t) => {
     x.runner.handoffService.reasoningPolicy = "high";
   }));
   await t.test("stale Runner binding", () => continuityFailureScenario("RUNNER_OWNERSHIP_ATTESTATION_FAILED", async ({ x, result }) => {
-    x.runner.storage.supersedeRunnerSessionBinding(result.handoff_id, "simulated stale Runner");
+    supersedeRunnerSessionBindingForInternalTest(x.runner.storage, result.handoff_id, "simulated stale Runner");
   }));
 });

@@ -10,6 +10,31 @@ const HANDOFF_KEYS = Object.freeze([
   "admissionState", "dispatchState", "failure",
 ]);
 const FAILURE_KEYS = Object.freeze(["code", "message"]);
+const trustedCurrentSourceVerifiers = new WeakMap();
+
+export function registerTrustedCurrentSourceVerifier(verifier, authority) {
+  invariant(typeof verifier === "function"
+    && authority?.sourceSession?.sessionId
+    && typeof authority?.runnerInstanceId === "string",
+  "HANDOFF_SOURCE_ATTESTATION_INVALID");
+  invariant(!trustedCurrentSourceVerifiers.has(verifier), "HANDOFF_SOURCE_ATTESTATION_INVALID");
+  trustedCurrentSourceVerifiers.set(verifier, Object.freeze({
+    sourceSession: authority.sourceSession,
+    sessionId: authority.sourceSession.sessionId,
+    runnerInstanceId: authority.runnerInstanceId,
+  }));
+  return verifier;
+}
+
+export function assertTrustedCurrentSourceVerifier(verifier, sourceSession, runnerInstanceId) {
+  const authority = trustedCurrentSourceVerifiers.get(verifier);
+  invariant(authority
+    && authority.sourceSession === sourceSession
+    && authority.sessionId === sourceSession?.sessionId
+    && authority.runnerInstanceId === runnerInstanceId,
+  "HANDOFF_SOURCE_ATTESTATION_REQUIRED", "Specialized owner confirmation requires the exact current Runner source verifier");
+  return authority;
+}
 
 function plain(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;

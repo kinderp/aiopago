@@ -7,6 +7,7 @@ import test from "node:test";
 import { initializeRepository } from "../src/bootstrap.mjs";
 import { canonicalJson, sha256, stableId } from "../src/canonical.mjs";
 import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
+import { satisfyOwnerGateForTest } from "./trusted-owner-gate-helper.mjs";
 import { assertExactSatisfiedOwnerGateTransition } from "../src/owner-gate-internal.mjs";
 import { MAX_PLAN_BYTES, PlanRevisionWriter, parseTaskPlanBytes } from "../src/plan-store.mjs";
 import {
@@ -509,15 +510,15 @@ test("owner-gate mutation keeps authorization/lifecycle semantics and shares ato
   });
   blocked.task_items[0].status = "BLOCKED";
   const x = fixture({ task: blocked });
-  assert.throws(() => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "agent:test" }), (error) => error.code === "OWNER_GATE_AUTHORIZATION_REQUIRED");
+  assert.throws(() => satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "agent:test" }), (error) => error.code === "OWNER_GATE_AUTHORIZATION_REQUIRED");
   assert.deepEqual(readFileSync(x.path), x.bytes);
   assert.throws(
-    () => new TaskLedger(x.path, { writerOptions: { io: failureIo("replace") } }).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }),
+    () => satisfyOwnerGateForTest(new TaskLedger(x.path, { writerOptions: { io: failureIo("replace") } }), { command: "/aio handoff confirm", actor: "human:test" }),
     /injected replace failure/,
   );
   assert.deepEqual(readFileSync(x.path), x.bytes);
   const ledger = new TaskLedger(x.path);
-  const applied = ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+  const applied = satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:test" });
   assert.equal(applied.owner_gate.status, "SATISFIED");
   assert.equal(applied.owner_gate.satisfied_by, "human:test");
   assert.equal(applied.plan_revision_id, "PLAN-GATE-2");
@@ -527,7 +528,7 @@ test("owner-gate mutation keeps authorization/lifecycle semantics and shares ato
   assert.equal(applied.task_items[0].status, "IN_PROGRESS");
   assert.equal(applied.next_step, "Continue ITEM-1, then ITEM-2.");
   const committed = readFileSync(x.path);
-  assert.deepEqual(ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }).content_digest, sha256(committed));
+  assert.deepEqual(satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:test" }).content_digest, sha256(committed));
   assert.deepEqual(readFileSync(x.path), committed);
 });
 
@@ -564,7 +565,7 @@ test("HANDOFF_CONFIRM gate command is a closed semantic authorization enum", asy
     assert.throws(() => new TaskLedger(x.path).read(), (error) => error?.code === "OWNER_GATE_INVALID");
     assert.throws(() => new PlanPort(x.path).apply(input), (error) => error?.code === "OWNER_GATE_INVALID");
     assert.throws(
-      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }),
+      () => satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:test" }),
       (error) => error?.code === "OWNER_GATE_INVALID",
     );
     assert.equal(existsSync(join(x.root, ".guardian")), false);
@@ -578,7 +579,7 @@ test("HANDOFF_CONFIRM gate command is a closed semantic authorization enum", asy
       value.owner_gate.command = gateCommand;
       const x = fixture({ task: value });
       assert.equal(new TaskLedger(x.path).read().owner_gate.command, gateCommand);
-      const released = new TaskLedger(x.path).satisfyOwnerGate({ command: submittedCommand, actor: "human:test" });
+      const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command: submittedCommand, actor: "human:test" });
       assert.equal(released.owner_gate.status, "SATISFIED");
       assert.equal(released.owner_gate.command, gateCommand, "compatibility bytes are not rewritten semantically");
     });
@@ -597,7 +598,7 @@ test("submitted owner authorization and actor validation fail with stable specia
   for (const command of invalidCommands) await t.test(`submitted ${JSON.stringify(command)} is unauthorized`, () => {
     const x = fixture({ task: blockedOwnerGateTask() });
     assert.throws(
-      () => new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" }),
+      () => satisfyOwnerGateForTest(new TaskLedger(x.path), { command, actor: "human:test" }),
       (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
     );
     assert.deepEqual(readFileSync(x.path), x.bytes);
@@ -607,7 +608,7 @@ test("submitted owner authorization and actor validation fail with stable specia
   for (const actor of invalidActors) await t.test(`actor ${String(actor)} is unauthorized without a generic exception`, () => {
     const x = fixture({ task: blockedOwnerGateTask() });
     assert.throws(
-      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor }),
+      () => satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor }),
       (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
     );
     assert.deepEqual(readFileSync(x.path), x.bytes);
@@ -615,7 +616,7 @@ test("submitted owner authorization and actor validation fail with stable specia
 
   for (const actor of ["human:test", "human:review", "human:/aio-handoff"]) await t.test(`${actor} authorizes`, () => {
     const x = fixture({ task: blockedOwnerGateTask() });
-    assert.equal(new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor }).owner_gate.satisfied_by, actor);
+    assert.equal(satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor }).owner_gate.satisfied_by, actor);
   });
 });
 
@@ -673,7 +674,7 @@ test("owner_gate contract fails closed and preserves post-SATISFIED evolution", 
 
   await t.test("specialized HUMAN satisfaction and subsequent generic lifecycle advance both pass", () => {
     const base = blockedTask(); const x = fixture({ task: base }); const port = new PlanPort(x.path);
-    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:owner" });
+    const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:owner" });
     assert.equal(released.owner_gate.status, "SATISFIED");
     const releasedBytes = readFileSync(x.path); const advanced = candidate(released, { plan_revision_id: "PLAN-GATE-3", current_item: "ITEM-2", next_item: null, next_step: "Continue ITEM-2." });
     advanced.task_items[0].status = "DONE"; advanced.task_items[0].evidence = ["ITEM-1 completed after owner confirmation"];
@@ -701,7 +702,7 @@ test("historical b317f79 owner_gate shape remains readable, closed, and idempote
   await t.test("already-SATISFIED specialized call is an exact no-write", () => {
     const root = mkdtempSync(join(tmpdir(), "aiopago-historical-gate-")); git(root, ["init"]);
     const path = join(root, "TASK_PLAN.md"); copyFileSync(historicalPath, path); const before = readFileSync(path);
-    const result = new TaskLedger(path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    const result = satisfyOwnerGateForTest(new TaskLedger(path), { command: "/aio handoff confirm", actor: "human:test" });
     assert.equal(result.owner_gate.status, "SATISFIED");
     assert.equal(result.content_digest, sha256(before));
     assert.deepEqual(readFileSync(path), before);
@@ -750,12 +751,12 @@ test("owner-gate satisfaction validates active-work targets and canonical comman
 
   for (const status of ["BLOCKED", "DONE", "DROPPED", "SUPERSEDED", "PLANNED"]) await t.test(`satisfied_task_status=${status} rejects before write`, () => {
     const value = blockedTask(); value.owner_gate.satisfied_task_status = status; const x = fixture({ task: value });
-    assert.throws(() => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" }), (error) => error.code === "OWNER_GATE_INVALID");
+    assert.throws(() => satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:test" }), (error) => error.code === "OWNER_GATE_INVALID");
     assert.deepEqual(readFileSync(x.path), x.bytes);
   });
   await t.test("absent satisfied_task_status defaults to the explicit IN_PROGRESS projection", () => {
     const value = blockedTask(); delete value.owner_gate.satisfied_task_status; const x = fixture({ task: value });
-    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio   handoff   confirm", actor: "human:test" });
+    const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio   handoff   confirm", actor: "human:test" });
     assert.equal(released.status, "IN_PROGRESS");
     assert.equal(released.current_item, "ITEM-1");
     assert.equal(released.task_items[0].status, "IN_PROGRESS");
@@ -817,7 +818,7 @@ test("owner-gate command tokenization is invariant across JS whitespace, aliases
       assert.throws(() => validateTaskLedger(invalid), (error) => error.code === "OWNER_GATE_INVALID");
 
       const x = fixture({ task: blockedOwnerGateTask() });
-      const released = new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" });
+      const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command, actor: "human:test" });
       assert.equal(released.owner_gate.status, "SATISFIED");
     });
   }
@@ -830,7 +831,7 @@ test("owner-gate command tokenization is invariant across JS whitespace, aliases
     assert.doesNotThrow(() => validateTaskLedger(mention));
     const x = fixture({ task: blockedOwnerGateTask() });
     assert.throws(
-      () => new TaskLedger(x.path).satisfyOwnerGate({ command, actor: "human:test" }),
+      () => satisfyOwnerGateForTest(new TaskLedger(x.path), { command, actor: "human:test" }),
       (error) => error?.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
     );
   });
@@ -838,7 +839,7 @@ test("owner-gate command tokenization is invariant across JS whitespace, aliases
   await t.test("wrong canonical command remains unauthorized", () => {
     const x = fixture({ task: blockedOwnerGateTask() });
     assert.throws(
-      () => new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio other confirm", actor: "human:test" }),
+      () => satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio other confirm", actor: "human:test" }),
       (error) => error.code === "OWNER_GATE_AUTHORIZATION_REQUIRED",
     );
     assert.deepEqual(readFileSync(x.path), x.bytes);
@@ -982,7 +983,7 @@ test("satisfyOwnerGate shares structural Markdown materialization and preserves 
     const value = blockedTask(); const x = fixture({ task: value, prose: { before: prose, after: "Coda Unicode è." } });
     const compact = Buffer.from(x.bytes.toString("utf8").replace(`**Current revision:** \`P-1\`\n**Requirements version:** \`REQ-PLAN-1\`\n**Updated:** ${BASE_TIME}\n`, ""));
     writeFileSync(x.path, compact); const beforeOutside = outsideJson(compact);
-    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:test" });
     const after = readFileSync(x.path);
     assert.equal(released.plan_revision_id, value.owner_gate.satisfied_plan_revision_id);
     assert.equal(outsideJson(after), beforeOutside);
@@ -997,7 +998,7 @@ test("satisfyOwnerGate shares structural Markdown materialization and preserves 
     const schemaBytes = legacy ? Buffer.from(x.bytes.toString("utf8").replace("aiopago.task-ledger/0.1.0", "eiopago.task-ledger/0.1.0")) : x.bytes;
     const before = bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), schemaBytes]) : schemaBytes; writeFileSync(x.path, before);
     const beforeOutside = outsideJson(before);
-    const released = new TaskLedger(x.path).satisfyOwnerGate({ command: "/eiopago handoff confirm", actor: "human:test" });
+    const released = satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/eiopago handoff confirm", actor: "human:test" });
     const after = readFileSync(x.path); const afterOutside = outsideJson(after);
     const expectedOutside = beforeOutside
       .replace("**Current revision:** `P-1`", `**Current revision:** \`${released.plan_revision_id}\``)
@@ -1034,7 +1035,7 @@ test("SATISFIED owner-gate item references remain historical after later project
 
   for (const removedReference of ["item_id", "satisfied_next_item"]) await t.test(`${removedReference} may leave the current projection`, () => {
     const x = fixture({ task: blockedTask() });
-    new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+    satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:test" });
     const releasedGate = structuredClone(currentPlan(x.path).owner_gate);
     apply(x.path, "PLAN-GATE-3", "2026-08-20T10:10:00.000Z", (next) => {
       next.current_item = "ITEM-2"; next.next_item = null; next.next_step = "Complete ITEM-2.";
@@ -1686,7 +1687,7 @@ test("POSIX authority mode is preserved by the prepared-temp rename", { skip: pr
 test("owner-gate uses the same owned CAS writer and preserves exact history", () => {
   const blocked = task({ status: "BLOCKED", current_item: null, next_item: "ITEM-1", next_step: "Owner gate: execute /aio handoff confirm", owner_gate: { kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1", satisfied_plan_revision_id: "PLAN-GATE-HISTORY", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: "ITEM-2", satisfied_next_step: "Continue ITEM-1, then ITEM-2." } });
   blocked.task_items[0].status = "BLOCKED"; const x = fixture({ task: blocked }); const old = Buffer.from(x.bytes);
-  new TaskLedger(x.path).satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:test" });
+  satisfyOwnerGateForTest(new TaskLedger(x.path), { command: "/aio handoff confirm", actor: "human:test" });
   const history = join(x.root, ".guardian", "plan-history", `sha256-${sha256(old).slice("sha256:".length)}.md`); assert.deepEqual(readFileSync(history), old);
 });
 

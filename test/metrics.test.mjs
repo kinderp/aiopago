@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { MeasurementInstrumentation, METRICS_SCHEMA_VERSION, assertTelemetrySafe, measureHandoffArtifacts } from "../src/metrics.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, claimLatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest } from "../src/storage.mjs";
 
 function temp() { return mkdtempSync(join(tmpdir(), "aiopago-metrics-")); }
 function plan(item = "ITEM-H2-01") {
@@ -50,8 +50,8 @@ function instrumentation(storage, overrides = {}) {
 }
 function correlateTarget(storage, sessionId = "SES-target") {
   storage.ensureLatch("TASK-H2");
-  const latch = storage.engageLatch("TASK-H2", "INTEGRITY", "human:test");
-  storage.reserveHandoff({
+  const latch = claimLatchForInternalTest(storage, "TASK-H2", "INTEGRITY", "human:test");
+  reserveHandoffForInternalTest(storage, {
     handoff_id: "HO-H2",
     source_session_id: "SES-source",
     target_session_id: null,
@@ -64,7 +64,7 @@ function correlateTarget(storage, sessionId = "SES-target") {
   const handoff = storage.getHandoff("HO-H2");
   handoff.target_session_id = sessionId;
   handoff.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
-  storage.saveHandoff(handoff);
+  saveHandoffForInternalTest(storage, handoff);
   return storage.getHandoff("HO-H2");
 }
 

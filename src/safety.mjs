@@ -153,7 +153,20 @@ export class SafePointCoordinator {
       generation: observed.generation,
       reason: observed.reason ?? null,
     };
-    const latch = this.storage.claimLatch(this.taskId, reason, actor, reason === "HUMAN_TAKEOVER" ? null : expectedLatch);
+    let latch;
+    if (reason === "HUMAN_TAKEOVER") {
+      latch = options.acquiredLatch;
+      invariant(latch?.task_id === this.taskId && latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER",
+        "HUMAN_TAKEOVER_TRUSTED_PATH_REQUIRED", "Takeover drain requires the synchronously plan-coordinated latch claim");
+      this.acquiredLatch(latch, reason);
+    } else if (options.acquiredLatch) {
+      latch = options.acquiredLatch;
+      invariant(latch.task_id === this.taskId && latch.state === "ENGAGED" && latch.reason === reason,
+        "HANDOFF_LATCH_AUTHORITY_INVALID", "SafePoint drain requires the exact plan-coordinated latch claim");
+      this.acquiredLatch(latch, reason);
+    } else {
+      throw new GuardianError("HANDOFF_LATCH_AUTHORITY_INVALID", "SafePoint requires a package-private plan-coordinated latch claim");
+    }
     session.clearQueue();
     session.abortRetry();
     session.abortCompaction();

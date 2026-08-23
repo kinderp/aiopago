@@ -314,10 +314,12 @@ function ledgerResult(task, contentDigest, path) {
 }
 
 export class TaskLedger {
+  #writer;
+
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
-    this.writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
-    const coordinateExactPlan = (expected, use, code, message) => this.writer.coordinate({
+    this.#writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
+    const coordinateExactPlan = (expected, use, code, message) => this.#writer.coordinate({
       validate: validateTaskLedger,
       use: (observed) => {
         const plan = ledgerResult(observed.task, observed.contentDigest, this.path);
@@ -343,12 +345,12 @@ export class TaskLedger {
   }
 
   read() {
-    const observed = this.writer.readCurrent({ validate: validateTaskLedger });
+    const observed = this.#writer.readCurrent({ validate: validateTaskLedger });
     return ledgerResult(observed.task, observed.contentDigest, this.path);
   }
 
   #satisfyOwnerGate({ command, actor, expected = null }, assertEligible = null) {
-    return this.writer.commit({
+    return this.#writer.commit({
       expected,
       validate: validateTaskLedger,
       prepare: (observed) => {
@@ -395,10 +397,6 @@ export class TaskLedger {
         return { bytes, result: ledgerResult(task, sha256(bytes), this.path) };
       },
     });
-  }
-
-  satisfyOwnerGate(request) {
-    return this.#satisfyOwnerGate(request);
   }
 
   validate(task) {

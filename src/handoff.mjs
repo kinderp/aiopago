@@ -6,13 +6,20 @@ import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
 import {
   authorizeTrustedResume,
+  beginTrustedResumeDispatch,
+  bindTrustedRunnerSession,
+  claimTrustedHandoffLatch,
+  finishTrustedResumeDispatch,
   prepareTrustedContinuityRecovery,
   reserveTrustedHandoffPlan,
   satisfyTrustedHandoffOwnerGate,
+  saveTrustedHandoff,
+  supersedeTrustedRunnerSessionBinding,
 } from "./handoff-plan-internal.mjs";
 import {
   assertGuidedHandoffEligibilityIdentity,
   assertHandoffConsentIdentity,
+  assertTrustedCurrentSourceVerifier,
   assertPlanConsentIdentity,
   handoffConsentIdentity,
 } from "./handoff-consent.mjs";
@@ -26,6 +33,7 @@ import {
   samePlanSemantics,
 } from "./plan-semantics-internal.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
+import { storageDatabaseForInternalUse } from "./storage.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
 
@@ -202,6 +210,7 @@ export class HandoffService {
   verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
     invariant(!required || typeof currentSourceVerifier === "function", "HANDOFF_SOURCE_ATTESTATION_REQUIRED");
     if (typeof currentSourceVerifier !== "function") return null;
+    if (required) assertTrustedCurrentSourceVerifier(currentSourceVerifier, sourceSession, this.runnerInstanceId);
     const attestation = currentSourceVerifier();
     invariant(attestation && typeof attestation === "object" && typeof attestation.then !== "function",
       "HANDOFF_SOURCE_CHANGED", "Current Runner source attestation must be synchronous");
@@ -351,7 +360,7 @@ export class HandoffService {
     const sourceFile = normalizePath(sourceSession?.sessionFile);
     invariant(sourceFile, "PERSISTED_SOURCE_SESSION_REQUIRED");
     const sourceSessionId = sourceSession.sessionId;
-    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: mode === "confirm" });
     if (guided) {
       invariant(expectedEligibility.runnerInstanceId === this.runnerInstanceId, "HANDOFF_RUNNER_CHANGED", "Guided consent belongs to a different Runner");
       invariant(expectedEligibility.sessionId === sourceSessionId, "HANDOFF_SOURCE_CHANGED", "Guided consent belongs to a different source session");
@@ -390,12 +399,17 @@ export class HandoffService {
       this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
     }
     if (mode === "confirm" && recoveryOf === null) {
+      // Optional UI/test preparation is complete before O*. This is the final
+      // asynchronous boundary: exact Runner/source lifecycle attestation is
+      // then immediately followed by the synchronous owner-authority section.
       await this.testHooks?.beforeOwnerGate?.({ plan, sourceSession, expected: ownerGateExpected });
+      this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: true });
       plan = satisfyTrustedHandoffOwnerGate(this.ledger, {
         storage: this.storage,
         expected: ownerGateExpected,
         taskId: plan.task_id,
         expectedHandoff,
+        expectedLatch,
         command: "/aio handoff confirm",
         actor,
       });
@@ -413,11 +427,19 @@ export class HandoffService {
     this.assertModelPolicy(plan, sourceSession);
     const safePointReason = expectedLatch.state === "ENGAGED" ? expectedLatch.reason : "INTEGRITY";
     invariant(typeof safePointReason === "string" && safePointReason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
-    const safe = await this.safePoint.request(sourceSession, actor, safePointReason, { expectedLatch });
+    const acquiredLatch = claimTrustedHandoffLatch(this.ledger, {
+      storage: this.storage,
+      expected: trustedPlanIdentity,
+      taskId: plan.task_id,
+      reason: safePointReason,
+      actor,
+      expectedLatch,
+    });
+    const safe = await this.safePoint.request(sourceSession, actor, safePointReason, { expectedLatch, acquiredLatch });
     await this.testHooks?.afterSafePoint?.({ safe, plan, sourceSession });
     const git = this.observeGit();
 
-    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: guided });
+    this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: mode === "confirm" });
     assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
     this.storage.assertLatchIdentity(plan.task_id, safe.latch);
     const base = this.#buildHandoffReservation({
@@ -454,12 +476,12 @@ export class HandoffService {
     });
 
     handoff.state = "CHECKPOINT_PERSISTING";
-    this.storage.saveHandoff(handoff, "STATE_TRANSITION", { from: "SAFE_TO_HANDOFF", to: handoff.state });
+    saveTrustedHandoff(this.storage, handoff, "STATE_TRANSITION", { from: "SAFE_TO_HANDOFF", to: handoff.state });
     try {
       const checkpoint = this.artifacts.persist("checkpoint", checkpointId, this.buildCheckpoint(handoff, plan, safe.operations));
       handoff.checkpoint_digest = checkpoint.digest;
       handoff.state = "CHECKPOINT_PERSISTED";
-      this.storage.saveHandoff(handoff, "CHECKPOINT_PERSISTED", { checkpoint_id: checkpointId, digest: checkpoint.digest, event_key: `checkpoint:${checkpointId}` });
+      saveTrustedHandoff(this.storage, handoff, "CHECKPOINT_PERSISTED", { checkpoint_id: checkpointId, digest: checkpoint.digest, event_key: `checkpoint:${checkpointId}` });
       this.metric("CHECKPOINT_SEALED", {
         handoff,
         session_id: sourceSessionId,
@@ -476,7 +498,7 @@ export class HandoffService {
         `Preserve and inspect checkpoint ${checkpointId}; reconcile handoff ${handoffId} before any new handoff.`,
         "Do not rewrite the artifact or retry handoff automatically.",
       ];
-      this.storage.saveHandoff(handoff, "CHECKPOINT_PERSIST_FAILED", { code: handoff.failure.code, error: handoff.failure.message, manual_recovery: handoff.manual_recovery, event_key: `checkpoint-failed:${checkpointId}` });
+      saveTrustedHandoff(this.storage, handoff, "CHECKPOINT_PERSIST_FAILED", { code: handoff.failure.code, error: handoff.failure.message, manual_recovery: handoff.manual_recovery, event_key: `checkpoint-failed:${checkpointId}` });
       throw error;
     }
 
@@ -491,12 +513,13 @@ export class HandoffService {
         "Human control changed after durable handoff reservation; no replacement session was created.",
         `Inspect /aio status and reconcile handoff ${handoffId}; do not retry automatically.`,
       ];
-      this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { code: handoff.failure.code, error: handoff.failure.message, event_key: `handoff-failed:${handoffId}` });
+      saveTrustedHandoff(this.storage, handoff, "HANDOFF_FAILED", { code: handoff.failure.code, error: handoff.failure.message, event_key: `handoff-failed:${handoffId}` });
       throw error;
     }
 
     handoff.state = "REPLACEMENT_SESSION_CREATING";
-    this.storage.saveHandoff(handoff, "REPLACEMENT_SESSION_CREATE_INTENT", { parent_session_file: sourceFile, event_key: `replacement-intent:${handoffId}` });
+    saveTrustedHandoff(this.storage, handoff, "REPLACEMENT_SESSION_CREATE_INTENT", { parent_session_file: sourceFile, event_key: `replacement-intent:${handoffId}` });
+    await this.testHooks?.afterReplacementIntent?.({ handoff: this.storage.getHandoff(handoffId), safe, plan, sourceSession });
     let replacementResult;
     try {
       this.storage.assertLatchIdentity(plan.task_id, safe.latch);
@@ -510,7 +533,7 @@ export class HandoffService {
     } catch (error) {
       handoff = this.storage.getHandoff(handoffId);
       if (handoff.target_session_id) throw error;
-      this.storage.supersedeRunnerSessionBinding(handoffId, "replacement creation failed before target registration");
+      supersedeTrustedRunnerSessionBinding(this.storage, handoffId, "replacement creation failed before target registration");
       handoff.state = "HANDOFF_FAILED";
       if (["HUMAN_TAKEOVER_ACTIVE", "LATCH_GENERATION_MISMATCH"].includes(error?.code)) {
         handoff.failure = { code: error.code, message: error.message };
@@ -518,12 +541,12 @@ export class HandoffService {
           "Human control changed before replacement creation; no replacement session was created.",
           `Inspect /aio status and reconcile handoff ${handoffId}; do not retry automatically.`,
         ];
-        this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { code: error.code, error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
+        saveTrustedHandoff(this.storage, handoff, "HANDOFF_FAILED", { code: error.code, error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
         throw error;
       }
       handoff.failure = { code: "REPLACEMENT_SESSION_CREATE_UNKNOWN", message: error.message };
       handoff.manual_recovery = this.buildManualRecovery(handoff, "Replacement creation outcome is ambiguous");
-      this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
+      saveTrustedHandoff(this.storage, handoff, "HANDOFF_FAILED", { error: error.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
       throw new GuardianError("HANDOFF_FAILED", handoff.manual_recovery.join("\n"), { cause: error.message, instructions: handoff.manual_recovery });
     }
     if (replacementResult?.cancelled) {
@@ -531,7 +554,7 @@ export class HandoffService {
       handoff.state = "HANDOFF_FAILED";
       handoff.failure = { code: "REPLACEMENT_SESSION_CANCELLED", message: "Pi cancelled replacement creation before a target was registered" };
       handoff.manual_recovery = this.buildManualRecovery(handoff, handoff.failure.message);
-      this.storage.saveHandoff(handoff, "HANDOFF_FAILED", { error: handoff.failure.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
+      saveTrustedHandoff(this.storage, handoff, "HANDOFF_FAILED", { error: handoff.failure.message, manual_recovery: handoff.manual_recovery, event_key: `handoff-failed:${handoffId}` });
       throw new GuardianError("HANDOFF_FAILED", handoff.manual_recovery.join("\n"), { instructions: handoff.manual_recovery });
     }
     return this.storage.getHandoff(handoffId);
@@ -543,7 +566,7 @@ export class HandoffService {
     h.target_session_id = session.sessionId;
     h.target_session_file = normalizePath(session.sessionFile);
     h.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
-    this.storage.saveHandoff(h, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: h.target_session_id, target_session_file: h.target_session_file, event_key: `replacement:${handoffId}` });
+    saveTrustedHandoff(this.storage, h, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: h.target_session_id, target_session_file: h.target_session_file, event_key: `replacement:${handoffId}` });
     this.metric("REPLACEMENT_STARTED", {
       handoff: h,
       session_id: h.target_session_id,
@@ -554,7 +577,7 @@ export class HandoffService {
     try {
       const runtimeBinding = readRuntimeRunnerBinding(session);
       invariant(runtimeBinding.handoff_id === h.handoff_id && runtimeBinding.runner_instance_id === h.runner_instance_id && runtimeBinding.session_binding_id === h.session_binding_id, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "replacement setup binding");
-      this.storage.bindRunnerSession(handoffId, runtimeBinding);
+      bindTrustedRunnerSession(this.storage, handoffId, runtimeBinding);
     } catch (error) {
       h = this.storage.getHandoff(handoffId);
       h.state = "RUNNER_OWNERSHIP_ATTESTATION_FAILED";
@@ -564,14 +587,14 @@ export class HandoffService {
         "Keep the target paused and reconcile its session header and durable binding before any new handoff.",
         "Do not install a replacement binding or retry automatically.",
       ];
-      this.storage.saveHandoff(h, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery });
+      saveTrustedHandoff(this.storage, h, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery });
       throw error;
     }
 
     h = this.storage.getHandoff(handoffId);
     h.resume_prompt_id = stableId("RP", h.handoff_id, h.checkpoint_digest, h.task_plan_revision, h.requirements_version);
     h.state = "MANIFEST_PERSISTING";
-    this.storage.saveHandoff(h, "STATE_TRANSITION", { from: "REPLACEMENT_SESSION_CREATED_PAUSED", to: h.state });
+    saveTrustedHandoff(this.storage, h, "STATE_TRANSITION", { from: "REPLACEMENT_SESSION_CREATED_PAUSED", to: h.state });
     try {
       const plan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
       const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
@@ -580,7 +603,7 @@ export class HandoffService {
       const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan));
       h.resume_manifest_digest = manifest.digest;
       h.state = "MANIFEST_PERSISTED";
-      this.storage.saveHandoff(h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
+      saveTrustedHandoff(this.storage, h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
     } catch (error) {
       h.state = "MANIFEST_PERSIST_FAILED";
       h.failure = boundedFailure(error, "MANIFEST_PERSIST_FAILED");
@@ -589,7 +612,7 @@ export class HandoffService {
         `Keep target ${h.target_session_id} paused and reconcile manifest ${h.resume_manifest_id} before any new handoff.`,
         "Do not rewrite the artifact, recreate the target, or retry automatically.",
       ];
-      this.storage.saveHandoff(h, "MANIFEST_PERSIST_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery, event_key: `manifest-failed:${h.resume_manifest_id}` });
+      saveTrustedHandoff(this.storage, h, "MANIFEST_PERSIST_FAILED", { code: h.failure.code, error: h.failure.message, manual_recovery: h.manual_recovery, event_key: `manifest-failed:${h.resume_manifest_id}` });
       throw error;
     }
 
@@ -598,7 +621,7 @@ export class HandoffService {
       h = this.storage.getHandoff(handoffId);
       h.state = "CONTINUITY_FAILED";
       h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
-      this.storage.saveHandoff(h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
+      saveTrustedHandoff(this.storage, h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
       throw error;
     }
     target.setEditor?.(h.resume_prompt);
@@ -630,7 +653,15 @@ export class HandoffService {
       plan: this.ledger.read(),
       expectedLatch: null,
     });
-    const safe = await this.safePoint.request(sourceSession, actor, initial.latch.reason, { expectedLatch: initial.latch });
+    const recoveryLatch = claimTrustedHandoffLatch(this.ledger, {
+      storage: this.storage,
+      expected: { taskId: initial.plan.task_id, planRevisionId: initial.plan.plan_revision_id, contentDigest: initial.plan.content_digest },
+      taskId: initial.plan.task_id,
+      reason: initial.latch.reason,
+      actor,
+      expectedLatch: initial.latch,
+    });
+    const safe = await this.safePoint.request(sourceSession, actor, initial.latch.reason, { expectedLatch: initial.latch, acquiredLatch: recoveryLatch });
 
     // SafePoint is only an asynchronous drain. The single final R* capture and
     // prepare+child reservation below run synchronously while compliant plan
@@ -763,7 +794,7 @@ export class HandoffService {
     h.resume_prompt = resumePrompt;
     h.resume_prompt_digest = resumePromptDigest;
     h.state = "RESUME_READY";
-    this.storage.saveHandoff(h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
+    saveTrustedHandoff(this.storage, h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
     const ready = this.storage.getHandoff(handoffId);
     this.metric("RESUME_READY", {
       handoff: ready,
@@ -858,9 +889,9 @@ export class HandoffService {
     const latest = this.storage.latestHandoffForTask(h.task_id);
     invariant(latest?.handoff_id === h.handoff_id, "TASK_OPERATION_CONFLICT", "The handoff no longer owns the task operation");
     const durableCounts = {
-      authorizations: this.storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
-      admissions: this.storage.db.prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
-      dispatch_attempts: this.storage.db.prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
+      authorizations: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
+      admissions: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
+      dispatch_attempts: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
     };
     invariant(Object.values(durableCounts).every((count) => count === 0), "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
     const authority = deepFreeze(structuredClone({
@@ -997,16 +1028,16 @@ export class HandoffService {
       reason: "HUMAN_RESUME_AUTHORIZED",
     });
     const attemptId = stableId("DSP", admissionId, "1");
-    const dispatch = this.storage.beginDispatch(handoffId, attemptId, 1);
+    const dispatch = beginTrustedResumeDispatch(this.storage, handoffId, attemptId, 1);
     if (dispatch.idempotent) {
       const state = dispatch.attempt.state;
       if (state === "ACKNOWLEDGED") return this.storage.getHandoff(handoffId);
-      this.storage.finishDispatch(handoffId, "UNKNOWN", "reload/retry after durable dispatch intent");
+      finishTrustedResumeDispatch(this.storage, handoffId, "UNKNOWN", "reload/retry after durable dispatch intent");
       throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Durable dispatch intent has no safe replay");
     }
     try {
       await sendResume(h.resume_prompt);
-      const completed = this.storage.finishDispatch(handoffId, "ACKNOWLEDGED");
+      const completed = finishTrustedResumeDispatch(this.storage, handoffId, "ACKNOWLEDGED");
       this.metric("COMPLETED", {
         handoff: completed,
         session_id: completed.target_session_id,
@@ -1016,7 +1047,7 @@ export class HandoffService {
       });
       return completed;
     } catch (error) {
-      this.storage.finishDispatch(handoffId, "UNKNOWN", error.message);
+      finishTrustedResumeDispatch(this.storage, handoffId, "UNKNOWN", error.message);
       throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Resume might have been accepted; no automatic retry", { cause: error.message });
     }
   }

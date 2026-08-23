@@ -6,8 +6,9 @@ import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./con
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
-import { assertGuidedHandoffEligibilityIdentity } from "./handoff-consent.mjs";
+import { assertGuidedHandoffEligibilityIdentity, registerTrustedCurrentSourceVerifier } from "./handoff-consent.mjs";
 import { HandoffService } from "./handoff.mjs";
+import { claimTrustedHumanTakeover } from "./handoff-plan-internal.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
@@ -246,6 +247,7 @@ export class GuardianRunner {
       "HANDOFF_SOURCE_CHANGED", "Runner source session lifecycle changed or is no longer ACTIVE");
       return Object.freeze({ sessionId: sourceSessionId, runnerInstanceId, lifecycleEpoch, active: true });
     };
+    registerTrustedCurrentSourceVerifier(verifyCurrentSource, { sourceSession, runnerInstanceId });
     verifyCurrentSource();
     return Object.freeze({ sourceSession, verifyCurrentSource });
   }
@@ -316,7 +318,15 @@ export class GuardianRunner {
   }
 
   async takeoverFromCommand(ctx) {
-    const result = await this.safePoint.request(this.runtime.session, "human:/aio-takeover", "HUMAN_TAKEOVER");
+    const plan = this.ledger.read();
+    const actor = "human:/aio-takeover";
+    const latch = claimTrustedHumanTakeover(this.ledger, {
+      storage: this.storage,
+      expected: { taskId: plan.task_id, planRevisionId: plan.plan_revision_id, contentDigest: plan.content_digest },
+      taskId: plan.task_id,
+      actor,
+    });
+    const result = await this.safePoint.request(this.runtime.session, actor, "HUMAN_TAKEOVER", { acquiredLatch: latch });
     ctx.ui.notify(`Aiopago paused at ${result.state}; latch generation=${result.latch_generation}`, "warning");
     return result;
   }

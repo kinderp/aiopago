@@ -10,6 +10,46 @@ import { taskOperationBlocksNewHandoff, taskOperationDisposition } from "./task-
 
 const TERMINAL_HANDOFF = new Set(["RESUMED"]);
 const TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
+const internalTestCapabilities = new WeakMap();
+const storageDatabases = new WeakMap();
+
+function database(storage) {
+  const value = storageDatabases.get(storage);
+  invariant(value, "STORAGE_CLOSED", "GuardianStorage is closed or invalid");
+  return value;
+}
+
+// Internal modules and source-level tests may inspect the connection. The npm
+// root does not export GuardianStorage or this accessor, and instances expose
+// no raw DatabaseSync handle.
+export function storageDatabaseForInternalUse(storage) { return database(storage); }
+export const storageDatabaseForInternalTest = storageDatabaseForInternalUse;
+
+// Source-level regression support only. src/storage.mjs is not a package export;
+// packed consumers cannot obtain these helpers or the registered capabilities.
+export function reserveHandoffForInternalTest(storage, projection, precondition) {
+  const capability = internalTestCapabilities.get(storage);
+  invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED");
+  return capability.reserve(projection, precondition);
+}
+
+export function claimTakeoverForInternalTest(storage, taskId, actor = "human:test-takeover") {
+  const capability = internalTestCapabilities.get(storage);
+  invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED");
+  return capability.claimTakeover({ taskId, actor });
+}
+
+export function claimLatchForInternalTest(storage, taskId, reason, actor, expected = null) {
+  const capability = internalTestCapabilities.get(storage);
+  invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED");
+  return capability.claimLatch({ taskId, reason, actor, expected });
+}
+
+export function saveHandoffForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).saveHandoff(...args); }
+export function bindRunnerSessionForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).bindRunnerSession(...args); }
+export function supersedeRunnerSessionBindingForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).supersedeRunnerSessionBinding(...args); }
+export function beginDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).beginDispatch(...args); }
+export function finishDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).finishDispatch(...args); }
 
 const HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
   "handoff_id",
@@ -72,16 +112,16 @@ function sameRecoveryFailedIdentity(actual, expected, expectedPlanSemanticDigest
 }
 
 function recoveryStarted(storage, handoffId) {
-  return Boolean(storage.db.prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(handoffId));
+  return Boolean(database(storage).prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(handoffId));
 }
 
 function recoveryChildExists(storage, handoffId) {
-  const rows = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=(SELECT task_id FROM handoffs WHERE handoff_id=?)").all(handoffId);
+  const rows = database(storage).prepare("SELECT handoff_id FROM handoffs WHERE task_id=(SELECT task_id FROM handoffs WHERE handoff_id=?)").all(handoffId);
   return rows.some((row) => storage.getHandoff(row.handoff_id)?.recovery_of_handoff_id === handoffId);
 }
 
 function blockingTaskOperation(storage, taskId, excludingHandoffId = null) {
-  const rows = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at, rowid").all(taskId);
+  const rows = database(storage).prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at, rowid").all(taskId);
   for (const row of rows) {
     if (row.handoff_id === excludingHandoffId) continue;
     const handoff = storage.getHandoff(row.handoff_id);
@@ -95,10 +135,19 @@ function blockingTaskOperation(storage, taskId, excludingHandoffId = null) {
   return null;
 }
 
-function assertOwnerGateEligibilityInTransaction(storage, request) {
-  const { taskId, expectedHandoff } = request ?? {};
-  invariant(typeof taskId === "string" && taskId.length > 0 && Object.hasOwn(request ?? {}, "expectedHandoff"),
-    "HANDOFF_OWNER_GATE_AUTHORITY_INVALID");
+function assertOwnerGateAuthorityInTransaction(storage, request) {
+  const { taskId, expectedHandoff, expectedLatch } = request ?? {};
+  invariant(typeof taskId === "string" && taskId.length > 0
+    && Object.hasOwn(request ?? {}, "expectedHandoff") && expectedLatch?.task_id === taskId,
+  "HANDOFF_OWNER_GATE_AUTHORITY_INVALID");
+  const latch = storage.getLatch(taskId);
+  if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+    throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover won owner-authority arbitration");
+  }
+  invariant(latch?.state === expectedLatch.state
+    && latch.generation === expectedLatch.generation
+    && (latch.reason ?? null) === (expectedLatch.reason ?? null),
+  "LATCH_GENERATION_MISMATCH", "Canonical latch changed before owner-gate mutation");
   const conflict = blockingTaskOperation(storage, taskId);
   if (conflict) {
     const code = conflict.disposition === "RECOVERY_REQUIRED" ? "CONTINUITY_RECOVERY_REQUIRED" : "TASK_OPERATION_CONFLICT";
@@ -109,7 +158,7 @@ function assertOwnerGateEligibilityInTransaction(storage, request) {
       disposition: conflict.disposition,
     });
   }
-  const latestRow = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(taskId);
+  const latestRow = database(storage).prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(taskId);
   const latest = latestRow ? storage.getHandoff(latestRow.handoff_id) : null;
   invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(expectedHandoff),
     "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before owner-gate mutation");
@@ -121,7 +170,7 @@ function isExactRecoveryTransfer(storage, conflict, projection, precondition) {
     || conflict.disposition !== "RECOVERY_REQUIRED"
     || JSON.stringify(handoffConsentIdentity(conflict.handoff)) !== JSON.stringify(precondition.expectedHandoff)) return false;
   const binding = storage.getRunnerSessionBinding(conflict.handoff.handoff_id);
-  const event = storage.db.prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(conflict.handoff.handoff_id);
+  const event = database(storage).prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED' LIMIT 1").get(conflict.handoff.handoff_id);
   const data = event ? JSON.parse(event.data_json) : null;
   return binding?.status === "SUPERSEDED"
     && data?.current_source_session_id === projection.source_session_id
@@ -145,7 +194,7 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
     && latch.reason === precondition.latch.reason
     && projection.latch_generation === latch.generation,
   "LATCH_GENERATION_MISMATCH", "Durable handoff reservation does not match the acquired safe-point latch");
-  const active = storage.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
+  const active = database(storage).prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
   if (active) {
     const existing = storage.getHandoff(active.handoff_id);
     if (sameHandoffReservationIdentity(existing, projection)) return { created: false, handoff: existing };
@@ -155,7 +204,7 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
       requested_handoff_id: projection.handoff_id,
     });
   }
-  const latestRow = storage.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(projection.task_id);
+  const latestRow = database(storage).prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(projection.task_id);
   const latest = latestRow ? storage.getHandoff(latestRow.handoff_id) : null;
   invariant(JSON.stringify(handoffConsentIdentity(latest)) === JSON.stringify(precondition.expectedHandoff),
     "HANDOFF_CONSENT_STALE", "Handoff lifecycle changed before durable reservation");
@@ -170,9 +219,9 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
     });
   }
   const now = utcNow();
-  storage.db.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+  database(storage).prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
     .run(projection.handoff_id, projection.source_session_id, null, projection.task_id, projection.state, projection.latch_generation, JSON.stringify(projection), now, now);
-  storage.db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
+  database(storage).prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
   storage.appendEvent("HANDOFF_STARTED", { source_session_id: projection.source_session_id, latch_generation: projection.latch_generation, recovery_of_handoff_id: projection.recovery_of_handoff_id ?? null }, { handoffId: projection.handoff_id, eventKey: `handoff:${projection.handoff_id}` });
   return { created: true, handoff: storage.getHandoff(projection.handoff_id) };
 }
@@ -197,11 +246,11 @@ function prepareContinuityRecoveryInTransaction(storage, handoffId, request) {
   );
   invariant(sourceSessionId !== handoff.source_session_id && sourceSessionId !== handoff.target_session_id, "CONTINUITY_RECOVERY_SOURCE_INVALID", "recovery requires a distinct fresh source session");
   invariant(handoff.authorization_state === "NOT_AUTHORIZED" && handoff.admission_state === "NOT_COMMITTED" && handoff.dispatch_state === "NOT_STARTED", "CONTINUITY_RECOVERY_UNSAFE", "authorization/admission/dispatch state is not provably empty");
-  const authorization = storage.db.prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? LIMIT 1").get(handoffId);
-  const admission = storage.db.prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? LIMIT 1").get(handoffId);
-  const dispatch = storage.db.prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(handoffId);
+  const authorization = database(storage).prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? LIMIT 1").get(handoffId);
+  const admission = database(storage).prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? LIMIT 1").get(handoffId);
+  const dispatch = database(storage).prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(handoffId);
   invariant(!authorization && !admission && !dispatch, "CONTINUITY_RECOVERY_UNSAFE", "durable authorization/admission/dispatch evidence exists");
-  const continuityFailure = storage.db.prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_FAILED' LIMIT 1").get(handoffId);
+  const continuityFailure = database(storage).prepare("SELECT 1 AS present FROM journal WHERE handoff_id=? AND event_type='CONTINUITY_FAILED' LIMIT 1").get(handoffId);
   invariant(continuityFailure, "CONTINUITY_RECOVERY_UNSAFE", "terminal continuity failure journal evidence is missing");
   const latch = storage.getLatch(handoff.task_id);
   invariant(latch?.state === "ENGAGED" && latch.generation === handoff.latch_generation, "LATCH_GENERATION_MISMATCH");
@@ -215,12 +264,12 @@ function prepareContinuityRecoveryInTransaction(storage, handoffId, request) {
     && binding.runner_instance_id === expectedBinding.runner_instance_id
     && binding.session_binding_id === expectedBinding.session_binding_id,
   "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed binding changed after final recovery attestation");
-  const currentUse = storage.db.prepare("SELECT handoff_id,state FROM handoffs WHERE source_session_id=? OR target_session_id=? LIMIT 1").get(sourceSessionId, sourceSessionId);
-  const activeSource = storage.db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=? LIMIT 1").get(sourceSessionId);
+  const currentUse = database(storage).prepare("SELECT handoff_id,state FROM handoffs WHERE source_session_id=? OR target_session_id=? LIMIT 1").get(sourceSessionId, sourceSessionId);
+  const activeSource = database(storage).prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=? LIMIT 1").get(sourceSessionId);
   invariant(!currentUse && !activeSource, "CONTINUITY_RECOVERY_SOURCE_INVALID", "current recovery source already participates in a handoff");
   const reason = `explicit continuity recovery by ${actor}`;
   const now = utcNow();
-  const changed = storage.db.prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
+  const changed = database(storage).prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
     .run(now, reason, handoffId);
   invariant(changed.changes === 1, "CONTINUITY_RECOVERY_UNSAFE", "failed target binding reconciliation raced");
   storage.appendEvent("RUNNER_SESSION_BINDING_SUPERSEDED", { reason }, { handoffId, eventKey: `runner-binding-superseded:${handoffId}` });
@@ -238,21 +287,40 @@ export class GuardianStorage {
   constructor(path = ".guardian/runtime/guardian.sqlite") {
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true });
-    this.db = new DatabaseSync(this.path);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    const connection = new DatabaseSync(this.path);
+    storageDatabases.set(this, connection);
+    connection.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate();
-    registerTrustedHandoffStorageCapability(this, {
-      reserve: this.reserveHandoff.bind(this),
+    const trustedCapability = {
+      reserve: (projection, precondition) => this.#reserveHandoff(projection, precondition),
       prepareRecovery: ({ failedHandoffId, preparation, reservation, attestation }) => this.prepareContinuityRecovery(
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
       authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
-      assertOwnerGateEligibility: (request) => this.transaction(() => assertOwnerGateEligibilityInTransaction(this, request)),
-    });
+      assertOwnerGateAuthority: (request) => this.transaction(() => assertOwnerGateAuthorityInTransaction(this, request)),
+      claimTakeover: ({ taskId, actor }) => this.#claimLatch(taskId, "HUMAN_TAKEOVER", actor),
+      claimHandoffLatch: ({ taskId, reason, actor, expectedLatch }) => this.#claimLatch(taskId, reason, actor, expectedLatch),
+      saveHandoff: (...args) => this.#saveHandoff(...args),
+      bindRunnerSession: (...args) => this.#bindRunnerSession(...args),
+      supersedeRunnerSessionBinding: (...args) => this.#supersedeRunnerSessionBinding(...args),
+      beginDispatch: (...args) => this.#beginDispatch(...args),
+      finishDispatch: (...args) => this.#finishDispatch(...args),
+    };
+    registerTrustedHandoffStorageCapability(this, trustedCapability);
+    internalTestCapabilities.set(this, Object.freeze({
+      reserve: trustedCapability.reserve,
+      claimTakeover: trustedCapability.claimTakeover,
+      claimLatch: ({ taskId, reason, actor, expected }) => this.#claimLatch(taskId, reason, actor, expected),
+      saveHandoff: trustedCapability.saveHandoff,
+      bindRunnerSession: trustedCapability.bindRunnerSession,
+      supersedeRunnerSessionBinding: trustedCapability.supersedeRunnerSessionBinding,
+      beginDispatch: trustedCapability.beginDispatch,
+      finishDispatch: trustedCapability.finishDispatch,
+    }));
   }
 
   migrate() {
-    this.db.exec(`
+    database(this).exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS authorities(
         name TEXT PRIMARY KEY,
@@ -411,7 +479,7 @@ export class GuardianStorage {
   }
 
   getCalibrationRuntimeIdentity() {
-    return this.db.prepare("SELECT run_id,runtime_store_id,attestation_sha256,created_at FROM calibration_runtime_identity WHERE singleton=1").get() ?? null;
+    return database(this).prepare("SELECT run_id,runtime_store_id,attestation_sha256,created_at FROM calibration_runtime_identity WHERE singleton=1").get() ?? null;
   }
 
   bindCalibrationRuntimeIdentity(identity, { allowExisting = false } = {}) {
@@ -424,30 +492,30 @@ export class GuardianStorage {
         return prior;
       }
       const domainTables = ["journal", "latches", "handoffs", "runner_session_bindings", "operations", "artifacts", "metric_sessions", "metric_samples", "metric_handoff_events", "metric_diagnostics"];
-      const contaminated = domainTables.filter((table) => this.db.prepare(`SELECT 1 AS present FROM ${table} LIMIT 1`).get());
+      const contaminated = domainTables.filter((table) => database(this).prepare(`SELECT 1 AS present FROM ${table} LIMIT 1`).get());
       invariant(contaminated.length === 0, "STALE_RUNTIME_STORE", this.path, contaminated);
-      this.db.prepare("INSERT INTO calibration_runtime_identity(singleton,run_id,runtime_store_id,attestation_sha256,created_at) VALUES(1,?,?,?,?)")
+      database(this).prepare("INSERT INTO calibration_runtime_identity(singleton,run_id,runtime_store_id,attestation_sha256,created_at) VALUES(1,?,?,?,?)")
         .run(identity.run_id, identity.runtime_store_id, identity.attestation_sha256, utcNow());
       return this.getCalibrationRuntimeIdentity();
     });
   }
 
   transaction(fn) {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const result = fn(); this.db.exec("COMMIT"); return result; }
-    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    database(this).exec("BEGIN IMMEDIATE");
+    try { const result = fn(); database(this).exec("COMMIT"); return result; }
+    catch (error) { database(this).exec("ROLLBACK"); throw error; }
   }
 
   appendEvent(eventType, data = {}, { handoffId = null, eventKey = null } = {}) {
     const eventId = opaqueId("EVT");
     const occurredAt = utcNow();
     try {
-      this.db.prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
         .run(eventId, handoffId, eventType, eventKey, occurredAt, JSON.stringify(data));
       return { inserted: true, event_id: eventId, event_type: eventType, data, occurred_at: occurredAt };
     } catch (error) {
       if (!eventKey || !String(error.message).includes("UNIQUE")) throw error;
-      const prior = this.db.prepare("SELECT * FROM journal WHERE event_key=?").get(eventKey);
+      const prior = database(this).prepare("SELECT * FROM journal WHERE event_key=?").get(eventKey);
       invariant(prior && prior.event_type === eventType && prior.data_json === JSON.stringify(data), "JOURNAL_EVENT_CONFLICT", eventKey);
       return { inserted: false, event_id: prior.event_id, event_type: prior.event_type, data: JSON.parse(prior.data_json), occurred_at: prior.occurred_at };
     }
@@ -460,15 +528,15 @@ export class GuardianStorage {
       const raced = this.getLatch(taskId);
       if (raced) return raced;
       const event = this.appendEvent("LATCH_BOOTSTRAPPED", { task_id: taskId, state: "RELEASED", actor: "human:bootstrap" }, { eventKey: `latch-bootstrap:${taskId}` });
-      this.db.prepare("INSERT INTO latches(task_id,state,generation,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?)")
+      database(this).prepare("INSERT INTO latches(task_id,state,generation,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?)")
         .run(taskId, "RELEASED", 0, event.occurred_at, "human:bootstrap", event.event_id);
       return this.getLatch(taskId);
     });
   }
 
-  getLatch(taskId) { return this.db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId) ?? null; }
+  getLatch(taskId) { return database(this).prepare("SELECT * FROM latches WHERE task_id=?").get(taskId) ?? null; }
 
-  claimLatch(taskId, reason, actor, expected = null) {
+  #claimLatch(taskId, reason, actor, expected = null) {
     invariant(typeof taskId === "string" && taskId.length > 0 && typeof reason === "string" && reason.length > 0 && typeof actor === "string" && actor.length > 0, "LATCH_CLAIM_INVALID");
     if (expected !== null) {
       invariant(expected.task_id === taskId && ["ENGAGED", "RELEASED"].includes(expected.state)
@@ -487,7 +555,7 @@ export class GuardianStorage {
       if (latch.state === "ENGAGED") {
         if (reason === "HUMAN_TAKEOVER" && latch.reason !== reason) {
           const event = this.appendEvent("LATCH_ESCALATED", { task_id: taskId, generation: latch.generation, from: latch.reason, reason, actor }, { eventKey: `latch-escalated:${taskId}:${latch.generation}` });
-          const changed = this.db.prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
+          const changed = database(this).prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
             .run(reason, actor, event.event_id, taskId, latch.generation, latch.reason);
           invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch escalation raced");
           return this.getLatch(taskId);
@@ -497,15 +565,19 @@ export class GuardianStorage {
       }
       const generation = latch.generation + 1;
       const event = this.appendEvent("LATCH_ENGAGED", { task_id: taskId, generation, reason, actor }, { eventKey: `latch-engaged:${taskId}:${generation}` });
-      const changed = this.db.prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND state='RELEASED' AND generation=? AND reason IS ?")
+      const changed = database(this).prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND state='RELEASED' AND generation=? AND reason IS ?")
         .run(generation, reason, event.occurred_at, actor, event.event_id, taskId, latch.generation, latch.reason);
       invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch acquisition raced");
       return this.getLatch(taskId);
     });
   }
 
-  engageLatch(taskId, reason, actor) {
-    return this.claimLatch(taskId, reason, actor);
+  claimLatch() {
+    throw new GuardianError("LATCH_TRUSTED_PATH_REQUIRED", "Canonical latch acquisition is package-private and requires plan coordination");
+  }
+
+  engageLatch() {
+    throw new GuardianError("LATCH_TRUSTED_PATH_REQUIRED", "Canonical latch acquisition is package-private and requires plan coordination");
   }
 
   assertLatchIdentity(taskId, expected, { allowHumanTakeover = false } = {}) {
@@ -523,44 +595,48 @@ export class GuardianStorage {
     catch { return false; }
   }
 
-  reserveHandoff(projection, precondition = null) {
+  #reserveHandoff(projection, precondition = null) {
     return this.transaction(() => reserveHandoffInTransaction(this, projection, precondition));
   }
 
+  reserveHandoff() {
+    throw new GuardianError("HANDOFF_RESERVATION_TRUSTED_PATH_REQUIRED", "Authoritative handoff reservation is package-private and requires plan coordination");
+  }
+
   getHandoff(id) {
-    const row = this.db.prepare("SELECT * FROM handoffs WHERE handoff_id=?").get(id);
+    const row = database(this).prepare("SELECT * FROM handoffs WHERE handoff_id=?").get(id);
     return row ? { ...JSON.parse(row.projection_json), state: row.state, target_session_id: row.target_session_id } : null;
   }
 
   findHandoffByTarget(targetSessionId) {
-    const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE target_session_id=? ORDER BY created_at DESC LIMIT 1").get(targetSessionId);
+    const row = database(this).prepare("SELECT handoff_id FROM handoffs WHERE target_session_id=? ORDER BY created_at DESC LIMIT 1").get(targetSessionId);
     return row ? this.getHandoff(row.handoff_id) : null;
   }
 
   findHandoffBySource(sourceSessionId) {
-    const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE source_session_id=? ORDER BY created_at DESC LIMIT 1").get(sourceSessionId);
+    const row = database(this).prepare("SELECT handoff_id FROM handoffs WHERE source_session_id=? ORDER BY created_at DESC LIMIT 1").get(sourceSessionId);
     return row ? this.getHandoff(row.handoff_id) : null;
   }
 
   pendingContinuityFailureForTask(taskId) {
-    const row = this.db.prepare("SELECT h.handoff_id FROM handoffs h JOIN runner_session_bindings b ON b.handoff_id=h.handoff_id WHERE h.task_id=? AND h.state='CONTINUITY_FAILED' AND b.status='ACTIVE' ORDER BY h.created_at DESC LIMIT 1").get(taskId);
+    const row = database(this).prepare("SELECT h.handoff_id FROM handoffs h JOIN runner_session_bindings b ON b.handoff_id=h.handoff_id WHERE h.task_id=? AND h.state='CONTINUITY_FAILED' AND b.status='ACTIVE' ORDER BY h.created_at DESC LIMIT 1").get(taskId);
     return row ? this.getHandoff(row.handoff_id) : null;
   }
 
   assertContinuityRecoveryPrepared(handoffId, { sourceSessionId, runnerInstanceId }) {
     const binding = this.getRunnerSessionBinding(handoffId);
     invariant(binding?.status === "SUPERSEDED", "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed target binding was not superseded");
-    const event = this.db.prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_key=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(handoffId, `continuity-recovery:${handoffId}`);
+    const event = database(this).prepare("SELECT data_json FROM journal WHERE handoff_id=? AND event_key=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(handoffId, `continuity-recovery:${handoffId}`);
     const data = event ? JSON.parse(event.data_json) : null;
     invariant(data?.current_source_session_id === sourceSessionId && data?.current_runner_instance_id === runnerInstanceId, "CONTINUITY_RECOVERY_SOURCE_INVALID", "recovery preparation does not belong to the current Runner source");
     return data;
   }
 
-  bindRunnerSession(handoffId, binding) {
+  #bindRunnerSession(handoffId, binding) {
     return this.transaction(() => {
       const handoff = this.getHandoff(handoffId);
       invariant(handoff?.state === "REPLACEMENT_SESSION_CREATED_PAUSED" && handoff.target_session_id === binding.replacement_session_id, "RUNNER_BINDING_STATE_INVALID");
-      const prior = this.db.prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
+      const prior = database(this).prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
       if (prior) {
         invariant(prior.status === "ACTIVE" && prior.replacement_session_id === binding.replacement_session_id && prior.runner_instance_id === binding.runner_instance_id && prior.session_binding_id === binding.session_binding_id, "RUNNER_BINDING_CONFLICT");
         return this.getRunnerSessionBinding(handoffId);
@@ -572,59 +648,75 @@ export class GuardianStorage {
         session_binding_id: binding.session_binding_id,
       };
       const event = this.appendEvent("RUNNER_SESSION_BOUND", data, { handoffId, eventKey: `runner-binding:${handoffId}` });
-      this.db.prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)")
+      database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)")
         .run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", event.occurred_at, event.event_id);
       return this.getRunnerSessionBinding(handoffId);
     });
   }
 
   getRunnerSessionBinding(handoffId) {
-    const row = this.db.prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
+    const row = database(this).prepare("SELECT * FROM runner_session_bindings WHERE handoff_id=?").get(handoffId);
     if (!row) return null;
-    const event = this.db.prepare("SELECT event_type,data_json FROM journal WHERE event_id=? AND handoff_id=?").get(row.bind_event_id, handoffId);
+    const event = database(this).prepare("SELECT event_type,data_json FROM journal WHERE event_id=? AND handoff_id=?").get(row.bind_event_id, handoffId);
     invariant(event?.event_type === "RUNNER_SESSION_BOUND", "RUNNER_BINDING_JOURNAL_MISMATCH");
     return { schema_version: "1.0.0", ...row, event_data: JSON.parse(event.data_json) };
   }
 
-  supersedeRunnerSessionBinding(handoffId, reason) {
+  bindRunnerSession() {
+    throw new GuardianError("HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED", "Runner binding mutation is package-private");
+  }
+
+  #supersedeRunnerSessionBinding(handoffId, reason) {
     return this.transaction(() => {
       const binding = this.getRunnerSessionBinding(handoffId);
       if (!binding || binding.status === "SUPERSEDED") return binding;
       const now = utcNow();
-      this.db.prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
+      database(this).prepare("UPDATE runner_session_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=? WHERE handoff_id=? AND status='ACTIVE'")
         .run(now, reason, handoffId);
       this.appendEvent("RUNNER_SESSION_BINDING_SUPERSEDED", { reason }, { handoffId, eventKey: `runner-binding-superseded:${handoffId}` });
       return this.getRunnerSessionBinding(handoffId);
     });
   }
 
+  supersedeRunnerSessionBinding() {
+    throw new GuardianError("HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED", "Runner binding supersession is package-private");
+  }
+
   prepareContinuityRecovery(handoffId, request, trusted = null) {
-    if (trusted !== null) invariant(trusted?.token === TRUSTED_RECOVERY_RESERVATION, "CONTINUITY_RECOVERY_AUTHORITY_INVALID");
+    invariant(trusted?.token === TRUSTED_RECOVERY_RESERVATION,
+      "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED", "Continuity recovery transfer is package-private and requires final plan/source attestation");
     return this.transaction(() => {
       const prepared = prepareContinuityRecoveryInTransaction(this, handoffId, request);
-      if (!trusted) return prepared;
       const reserved = reserveHandoffInTransaction(this, trusted.reservation.projection, trusted.reservation.precondition);
       return { prepared, reserved, attestation: trusted.attestation };
     });
   }
 
   latestHandoffForTask(taskId) {
-    const row = this.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC LIMIT 1").get(taskId);
+    const row = database(this).prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC LIMIT 1").get(taskId);
     return row ? this.getHandoff(row.handoff_id) : null;
   }
 
-  saveHandoff(handoff, eventType = null, eventData = {}) {
+  #saveHandoff(handoff, eventType = null, eventData = {}) {
     return this.transaction(() => {
       const now = utcNow();
       handoff.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET target_session_id=?,state=?,projection_json=?,updated_at=? WHERE handoff_id=?")
+      database(this).prepare("UPDATE handoffs SET target_session_id=?,state=?,projection_json=?,updated_at=? WHERE handoff_id=?")
         .run(handoff.target_session_id ?? null, handoff.state, JSON.stringify(handoff), now, handoff.handoff_id);
       if (eventType) this.appendEvent(eventType, eventData, { handoffId: handoff.handoff_id, eventKey: eventData.event_key ?? null });
       return this.getHandoff(handoff.handoff_id);
     });
   }
 
-  transition(id, expectedStates, next, data = {}) {
+  saveHandoff() {
+    throw new GuardianError("HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED", "Handoff lifecycle mutation is package-private");
+  }
+
+  transition() {
+    throw new GuardianError("HANDOFF_LIFECYCLE_TRUSTED_PATH_REQUIRED", "Raw handoff transition is not a supported public mutation");
+  }
+
+  #transition(id, expectedStates, next, data = {}) {
     return this.transaction(() => {
       const h = this.getHandoff(id);
       invariant(h, "HANDOFF_NOT_FOUND", id);
@@ -633,7 +725,7 @@ export class GuardianStorage {
       const previous = h.state;
       h.state = next;
       const now = utcNow(); h.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=? AND state=?")
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=? AND state=?")
         .run(next, JSON.stringify(h), now, id, previous);
       this.appendEvent("STATE_TRANSITION", { from: previous, to: next, ...data }, { handoffId: id });
       return this.getHandoff(id);
@@ -683,24 +775,24 @@ export class GuardianStorage {
         && h.admission_state === "NOT_COMMITTED"
         && h.dispatch_state === "NOT_STARTED",
       "RESUME_EXPECTATION_STALE", "Resume already has competing authorization, admission, or dispatch state");
-      const authorization = this.db.prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
-      const admission = this.db.prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
-      const dispatch = this.db.prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(id);
+      const authorization = database(this).prepare("SELECT 1 AS present FROM authorizations WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
+      const admission = database(this).prepare("SELECT 1 AS present FROM admissions WHERE handoff_id=? OR resume_prompt_id=? LIMIT 1").get(id, h.resume_prompt_id);
+      const dispatch = database(this).prepare("SELECT 1 AS present FROM dispatch_attempts WHERE handoff_id=? LIMIT 1").get(id);
       invariant(!authorization && !admission && !dispatch, "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
-      const latest = this.db.prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(h.task_id);
+      const latest = database(this).prepare("SELECT handoff_id FROM handoffs WHERE task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(h.task_id);
       invariant(latest?.handoff_id === id && expected.taskOperationHandoffId === id,
         "TASK_OPERATION_CONFLICT", "The confirmed handoff no longer owns the task operation");
 
       const releaseGeneration = latch.generation + 1;
       const release = this.appendEvent("LATCH_RELEASED", { task_id: h.task_id, generation: releaseGeneration, actor }, { handoffId: id, eventKey: `latch-release:${h.task_id}:${releaseGeneration}` });
-      const released = this.db.prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
+      const released = database(this).prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
         .run(releaseGeneration, release.occurred_at, actor, release.event_id, h.task_id, latch.generation, latch.reason);
       invariant(released.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch release raced final resume admission");
       const now = utcNow();
-      this.db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      database(this).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
         .run(h.resume_prompt_id, id, actor, releaseGeneration, now);
       try {
-        this.db.prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+        database(this).prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
           .run(admissionId, h.resume_prompt_id, idempotencyKey, id, now);
       } catch (error) {
         if (String(error.message).includes("idempotency_key")) throw new GuardianError("IDEMPOTENCY_KEY_CONFLICT");
@@ -711,7 +803,7 @@ export class GuardianStorage {
       h.admission_id = admissionId;
       h.state = "RESUME_ADMISSION_COMMITTED";
       h.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=? AND state='RESUME_READY'")
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=? AND state='RESUME_READY'")
         .run(h.state, JSON.stringify(h), now, id);
       this.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor }, { handoffId: id, eventKey: `authorization:${h.resume_prompt_id}` });
       this.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admissionId, idempotency_key: idempotencyKey }, { handoffId: id, eventKey: `admission:${h.resume_prompt_id}` });
@@ -723,34 +815,42 @@ export class GuardianStorage {
     throw new GuardianError("RESUME_ATTESTATION_REQUIRED", "Direct durable resume admission is package-private and requires final runtime, Git, plan, and ownership attestation");
   }
 
-  beginDispatch(id, attemptId, attemptNo = 1) {
+  beginDispatch() {
+    throw new GuardianError("RESUME_DISPATCH_TRUSTED_PATH_REQUIRED", "Resume dispatch mutation is package-private");
+  }
+
+  #beginDispatch(id, attemptId, attemptNo = 1) {
     return this.transaction(() => {
       const h = this.getHandoff(id);
       invariant(h?.admission_state === "COMMITTED", "ADMISSION_REQUIRED");
       if (h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN");
-      const prior = this.db.prepare("SELECT * FROM dispatch_attempts WHERE admission_id=? AND attempt_no=?").get(h.admission_id, attemptNo);
+      const prior = database(this).prepare("SELECT * FROM dispatch_attempts WHERE admission_id=? AND attempt_no=?").get(h.admission_id, attemptNo);
       if (prior) return { idempotent: true, attempt: prior, handoff: h };
       const now = utcNow();
-      this.db.prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
+      database(this).prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
         .run(attemptId, h.admission_id, id, attemptNo, "DISPATCHING", now);
       h.dispatch_state = "DISPATCHING"; h.dispatch_attempt_id = attemptId; h.dispatch_attempt_no = attemptNo; h.state = "RESUME_DISPATCHING"; h.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), now, id);
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), now, id);
       this.appendEvent("RESUME_DISPATCH_INTENT", { dispatch_attempt_id: attemptId, admission_id: h.admission_id }, { handoffId: id, eventKey: `dispatch-intent:${attemptId}` });
-      return { idempotent: false, attempt: this.db.prepare("SELECT * FROM dispatch_attempts WHERE dispatch_attempt_id=?").get(attemptId), handoff: this.getHandoff(id) };
+      return { idempotent: false, attempt: database(this).prepare("SELECT * FROM dispatch_attempts WHERE dispatch_attempt_id=?").get(attemptId), handoff: this.getHandoff(id) };
     });
   }
 
-  finishDispatch(id, state, error = null) {
+  finishDispatch() {
+    throw new GuardianError("RESUME_DISPATCH_TRUSTED_PATH_REQUIRED", "Resume dispatch mutation is package-private");
+  }
+
+  #finishDispatch(id, state, error = null) {
     invariant(["ACKNOWLEDGED", "DISPATCHED", "UNKNOWN", "FAILED"].includes(state), "DISPATCH_STATE_INVALID");
     return this.transaction(() => {
       const h = this.getHandoff(id);
       invariant(h?.dispatch_attempt_id, "DISPATCH_INTENT_REQUIRED");
       const now = utcNow();
-      this.db.prepare("UPDATE dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?").run(state, now, error, h.dispatch_attempt_id);
+      database(this).prepare("UPDATE dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?").run(state, now, error, h.dispatch_attempt_id);
       h.dispatch_state = state;
       h.state = state === "ACKNOWLEDGED" ? "RESUMED" : state === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : state === "FAILED" ? "RESUME_DISPATCH_FAILED" : "RESUME_DISPATCHED";
       h.updated_at = now;
-      this.db.prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), now, id);
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), now, id);
       if (state === "ACKNOWLEDGED") {
         this.appendEvent("RESUME_DISPATCHED", { dispatch_attempt_id: h.dispatch_attempt_id }, { handoffId: id, eventKey: `dispatch-dispatched:${h.dispatch_attempt_id}` });
         this.appendEvent("RESUME_ACKNOWLEDGED", { dispatch_attempt_id: h.dispatch_attempt_id }, { handoffId: id, eventKey: `dispatch-acknowledged:${h.dispatch_attempt_id}` });
@@ -764,17 +864,17 @@ export class GuardianStorage {
   admitOperation({ operationId, taskId, generation, profile }) {
     const latch = this.getLatch(taskId);
     invariant(latch?.state === "RELEASED", "TOOL_ADMISSION_BLOCKED");
-    this.db.prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,admitted_at) VALUES(?,?,?,?,?,?)")
+    database(this).prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,admitted_at) VALUES(?,?,?,?,?,?)")
       .run(operationId, taskId, generation, profile, "ACTIVE", utcNow());
   }
 
   finishOperation(operationId, outcome, effectReference = null) {
     invariant(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"].includes(outcome), "OPERATION_OUTCOME_INVALID");
-    this.db.prepare("UPDATE operations SET state='TERMINAL',outcome=?,effect_reference=?,terminal_at=? WHERE operation_id=? AND state='ACTIVE'")
+    database(this).prepare("UPDATE operations SET state='TERMINAL',outcome=?,effect_reference=?,terminal_at=? WHERE operation_id=? AND state='ACTIVE'")
       .run(outcome, effectReference, utcNow(), operationId);
   }
 
-  operationsForTask(taskId) { return this.db.prepare("SELECT * FROM operations WHERE task_id=? ORDER BY admitted_at").all(taskId); }
+  operationsForTask(taskId) { return database(this).prepare("SELECT * FROM operations WHERE task_id=? ORDER BY admitted_at").all(taskId); }
 
   metricLimit(value) {
     invariant(Number.isInteger(value) && value > 0, "METRICS_RETENTION_INVALID");
@@ -784,71 +884,71 @@ export class GuardianStorage {
   upsertMetricSession(record, retentionLimit) {
     const limit = this.metricLimit(retentionLimit);
     this.transaction(() => {
-      this.db.prepare(`INSERT INTO metric_sessions(session_id,started_at,ended_at,updated_at,record_json) VALUES(?,?,?,?,?)
+      database(this).prepare(`INSERT INTO metric_sessions(session_id,started_at,ended_at,updated_at,record_json) VALUES(?,?,?,?,?)
         ON CONFLICT(session_id) DO UPDATE SET started_at=excluded.started_at,ended_at=excluded.ended_at,updated_at=excluded.updated_at,record_json=excluded.record_json`)
         .run(record.session_id, record.started_at, record.ended_at, record.updated_at, JSON.stringify(record));
-      this.db.prepare("DELETE FROM metric_sessions WHERE session_id NOT IN (SELECT session_id FROM metric_sessions ORDER BY updated_at DESC, rowid DESC LIMIT ?)").run(limit);
+      database(this).prepare("DELETE FROM metric_sessions WHERE session_id NOT IN (SELECT session_id FROM metric_sessions ORDER BY updated_at DESC, rowid DESC LIMIT ?)").run(limit);
     });
     return this.getMetricSession(record.session_id);
   }
 
   getMetricSession(sessionId) {
-    const row = this.db.prepare("SELECT record_json FROM metric_sessions WHERE session_id=?").get(sessionId);
+    const row = database(this).prepare("SELECT record_json FROM metric_sessions WHERE session_id=?").get(sessionId);
     return row ? JSON.parse(row.record_json) : null;
   }
 
   metricSessions() {
-    return this.db.prepare("SELECT record_json FROM metric_sessions ORDER BY updated_at, rowid").all().map((row) => JSON.parse(row.record_json));
+    return database(this).prepare("SELECT record_json FROM metric_sessions ORDER BY updated_at, rowid").all().map((row) => JSON.parse(row.record_json));
   }
 
   appendMetricSample(record, sessionSummary, retentionLimit) {
     const limit = this.metricLimit(retentionLimit);
     return this.transaction(() => {
-      this.db.prepare("INSERT INTO metric_samples(sample_id,session_id,call_index,captured_at,record_json) VALUES(?,?,?,?,?)")
+      database(this).prepare("INSERT INTO metric_samples(sample_id,session_id,call_index,captured_at,record_json) VALUES(?,?,?,?,?)")
         .run(record.sample_id, record.session_id, record.call_index, record.captured_at, JSON.stringify(record));
-      this.db.prepare("UPDATE metric_sessions SET started_at=?,ended_at=?,updated_at=?,record_json=? WHERE session_id=?")
+      database(this).prepare("UPDATE metric_sessions SET started_at=?,ended_at=?,updated_at=?,record_json=? WHERE session_id=?")
         .run(sessionSummary.started_at, sessionSummary.ended_at, sessionSummary.updated_at, JSON.stringify(sessionSummary), record.session_id);
-      this.db.prepare("DELETE FROM metric_samples WHERE seq NOT IN (SELECT seq FROM metric_samples ORDER BY seq DESC LIMIT ?)").run(limit);
+      database(this).prepare("DELETE FROM metric_samples WHERE seq NOT IN (SELECT seq FROM metric_samples ORDER BY seq DESC LIMIT ?)").run(limit);
       return record;
     });
   }
 
   metricSamples(sessionId = null) {
     const rows = sessionId
-      ? this.db.prepare("SELECT record_json FROM metric_samples WHERE session_id=? ORDER BY seq").all(sessionId)
-      : this.db.prepare("SELECT record_json FROM metric_samples ORDER BY seq").all();
+      ? database(this).prepare("SELECT record_json FROM metric_samples WHERE session_id=? ORDER BY seq").all(sessionId)
+      : database(this).prepare("SELECT record_json FROM metric_samples ORDER BY seq").all();
     return rows.map((row) => JSON.parse(row.record_json));
   }
 
   appendHandoffMetricEvent(record, retentionLimit) {
     const limit = this.metricLimit(retentionLimit);
     this.transaction(() => {
-      this.db.prepare("INSERT INTO metric_handoff_events(metric_event_id,session_id,handoff_id,lifecycle_state,occurred_at,record_json) VALUES(?,?,?,?,?,?)")
+      database(this).prepare("INSERT INTO metric_handoff_events(metric_event_id,session_id,handoff_id,lifecycle_state,occurred_at,record_json) VALUES(?,?,?,?,?,?)")
         .run(record.metric_event_id, record.session_id, record.handoff_id, record.lifecycle_state, record.timestamp, JSON.stringify(record));
-      this.db.prepare("DELETE FROM metric_handoff_events WHERE seq NOT IN (SELECT seq FROM metric_handoff_events ORDER BY seq DESC LIMIT ?)").run(limit);
+      database(this).prepare("DELETE FROM metric_handoff_events WHERE seq NOT IN (SELECT seq FROM metric_handoff_events ORDER BY seq DESC LIMIT ?)").run(limit);
     });
     return record;
   }
 
   handoffMetricEvents(handoffId = null) {
     const rows = handoffId
-      ? this.db.prepare("SELECT record_json FROM metric_handoff_events WHERE handoff_id=? ORDER BY seq").all(handoffId)
-      : this.db.prepare("SELECT record_json FROM metric_handoff_events ORDER BY seq").all();
+      ? database(this).prepare("SELECT record_json FROM metric_handoff_events WHERE handoff_id=? ORDER BY seq").all(handoffId)
+      : database(this).prepare("SELECT record_json FROM metric_handoff_events ORDER BY seq").all();
     return rows.map((row) => JSON.parse(row.record_json));
   }
 
   appendMetricDiagnostic(record, retentionLimit) {
     const limit = this.metricLimit(retentionLimit);
     this.transaction(() => {
-      this.db.prepare("INSERT INTO metric_diagnostics(diagnostic_id,occurred_at,record_json) VALUES(?,?,?)")
+      database(this).prepare("INSERT INTO metric_diagnostics(diagnostic_id,occurred_at,record_json) VALUES(?,?,?)")
         .run(record.diagnostic_id, record.timestamp, JSON.stringify(record));
-      this.db.prepare("DELETE FROM metric_diagnostics WHERE seq NOT IN (SELECT seq FROM metric_diagnostics ORDER BY seq DESC LIMIT ?)").run(limit);
+      database(this).prepare("DELETE FROM metric_diagnostics WHERE seq NOT IN (SELECT seq FROM metric_diagnostics ORDER BY seq DESC LIMIT ?)").run(limit);
     });
     return record;
   }
 
   metricDiagnostics() {
-    return this.db.prepare("SELECT record_json FROM metric_diagnostics ORDER BY seq").all().map((row) => JSON.parse(row.record_json));
+    return database(this).prepare("SELECT record_json FROM metric_diagnostics ORDER BY seq").all().map((row) => JSON.parse(row.record_json));
   }
 
   indexArtifact({ kind, id, path, digest, contentDigest }) {
@@ -857,13 +957,13 @@ export class GuardianStorage {
       invariant(prior.path === path && prior.digest === digest && prior.content_digest === contentDigest, "ARTIFACT_INDEX_CONFLICT");
       return prior;
     }
-    this.db.prepare("INSERT INTO artifacts(kind,artifact_id,path,digest,content_digest,created_at) VALUES(?,?,?,?,?,?)")
+    database(this).prepare("INSERT INTO artifacts(kind,artifact_id,path,digest,content_digest,created_at) VALUES(?,?,?,?,?,?)")
       .run(kind, id, path, digest, contentDigest, utcNow());
     return this.getArtifact(kind, id);
   }
-  getArtifact(kind, id) { return this.db.prepare("SELECT * FROM artifacts WHERE kind=? AND artifact_id=?").get(kind, id) ?? null; }
-  events(id) { return this.db.prepare("SELECT * FROM journal WHERE handoff_id=? ORDER BY seq").all(id).map((row) => ({ ...row, data: JSON.parse(row.data_json) })); }
-  close() { this.db.close(); }
+  getArtifact(kind, id) { return database(this).prepare("SELECT * FROM artifacts WHERE kind=? AND artifact_id=?").get(kind, id) ?? null; }
+  events(id) { return database(this).prepare("SELECT * FROM journal WHERE handoff_id=? ORDER BY seq").all(id).map((row) => ({ ...row, data: JSON.parse(row.data_json) })); }
+  close() { const connection = database(this); storageDatabases.delete(this); internalTestCapabilities.delete(this); connection.close(); }
 }
 
 export { TERMINAL_HANDOFF };

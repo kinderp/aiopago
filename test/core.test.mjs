@@ -17,11 +17,19 @@ import { createGuardianExtension } from "../src/extension.mjs";
 import { observeGitState, sameGitState } from "../src/git-state.mjs";
 import { HandoffService, verifyRequiredLocalPaths } from "../src/handoff.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
+import { satisfyOwnerGateForTest } from "./trusted-owner-gate-helper.mjs";
 import { LEGACY_RUNNER_BINDING_CUSTOM_TYPE, readRuntimeRunnerBinding, verifyRunnerOwnership } from "../src/runner-ownership.mjs";
 import { AdmissionGate, SafePointCoordinator, TOOL_PROFILES, ToolOperationTracker } from "../src/safety.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
 function temp() { return mkdtempSync(join(tmpdir(), "aiopago-core-")); }
+
+async function requestSafePointForTest(coordinator, storage, taskId, session, actor = "human:handoff", reason = "INTEGRITY") {
+  const observed = storage.getLatch(taskId) ?? storage.ensureLatch(taskId);
+  const expectedLatch = { task_id: taskId, state: observed.state, generation: observed.generation, reason: observed.reason ?? null };
+  const acquiredLatch = claimLatchForInternalTest(storage, taskId, reason, actor, expectedLatch);
+  return coordinator.request(session, actor, reason, { expectedLatch, acquiredLatch });
+}
 
 test("Context Handoff Advisor validates configuration and deduplicates above-threshold events", () => {
   assert.equal(contextHandoffThreshold(), 50);
@@ -365,7 +373,7 @@ test("a pre-rename Ledger heading and owner command remain readable and advance 
   writeFileSync(path, `# Eiopago Task Ledger\n\n**Schema:** \`eiopago.task-ledger/0.1.0\`\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
   const ledger = new TaskLedger(path);
   assert.equal(ledger.read().owner_gate.command, "/eio handoff confirm");
-  const advanced = ledger.satisfyOwnerGate({ command: "/aio handoff confirm", actor: "human:/aio-handoff" });
+  const advanced = satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:/aio-handoff" });
   assert.equal(advanced.owner_gate.status, "SATISFIED");
   assert.equal(advanced.current_item, "ITEM-1");
 });
@@ -539,17 +547,17 @@ test("Runner ownership attestation passes only when runtime, journal, manifest, 
   await t.test("SQLite persists and supersedes the authoritative Runner relation", () => {
     const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
     storage.ensureLatch("TASK-T");
-    const reservationLatch = storage.engageLatch("TASK-T", "INTEGRITY", "human:test");
-    storage.reserveHandoff({ handoff_id: expected.handoff_id, source_session_id: "SES-source", target_session_id: null, task_id: "TASK-T", state: "REPLACEMENT_SESSION_CREATING", latch_generation: reservationLatch.generation }, { latch: reservationLatch, expectedHandoff: null });
+    const reservationLatch = claimLatchForInternalTest(storage, "TASK-T", "INTEGRITY", "human:test");
+    reserveHandoffForInternalTest(storage, { handoff_id: expected.handoff_id, source_session_id: "SES-source", target_session_id: null, task_id: "TASK-T", state: "REPLACEMENT_SESSION_CREATING", latch_generation: reservationLatch.generation }, { latch: reservationLatch, expectedHandoff: null });
     const handoff = storage.getHandoff(expected.handoff_id);
     handoff.target_session_id = expected.replacement_session_id;
     handoff.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
-    storage.saveHandoff(handoff);
-    const active = storage.bindRunnerSession(expected.handoff_id, expected);
+    saveHandoffForInternalTest(storage, handoff);
+    const active = bindRunnerSessionForInternalTest(storage, expected.handoff_id, expected);
     assert.equal(active.status, "ACTIVE");
     assert.deepEqual(active.event_data, journalBinding.event_data);
     assert.equal(storage.events(expected.handoff_id).filter((event) => event.event_type === "RUNNER_SESSION_BOUND").length, 1);
-    const superseded = storage.supersedeRunnerSessionBinding(expected.handoff_id, "newer handoff");
+    const superseded = supersedeRunnerSessionBindingForInternalTest(storage, expected.handoff_id, "newer handoff");
     assert.equal(superseded.status, "SUPERSEDED");
     assert.throws(() => verifyRunnerOwnership({ runtimeBinding, journalBinding: superseded, manifestBinding, expected }), (error) => error.code === "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
     storage.close();
@@ -572,33 +580,33 @@ test("sealed artifacts are immutable, indexed, and detect byte tampering", () =>
 test("direct SQLite resume admission cannot bypass package-private final attestation", () => {
   const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
   storage.ensureLatch("TASK-T");
-  const latch = storage.engageLatch("TASK-T", "INTEGRITY", "human:test");
+  const latch = claimLatchForInternalTest(storage, "TASK-T", "INTEGRITY", "human:test");
   const h = {
     handoff_id: "HO-one", source_session_id: "SES-source", target_session_id: "SES-target",
     task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
     resume_prompt_id: "RP-one", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
   };
-  storage.reserveHandoff(h, { latch, expectedHandoff: null });
+  reserveHandoffForInternalTest(storage, h, { latch, expectedHandoff: null });
   assert.throws(
     () => storage.authorizeAndAdmit("HO-one", "human:test", "resume:RP-one", "ADM-one"),
     (error) => error.code === "RESUME_ATTESTATION_REQUIRED",
   );
   assert.equal(storage.getLatch("TASK-T").state, "ENGAGED");
-  assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM authorizations").get().count, 0);
-  assert.equal(storage.db.prepare("SELECT COUNT(*) AS count FROM admissions").get().count, 0);
+  assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM authorizations").get().count, 0);
+  assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM admissions").get().count, 0);
   storage.close();
 });
 
 test("a pending handoff confirmation cannot release HUMAN_TAKEOVER", () => {
   const root = temp(); const storage = new GuardianStorage(join(root, "guardian.sqlite"));
   storage.ensureLatch("TASK-T");
-  const latch = storage.engageLatch("TASK-T", "HANDOFF", "human:test");
-  storage.reserveHandoff({
+  const latch = claimLatchForInternalTest(storage, "TASK-T", "HANDOFF", "human:test");
+  reserveHandoffForInternalTest(storage, {
     handoff_id: "HO-stale-confirm", source_session_id: "SES-source", target_session_id: "SES-target",
     task_id: "TASK-T", state: "RESUME_READY", latch_generation: latch.generation,
     resume_prompt_id: "RP-stale-confirm", admission_state: "NOT_COMMITTED", dispatch_state: "NOT_STARTED",
   }, { latch, expectedHandoff: null });
-  storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
+  claimTakeoverForInternalTest(storage, "TASK-T", "human:/aio-takeover");
   assert.throws(
     () => storage.authorizeAndAdmit("HO-stale-confirm", "human:stale-confirm", "resume:RP-stale-confirm", "ADM-stale-confirm"),
     (error) => error.code === "RESUME_ATTESTATION_REQUIRED",
@@ -633,7 +641,7 @@ test("bash safety profile tracks known outcomes without journaling raw commands"
   assert.match(success.effect_reference, /^shell:sha256:[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(success).includes("printf 'secret-value'"), false);
   const safe = new SafePointCoordinator({ storage, taskId, gate: new AdmissionGate(storage, taskId) });
-  assert.equal((await safe.request(idleSession)).state, "SAFE_TO_HANDOFF", "bash success needs no input.path");
+  assert.equal((await requestSafePointForTest(safe, storage, taskId, idleSession)).state, "SAFE_TO_HANDOFF", "bash success needs no input.path");
 
   const failureTask = "TASK-BASH-FAILURE"; storage.ensureLatch(failureTask);
   const failureTracker = new ToolOperationTracker(storage, failureTask);
@@ -642,7 +650,8 @@ test("bash safety profile tracks known outcomes without journaling raw commands"
   const failure = storage.operationsForTask(failureTask)[0];
   assert.equal(failure.outcome, "KNOWN_FAILURE");
   assert.equal(failure.effect_reference, null);
-  assert.equal((await new SafePointCoordinator({ storage, taskId: failureTask, gate: new AdmissionGate(storage, failureTask) }).request(idleSession)).state, "SAFE_TO_HANDOFF");
+  const failureSafe = new SafePointCoordinator({ storage, taskId: failureTask, gate: new AdmissionGate(storage, failureTask) });
+  assert.equal((await requestSafePointForTest(failureSafe, storage, failureTask, idleSession)).state, "SAFE_TO_HANDOFF");
 
   for (const [task, operation, finish] of [
     ["TASK-BASH-ABORT", "OP-bash-abort", (current) => current.finish("OP-bash-abort", true, { content: [{ type: "text", text: "partial\n\nCommand aborted" }] }, true)],
@@ -655,7 +664,7 @@ test("bash safety profile tracks known outcomes without journaling raw commands"
     finish(current);
     assert.equal(storage.operationsForTask(task)[0].outcome, "UNKNOWN");
     await assert.rejects(
-      () => new SafePointCoordinator({ storage, taskId: task, gate: new AdmissionGate(storage, task) }).request(idleSession),
+      () => requestSafePointForTest(new SafePointCoordinator({ storage, taskId: task, gate: new AdmissionGate(storage, task) }), storage, task, idleSession),
       (error) => error.code === "HUMAN_DECISION_REQUIRED",
     );
   }
@@ -689,7 +698,7 @@ test("safe point waits for an active bash terminal boundary", async () => {
     async abort() { aborts += 1; },
     async waitForIdle() { waitStarted(); await idle; this.isIdle = true; },
   };
-  const request = new SafePointCoordinator({ storage, taskId, gate: new AdmissionGate(storage, taskId) }).request(session);
+  const request = requestSafePointForTest(new SafePointCoordinator({ storage, taskId, gate: new AdmissionGate(storage, taskId) }), storage, taskId, session);
   let settled = false;
   request.finally(() => { settled = true; });
   await started;
@@ -713,10 +722,10 @@ test("safe point closes transport, clears queue, and fails closed on unknown mut
     clearQueue() { this.pendingMessageCount = 0; }, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {},
     async abort() { this.isIdle = true; }, async waitForIdle() {},
   };
-  const result = await safe.request(session);
+  const result = await requestSafePointForTest(safe, storage, "TASK-T", session);
   assert.equal(result.state, "SAFE_TO_HANDOFF");
   assert.throws(() => gate.admit(() => null), (error) => error.code === "LLM_ADMISSION_BLOCKED");
-  const escalated = storage.engageLatch("TASK-T", "HUMAN_TAKEOVER", "human:/aio-takeover");
+  const escalated = claimTakeoverForInternalTest(storage, "TASK-T", "human:/aio-takeover");
   assert.equal(escalated.generation, result.latch_generation);
   assert.equal(escalated.reason, "HUMAN_TAKEOVER");
   const drainTask = "TASK-V"; storage.ensureLatch(drainTask);
@@ -728,7 +737,7 @@ test("safe point closes transport, clears queue, and fails closed on unknown mut
     async abort() { aborts += 1; },
     async waitForIdle() { storage.finishOperation("OP-drain", "KNOWN_SUCCESS", "file:atomic.txt"); this.isIdle = true; },
   };
-  const drained = await new SafePointCoordinator({ storage, taskId: drainTask, gate: new AdmissionGate(storage, drainTask) }).request(drainingSession);
+  const drained = await requestSafePointForTest(new SafePointCoordinator({ storage, taskId: drainTask, gate: new AdmissionGate(storage, drainTask) }), storage, drainTask, drainingSession);
   assert.equal(drained.state, "SAFE_TO_HANDOFF");
   assert.equal(aborts, 0, "an admitted atomic operation must not be aborted");
   const trackedTask = "TASK-W"; storage.ensureLatch(trackedTask);
@@ -737,12 +746,12 @@ test("safe point closes transport, clears queue, and fails closed on unknown mut
   tracker.finish("OP-write", false);
   const tracked = storage.operationsForTask(trackedTask)[0];
   assert.equal(tracked.effect_reference, "file:src/atomic.txt");
-  const trackedSafe = await new SafePointCoordinator({ storage, taskId: trackedTask, gate: new AdmissionGate(storage, trackedTask) }).request({ ...session, pendingMessageCount: 0 });
+  const trackedSafe = await requestSafePointForTest(new SafePointCoordinator({ storage, taskId: trackedTask, gate: new AdmissionGate(storage, trackedTask) }), storage, trackedTask, { ...session, pendingMessageCount: 0 });
   assert.equal(trackedSafe.state, "SAFE_TO_HANDOFF");
   const releaseTask = "TASK-U"; storage.ensureLatch(releaseTask);
   storage.admitOperation({ operationId: "OP-1", taskId: releaseTask, generation: 0, profile: "LOCAL_ATOMIC_MUTATION" });
   storage.finishOperation("OP-1", "UNKNOWN");
   const other = new SafePointCoordinator({ storage, taskId: releaseTask, gate: new AdmissionGate(storage, releaseTask) });
-  await assert.rejects(() => other.request({ ...session, pendingMessageCount: 0 }), (error) => error.code === "HUMAN_DECISION_REQUIRED");
+  await assert.rejects(() => requestSafePointForTest(other, storage, releaseTask, { ...session, pendingMessageCount: 0 }), (error) => error.code === "HUMAN_DECISION_REQUIRED");
   storage.close();
 });
