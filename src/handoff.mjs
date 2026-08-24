@@ -5,6 +5,7 @@ import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
 import {
+  assertNoCompetingResumeEvidence,
   authorizeTrustedResume,
   beginTrustedResumeDispatch,
   bindTrustedRunnerSession,
@@ -33,7 +34,6 @@ import {
   samePlanSemantics,
 } from "./plan-semantics-internal.mjs";
 import { readRuntimeRunnerBinding, verifyRunnerOwnership } from "./runner-ownership.mjs";
-import { storageDatabaseForInternalUse } from "./storage.mjs";
 
 function normalizePath(path) { return path?.replaceAll("\\", "/"); }
 
@@ -888,12 +888,7 @@ export class HandoffService {
       "RESUME_EXPECTATION_STALE", "Resume authorization, admission, or dispatch is no longer empty");
     const latest = this.storage.latestHandoffForTask(h.task_id);
     invariant(latest?.handoff_id === h.handoff_id, "TASK_OPERATION_CONFLICT", "The handoff no longer owns the task operation");
-    const durableCounts = {
-      authorizations: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
-      admissions: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
-      dispatch_attempts: storageDatabaseForInternalUse(this.storage).prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
-    };
-    invariant(Object.values(durableCounts).every((count) => count === 0), "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
+    const durableCounts = assertNoCompetingResumeEvidence(this.storage, handoffId);
     const authority = deepFreeze(structuredClone({
       schema: "aiopago.internal-resume-attestation/1",
       handoff: h,

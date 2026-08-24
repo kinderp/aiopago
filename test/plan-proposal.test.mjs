@@ -1169,7 +1169,7 @@ test("a stale or corrupt cooperative lock fails clearly without waiting or writi
   const x = fixture();
   mkdirSync(join(x.root, ".guardian"));
   writeFileSync(join(x.root, ".guardian", "plan-write.lock"), "corrupt stale lock\n");
-  assert.throws(() => new PlanPort(x.path).apply(proposal(x.bytes, x.base)), (error) => error.code === "PLAN_WRITE_LOCKED" && error.message.includes("explicit human inspection"));
+  assert.throws(() => new PlanPort(x.path).apply(proposal(x.bytes, x.base)), (error) => error.code === "PLAN_LOCK_INVALID" && error.message.includes("explicit human reconciliation"));
   assert.deepEqual(readFileSync(x.path), x.bytes);
 });
 

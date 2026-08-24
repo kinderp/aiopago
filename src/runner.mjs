@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { ArtifactStore } from "./artifact-store.mjs";
 import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
@@ -8,7 +9,7 @@ import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
 import { assertGuidedHandoffEligibilityIdentity, registerTrustedCurrentSourceVerifier } from "./handoff-consent.mjs";
 import { HandoffService } from "./handoff.mjs";
-import { claimTrustedHumanTakeover } from "./handoff-plan-internal.mjs";
+import { claimTrustedHumanTakeoverCurrentPlan } from "./handoff-plan-internal.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
@@ -318,17 +319,32 @@ export class GuardianRunner {
   }
 
   async takeoverFromCommand(ctx) {
-    const plan = this.ledger.read();
     const actor = "human:/aio-takeover";
-    const latch = claimTrustedHumanTakeover(this.ledger, {
-      storage: this.storage,
-      expected: { taskId: plan.task_id, planRevisionId: plan.plan_revision_id, contentDigest: plan.content_digest },
-      taskId: plan.task_id,
-      actor,
-    });
-    const result = await this.safePoint.request(this.runtime.session, actor, "HUMAN_TAKEOVER", { acquiredLatch: latch });
+    const taskId = this.safePoint.taskId;
+    const timeoutMs = 10_000;
+    const started = performance.now();
+    let attempt = 0;
+    let authority;
+    while (!authority) {
+      try {
+        authority = claimTrustedHumanTakeoverCurrentPlan(this.ledger, { storage: this.storage, taskId, actor });
+      } catch (error) {
+        if (error?.code !== "PLAN_WRITE_LOCKED") throw error;
+        const elapsed = performance.now() - started;
+        if (elapsed >= timeoutMs) {
+          throw new GuardianError("HUMAN_TAKEOVER_COORDINATION_TIMEOUT", "Human takeover could not establish canonical current-plan authority before the bounded coordination deadline", {
+            attempts: attempt + 1,
+            elapsed_ms: elapsed,
+          });
+        }
+        const delay = Math.min(250, 20 + attempt * 15, timeoutMs - elapsed);
+        attempt += 1;
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+      }
+    }
+    const result = await this.safePoint.request(this.runtime.session, actor, "HUMAN_TAKEOVER", { acquiredLatch: authority.latch });
     ctx.ui.notify(`Aiopago paused at ${result.state}; latch generation=${result.latch_generation}`, "warning");
-    return result;
+    return Object.freeze({ ...result, task_id: authority.taskId, plan_revision_id: authority.planRevisionId, plan_content_digest: authority.contentDigest });
   }
 
   async resumeFromCommand(ctx, handoffId = undefined) {

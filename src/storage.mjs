@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { opaqueId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { handoffConsentIdentity } from "./handoff-consent.mjs";
@@ -8,9 +8,12 @@ import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal
 import { planSemanticDigest, sameCanonicalJson } from "./plan-semantics-internal.mjs";
 import { taskOperationBlocksNewHandoff, taskOperationDisposition } from "./task-operation-internal.mjs";
 
+const require = createRequire(import.meta.url);
 const TERMINAL_HANDOFF = new Set(["RESUMED"]);
 const TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
+// @source-test-support-start
 const internalTestCapabilities = new WeakMap();
+// @source-test-support-end
 const storageDatabases = new WeakMap();
 
 function database(storage) {
@@ -19,14 +22,13 @@ function database(storage) {
   return value;
 }
 
-// Internal modules and source-level tests may inspect the connection. The npm
-// root does not export GuardianStorage or this accessor, and instances expose
-// no raw DatabaseSync handle.
+// Source tests use this instrumentation while exercising real fixture
+// databases. The package build removes the entire marked region before
+// bundling; no raw handle or lifecycle helper exists in the npm artifact.
+// @source-test-support-start
 export function storageDatabaseForInternalUse(storage) { return database(storage); }
 export const storageDatabaseForInternalTest = storageDatabaseForInternalUse;
 
-// Source-level regression support only. src/storage.mjs is not a package export;
-// packed consumers cannot obtain these helpers or the registered capabilities.
 export function reserveHandoffForInternalTest(storage, projection, precondition) {
   const capability = internalTestCapabilities.get(storage);
   invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED");
@@ -50,6 +52,7 @@ export function bindRunnerSessionForInternalTest(storage, ...args) { return inte
 export function supersedeRunnerSessionBindingForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).supersedeRunnerSessionBinding(...args); }
 export function beginDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).beginDispatch(...args); }
 export function finishDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).finishDispatch(...args); }
+// @source-test-support-end
 
 const HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
   "handoff_id",
@@ -287,6 +290,7 @@ export class GuardianStorage {
   constructor(path = ".guardian/runtime/guardian.sqlite") {
     this.path = resolve(path);
     mkdirSync(dirname(this.path), { recursive: true });
+    const { DatabaseSync } = require("node:sqlite");
     const connection = new DatabaseSync(this.path);
     storageDatabases.set(this, connection);
     connection.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
@@ -297,6 +301,11 @@ export class GuardianStorage {
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
       authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
+      resumeEvidence: (handoffId) => Object.freeze({
+        authorizations: database(this).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
+        admissions: database(this).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
+        dispatch_attempts: database(this).prepare("SELECT COUNT(*) AS count FROM dispatch_attempts WHERE handoff_id=?").get(handoffId).count,
+      }),
       assertOwnerGateAuthority: (request) => this.transaction(() => assertOwnerGateAuthorityInTransaction(this, request)),
       claimTakeover: ({ taskId, actor }) => this.#claimLatch(taskId, "HUMAN_TAKEOVER", actor),
       claimHandoffLatch: ({ taskId, reason, actor, expectedLatch }) => this.#claimLatch(taskId, reason, actor, expectedLatch),
@@ -307,6 +316,7 @@ export class GuardianStorage {
       finishDispatch: (...args) => this.#finishDispatch(...args),
     };
     registerTrustedHandoffStorageCapability(this, trustedCapability);
+    // @source-test-support-start
     internalTestCapabilities.set(this, Object.freeze({
       reserve: trustedCapability.reserve,
       claimTakeover: trustedCapability.claimTakeover,
@@ -317,6 +327,7 @@ export class GuardianStorage {
       beginDispatch: trustedCapability.beginDispatch,
       finishDispatch: trustedCapability.finishDispatch,
     }));
+    // @source-test-support-end
   }
 
   migrate() {
@@ -963,7 +974,14 @@ export class GuardianStorage {
   }
   getArtifact(kind, id) { return database(this).prepare("SELECT * FROM artifacts WHERE kind=? AND artifact_id=?").get(kind, id) ?? null; }
   events(id) { return database(this).prepare("SELECT * FROM journal WHERE handoff_id=? ORDER BY seq").all(id).map((row) => ({ ...row, data: JSON.parse(row.data_json) })); }
-  close() { const connection = database(this); storageDatabases.delete(this); internalTestCapabilities.delete(this); connection.close(); }
+  close() {
+    const connection = database(this);
+    storageDatabases.delete(this);
+    // @source-test-support-start
+    internalTestCapabilities.delete(this);
+    // @source-test-support-end
+    connection.close();
+  }
 }
 
 export { TERMINAL_HANDOFF };

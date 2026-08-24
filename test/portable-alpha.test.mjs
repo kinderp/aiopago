@@ -427,7 +427,9 @@ test("package declares a real CLI bin, ESM export, engine, and supported Pi peer
   assert.equal(manifest.bin.aio, "bin/aio.mjs");
   assert.equal(manifest.bin.eio, "bin/eio.mjs");
   assert.equal(manifest.repository.url, "git+https://github.com/kinderp/aiopago.git");
-  assert.equal(manifest.exports["."], "./src/index.mjs");
+  assert.equal(manifest.exports["."], "./dist/index.mjs");
+  assert.deepEqual(manifest.files.slice(0, 2), ["bin/", "dist/"]);
+  assert.equal(manifest.files.includes("src/"), false);
   assert.equal(manifest.engines.node, ">=22.19.0");
   assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.83.0 <0.84.0");
 });

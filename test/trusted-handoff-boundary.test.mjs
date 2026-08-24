@@ -243,18 +243,17 @@ function runTrustedTakeoverProcess(x, suffix) {
   writeFileSync(childPath, `
     import { TaskLedger } from ${JSON.stringify(ledgerModule)};
     import { GuardianStorage } from ${JSON.stringify(storageModule)};
-    import { claimTrustedHumanTakeover } from ${JSON.stringify(internalModule)};
+    import { claimTrustedHumanTakeoverCurrentPlan } from ${JSON.stringify(internalModule)};
     const ledger = new TaskLedger(${JSON.stringify(x.ledgerPath)});
     const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
     try {
       const plan = ledger.read();
-      const latch = claimTrustedHumanTakeover(ledger, {
+      const authority = claimTrustedHumanTakeoverCurrentPlan(ledger, {
         storage,
-        expected: { taskId: plan.task_id, planRevisionId: plan.plan_revision_id, contentDigest: plan.content_digest },
         taskId: plan.task_id,
         actor: ${JSON.stringify(`human:process-${suffix}`)},
       });
-      process.stdout.write(JSON.stringify({ ok: true, reason: latch.reason, generation: latch.generation }));
+      process.stdout.write(JSON.stringify({ ok: true, reason: authority.latch.reason, generation: authority.latch.generation }));
     } catch (error) {
       process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null, message: error.message }));
     } finally { storage.close(); }

@@ -1,0 +1,349 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import test from "node:test";
+import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
+import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
+import { PlanRevisionWriter } from "../src/plan-store.mjs";
+import { GuardianRunner } from "../src/runner.mjs";
+import { AdmissionGate, SafePointCoordinator } from "../src/safety.mjs";
+import { GuardianStorage, storageDatabaseForInternalTest } from "../src/storage.mjs";
+
+function task(overrides = {}) {
+  return {
+    schema_version: "0.1.0", task_id: "TASK-TAKEOVER", title: "Takeover", objective: "Preserve one human command",
+    requirements_version: "REQ-1", plan_revision_id: "PLAN-P1", status: "BLOCKED",
+    completion_criteria: ["safe"], risk: "HIGH", created_at: "2026-08-24T00:00:00.000Z",
+    updated_at: "2026-08-24T00:00:00.000Z", current_item: null, next_item: "ITEM-1", next_step: "Authorize owner",
+    owner_gate: {
+      kind: "HANDOFF_CONFIRM", status: "BLOCKED", command: "/aio handoff confirm", item_id: "ITEM-1",
+      satisfied_plan_revision_id: "PLAN-P1-PRIME", satisfied_task_status: "IN_PROGRESS", satisfied_next_item: null,
+      satisfied_next_step: "Continue after owner authorization.",
+    },
+    task_items: [{
+      task_item_id: "ITEM-1", task_id: "TASK-TAKEOVER", title: "Owner", description: "owner", status: "BLOCKED",
+      depends_on: [], completion_criteria: ["safe"], evidence: [], requirements_refs: [], risk: "HIGH", milestone: "0.2-E",
+      last_updated_at: "2026-08-24T00:00:00.000Z", last_updated_by: "human:test",
+    }],
+    ...overrides,
+  };
+}
+
+function writePlan(path, value = task()) {
+  writeFileSync(path, `# Takeover fixture\n\n**Schema:** \`aiopago.task-ledger/0.1.0\`\n\n\`\`\`json task-ledger\n${JSON.stringify(value, null, 2)}\n\`\`\`\n`);
+}
+
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "aiopago-takeover-lock-"));
+  const planPath = join(root, "TASK_PLAN.md");
+  const storagePath = join(root, ".guardian", "runtime", "guardian.sqlite");
+  writePlan(planPath);
+  const ledger = new TaskLedger(planPath);
+  const storage = new GuardianStorage(storagePath);
+  storage.ensureLatch("TASK-TAKEOVER");
+  const gate = new AdmissionGate(storage, "TASK-TAKEOVER");
+  const safePoint = new SafePointCoordinator({ storage, taskId: "TASK-TAKEOVER", gate });
+  const session = {
+    sessionId: "SESSION-TAKEOVER", isIdle: true, isStreaming: false, pendingMessageCount: 0, isRetrying: false, isCompacting: false,
+    clearQueue() {}, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {}, async abort() {}, async waitForIdle() {},
+  };
+  const runner = new GuardianRunner({ ledger, storage, safePoint });
+  runner.runtime = { session };
+  const notifications = [];
+  const ctx = { ui: { notify(text, type) { notifications.push({ text, type }); } } };
+  return { root, planPath, storagePath, ledger, storage, runner, ctx, notifications, close: () => storage.close() };
+}
+
+async function waitFor(path, timeoutMs = 10_000) {
+  const started = Date.now();
+  while (!existsSync(path)) {
+    if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+}
+
+function ownerChild(x, holdMs = 500) {
+  const script = join(x.root, "owner-child.mjs");
+  const ready = join(x.root, "owner-ready");
+  writeFileSync(script, `
+    import { writeFileSync } from "node:fs";
+    import { TaskLedger } from ${JSON.stringify(new URL("../src/ledger.mjs", import.meta.url).href)};
+    import { GuardianStorage } from ${JSON.stringify(new URL("../src/storage.mjs", import.meta.url).href)};
+    import { satisfyOwnerGateForTest } from ${JSON.stringify(new URL("./trusted-owner-gate-helper.mjs", import.meta.url).href)};
+    let held = false;
+    const ledger = new TaskLedger(${JSON.stringify(x.planPath)}, { writerOptions: { testHooks: { afterPreparation() {
+      if (held) return; held = true; writeFileSync(${JSON.stringify(ready)}, "ready"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${holdMs});
+    } } } });
+    const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
+    try {
+      const plan = satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:owner-child" }, storage);
+      process.stdout.write(JSON.stringify({ ok: true, revision: plan.plan_revision_id }));
+    } catch (error) { process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null })); }
+    finally { storage.close(); }
+  `);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const done = new Promise((resolveDone, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => code === 0 ? resolveDone(JSON.parse(stdout)) : reject(new Error(`owner child exit ${code}`)));
+  });
+  return { child, ready, done };
+}
+
+function applyP2(path, suffix = "P2") {
+  const adapter = createPlanAdapter(path);
+  const observed = adapter.observe();
+  const candidate = structuredClone(observed.plan);
+  candidate.plan_revision_id = `PLAN-${suffix}`;
+  candidate.updated_at = "2026-08-24T00:01:00.000Z";
+  candidate.objective = `Current plan ${suffix}`;
+  const proposal = adapter.propose({
+    schema: PLAN_INTENT_SCHEMA, proposal_id: `PPR-${suffix}`, producer: "test/takeover", change_reason: "legitimate current plan drift",
+    base: { task_id: observed.task_id, plan_revision_id: observed.plan_revision_id, content_digest: observed.content_digest },
+    candidate_plan: candidate,
+  });
+  return adapter.apply(proposal);
+}
+
+function lockMetadata(planPath, { pid, identity, nonce = "a".repeat(64), schema = "aiopago.plan-write-lock/0.3.0" }) {
+  return `${JSON.stringify({
+    schema, ownership_nonce: nonce, pid, process_identity: identity, created_at: "2026-08-24T00:00:00.000Z",
+    plan_path: resolve(planPath), guardian_root: resolve(dirname(planPath), ".guardian"),
+  })}\n`;
+}
+
+test("R1-M-06 owner-first contention keeps one takeover command alive until HUMAN_TAKEOVER is canonical", async () => {
+  const x = fixture();
+  try {
+    const owner = ownerChild(x, 650);
+    await waitFor(owner.ready);
+    const pending = x.runner.takeoverFromCommand(x.ctx);
+    const ownerResult = await owner.done;
+    const takeover = await pending;
+    assert.deepEqual(ownerResult, { ok: true, revision: "PLAN-P1-PRIME" });
+    assert.equal(x.ledger.read().plan_revision_id, "PLAN-P1-PRIME");
+    assert.equal(takeover.state, "HUMAN_TAKEOVER");
+    assert.equal(takeover.plan_revision_id, "PLAN-P1-PRIME");
+    assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+    assert.equal(x.notifications.length, 1, "pause notification occurs only after the canonical SafePoint");
+  } finally { x.close(); }
+});
+
+test("R1-M-06 takeover-first rejects a later owner mutation with zero stale P1-prime", async () => {
+  const x = fixture();
+  const script = join(x.root, "owner-after.mjs");
+  writeFileSync(script, `
+    import { TaskLedger } from ${JSON.stringify(new URL("../src/ledger.mjs", import.meta.url).href)};
+    import { GuardianStorage } from ${JSON.stringify(new URL("../src/storage.mjs", import.meta.url).href)};
+    import { satisfyOwnerGateForTest } from ${JSON.stringify(new URL("./trusted-owner-gate-helper.mjs", import.meta.url).href)};
+    const ledger = new TaskLedger(${JSON.stringify(x.planPath)});
+    const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
+    try { satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:late-owner" }, storage); process.stdout.write(JSON.stringify({ ok: true })); }
+    catch (error) { process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null })); }
+    finally { storage.close(); }
+  `);
+  try {
+    await x.runner.takeoverFromCommand(x.ctx);
+    const owner = JSON.parse(execFileSync(process.execPath, [script], { encoding: "utf8" }));
+    assert.deepEqual(owner, { ok: false, code: "HUMAN_TAKEOVER_ACTIVE" });
+    assert.equal(x.ledger.read().plan_revision_id, "PLAN-P1");
+    assert.equal(x.ledger.read().owner_gate.status, "BLOCKED");
+  } finally { x.close(); }
+});
+
+test("R1-M-06 P2-first drift binds the same takeover command to current P2 authority", async () => {
+  const x = fixture();
+  try {
+    applyP2(x.planPath, "P2");
+    const result = await x.runner.takeoverFromCommand(x.ctx);
+    assert.equal(result.plan_revision_id, "PLAN-P2");
+    assert.equal(result.plan_content_digest, x.ledger.read().content_digest);
+    assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+  } finally { x.close(); }
+});
+
+test("R1-M-06 repeated bounded P2 churn and one takeover command converge without a second prompt", async () => {
+  const x = fixture();
+  const script = join(x.root, "p2-churn-child.mjs");
+  const ready = join(x.root, "p2-churn-ready");
+  writeFileSync(script, `
+    import { writeFileSync } from "node:fs";
+    import { TaskLedger } from ${JSON.stringify(new URL("../src/ledger.mjs", import.meta.url).href)};
+    import { GuardianStorage } from ${JSON.stringify(new URL("../src/storage.mjs", import.meta.url).href)};
+    import { createPlanAdapter, PLAN_INTENT_SCHEMA } from ${JSON.stringify(new URL("../src/intent-adapter.mjs", import.meta.url).href)};
+    import { satisfyOwnerGateForTest } from ${JSON.stringify(new URL("./trusted-owner-gate-helper.mjs", import.meta.url).href)};
+    let held = false;
+    const ledger = new TaskLedger(${JSON.stringify(x.planPath)}, { writerOptions: { testHooks: { afterPreparation() { if (!held) { held = true; writeFileSync(${JSON.stringify(ready)}, "ready"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 450); } } } } });
+    const storage = new GuardianStorage(${JSON.stringify(x.storagePath)});
+    try {
+      satisfyOwnerGateForTest(ledger, { command: "/aio handoff confirm", actor: "human:churn-owner" }, storage);
+      for (let index = 0; index < 4; index += 1) {
+        for (let attempt = 0; ; attempt += 1) {
+          const adapter = createPlanAdapter(${JSON.stringify(x.planPath)}); const observed = adapter.observe(); const candidate = structuredClone(observed.plan);
+          candidate.plan_revision_id = "PLAN-CHURN-" + index; candidate.updated_at = "2026-08-24T00:0" + (index + 2) + ":00.000Z"; candidate.objective = "P2 churn " + index;
+          try { adapter.apply(adapter.propose({ schema: PLAN_INTENT_SCHEMA, proposal_id: "PPR-CHURN-" + index + "-" + attempt, producer: "test/churn", change_reason: "bounded churn", base: { task_id: observed.task_id, plan_revision_id: observed.plan_revision_id, content_digest: observed.content_digest }, candidate_plan: candidate })); break; }
+          catch (error) { if (error.code !== "PLAN_WRITE_LOCKED" || attempt >= 20) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); }
+        }
+      }
+      process.stdout.write(JSON.stringify({ ok: true }));
+    } catch (error) { process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null })); }
+    finally { storage.close(); }
+  `);
+  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
+  let output = ""; child.stdout.on("data", (chunk) => { output += chunk; });
+  try {
+    await waitFor(ready);
+    const takeover = x.runner.takeoverFromCommand(x.ctx);
+    await new Promise((resolveExit, reject) => { child.once("error", reject); child.once("exit", (code) => code === 0 ? resolveExit() : reject(new Error(`churn child exit ${code}`))); });
+    assert.deepEqual(JSON.parse(output), { ok: true });
+    assert.equal((await takeover).state, "HUMAN_TAKEOVER");
+    assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+    assert.equal(x.ledger.read().plan_revision_id, "PLAN-CHURN-3");
+    assert.equal(x.notifications.length, 1);
+  } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
+});
+
+test("R1-M-06 task-id movement is a terminal identity failure and never claims another task latch", async () => {
+  const x = fixture();
+  try {
+    const moved = task({ task_id: "TASK-OTHER", plan_revision_id: "PLAN-OTHER" });
+    moved.task_items[0].task_id = "TASK-OTHER";
+    writePlan(x.planPath, moved);
+    await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "HUMAN_TAKEOVER_TASK_CHANGED");
+    assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+    assert.equal(x.notifications.length, 0);
+  } finally { x.close(); }
+});
+
+test("R1-M-07 SIGKILL leaves a complete dead-owner lock that fresh takeover safely recovers", async () => {
+  const x = fixture();
+  const script = join(x.root, "dead-lock-child.mjs");
+  const ready = join(x.root, "dead-lock-ready");
+  writeFileSync(script, `
+    import { writeFileSync } from "node:fs";
+    import { PlanRevisionWriter } from ${JSON.stringify(new URL("../src/plan-store.mjs", import.meta.url).href)};
+    import { validateTaskLedger } from ${JSON.stringify(new URL("../src/ledger.mjs", import.meta.url).href)};
+    let held = false;
+    const writer = new PlanRevisionWriter(${JSON.stringify(x.planPath)}, { testHooks: { afterLockAttestation() {
+      if (held) return; held = true; writeFileSync(${JSON.stringify(ready)}, "ready"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    } } });
+    writer.coordinate({ validate: validateTaskLedger, use() {} });
+  `);
+  const child = spawn(process.execPath, [script], { stdio: "ignore" });
+  try {
+    await waitFor(ready);
+    child.kill("SIGKILL");
+    await new Promise((resolveExit) => child.once("exit", resolveExit));
+    const lockPath = join(x.root, ".guardian", "plan-write.lock");
+    assert.equal(existsSync(lockPath), true);
+    const result = await x.runner.takeoverFromCommand(x.ctx);
+    assert.equal(result.state, "HUMAN_TAKEOVER");
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(existsSync(`${lockPath}.recovery`), false);
+    applyP2(x.planPath, "AFTER-DEAD-LOCK");
+    assert.equal(x.ledger.read().plan_revision_id, "PLAN-AFTER-DEAD-LOCK", "normal plan writers also proceed after dead-lock recovery");
+  } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
+});
+
+test("R1-M-07 real child crash seams never permanently deny fresh takeover", async (t) => {
+  for (const seam of ["after-metadata", "after-create", "after-attestation", "during-critical", "before-release"]) {
+    await t.test(seam, async () => {
+      const x = fixture();
+      const script = join(x.root, `crash-${seam}.mjs`);
+      const ready = join(x.root, `crash-${seam}-ready`);
+      writeFileSync(script, `
+        import { writeFileSync } from "node:fs";
+        import { PlanRevisionWriter } from ${JSON.stringify(new URL("../src/plan-store.mjs", import.meta.url).href)};
+        import { validateTaskLedger } from ${JSON.stringify(new URL("../src/ledger.mjs", import.meta.url).href)};
+        const seam = ${JSON.stringify(seam)}; let blocked = false;
+        const block = (name) => { if (!blocked && seam === name) { blocked = true; writeFileSync(${JSON.stringify(ready)}, name); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); } };
+        const writer = new PlanRevisionWriter(${JSON.stringify(x.planPath)}, { testHooks: {
+          afterLockMetadataWrite() { block("after-metadata"); }, afterLockCreate() { block("after-create"); },
+          afterLockAttestation() { block("after-attestation"); }, beforeLockRelease() { block("before-release"); },
+        } });
+        writer.coordinate({ validate: validateTaskLedger, use() { block("during-critical"); } });
+      `);
+      const child = spawn(process.execPath, [script], { stdio: "ignore" });
+      try {
+        await waitFor(ready);
+        child.kill("SIGKILL");
+        await new Promise((resolveExit) => child.once("exit", resolveExit));
+        assert.equal((await x.runner.takeoverFromCommand(x.ctx)).state, "HUMAN_TAKEOVER");
+        assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+        assert.equal(existsSync(join(x.root, ".guardian", "plan-write.lock")), false);
+        assert.equal(existsSync(join(x.root, ".guardian", "plan-write.lock.recovery")), false);
+      } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
+    });
+  }
+});
+
+test("R1-M-07 malformed and unknown lock metadata fails closed without latch mutation", async (t) => {
+  const attacks = [
+    ["empty", () => ""],
+    ["partial", () => "{\"schema\":"],
+    ["unknown schema", (x) => lockMetadata(x.planPath, { pid: 999, identity: "unknown", schema: "aiopago.plan-write-lock/future" })],
+    ["bad pid", (x) => lockMetadata(x.planPath, { pid: -1, identity: "bad" })],
+    ["bad owner identity", (x) => lockMetadata(x.planPath, { pid: 999, identity: "" })],
+    ["wrong plan path", (x) => lockMetadata(join(x.root, "OTHER_PLAN.md"), { pid: 999, identity: "old" })],
+    ["unexpected field", (x) => {
+      const value = JSON.parse(lockMetadata(x.planPath, { pid: 999, identity: "old" })); value.extra = true; return `${JSON.stringify(value)}\n`;
+    }],
+    ["bad timestamp", (x) => {
+      const value = JSON.parse(lockMetadata(x.planPath, { pid: 999, identity: "old" })); value.created_at = "not-a-time"; return `${JSON.stringify(value)}\n`;
+    }],
+  ];
+  for (const [name, attack] of attacks) await t.test(name, async () => {
+    const x = fixture();
+    const lockPath = join(x.root, ".guardian", "plan-write.lock");
+    const bytes = attack(x);
+    try {
+      writeFileSync(lockPath, bytes);
+      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_INVALID");
+      assert.equal(readFileSync(lockPath, "utf8"), bytes);
+      assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+    } finally { x.close(); }
+  });
+});
+
+test("R1-M-07 process-start identity handles PID reuse and unknown proof without PID-only theft", () => {
+  const x = fixture();
+  const lockPath = join(x.root, ".guardian", "plan-write.lock");
+  try {
+    writeFileSync(lockPath, lockMetadata(x.planPath, { pid: 999, identity: "old-process-start" }));
+    const unknown = new PlanRevisionWriter(x.planPath, { processIdentityProbe: (pid) => pid === process.pid
+      ? ({ status: "LIVE", identity: "current-process-start" })
+      : ({ status: "UNKNOWN", identity: null }) });
+    assert.throws(() => unknown.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+    assert.equal(existsSync(lockPath), true, "PID existence alone cannot authorize cleanup");
+
+    const reused = new PlanRevisionWriter(x.planPath, { processIdentityProbe(pid) {
+      return pid === 999 ? { status: "LIVE", identity: "new-unrelated-process-start" } : { status: "LIVE", identity: "current-process-start" };
+    } });
+    assert.equal(reused.coordinate({ validate: validateTaskLedger, use: () => "recovered" }), "recovered");
+    assert.equal(existsSync(lockPath), false, "different process-start identity proves the recorded owner is dead");
+  } finally { x.close(); }
+});
+
+test("R1-M-07 stale cleanup never removes a replacement lock in the recovery ABA race", () => {
+  const x = fixture();
+  const lockPath = join(x.root, ".guardian", "plan-write.lock");
+  const recoveryPath = `${lockPath}.recovery`;
+  try {
+    const stale = lockMetadata(x.planPath, { pid: 999, identity: "dead-start", nonce: "b".repeat(64) });
+    const replacement = lockMetadata(x.planPath, { pid: 1000, identity: "live-start", nonce: "c".repeat(64) });
+    writeFileSync(lockPath, stale);
+    linkSync(lockPath, recoveryPath);
+    unlinkSync(lockPath);
+    writeFileSync(lockPath, replacement);
+    const writer = new PlanRevisionWriter(x.planPath, { processIdentityProbe(pid) {
+      if (pid === 999) return { status: "DEAD", identity: null };
+      if (pid === 1000) return { status: "LIVE", identity: "live-start" };
+      return { status: "LIVE", identity: "current-start" };
+    } });
+    assert.throws(() => writer.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_RECOVERY_RACED");
+    assert.equal(readFileSync(lockPath, "utf8"), replacement, "the new live lock remains byte-exact");
+  } finally { x.close(); }
+});

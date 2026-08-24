@@ -1,10 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 execFileSync(process.execPath, ["scripts/check-brand-migration.mjs"], { stdio: "inherit" });
+execFileSync(process.execPath, ["scripts/build-package.mjs"], { stdio: "inherit" });
+for (const path of ["dist/index.mjs", "dist/cli-entry.mjs"]) {
+  const source = readFileSync(path, "utf8");
+  if (/storageDatabaseForInternal|ForInternalTest|internalTestCapabilities/.test(source)) {
+    throw new Error(`source-test authority instrumentation leaked into ${path}`);
+  }
+}
 
-const roots = ["src", "bin", "scripts", "test"];
+const roots = ["src", "dist", "bin", "scripts", "test"];
 const files = [];
 function walk(path) {
   for (const name of readdirSync(path)) {

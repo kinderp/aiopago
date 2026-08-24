@@ -610,7 +610,7 @@ test("plan.apply preserves lock contention without mutating authority", () => {
   const proposal = x.adapter.propose(intent(candidate(x.base), fixtureIdentity(x)));
   mkdirSync(join(x.root, ".guardian"));
   writeFileSync(join(x.root, ".guardian", "plan-write.lock"), "owned externally\n");
-  assert.throws(() => x.adapter.apply(proposal), (error) => error.code === "PLAN_WRITE_LOCKED");
+  assert.throws(() => x.adapter.apply(proposal), (error) => error.code === "PLAN_LOCK_INVALID");
   assert.deepEqual(readFileSync(x.path), x.bytes);
 });
 

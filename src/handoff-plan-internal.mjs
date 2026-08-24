@@ -11,12 +11,14 @@ export function registerTrustedHandoffPlanCapability(ledger, capability) {
     && typeof capability?.attest === "function"
     && typeof capability?.attestRecovery === "function"
     && typeof capability?.attestResume === "function"
+    && typeof capability?.attestCurrentTakeover === "function"
     && typeof capability?.satisfyOwnerGate === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
   invariant(!handoffPlanCapabilities.has(ledger), "HANDOFF_PLAN_CAPABILITY_DUPLICATE");
   handoffPlanCapabilities.set(ledger, Object.freeze({
     attest: capability.attest,
     attestRecovery: capability.attestRecovery,
     attestResume: capability.attestResume,
+    attestCurrentTakeover: capability.attestCurrentTakeover,
     satisfyOwnerGate: capability.satisfyOwnerGate,
   }));
 }
@@ -26,6 +28,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     && typeof capability?.reserve === "function"
     && typeof capability?.prepareRecovery === "function"
     && typeof capability?.authorizeResume === "function"
+    && typeof capability?.resumeEvidence === "function"
     && typeof capability?.assertOwnerGateAuthority === "function"
     && typeof capability?.claimTakeover === "function"
     && typeof capability?.claimHandoffLatch === "function"
@@ -39,6 +42,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     reserve: capability.reserve,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
+    resumeEvidence: capability.resumeEvidence,
     assertOwnerGateAuthority: capability.assertOwnerGateAuthority,
     claimTakeover: capability.claimTakeover,
     claimHandoffLatch: capability.claimHandoffLatch,
@@ -70,20 +74,28 @@ export function satisfyTrustedHandoffOwnerGate(ledger, request) {
   });
 }
 
-// HUMAN_TAKEOVER uses the same global order as owner confirmation and every
-// trusted lifecycle creator: PlanRevisionWriter, then one SQLite authority
-// transaction. The plan lock is released before SafePoint performs any drain.
-export function claimTrustedHumanTakeover(ledger, request) {
+// HUMAN_TAKEOVER is current-task control authority, not consent to a plan
+// revision observed before coordination. One attempt acquires the common
+// PlanRevisionWriter → SQLite order, reads the current validated plan while the
+// lock is held, binds it to the current Runner task, and claims the latch. The
+// Runner owns bounded retry of transient lock contention before SafePoint.
+export function claimTrustedHumanTakeoverCurrentPlan(ledger, request) {
   const planCapability = handoffPlanCapabilities.get(ledger);
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed GuardianStorage");
-  const { expected, taskId, actor } = request;
-  invariant(taskId === expected?.taskId && typeof actor === "string", "HUMAN_TAKEOVER_AUTHORITY_INVALID");
-  return planCapability.attest(expected, () => {
-    const claimed = storageCapability.claimTakeover({ taskId, actor });
-    invariant(claimed && typeof claimed.then !== "function", "HUMAN_TAKEOVER_AUTHORITY_INVALID", "Takeover claim must be synchronous");
-    return claimed;
+  const { taskId, actor } = request;
+  invariant(typeof taskId === "string" && taskId.length > 0 && typeof actor === "string", "HUMAN_TAKEOVER_AUTHORITY_INVALID");
+  return planCapability.attestCurrentTakeover((plan) => {
+    invariant(plan.task_id === taskId, "HUMAN_TAKEOVER_TASK_CHANGED", "The current plan belongs to a different task than the active Runner");
+    const latch = storageCapability.claimTakeover({ taskId, actor });
+    invariant(latch && typeof latch.then !== "function", "HUMAN_TAKEOVER_AUTHORITY_INVALID", "Takeover claim must be synchronous");
+    return Object.freeze({
+      taskId: plan.task_id,
+      planRevisionId: plan.plan_revision_id,
+      contentDigest: plan.content_digest,
+      latch,
+    });
   });
 }
 
@@ -107,6 +119,18 @@ function trustedStorageCapability(storage) {
   const capability = handoffStorageCapabilities.get(storage);
   invariant(capability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted lifecycle mutation requires an internally constructed GuardianStorage");
   return capability;
+}
+
+export function assertNoCompetingResumeEvidence(storage, handoffId) {
+  const evidence = trustedStorageCapability(storage).resumeEvidence(handoffId);
+  invariant(evidence && typeof evidence.then !== "function"
+    && Number.isInteger(evidence.authorizations)
+    && Number.isInteger(evidence.admissions)
+    && Number.isInteger(evidence.dispatch_attempts),
+  "RESUME_ATTESTATION_INVALID", "Durable resume evidence attestation must be synchronous and structured");
+  invariant(Object.values(evidence).every((count) => count === 0),
+    "RESUME_EXPECTATION_STALE", "Competing durable resume evidence exists");
+  return evidence;
 }
 
 export function saveTrustedHandoff(storage, ...args) {
