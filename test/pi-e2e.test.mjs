@@ -12,7 +12,7 @@ import { HandoffService } from "../src/handoff.mjs";
 import { observeRunnerHumanWorkflow, projectHumanWorkflow } from "../src/human-workflow.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
-import { GuardianRunner } from "../src/runner.mjs";
+import { GuardianRunner, runnerForInternalTest } from "../src/runner.mjs";
 import { readRuntimeRunnerBinding, RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
 import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
@@ -115,7 +115,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const sessions = mkdtempSync(join(tmpdir(), "aiopago-pi-sessions-"));
-  const runner = await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" });
+  const runner = runnerForInternalTest(await GuardianRunner.create({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" }));
   await runner.runtime.session.bindExtensions({
     mode: "print",
     commandContextActions: {

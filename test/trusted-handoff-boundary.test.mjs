@@ -11,7 +11,7 @@ import { HandoffService } from "../src/handoff.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { satisfyOwnerGateForTest } from "./trusted-owner-gate-helper.mjs";
-import { GuardianRunner } from "../src/runner.mjs";
+import { GuardianRunner, runnerForInternalTest } from "../src/runner.mjs";
 import { AdmissionGate, SafePointCoordinator } from "../src/safety.mjs";
 import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
@@ -125,10 +125,10 @@ function fixture({ session = sourceSession(), testHooks = null, planValue = task
     storage, artifacts, ledger, safePoint, runnerInstanceId,
     observeGit: () => gitState(root), modelPolicy: "offline/fake", reasoningPolicy: "off", testHooks,
   });
-  const runner = new GuardianRunner({
+  const runner = runnerForInternalTest(new GuardianRunner({
     cwd: root, roots: { targetRoot: root, runtimeRoot: join(root, ".guardian", "runtime"), artifactRoot: join(root, ".guardian") },
     ledger, storage, artifacts, gate, safePoint, handoffService: service, runnerInstanceId, confirmMode: "confirm-or-manual",
-  });
+  }));
   runner.runtime = { session };
   runner.recoverySourceSession = session;
   runner.contextAdvisor = { reset() {} };

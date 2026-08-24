@@ -84,7 +84,7 @@ export function claimTrustedHumanTakeoverCurrentPlan(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted takeover requires an internally constructed GuardianStorage");
-  const { taskId, actor } = request;
+  const { taskId, actor, coordinationDeadline = null } = request;
   invariant(typeof taskId === "string" && taskId.length > 0 && typeof actor === "string", "HUMAN_TAKEOVER_AUTHORITY_INVALID");
   return planCapability.attestCurrentTakeover((plan) => {
     invariant(plan.task_id === taskId, "HUMAN_TAKEOVER_TASK_CHANGED", "The current plan belongs to a different task than the active Runner");
@@ -96,7 +96,7 @@ export function claimTrustedHumanTakeoverCurrentPlan(ledger, request) {
       contentDigest: plan.content_digest,
       latch,
     });
-  });
+  }, coordinationDeadline);
 }
 
 export function claimTrustedHandoffLatch(ledger, request) {

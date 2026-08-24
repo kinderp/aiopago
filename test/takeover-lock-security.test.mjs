@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { TaskLedger, validateTaskLedger } from "../src/ledger.mjs";
-import { PlanRevisionWriter } from "../src/plan-store.mjs";
-import { GuardianRunner } from "../src/runner.mjs";
+import { PlanRevisionWriter, processIdentityProbeForInternalTest } from "../src/plan-store.mjs";
+import { GuardianRunner, runnerForInternalTest } from "../src/runner.mjs";
 import { AdmissionGate, SafePointCoordinator } from "../src/safety.mjs";
 import { GuardianStorage, storageDatabaseForInternalTest } from "../src/storage.mjs";
 
@@ -49,7 +50,7 @@ function fixture() {
     sessionId: "SESSION-TAKEOVER", isIdle: true, isStreaming: false, pendingMessageCount: 0, isRetrying: false, isCompacting: false,
     clearQueue() {}, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {}, async abort() {}, async waitForIdle() {},
   };
-  const runner = new GuardianRunner({ ledger, storage, safePoint });
+  const runner = runnerForInternalTest(new GuardianRunner({ ledger, storage, safePoint }));
   runner.runtime = { session };
   const notifications = [];
   const ctx = { ui: { notify(text, type) { notifications.push({ text, type }); } } };
@@ -91,6 +92,37 @@ function ownerChild(x, holdMs = 500) {
     child.once("exit", (code) => code === 0 ? resolveDone(JSON.parse(stdout)) : reject(new Error(`owner child exit ${code}`)));
   });
   return { child, ready, done };
+}
+
+function lockOwnerChild(x, holdMs) {
+  const script = join(x.root, `lock-owner-${holdMs}.mjs`);
+  const ready = join(x.root, `lock-owner-${holdMs}-ready`);
+  writeFileSync(script, `
+    import { writeFileSync } from "node:fs";
+    import { PlanRevisionWriter } from ${JSON.stringify(new URL("../src/plan-store.mjs", import.meta.url).href)};
+    const writer = new PlanRevisionWriter(${JSON.stringify(x.planPath)});
+    writer.coordinate({ validate() {}, use() {
+      writeFileSync(${JSON.stringify(ready)}, "ready");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${holdMs});
+    } });
+  `);
+  const child = spawn(process.execPath, [script], { stdio: "ignore" });
+  const done = new Promise((resolveDone, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => code === 0 || signal === "SIGKILL" ? resolveDone({ code, signal }) : reject(new Error(`lock owner exit ${code}`)));
+  });
+  return { child, ready, done };
+}
+
+function lockSnapshot(path) {
+  const stat = statSync(path, { bigint: true });
+  return { bytes: readFileSync(path), dev: stat.dev, ino: stat.ino };
+}
+
+function sameLockSnapshot(path, snapshot) {
+  if (!existsSync(path)) return false;
+  const stat = statSync(path, { bigint: true });
+  return stat.dev === snapshot.dev && stat.ino === snapshot.ino && readFileSync(path).equals(snapshot.bytes);
 }
 
 function applyP2(path, suffix = "P2") {
@@ -216,6 +248,88 @@ test("R1-M-06 task-id movement is a terminal identity failure and never claims a
     assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
     assert.equal(x.notifications.length, 0);
   } finally { x.close(); }
+});
+
+test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot steal a real live lock", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows process probe regression");
+
+  await t.test("structured probe classification", () => {
+    const spawnCase = (result) => processIdentityProbeForInternalTest(process.pid, { spawn: () => result });
+    for (const [name, result] of [
+      ["powershell executable absent", { status: null, stdout: "", stderr: "", error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }) }],
+      ["generic exit 1", { status: 1, stdout: "", stderr: "localized generic failure" }],
+      ["access denied", { status: null, stdout: "", stderr: "", error: Object.assign(new Error("access denied"), { code: "EACCES" }) }],
+      ["timeout", { status: null, stdout: "", stderr: "", error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }) }],
+      ["malformed stdout", { status: 0, stdout: "AIOPAGO_PROCESS_LIVE_V1:not-ticks", stderr: "" }],
+      ["empty stdout", { status: 0, stdout: "", stderr: "" }],
+      ["dead exit without sentinel", { status: 3, stdout: "", stderr: "" }],
+    ]) assert.deepEqual(spawnCase(result), { status: "UNKNOWN", identity: null }, name);
+    assert.deepEqual(spawnCase({ status: 3, stdout: "AIOPAGO_PROCESS_DEAD_V1", stderr: "" }), { status: "DEAD", identity: null });
+    assert.equal(processIdentityProbeForInternalTest(process.pid).status, "LIVE");
+    assert.deepEqual(processIdentityProbeForInternalTest(2_147_483_000), { status: "DEAD", identity: null }, "native ESRCH is positive absence evidence");
+  });
+
+  await t.test("real live owner with powershell.exe unavailable", async () => {
+    const x = fixture();
+    const writer = new PlanRevisionWriter(x.planPath);
+    writer.coordinate({ validate: validateTaskLedger, use() {} }); // cache only this process's exact start identity
+    const owner = lockOwnerChild(x, 30_000);
+    const lockPath = join(x.root, ".guardian", "plan-write.lock");
+    const originalPath = process.env.PATH;
+    try {
+      await waitFor(owner.ready);
+      const before = lockSnapshot(lockPath);
+      process.env.PATH = x.root;
+      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+      assert.equal(owner.child.exitCode, null, "the exact owner remains live");
+      assert.equal(sameLockSnapshot(lockPath, before), true, "lock bytes and filesystem identity remain exact");
+      assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+      assert.equal(x.notifications.length, 0);
+    } finally {
+      process.env.PATH = originalPath;
+      if (owner.child.exitCode === null) owner.child.kill("SIGKILL");
+      await owner.done;
+      x.close();
+    }
+  });
+});
+
+test("R1-L-09 takeover coordination authority obeys one 10-second monotonic deadline", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows deadline boundary regression");
+  for (const holdMs of [9_000, 9_800, 9_950, 11_000]) {
+    await t.test(`holder ${holdMs}ms`, async () => {
+      const x = fixture();
+      const owner = lockOwnerChild(x, holdMs);
+      try {
+        await waitFor(owner.ready);
+        const started = performance.now();
+        let result = null;
+        let error = null;
+        try { result = await x.runner.takeoverFromCommand(x.ctx); }
+        catch (caught) { error = caught; }
+        const elapsed = performance.now() - started;
+        t.diagnostic(`holder=${holdMs}ms completion=${elapsed.toFixed(1)}ms acquisition=${result?.coordination_acquired_ms?.toFixed(1) ?? "none"}ms outcome=${result ? "acquired" : error?.code}`);
+        assert.ok(elapsed < 10_200, `coordination returned in ${elapsed}ms`);
+        if (result) {
+          assert.equal(result.state, "HUMAN_TAKEOVER");
+          assert.equal(result.coordination_deadline_ms, 10_000);
+          assert.ok(result.coordination_acquired_ms < result.coordination_deadline_ms,
+            `authority acquired before the bounded deadline (${result.coordination_acquired_ms}ms)`);
+        } else {
+          assert.equal(error?.code, "HUMAN_TAKEOVER_COORDINATION_TIMEOUT");
+          assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+          const eventsBefore = storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE event_type='LATCH_ENGAGED' AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count;
+          await new Promise((resolveWait) => setTimeout(resolveWait, 350));
+          assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED", "no delayed retry claims the latch after timeout");
+          assert.equal(storageDatabaseForInternalTest(x.storage).prepare("SELECT COUNT(*) AS count FROM journal WHERE event_type='LATCH_ENGAGED' AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count, eventsBefore);
+        }
+      } finally {
+        if (owner.child.exitCode === null) owner.child.kill("SIGKILL");
+        await owner.done;
+        x.close();
+      }
+    });
+  }
 });
 
 test("R1-M-07 SIGKILL leaves a complete dead-owner lock that fresh takeover safely recovers", async () => {

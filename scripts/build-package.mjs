@@ -7,7 +7,7 @@ rmSync("dist", { recursive: true, force: true });
 const removeSourceTestSupport = {
   name: "remove-source-test-support",
   setup(buildContext) {
-    buildContext.onLoad({ filter: /[\\/]src[\\/]storage\.mjs$/ }, async ({ path }) => ({
+    buildContext.onLoad({ filter: /[\\/]src[\\/](?:storage|runner)\.mjs$/ }, async ({ path }) => ({
       contents: (await readFile(path, "utf8")).replace(
         /[ \t]*\/\/ @source-test-support-start[\s\S]*?[ \t]*\/\/ @source-test-support-end\r?\n?/g,
         "",

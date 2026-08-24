@@ -340,9 +340,10 @@ export class TaskLedger {
       attestResume: (expected, capture) => coordinateExactPlan(
         expected, capture, "RESUME_EXPECTATION_STALE", "The authoritative plan changed after resume confirmation was displayed",
       ),
-      attestCurrentTakeover: (claim) => this.#writer.coordinate({
+      attestCurrentTakeover: (claim, deadline = null) => this.#writer.coordinate({
         validate: validateTaskLedger,
         use: (observed) => claim(ledgerResult(observed.task, observed.contentDigest, this.path)),
+        deadline,
       }),
       satisfyOwnerGate: (request, assertEligible) => this.#satisfyOwnerGate(request, assertEligible),
     });

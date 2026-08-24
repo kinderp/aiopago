@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -18,6 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { TextDecoder } from "node:util";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
@@ -169,49 +170,115 @@ function randomToken() {
   return randomBytes(32).toString("hex");
 }
 
-function processIdentityProbe(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return Object.freeze({ status: "UNKNOWN", identity: null });
-  try {
-    if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const close = stat.lastIndexOf(")");
-      if (close < 0) return Object.freeze({ status: "UNKNOWN", identity: null });
-      const fields = stat.slice(close + 2).split(" ");
-      const startTicks = fields[19];
-      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-      if (!/^\d+$/.test(startTicks) || !/^[a-f0-9-]{16,}$/i.test(bootId)) return Object.freeze({ status: "UNKNOWN", identity: null });
-      return Object.freeze({ status: "LIVE", identity: `linux:${bootId}:${startTicks}` });
-    }
-    if (process.platform === "win32") {
-      const command = `$ErrorActionPreference='Stop';$p=Get-Process -Id ${pid};[Console]::Write($p.StartTime.ToUniversalTime().Ticks)`;
-      const ticks = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
-        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000, windowsHide: true,
-      }).trim();
-      if (!/^\d+$/.test(ticks)) return Object.freeze({ status: "UNKNOWN", identity: null });
-      return Object.freeze({ status: "LIVE", identity: `win32:${ticks}` });
-    }
-    const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
-    }).trim().replace(/\s+/g, " ");
-    if (!started) return Object.freeze({ status: "UNKNOWN", identity: null });
-    const boot = execFileSync("sysctl", ["-n", "kern.boottime"], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
-    }).trim().replace(/\s+/g, " ");
-    return Object.freeze({ status: "LIVE", identity: `${process.platform}:${boot}:${started}` });
-  } catch (error) {
-    const text = String(error?.message ?? error);
-    if (error?.code === "ENOENT" || error?.status === 1 || /Cannot find a process|No process|not found/i.test(text)) {
-      return Object.freeze({ status: "DEAD", identity: null });
-    }
-    return Object.freeze({ status: "UNKNOWN", identity: null });
+const PROCESS_LIVE = (identity) => Object.freeze({ status: "LIVE", identity });
+const PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
+const PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
+const WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
+const WINDOWS_DEAD_SENTINEL = "AIOPAGO_PROCESS_DEAD_V1";
+const WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
+// Node's synchronous child termination after a Windows timeout can itself take
+// a short scheduling interval. Near a takeover deadline, do not start a new OS
+// subprocess that cannot be safely reaped inside the remaining wall-clock
+// budget. The deadline itself remains start + timeoutMs.
+const MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3_000;
+
+function positiveNativeProcessAbsence(pid, kill = process.kill.bind(process)) {
+  try { kill(pid, 0); return false; }
+  catch (error) {
+    if (error?.code === "ESRCH") return true;
+    return null;
   }
 }
 
+function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync, kill } = {}) {
+  const nativeAbsence = positiveNativeProcessAbsence(pid, kill);
+  if (nativeAbsence === true) return PROCESS_DEAD;
+  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    "$probeErrors=@()",
+    `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
+    "if ($null -eq $p) {",
+    "  $notFound=@($probeErrors | Where-Object { $_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId,*' })",
+    `  if ($probeErrors.Count -gt 0 -and $notFound.Count -eq $probeErrors.Count) { [Console]::Out.Write('${WINDOWS_DEAD_SENTINEL}'); exit 3 }`,
+    `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
+    "}",
+    "try {",
+    `  [Console]::Out.Write('${WINDOWS_LIVE_SENTINEL}'+$p.StartTime.ToUniversalTime().Ticks); exit 0`,
+    "} catch {",
+    `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
+    "}",
+  ].join(";");
+  const result = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: Math.max(1, Math.floor(timeoutMs)),
+    windowsHide: true,
+  });
+  if (result?.error) return PROCESS_UNKNOWN;
+  const stdout = String(result?.stdout ?? "").trim();
+  if (result?.status === 0 && stdout.startsWith(WINDOWS_LIVE_SENTINEL)) {
+    const ticks = stdout.slice(WINDOWS_LIVE_SENTINEL.length);
+    return /^\d+$/.test(ticks) ? PROCESS_LIVE(`win32:${ticks}`) : PROCESS_UNKNOWN;
+  }
+  if (result?.status === 3 && stdout === WINDOWS_DEAD_SENTINEL) return PROCESS_DEAD;
+  return PROCESS_UNKNOWN;
+}
+
+function processIdentityProbe(pid, options = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return PROCESS_UNKNOWN;
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 5_000;
+  if (process.platform === "linux") {
+    let stat;
+    try { stat = (options.readFileSync ?? readFileSync)(`/proc/${pid}/stat`, "utf8"); }
+    catch (error) { return error?.code === "ENOENT" ? PROCESS_DEAD : PROCESS_UNKNOWN; }
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return PROCESS_UNKNOWN;
+    const fields = stat.slice(close + 2).split(" ");
+    const startTicks = fields[19];
+    let bootId;
+    try { bootId = (options.readFileSync ?? readFileSync)("/proc/sys/kernel/random/boot_id", "utf8").trim(); }
+    catch { return PROCESS_UNKNOWN; }
+    if (!/^\d+$/.test(startTicks) || !/^[a-f0-9-]{16,}$/i.test(bootId)) return PROCESS_UNKNOWN;
+    return PROCESS_LIVE(`linux:${bootId}:${startTicks}`);
+  }
+  if (process.platform === "win32") return windowsProcessIdentityProbe(pid, { ...options, timeoutMs });
+
+  const nativeAbsence = positiveNativeProcessAbsence(pid, options.kill);
+  if (nativeAbsence === true) return PROCESS_DEAD;
+  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  try {
+    const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs,
+    }).trim().replace(/\s+/g, " ");
+    if (!started) return PROCESS_UNKNOWN;
+    const boot = execFileSync("sysctl", ["-n", "kern.boottime"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs,
+    }).trim().replace(/\s+/g, " ");
+    return boot ? PROCESS_LIVE(`${process.platform}:${boot}:${started}`) : PROCESS_UNKNOWN;
+  } catch {
+    return PROCESS_UNKNOWN;
+  }
+}
+
+export function processIdentityProbeForInternalTest(pid, options = {}) { return processIdentityProbe(pid, options); }
+
 let cachedCurrentProcessIdentity = null;
-function defaultProcessIdentityProbe(pid) {
-  if (pid !== process.pid) return processIdentityProbe(pid);
-  cachedCurrentProcessIdentity ??= processIdentityProbe(pid);
-  return cachedCurrentProcessIdentity;
+const deadlineVerifiedLockOwners = new WeakMap();
+function defaultProcessIdentityProbe(pid, options = {}) {
+  if (pid !== process.pid) return processIdentityProbe(pid, options);
+  if (cachedCurrentProcessIdentity?.status === "LIVE") return cachedCurrentProcessIdentity;
+  const observed = processIdentityProbe(pid, options);
+  if (observed.status === "LIVE") cachedCurrentProcessIdentity = observed;
+  return observed;
+}
+
+function deadlineRemaining(deadline) {
+  if (deadline === null || deadline === undefined) return null;
+  invariant(deadline && Number.isFinite(deadline.expiresAt), "PLAN_COORDINATION_DEADLINE_INVALID");
+  const remaining = deadline.expiresAt - performance.now();
+  if (remaining <= 0) throw new GuardianError("PLAN_COORDINATION_DEADLINE_EXCEEDED", "Plan coordination deadline expired before canonical authority acquisition");
+  return remaining;
 }
 
 function exactObjectKeys(value, keys) {
@@ -310,30 +377,54 @@ export class PlanRevisionWriter {
     return Object.freeze(metadata);
   }
 
-  #ownerState(metadata) {
-    const observed = this.#processIdentityProbe(metadata.pid);
+  #ownerState(metadata, deadline = null) {
+    const remaining = deadlineRemaining(deadline);
+    const deadlineOwnerKey = `${metadata.ownership_nonce}\0${metadata.pid}\0${metadata.process_identity}`;
+    const verifiedOwners = deadline && process.platform === "win32"
+      ? (deadlineVerifiedLockOwners.get(deadline) ?? new Set())
+      : null;
+    if (verifiedOwners && !deadlineVerifiedLockOwners.has(deadline)) deadlineVerifiedLockOwners.set(deadline, verifiedOwners);
+    if (verifiedOwners?.has(deadlineOwnerKey)) {
+      // This is not a liveness cache: native PID existence is re-observed on
+      // every retry. The prior exact match only means an existing PID cannot
+      // authorize cleanup without another start-identity proof.
+      if (positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
+      throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains held by an invocation-locally verified owner instance");
+    }
+    if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS) {
+      // A native ESRCH is still a positive, non-spawning absence proof. If the
+      // PID exists (including possible reuse), there is not enough time left to
+      // establish its exact start identity safely, so coordination times out.
+      if (process.platform === "win32" && positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
+      throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains coordinated because the exact owner cannot be re-probed inside the remaining deadline budget");
+    }
+    const observed = this.#processIdentityProbe(metadata.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
     invariant(observed && ["LIVE", "DEAD", "UNKNOWN"].includes(observed.status), "PLAN_PROCESS_IDENTITY_UNAVAILABLE");
-    if (observed.status === "LIVE" && observed.identity === metadata.process_identity) return "LIVE";
+    if (observed.status === "LIVE" && observed.identity === metadata.process_identity) {
+      verifiedOwners?.add(deadlineOwnerKey);
+      return "LIVE";
+    }
     if (observed.status === "DEAD" || (observed.status === "LIVE" && observed.identity !== metadata.process_identity)) return "DEAD";
     return "UNKNOWN";
   }
 
-  #assertDeadLock(record, path) {
+  #assertDeadLock(record, path, deadline = null) {
     const metadata = this.#parseLock(record, path);
-    const state = this.#ownerState(metadata);
+    const state = this.#ownerState(metadata, deadline);
     if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
     if (state !== "DEAD") throw this.#lockError("PLAN_LOCK_OWNER_UNVERIFIED", "Plan lock owner identity cannot be proven live or dead; explicit human reconciliation is required");
     return metadata;
   }
 
-  #completeStaleRecovery(expected = null) {
+  #completeStaleRecovery(expected = null, deadline = null) {
+    deadlineRemaining(deadline);
     let marker;
     try { marker = this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
     catch (error) {
       if (error?.code === "ENOENT") return false;
       throw error;
     }
-    this.#assertDeadLock(marker, this.lockRecoveryPath);
+    this.#assertDeadLock(marker, this.lockRecoveryPath, deadline);
     if (expected) invariant(sameFilesystemIdentity(marker.identity, expected.identity) && marker.bytes.equals(expected.bytes),
       "PLAN_LOCK_RECOVERY_RACED", "The stale-lock recovery marker no longer identifies the observed dead lock");
 
@@ -360,23 +451,25 @@ export class PlanRevisionWriter {
     return true;
   }
 
-  #recoverExistingLock() {
-    if (this.#pathExists(this.lockRecoveryPath)) return this.#completeStaleRecovery();
+  #recoverExistingLock(deadline = null) {
+    deadlineRemaining(deadline);
+    if (this.#pathExists(this.lockRecoveryPath)) return this.#completeStaleRecovery(null, deadline);
     let observed;
     try { observed = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_INVALID" }); }
     catch (error) { if (error?.code === "ENOENT") return true; throw error; }
-    this.#assertDeadLock(observed, this.lockPath);
+    this.#assertDeadLock(observed, this.lockPath, deadline);
     try { this.#io.linkSync(this.lockPath, this.lockRecoveryPath); }
     catch (error) {
-      if (error?.code === "EEXIST") return this.#completeStaleRecovery();
+      if (error?.code === "EEXIST") return this.#completeStaleRecovery(null, deadline);
       if (error?.code === "ENOENT") return true;
       throw error;
     }
     syncDirectory(this.#io, dirname(this.lockPath));
-    return this.#completeStaleRecovery(observed);
+    return this.#completeStaleRecovery(observed, deadline);
   }
 
-  #publishLock(bytes) {
+  #publishLock(bytes, deadline = null) {
+    deadlineRemaining(deadline);
     const temp = temporaryPath(this.lockPath, "owner");
     let fd;
     let ownsTemp = false;
@@ -389,6 +482,7 @@ export class PlanRevisionWriter {
       fd = undefined;
       this.#testHooks?.afterLockMetadataWrite?.(Object.freeze({ temp, lockPath: this.lockPath }));
       if (this.#pathExists(this.lockRecoveryPath)) throw Object.assign(new Error("stale recovery in progress"), { code: "EEXIST" });
+      deadlineRemaining(deadline);
       this.#io.linkSync(temp, this.lockPath);
       this.#io.unlinkSync(temp);
       ownsTemp = false;
@@ -408,9 +502,16 @@ export class PlanRevisionWriter {
     }
   }
 
-  #acquireLock() {
+  #acquireLock(deadline = null) {
+    deadlineRemaining(deadline);
     this.#ensureRealDirectory(this.guardianRoot);
-    const own = this.#processIdentityProbe(process.pid);
+    const remaining = deadlineRemaining(deadline);
+    const ownIdentityAlreadyCached = this.#processIdentityProbe === defaultProcessIdentityProbe
+      && cachedCurrentProcessIdentity?.status === "LIVE";
+    if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS && !ownIdentityAlreadyCached) {
+      throw new GuardianError("PLAN_COORDINATION_DEADLINE_EXCEEDED", "Insufficient remaining coordination budget for a bounded current-process identity probe");
+    }
+    const own = this.#processIdentityProbe(process.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
     invariant(own?.status === "LIVE" && typeof own.identity === "string", "PLAN_PROCESS_IDENTITY_UNAVAILABLE", "Cannot establish the current process start identity for plan locking");
     const bytes = Buffer.from(`${JSON.stringify({
       schema: LOCK_SCHEMA,
@@ -422,10 +523,11 @@ export class PlanRevisionWriter {
       guardian_root: this.guardianRoot,
     })}\n`, "utf8");
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      try { return this.#publishLock(bytes); }
+      deadlineRemaining(deadline);
+      try { return this.#publishLock(bytes, deadline); }
       catch (error) {
         if (error?.code !== "EEXIST") throw error;
-        if (!this.#recoverExistingLock()) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
+        if (!this.#recoverExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
       }
     }
     throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination after stale-lock recovery");
@@ -646,15 +748,18 @@ export class PlanRevisionWriter {
     return reference;
   }
 
-  coordinate({ requireSingleBlock = false, validate, use }) {
+  coordinate({ requireSingleBlock = false, validate, use, deadline = null }) {
     invariant(typeof validate === "function", "PLAN_VALIDATOR_REQUIRED", "Plan coordination requires the canonical semantic validator");
     invariant(typeof use === "function", "PLAN_COORDINATION_CALLBACK_REQUIRED");
+    deadlineRemaining(deadline);
     this.readCurrent({ requireSingleBlock, validate });
-    const lock = this.#acquireLock();
+    deadlineRemaining(deadline);
+    const lock = this.#acquireLock(deadline);
     let operationError;
     try {
       const current = this.readCurrent({ requireSingleBlock, validate });
       this.#attestLock(lock);
+      deadlineRemaining(deadline);
       const result = use(current);
       invariant(!result || typeof result.then !== "function", "PLAN_COORDINATION_ASYNC_FORBIDDEN", "Plan coordination callback must remain synchronous and bounded");
       this.#attestLock(lock);

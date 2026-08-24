@@ -52,7 +52,7 @@ test("R1-M-08 real npm tarball has one bundled lexical authority boundary under 
       "saveHandoffForInternalTest", "bindRunnerSessionForInternalTest", "supersedeRunnerSessionBindingForInternalTest",
       "beginDispatchForInternalTest", "finishDispatchForInternalTest", "claimTrustedHumanTakeoverCurrentPlan",
       "claimTrustedHandoffLatch", "reserveTrustedHandoffPlan", "prepareTrustedContinuityRecovery", "authorizeTrustedResume",
-      "taskOperationDisposition", "canonicalPlanSemantics", "planSemanticDigest",
+      "taskOperationDisposition", "canonicalPlanSemantics", "planSemanticDigest", "runnerForInternalTest", "processIdentityProbeForInternalTest",
     ];
     for (const name of forbidden) assert.equal(Object.hasOwn(root, name), false, name);
 
@@ -93,13 +93,119 @@ test("R1-M-08 real npm tarball has one bundled lexical authority boundary under 
       if (!value || (typeof value !== "object" && typeof value !== "function") || visited.has(value)) continue;
       visited.add(value);
       for (const key of Reflect.ownKeys(value)) {
-        const child = value[key];
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        const child = descriptor?.value;
         assert.equal(child?.constructor?.name === "DatabaseSync", false, "raw DatabaseSync is not reachable");
         if (child && (typeof child === "object" || typeof child === "function")) queue.push(child);
       }
     }
-    assert.equal(visited.has(ledger), true);
+    assert.equal(visited.has(ledger), false, "constructor-supplied internals are not public object-graph properties");
     assert.equal(readFileSync(${JSON.stringify(planPath)}).equals(before), true);
+
+    // R1-M-10: construct a real Runner from this installed tarball. Its public
+    // graph may expose detached reads, but no operation/journal/lifecycle writer.
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { DatabaseSync } = await import("node:sqlite");
+    const realRoot = mkdtempSync(join(tmpdir(), "aiopago-packed-authority-"));
+    const realPlan = join(realRoot, "TASK_PLAN.md");
+    const realTask = ${JSON.stringify(blockedTask())};
+    realTask.status = "IN_PROGRESS";
+    realTask.current_item = "ITEM-1";
+    realTask.next_item = null;
+    realTask.next_step = "continue";
+    realTask.task_items[0].status = "IN_PROGRESS";
+    delete realTask.owner_gate;
+    realTask.model_policy = "offline-fake/offline-fake";
+    realTask.reasoning_policy = "off";
+    writeFileSync(realPlan, "# packed real Runner\\n\\n\`\`\`json task-ledger\\n" + JSON.stringify(realTask, null, 2) + "\\n\`\`\`\\n");
+    execFileSync("git", ["init"], { cwd: realRoot });
+    execFileSync("git", ["config", "user.email", "packed@example.invalid"], { cwd: realRoot });
+    execFileSync("git", ["config", "user.name", "Packed Security"], { cwd: realRoot });
+    execFileSync("git", ["add", "."], { cwd: realRoot });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: realRoot });
+    const pi = await root.loadPi({ root: ${JSON.stringify(join(process.cwd(), "node_modules", "@earendil-works", "pi-coding-agent"))} });
+    const credentials = new pi.ai.InMemoryCredentialStore();
+    const modelRuntime = await pi.coding.ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+    const model = { id: "offline-fake", name: "Offline", api: "openai-completions", provider: "offline-fake", baseUrl: "offline://local", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 };
+    modelRuntime.registerProvider(model.provider, { baseUrl: model.baseUrl, apiKey: "x", api: model.api, models: [model], streamSimple() { throw new Error("provider must not run"); } });
+    await modelRuntime.setRuntimeApiKey(model.provider, "x");
+    const settingsManager = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const realRunner = await root.GuardianRunner.create({
+      cwd: realRoot, pi, modelRuntime, model, modelPolicy: "offline-fake/offline-fake", reasoningPolicy: "off",
+      settingsManager, sessionDir: mkdtempSync(join(tmpdir(), "aiopago-packed-authority-sessions-")), noTools: "all",
+    });
+    const operationBefore = realRunner.storage.operationsForTask(realTask.task_id);
+    assert.equal(Object.isFrozen(realRunner.storage), true);
+    for (const name of [
+      "appendEvent", "admitOperation", "finishOperation", "transaction", "bindCalibrationRuntimeIdentity", "indexArtifact",
+      "upsertMetricSession", "appendMetricSample", "appendHandoffMetricEvent", "appendMetricDiagnostic", "claimLatch",
+      "ensureLatch", "reserveHandoff", "saveHandoff", "transition", "authorizeAndAdmit", "beginDispatch", "finishDispatch",
+    ]) assert.equal(typeof realRunner.storage[name], "undefined", "public storage facade must omit " + name);
+    for (const name of ["toolTracker", "safePoint", "gate", "metrics", "artifacts", "pi", "modelRuntime", "settingsManager", "recoverySourceSession"]) {
+      assert.equal(realRunner[name], undefined, "Runner must hide " + name);
+    }
+    for (const attack of [
+      () => realRunner.storage.appendEvent("FORGED_REVIEW_EVENT", { attacker: true }),
+      () => realRunner.storage.admitOperation({ operationId: "OP-FORGED", taskId: realTask.task_id, generation: 0, profile: "LOCAL_ATOMIC_MUTATION" }),
+      () => realRunner.storage.finishOperation("OP-FORGED", "KNOWN_SUCCESS", "file:attacker-chosen"),
+      () => realRunner.storage.transaction(() => {}),
+      () => realRunner.storage.bindCalibrationRuntimeIdentity({ run_id: "attacker" }),
+      () => realRunner.storage.indexArtifact({ kind: "checkpoint", id: "CP-FORGED", path: "attacker", digest: "attacker", contentDigest: "attacker" }),
+      () => realRunner.toolTracker.finish("OP-FORGED", false),
+      () => realRunner.toolTracker.unknown("OP-FORGED"),
+    ]) assert.throws(attack, TypeError);
+    assert.equal(typeof realRunner.handoffService.observeGit, "function");
+    assert.deepEqual(Object.keys(realRunner.handoffService), ["observeGit"]);
+
+    const graphVisited = new Set();
+    const graphQueue = [realRunner, realRunner.storage, realRunner.runtime, realRunner.handoffService, realRunner.contextAdvisor, realRunner.ledger];
+    const dangerousNames = new Set([
+      "appendEvent", "admitOperation", "finishOperation", "finish", "unknown", "transaction", "bindCalibrationRuntimeIdentity",
+      "indexArtifact", "upsertMetricSession", "appendMetricSample", "appendHandoffMetricEvent", "appendMetricDiagnostic",
+      "claimLatch", "engageLatch", "reserveHandoff", "saveHandoff", "transition", "authorizeAndAdmit", "beginDispatch", "finishDispatch",
+    ]);
+    const reachableDangerous = [];
+    while (graphQueue.length && graphVisited.size < 500) {
+      const value = graphQueue.shift();
+      if (!value || (typeof value !== "object" && typeof value !== "function") || graphVisited.has(value)) continue;
+      graphVisited.add(value);
+      for (const key of Reflect.ownKeys(value)) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (dangerousNames.has(String(key)) && typeof descriptor?.value === "function") reachableDangerous.push(String(key));
+        const child = descriptor?.value;
+        assert.notEqual(child?.constructor?.name, "DatabaseSync");
+        if (child && (typeof child === "object" || typeof child === "function")) graphQueue.push(child);
+      }
+      let prototype = Object.getPrototypeOf(value);
+      for (let depth = 0; prototype && depth < 3; depth += 1, prototype = Object.getPrototypeOf(prototype)) {
+        for (const key of Reflect.ownKeys(prototype)) {
+          const descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+          if (dangerousNames.has(String(key)) && typeof descriptor?.value === "function") reachableDangerous.push(String(key));
+        }
+      }
+    }
+    assert.deepEqual([...new Set(reachableDangerous)], [], "no safety-bearing mutator is reachable through the real Runner graph");
+
+    for (const [name, args] of [
+      ["handoffDirect", []], ["recoverHandoffDirect", ["HO-FORGED"]], ["takeoverFromCommand", [{ ui: { notify() {} } }]],
+      ["resumeFromCommand", [{ ui: { confirm: async () => true, notify() {} } }, "HO-FORGED"]],
+      ["handoffFromCommand", [{}, "manual"]], ["recoverHandoffFromCommand", [{}, "HO-FORGED"]],
+      ["noteSessionStart", [{}]], ["noteSessionShutdown", [{}]], ["permitReplacement", []], ["consumeReplacementPermit", []],
+    ]) {
+      let refused = false;
+      try { await realRunner[name](...args); }
+      catch (error) { refused = error?.code === "RUNNER_TRUSTED_PATH_REQUIRED"; }
+      assert.equal(refused, true, name + " must fail closed outside the lexical Pi capability");
+    }
+    assert.deepEqual(realRunner.storage.operationsForTask(realTask.task_id), operationBefore);
+    const storagePath = realRunner.storage.path;
+    await realRunner.dispose();
+    const db = new DatabaseSync(storagePath, { readOnly: true });
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM operations WHERE operation_id='OP-FORGED'").get().count, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM journal WHERE event_type='FORGED_REVIEW_EVENT'").get().count, 0);
+    db.close();
   `;
   writeFileSync(join(consumer, "attack.mjs"), script);
   execFileSync(process.execPath, ["attack.mjs"], { cwd: consumer, stdio: "pipe" });
