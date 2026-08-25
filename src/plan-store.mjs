@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { getSystemErrorName, TextDecoder } from "node:util";
+import { TextDecoder } from "node:util";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
@@ -175,53 +175,24 @@ const PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
 const PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
 const WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
 const WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
-// Node's synchronous child termination after a Windows timeout can itself take
-// a short scheduling interval. Near a takeover deadline, do not start a new OS
-// subprocess that cannot be safely reaped inside the remaining wall-clock
-// budget. The deadline itself remains start + timeoutMs.
-const MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3_000;
-
-// process.kill is a writable ambient wrapper. In particular, a package
-// consumer can replace it before or after importing Aiopago and forge ESRCH.
-// Node's own process.kill implementation delegates to this native binding;
-// capture the genuine binding once and fail closed if startup code replaced it.
-const intrinsicFunctionToString = Function.prototype.toString;
-const processKillDescriptor = Object.getOwnPropertyDescriptor(process, "_kill");
-const nativeProcessKill = processKillDescriptor
-  && typeof processKillDescriptor.value === "function"
-  && intrinsicFunctionToString.call(processKillDescriptor.value).includes("[native code]")
-  ? processKillDescriptor.value.bind(process)
-  : null;
-
-function positiveNativeProcessAbsence(pid, kill = undefined) {
-  if (kill !== undefined) {
-    try { kill(pid, 0); return false; }
-    catch (error) {
-      if (error?.code === "ESRCH") return true;
-      return null;
-    }
-  }
-  if (!nativeProcessKill) return null;
-  let errno;
-  try { errno = nativeProcessKill(pid, 0); }
-  catch { return null; }
-  if (errno === 0) return false;
-  try { return getSystemErrorName(errno) === "ESRCH" ? true : null; }
-  catch { return null; }
+// Process probes are diagnostics only. They never authorize removal of an
+// existing plan lock or recovery marker. Same-process JavaScript can replace
+// every primitive used here, so availability may fail closed but lock safety
+// must not depend on authenticating these observations.
+function processAbsenceDiagnostic(pid, kill = process.kill.bind(process)) {
+  try { kill(pid, 0); return false; }
+  catch (error) { return error?.code === "ESRCH" ? true : null; }
 }
 
 function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync, kill } = {}) {
-  const nativeAbsence = positiveNativeProcessAbsence(pid, kill);
-  if (nativeAbsence === true) return PROCESS_DEAD;
-  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  const absence = processAbsenceDiagnostic(pid, kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
   const command = [
     "$ErrorActionPreference='Stop'",
     "$probeErrors=@()",
     `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
     "if ($null -eq $p) {",
-    // PowerShell is user-space identity diagnostics only. Even its exact
-    // not-found classification cannot authorize stale-lock deletion; a later
-    // native process.kill(pid, 0) ESRCH observation supplies that authority.
     `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
     "}",
     "try {",
@@ -264,9 +235,9 @@ function processIdentityProbe(pid, options = {}) {
   }
   if (process.platform === "win32") return windowsProcessIdentityProbe(pid, { ...options, timeoutMs });
 
-  const nativeAbsence = positiveNativeProcessAbsence(pid, options.kill);
-  if (nativeAbsence === true) return PROCESS_DEAD;
-  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  const absence = processAbsenceDiagnostic(pid, options.kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
   try {
     const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs,
@@ -384,7 +355,7 @@ export class PlanRevisionWriter {
   #parseLock(record, path = this.lockPath) {
     let metadata;
     try { metadata = JSON.parse(record.bytes.toString("utf8")); }
-    catch { throw this.#lockError("PLAN_LOCK_INVALID", "Plan lock metadata is malformed and requires explicit human reconciliation"); }
+    catch { throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "Plan lock metadata is malformed; verify that no Aiopago owner is operating, then explicitly reconcile stale state"); }
     invariant(exactObjectKeys(metadata, LOCK_METADATA_KEYS)
       && metadata.schema === LOCK_SCHEMA
       && /^[a-f0-9]{64}$/.test(metadata.ownership_nonce ?? "")
@@ -393,7 +364,7 @@ export class PlanRevisionWriter {
       && canonicalIsoTimestamp(metadata.created_at)
       && typeof metadata.plan_path === "string" && samePath(metadata.plan_path, this.path)
       && typeof metadata.guardian_root === "string" && samePath(metadata.guardian_root, this.guardianRoot),
-    "PLAN_LOCK_INVALID", `Plan lock metadata at ${path} is unknown, incomplete, or belongs to another plan; explicit human reconciliation is required`);
+    "PLAN_LOCK_RECONCILIATION_REQUIRED", `Plan lock metadata at ${path} is unknown, incomplete, or belongs to another plan; verify that no Aiopago owner is operating, then explicitly reconcile stale state`);
     return Object.freeze(metadata);
   }
 
@@ -404,96 +375,35 @@ export class PlanRevisionWriter {
       ? (deadlineVerifiedLockOwners.get(deadline) ?? new Set())
       : null;
     if (verifiedOwners && !deadlineVerifiedLockOwners.has(deadline)) deadlineVerifiedLockOwners.set(deadline, verifiedOwners);
-    if (verifiedOwners?.has(deadlineOwnerKey)) {
-      // This is not a liveness cache: native PID existence is re-observed on
-      // every retry. The prior exact match only means an existing PID cannot
-      // authorize cleanup without another start-identity proof.
-      if (positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
-      throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains held by an invocation-locally verified owner instance");
-    }
-    if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS) {
-      // A native ESRCH is still a positive, non-spawning absence proof. If the
-      // PID exists (including possible reuse), there is not enough time left to
-      // establish its exact start identity safely, so coordination times out.
-      if (process.platform === "win32" && positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
-      throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains coordinated because the exact owner cannot be re-probed inside the remaining deadline budget");
-    }
+    if (verifiedOwners?.has(deadlineOwnerKey)) return "LIVE";
     const observed = this.#processIdentityProbe(metadata.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
     invariant(observed && ["LIVE", "DEAD", "UNKNOWN"].includes(observed.status), "PLAN_PROCESS_IDENTITY_UNAVAILABLE");
     if (observed.status === "LIVE" && observed.identity === metadata.process_identity) {
       verifiedOwners?.add(deadlineOwnerKey);
       return "LIVE";
     }
-    if (process.platform === "win32") {
-      // The only Windows cleanup authority is a fresh positive native absence
-      // observation. PowerShell DEAD output, process-start mismatch, PATH/PATHEXT
-      // or cwd shadowing, and every other user-space ambiguity preserve the lock.
-      return positiveNativeProcessAbsence(metadata.pid) === true ? "DEAD" : "UNKNOWN";
-    }
-    if (observed.status === "DEAD") return "DEAD";
-    // A different start identity while the PID exists is conservative PID-reuse
-    // ambiguity, not proof that the recorded owner is absent.
-    return "UNKNOWN";
+    return observed.status === "DEAD" ? "DEAD" : "UNKNOWN";
   }
 
-  #assertDeadLock(record, path, deadline = null) {
-    const metadata = this.#parseLock(record, path);
-    const state = this.#ownerState(metadata, deadline);
-    if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
-    if (state !== "DEAD") throw this.#lockError("PLAN_LOCK_OWNER_UNVERIFIED", "Plan lock owner identity cannot be proven live or dead; explicit human reconciliation is required");
-    return metadata;
-  }
-
-  #completeStaleRecovery(expected = null, deadline = null) {
+  #rejectExistingLock(deadline = null) {
     deadlineRemaining(deadline);
-    let marker;
-    try { marker = this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
-    catch (error) {
-      if (error?.code === "ENOENT") return false;
-      throw error;
+    if (this.#pathExists(this.lockRecoveryPath)) {
+      // Historical recovery markers are evidence for a human, not deferred
+      // cleanup authority. Preserve both paths byte-for-byte.
+      try { this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
+      catch (error) {
+        if (error?.code === "ENOENT") return true;
+        throw error;
+      }
+      throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "A plan-lock recovery marker exists; verify that no Aiopago owner is operating, then explicitly reconcile the lock and marker");
     }
-    this.#assertDeadLock(marker, this.lockRecoveryPath, deadline);
-    if (expected) invariant(sameFilesystemIdentity(marker.identity, expected.identity) && marker.bytes.equals(expected.bytes),
-      "PLAN_LOCK_RECOVERY_RACED", "The stale-lock recovery marker no longer identifies the observed dead lock");
-
-    let current = null;
-    try { current = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
-    catch (error) { if (error?.code !== "ENOENT") throw error; }
-    if (current) {
-      invariant(sameFilesystemIdentity(current.identity, marker.identity) && current.bytes.equals(marker.bytes),
-        "PLAN_LOCK_RECOVERY_RACED", "A replacement plan lock appeared during stale cleanup and was not removed");
-      this.#io.unlinkSync(this.lockPath);
-      syncDirectory(this.#io, dirname(this.lockPath));
-    }
-    let markerAgain;
-    try { markerAgain = this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
-    catch (error) {
-      if (error?.code === "ENOENT") return true;
-      throw error;
-    }
-    invariant(sameFilesystemIdentity(markerAgain.identity, marker.identity) && markerAgain.bytes.equals(marker.bytes),
-      "PLAN_LOCK_RECOVERY_RACED", "The stale-lock recovery marker changed before cleanup");
-    try { this.#io.unlinkSync(this.lockRecoveryPath); }
-    catch (error) { if (error?.code !== "ENOENT") throw error; }
-    syncDirectory(this.#io, dirname(this.lockRecoveryPath));
-    return true;
-  }
-
-  #recoverExistingLock(deadline = null) {
-    deadlineRemaining(deadline);
-    if (this.#pathExists(this.lockRecoveryPath)) return this.#completeStaleRecovery(null, deadline);
     let observed;
     try { observed = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_INVALID" }); }
     catch (error) { if (error?.code === "ENOENT") return true; throw error; }
-    this.#assertDeadLock(observed, this.lockPath, deadline);
-    try { this.#io.linkSync(this.lockPath, this.lockRecoveryPath); }
-    catch (error) {
-      if (error?.code === "EEXIST") return this.#completeStaleRecovery(null, deadline);
-      if (error?.code === "ENOENT") return true;
-      throw error;
-    }
-    syncDirectory(this.#io, dirname(this.lockPath));
-    return this.#completeStaleRecovery(observed, deadline);
+    const metadata = this.#parseLock(observed, this.lockPath);
+    const state = this.#ownerState(metadata, deadline);
+    if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
+    throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", `Plan lock owner is ${state.toLowerCase()}; verify that no Aiopago owner is operating, then explicitly reconcile stale state`);
   }
 
   #publishLock(bytes, deadline = null) {
@@ -533,12 +443,8 @@ export class PlanRevisionWriter {
   #acquireLock(deadline = null) {
     deadlineRemaining(deadline);
     this.#ensureRealDirectory(this.guardianRoot);
+    if (this.#pathExists(this.lockRecoveryPath) || this.#pathExists(this.lockPath)) this.#rejectExistingLock(deadline);
     const remaining = deadlineRemaining(deadline);
-    const ownIdentityAlreadyCached = this.#processIdentityProbe === defaultProcessIdentityProbe
-      && cachedCurrentProcessIdentity?.status === "LIVE";
-    if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS && !ownIdentityAlreadyCached) {
-      throw new GuardianError("PLAN_COORDINATION_DEADLINE_EXCEEDED", "Insufficient remaining coordination budget for a bounded current-process identity probe");
-    }
     const own = this.#processIdentityProbe(process.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
     invariant(own?.status === "LIVE" && typeof own.identity === "string", "PLAN_PROCESS_IDENTITY_UNAVAILABLE", "Cannot establish the current process start identity for plan locking");
     const bytes = Buffer.from(`${JSON.stringify({
@@ -555,10 +461,10 @@ export class PlanRevisionWriter {
       try { return this.#publishLock(bytes, deadline); }
       catch (error) {
         if (error?.code !== "EEXIST") throw error;
-        if (!this.#recoverExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
+        if (!this.#rejectExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
       }
     }
-    throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination after stale-lock recovery");
+    throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination");
   }
 
   #attestLock(lock) {

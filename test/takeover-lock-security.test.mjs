@@ -237,13 +237,20 @@ test("R1-M-06 repeated bounded P2 churn and one takeover command converge withou
   let output = ""; child.stdout.on("data", (chunk) => { output += chunk; });
   try {
     await waitFor(ready);
-    const takeover = x.runner.takeoverFromCommand(x.ctx);
+    const takeover = x.runner.takeoverFromCommand(x.ctx).then((result) => ({ result }), (error) => ({ error }));
     await new Promise((resolveExit, reject) => { child.once("error", reject); child.once("exit", (code) => code === 0 ? resolveExit() : reject(new Error(`churn child exit ${code}`))); });
     assert.deepEqual(JSON.parse(output), { ok: true });
-    assert.equal((await takeover).state, "HUMAN_TAKEOVER");
-    assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+    const outcome = await takeover;
+    if (outcome.result) {
+      assert.equal(outcome.result.state, "HUMAN_TAKEOVER");
+      assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
+      assert.equal(x.notifications.length, 1);
+    } else {
+      assert.equal(outcome.error?.code, "PLAN_LOCK_RECONCILIATION_REQUIRED", "probe ambiguity intentionally narrows availability without stealing a writer");
+      assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+      assert.equal(x.notifications.length, 0);
+    }
     assert.equal(x.ledger.read().plan_revision_id, "PLAN-CHURN-3");
-    assert.equal(x.notifications.length, 1);
   } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
 });
 
@@ -292,12 +299,12 @@ test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot s
       const ownerMetadata = JSON.parse(before.bytes.toString("utf8"));
       const exactTicks = ownerMetadata.process_identity.slice("win32:".length);
       const cases = [
-        ["fake DEAD", "AIOPAGO_PROCESS_DEAD_V1", "3", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
-        ["fake LIVE wrong ticks", "AIOPAGO_PROCESS_LIVE_V1:1", "0", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["fake DEAD", "AIOPAGO_PROCESS_DEAD_V1", "3", false, false, "PLAN_LOCK_RECONCILIATION_REQUIRED"],
+        ["fake LIVE wrong ticks", "AIOPAGO_PROCESS_LIVE_V1:1", "0", false, false, "PLAN_LOCK_RECONCILIATION_REQUIRED"],
         ["fake LIVE exact ticks", `AIOPAGO_PROCESS_LIVE_V1:${exactTicks}`, "0", false, false, "PLAN_WRITE_LOCKED"],
-        ["malformed fake sentinel", "AIOPAGO_PROCESS_LIVE_V1:not-ticks", "0", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
-        ["PATHEXT manipulation", "AIOPAGO_PROCESS_DEAD_V1", "3", true, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
-        ["working-directory shadow", "AIOPAGO_PROCESS_DEAD_V1", "3", false, true, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["malformed fake sentinel", "AIOPAGO_PROCESS_LIVE_V1:not-ticks", "0", false, false, "PLAN_LOCK_RECONCILIATION_REQUIRED"],
+        ["PATHEXT manipulation", "AIOPAGO_PROCESS_DEAD_V1", "3", true, false, "PLAN_LOCK_RECONCILIATION_REQUIRED"],
+        ["working-directory shadow", "AIOPAGO_PROCESS_DEAD_V1", "3", false, true, "PLAN_LOCK_RECONCILIATION_REQUIRED"],
       ];
       for (const [name, output, exit, pathext, cwdShadow, expectedCode] of cases) {
         const marker = join(x.root, `fake-${name.replaceAll(/[^A-Za-z]/g, "-")}`);
@@ -346,7 +353,7 @@ test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot s
       await waitFor(owner.ready);
       const before = lockSnapshot(lockPath);
       process.env.PATH = x.root;
-      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
       assert.equal(owner.child.exitCode, null, "the exact owner remains live");
       assert.equal(sameLockSnapshot(lockPath, before), true, "lock bytes and filesystem identity remain exact");
       assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
@@ -360,8 +367,8 @@ test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot s
   });
 });
 
-test("R1-H-12 process.kill forgery before or after import cannot steal a real live Windows lock", async (t) => {
-  if (process.platform !== "win32") return t.skip("Windows native liveness regression");
+test("R1-H-13 forged same-process liveness intrinsics cannot authorize removal of a real live Windows lock", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows real-owner liveness regression");
   for (const patchTiming of ["before-import", "after-import"]) await t.test(patchTiming, async () => {
     const x = fixture();
     const owner = lockOwnerChild(x, 30_000);
@@ -371,21 +378,55 @@ test("R1-H-12 process.kill forgery before or after import cannot steal a real li
       await waitFor(owner.ready);
       const before = lockSnapshot(lockPath);
       writeFileSync(competitorScript, `
+        import fs from "node:fs";
+        import childProcess from "node:child_process";
+        import util from "node:util";
+        import { syncBuiltinESMExports } from "node:module";
         const originalKill = process.kill;
-        const patch = () => { process.kill = function forgedSelectiveEsrch(pid, signal) {
-          if (pid === ${owner.child.pid} && signal === 0) throw Object.assign(new Error("forged ESRCH"), { code: "ESRCH" });
-          return Reflect.apply(originalKill, process, [pid, signal]);
-        }; };
+        const originalRead = fs.readFileSync;
+        const originalDescriptor = Object.getOwnPropertyDescriptor;
+        const forgedNative = new Proxy(process._kill.bind(process), { apply() { return -3; } });
+        const patch = () => {
+          process.kill = function forgedSelectiveEsrch(pid, signal) {
+            if (pid === ${owner.child.pid} && signal === 0) throw Object.assign(new Error("forged ESRCH"), { code: "ESRCH" });
+            return Reflect.apply(originalKill, process, [pid, signal]);
+          };
+          process._kill = new Proxy(forgedNative, { apply() { return -3; } });
+          Function.prototype.toString = new Proxy(Function.prototype.toString, { apply() { return "function forged() { [native code] }"; } });
+          Object.getOwnPropertyDescriptor = new Proxy(originalDescriptor, { apply(target, thisArg, args) { return Reflect.apply(target, thisArg, args); } });
+          util.getSystemErrorName = () => "ESRCH";
+          fs.readFileSync = (path, ...args) => { if (String(path).includes("/proc/${owner.child.pid}/")) throw Object.assign(new Error("forged missing proc"), { code: "ENOENT" }); return Reflect.apply(originalRead, fs, [path, ...args]); };
+          childProcess.spawnSync = () => ({ status: 4, stdout: "AIOPAGO_PROCESS_UNKNOWN_V1", stderr: "" });
+          childProcess.execFileSync = () => "";
+          Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+          syncBuiltinESMExports();
+        };
         if (${JSON.stringify(patchTiming)} === "before-import") patch();
         const { PlanRevisionWriter } = await import(${JSON.stringify(new URL("../src/plan-store.mjs", import.meta.url).href)});
+        const { createPlanAdapter } = await import(${JSON.stringify(new URL("../src/intent-adapter.mjs", import.meta.url).href)});
         if (${JSON.stringify(patchTiming)} === "after-import") patch();
         let callbacks = 0; let code = null;
         try { new PlanRevisionWriter(${JSON.stringify(x.planPath)}).coordinate({ validate() {}, use() { callbacks += 1; } }); }
         catch (error) { code = error.code ?? null; }
-        process.stdout.write(JSON.stringify({ code, callbacks }));
+        const adapter = createPlanAdapter(${JSON.stringify(x.planPath)});
+        const observed = adapter.observe();
+        const candidate = structuredClone(observed.plan);
+        candidate.plan_revision_id = "PLAN-H13-FORGED";
+        candidate.updated_at = "2026-08-24T00:09:00.000Z";
+        candidate.objective = "forged competing plan";
+        const proposal = adapter.propose({
+          schema: "aiopago.plan-intent/0.1.0", proposal_id: "PPR-H13-FORGED", producer: "attack/h13",
+          change_reason: "attempt lock theft", base: { task_id: observed.task_id, plan_revision_id: observed.plan_revision_id, content_digest: observed.content_digest }, candidate_plan: candidate,
+        });
+        let publicCode = null;
+        try { adapter.apply(proposal); }
+        catch (error) { publicCode = error.code ?? null; }
+        process.stdout.write(JSON.stringify({ code, publicCode, callbacks }));
       `);
       const result = JSON.parse(execFileSync(process.execPath, [competitorScript], { encoding: "utf8" }));
-      assert.deepEqual(result, { code: "PLAN_WRITE_LOCKED", callbacks: 0 });
+      assert.equal(["PLAN_WRITE_LOCKED", "PLAN_LOCK_RECONCILIATION_REQUIRED"].includes(result.code), true, JSON.stringify(result));
+      assert.equal(["PLAN_WRITE_LOCKED", "PLAN_LOCK_RECONCILIATION_REQUIRED"].includes(result.publicCode), true, JSON.stringify(result));
+      assert.equal(result.callbacks, 0);
       assert.equal(owner.child.exitCode, null, "the original lock owner remains alive");
       assert.equal(sameLockSnapshot(lockPath, before), true, "the exact live lock remains byte- and identity-stable");
       assert.equal(existsSync(`${lockPath}.recovery`), false);
@@ -436,7 +477,7 @@ test("R1-L-09 takeover coordination authority obeys one 10-second monotonic dead
   }
 });
 
-test("R1-M-07 SIGKILL leaves a complete dead-owner lock that fresh takeover safely recovers", async () => {
+test("R1-M-07 dead-owner lock requires explicit reconciliation and is never automatically removed", async () => {
   const x = fixture();
   const script = join(x.root, "dead-lock-child.mjs");
   const ready = join(x.root, "dead-lock-ready");
@@ -457,16 +498,16 @@ test("R1-M-07 SIGKILL leaves a complete dead-owner lock that fresh takeover safe
     await new Promise((resolveExit) => child.once("exit", resolveExit));
     const lockPath = join(x.root, ".guardian", "plan-write.lock");
     assert.equal(existsSync(lockPath), true);
-    const result = await x.runner.takeoverFromCommand(x.ctx);
-    assert.equal(result.state, "HUMAN_TAKEOVER");
-    assert.equal(existsSync(lockPath), false);
+    const before = lockSnapshot(lockPath);
+    await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
+    assert.equal(sameLockSnapshot(lockPath, before), true, "dead-owner evidence never grants unlink authority");
     assert.equal(existsSync(`${lockPath}.recovery`), false);
-    applyP2(x.planPath, "AFTER-DEAD-LOCK");
-    assert.equal(x.ledger.read().plan_revision_id, "PLAN-AFTER-DEAD-LOCK", "normal plan writers also proceed after dead-lock recovery");
+    assert.equal(x.ledger.read().plan_revision_id, "PLAN-P1");
+    assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
   } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
 });
 
-test("R1-M-07 real child crash seams never permanently deny fresh takeover", async (t) => {
+test("R1-M-07 crash seams preserve any published stale lock for explicit reconciliation", async (t) => {
   for (const seam of ["after-metadata", "after-create", "after-attestation", "during-critical", "before-release"]) {
     await t.test(seam, async () => {
       const x = fixture();
@@ -489,9 +530,16 @@ test("R1-M-07 real child crash seams never permanently deny fresh takeover", asy
         await waitFor(ready);
         child.kill("SIGKILL");
         await new Promise((resolveExit) => child.once("exit", resolveExit));
-        assert.equal((await x.runner.takeoverFromCommand(x.ctx)).state, "HUMAN_TAKEOVER");
-        assert.equal(x.storage.getLatch("TASK-TAKEOVER").reason, "HUMAN_TAKEOVER");
-        assert.equal(existsSync(join(x.root, ".guardian", "plan-write.lock")), false);
+        const lockPath = join(x.root, ".guardian", "plan-write.lock");
+        if (seam === "after-metadata") {
+          assert.equal((await x.runner.takeoverFromCommand(x.ctx)).state, "HUMAN_TAKEOVER", "an unpublished temp is not an existing coordination lock");
+          assert.equal(existsSync(lockPath), false);
+        } else {
+          const before = lockSnapshot(lockPath);
+          await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
+          assert.equal(sameLockSnapshot(lockPath, before), true);
+          assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+        }
         assert.equal(existsSync(join(x.root, ".guardian", "plan-write.lock.recovery")), false);
       } finally { if (child.exitCode === null) child.kill("SIGKILL"); x.close(); }
     });
@@ -519,7 +567,7 @@ test("R1-M-07 malformed and unknown lock metadata fails closed without latch mut
     const bytes = attack(x);
     try {
       writeFileSync(lockPath, bytes);
-      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_INVALID");
+      await assert.rejects(() => x.runner.takeoverFromCommand(x.ctx), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
       assert.equal(readFileSync(lockPath, "utf8"), bytes);
       assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
     } finally { x.close(); }
@@ -534,19 +582,19 @@ test("R1-M-07 process-start identity handles PID reuse and unknown proof without
     const unknown = new PlanRevisionWriter(x.planPath, { processIdentityProbe: (pid) => pid === process.pid
       ? ({ status: "LIVE", identity: "current-process-start" })
       : ({ status: "UNKNOWN", identity: null }) });
-    assert.throws(() => unknown.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+    assert.throws(() => unknown.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
     assert.equal(existsSync(lockPath), true, "PID existence alone cannot authorize cleanup");
 
     writeFileSync(lockPath, lockMetadata(x.planPath, { pid: process.ppid, identity: "old-process-start" }));
     const reused = new PlanRevisionWriter(x.planPath, { processIdentityProbe(pid) {
       return pid === process.ppid ? { status: "LIVE", identity: "new-unrelated-process-start" } : { status: "LIVE", identity: "current-process-start" };
     } });
-    assert.throws(() => reused.coordinate({ validate: validateTaskLedger, use: () => "forbidden" }), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+    assert.throws(() => reused.coordinate({ validate: validateTaskLedger, use: () => "forbidden" }), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
     assert.equal(existsSync(lockPath), true, "a live reused PID with different start identity remains conservative UNKNOWN");
   } finally { x.close(); }
 });
 
-test("R1-M-07 stale cleanup never removes a replacement lock in the recovery ABA race", () => {
+test("R1-M-07 historical recovery marker and replacement lock both require manual reconciliation", () => {
   const x = fixture();
   const lockPath = join(x.root, ".guardian", "plan-write.lock");
   const recoveryPath = `${lockPath}.recovery`;
@@ -562,7 +610,10 @@ test("R1-M-07 stale cleanup never removes a replacement lock in the recovery ABA
       if (pid === 1000) return { status: "LIVE", identity: "live-start" };
       return { status: "LIVE", identity: "current-start" };
     } });
-    assert.throws(() => writer.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_RECOVERY_RACED");
-    assert.equal(readFileSync(lockPath, "utf8"), replacement, "the new live lock remains byte-exact");
+    const markerBefore = lockSnapshot(recoveryPath);
+    const lockBefore = lockSnapshot(lockPath);
+    assert.throws(() => writer.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_RECONCILIATION_REQUIRED");
+    assert.equal(sameLockSnapshot(lockPath, lockBefore), true, "the replacement lock remains byte-exact");
+    assert.equal(sameLockSnapshot(recoveryPath, markerBefore), true, "the historical recovery marker remains byte-exact");
   } finally { x.close(); }
 });

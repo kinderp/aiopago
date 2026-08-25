@@ -40,9 +40,6 @@
   "engines": {
     "node": ">=22.19.0"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.84.0"
-  },
   "devDependencies": {
     "esbuild": "0.25.9"
   },
@@ -57,5 +54,8 @@
     "calibration": "node scripts/calibration-run.mjs",
     "calibration:quality": "node scripts/calibration-quality-record.mjs",
     "calibration:finalize": "node scripts/calibration-finalize.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0"
   }
 }

@@ -6,10 +6,10 @@ Aiopago è installato separatamente dal repository su cui lavora. Nel target non
 
 - Node.js **22.19.0 o successivo**;
 - Git su `PATH` e un normale Git worktree, inclusi linked worktree;
-- `@earendil-works/pi-coding-agent` **0.83.x** accanto all'installazione Aiopago;
+- la dipendenza di produzione Aiopago-owned `@earendil-works/pi-coding-agent` **esattamente 0.83.0**;
 - un provider Pi configurato e utilizzabile.
 
-Aiopago verifica i prerequisiti prima di init e launch. Non installa e non aggiorna automaticamente Node, Git o Pi. Se Pi è installato in una posizione non risolvibile, impostare `PI_CODING_AGENT_ROOT` alla directory del package Pi. Un override errato fallisce senza fallback al `node_modules` del target.
+Aiopago verifica i prerequisiti prima di init e launch. Pi viene installato da npm come dipendenza esatta di Aiopago, non soddisfatto dal consumer come peer. Il runtime privilegiato non usa `PI_CODING_AGENT_ROOT`, `NODE_PATH`, il `node_modules` del target/cwd o un resolver package generico. Se la dipendenza esatta manca, ha versione errata o il layout fisico è rediretto, reinstallare Aiopago; non creare fallback ambienti.
 
 ## Installazione locale alpha
 
@@ -124,7 +124,7 @@ Oppure:
 aio --target F:/dev/un-altro-progetto
 ```
 
-Il comando risolve e valida il target, crea il Runner con quel repository esplicito, carica soltanto l'estensione Aiopago prevista e apre il normale TUI Pi. Il Runner possiede sessione e trasporto Pi; non esiste fallback implicito al cwd del source Aiopago. Il Runner portable normale espone `read`, `edit`, `write`, `grep`, `find`, `ls` e il built-in Pi `bash`; ogni invocation shell è tracciata come operazione atomica non read-only e deve raggiungere un outcome terminale noto prima del safe point.
+Il bootstrap `aio` avvia un nuovo processo Node operativo, rimuovendo dall'ambiente child `NODE_OPTIONS`, `NODE_PATH` e `PI_CODING_AGENT_ROOT`. Quel processo risolve e valida il target, crea internamente il Runner con quel repository esplicito, carica soltanto l'estensione Aiopago prevista e apre il normale TUI Pi. Il Runner possiede sessione e trasporto Pi; non esiste fallback implicito al cwd del source Aiopago. Il Runner portable normale espone `read`, `edit`, `write`, `grep`, `find`, `ls` e il built-in Pi `bash`; ogni invocation shell è tracciata come operazione atomica non read-only e deve raggiungere un outcome terminale noto prima del safe point.
 
 Se il target non è inizializzato, l'avvio termina con `REPOSITORY_NOT_INITIALIZED` e indica di eseguire `aio init`.
 
@@ -242,6 +242,9 @@ Eseguire il comando mostrato soltanto se si riconosce e si considera trusted que
 ## Failure recovery
 
 I controlli safety-critical falliscono chiuso.
+
+- `PLAN_WRITE_LOCKED`: un owner esatto è noto live; non rimuovere il lock.
+- `PLAN_LOCK_RECONCILIATION_REQUIRED`: owner dead/unknown/PID-reused/crash-stale, metadata non riconciliabile o marker storico `.guardian/plan-write.lock.recovery`. Aiopago preserva lock e marker e non esegue cleanup automatico su Windows, Linux o altri host. Ispezionare byte, path, PID/identità e marker; assicurarsi umanamente che nessun processo Aiopago stia operando; solo allora riconciliare/rimuovere esplicitamente lo stato stale. Non esiste force flag, retry distruttivo o cleanup differito.
 
 - `GIT_STATE_MISMATCH`, `PLAN_REVISION_MISMATCH`, `CHECKPOINT_MISMATCH`, `MANIFEST_MISMATCH`: non confermare e non ritentare alla cieca. Ripristinare o riconciliare esplicitamente Git/Ledger/artifact, quindi avviare un nuovo percorso solo quando lo stato è noto.
 - `MODEL_POLICY_MISMATCH` o `REASONING_POLICY_MISMATCH`: selezionare la policy dichiarata nel Ledger/manifest; Aiopago non cambia modello automaticamente.

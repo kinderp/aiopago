@@ -7,13 +7,13 @@ function isSupportedNode() {
     || current.every((value, index) => value === MINIMUM_NODE_VERSION[index]);
 }
 
-export async function runCliEntrypoint({ commandName = "aio", deprecated = false } = {}) {
-  if (deprecated) console.error("eio is deprecated; use aio instead.");
-  if (!isSupportedNode()) {
-    console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
-    process.exitCode = 1;
-    return;
-  }
+const deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
+const commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
+if (deprecated) console.error("eio is deprecated; use aio instead.");
+if (!isSupportedNode()) {
+  console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
+  process.exitCode = 1;
+} else {
   const { formatCliError, runCli } = await import("./cli.mjs");
   try { await runCli(); }
   catch (error) {

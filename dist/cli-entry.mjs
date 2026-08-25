@@ -361,7 +361,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { getSystemErrorName, TextDecoder } from "node:util";
+import { TextDecoder } from "node:util";
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -471,42 +471,23 @@ function sameFilesystemIdentity(left, right) {
 function randomToken() {
   return randomBytes(32).toString("hex");
 }
-function positiveNativeProcessAbsence(pid, kill = void 0) {
-  if (kill !== void 0) {
-    try {
-      kill(pid, 0);
-      return false;
-    } catch (error) {
-      if (error?.code === "ESRCH") return true;
-      return null;
-    }
-  }
-  if (!nativeProcessKill) return null;
-  let errno;
+function processAbsenceDiagnostic(pid, kill = process.kill.bind(process)) {
   try {
-    errno = nativeProcessKill(pid, 0);
-  } catch {
-    return null;
-  }
-  if (errno === 0) return false;
-  try {
-    return getSystemErrorName(errno) === "ESRCH" ? true : null;
-  } catch {
-    return null;
+    kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error?.code === "ESRCH" ? true : null;
   }
 }
 function windowsProcessIdentityProbe(pid, { timeoutMs = 5e3, spawn = spawnSync, kill } = {}) {
-  const nativeAbsence = positiveNativeProcessAbsence(pid, kill);
-  if (nativeAbsence === true) return PROCESS_DEAD;
-  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  const absence = processAbsenceDiagnostic(pid, kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
   const command = [
     "$ErrorActionPreference='Stop'",
     "$probeErrors=@()",
     `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
     "if ($null -eq $p) {",
-    // PowerShell is user-space identity diagnostics only. Even its exact
-    // not-found classification cannot authorize stale-lock deletion; a later
-    // native process.kill(pid, 0) ESRCH observation supplies that authority.
     `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
     "}",
     "try {",
@@ -553,9 +534,9 @@ function processIdentityProbe(pid, options = {}) {
     return PROCESS_LIVE(`linux:${bootId}:${startTicks}`);
   }
   if (process.platform === "win32") return windowsProcessIdentityProbe(pid, { ...options, timeoutMs });
-  const nativeAbsence = positiveNativeProcessAbsence(pid, options.kill);
-  if (nativeAbsence === true) return PROCESS_DEAD;
-  if (nativeAbsence === null) return PROCESS_UNKNOWN;
+  const absence = processAbsenceDiagnostic(pid, options.kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
   try {
     const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf8",
@@ -598,7 +579,7 @@ function canonicalIsoTimestamp(value) {
 function temporaryPath(path, label) {
   return `${path}.${process.pid}.${randomBytes(16).toString("hex")}.${label}.tmp`;
 }
-var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS, intrinsicFunctionToString, processKillDescriptor, nativeProcessKill, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
+var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
 var init_plan_store = __esm({
   "src/plan-store.mjs"() {
     init_canonical();
@@ -641,10 +622,6 @@ var init_plan_store = __esm({
     PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
     WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
     WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
-    MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3e3;
-    intrinsicFunctionToString = Function.prototype.toString;
-    processKillDescriptor = Object.getOwnPropertyDescriptor(process, "_kill");
-    nativeProcessKill = processKillDescriptor && typeof processKillDescriptor.value === "function" && intrinsicFunctionToString.call(processKillDescriptor.value).includes("[native code]") ? processKillDescriptor.value.bind(process) : null;
     cachedCurrentProcessIdentity = null;
     deadlineVerifiedLockOwners = /* @__PURE__ */ new WeakMap();
     PlanRevisionWriter = class {
@@ -714,12 +691,12 @@ var init_plan_store = __esm({
         try {
           metadata = JSON.parse(record.bytes.toString("utf8"));
         } catch {
-          throw this.#lockError("PLAN_LOCK_INVALID", "Plan lock metadata is malformed and requires explicit human reconciliation");
+          throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "Plan lock metadata is malformed; verify that no Aiopago owner is operating, then explicitly reconcile stale state");
         }
         invariant(
           exactObjectKeys(metadata, LOCK_METADATA_KEYS) && metadata.schema === LOCK_SCHEMA && /^[a-f0-9]{64}$/.test(metadata.ownership_nonce ?? "") && Number.isSafeInteger(metadata.pid) && metadata.pid > 0 && typeof metadata.process_identity === "string" && metadata.process_identity.length > 0 && metadata.process_identity.length <= 2048 && canonicalIsoTimestamp(metadata.created_at) && typeof metadata.plan_path === "string" && samePath(metadata.plan_path, this.path) && typeof metadata.guardian_root === "string" && samePath(metadata.guardian_root, this.guardianRoot),
-          "PLAN_LOCK_INVALID",
-          `Plan lock metadata at ${path} is unknown, incomplete, or belongs to another plan; explicit human reconciliation is required`
+          "PLAN_LOCK_RECONCILIATION_REQUIRED",
+          `Plan lock metadata at ${path} is unknown, incomplete, or belongs to another plan; verify that no Aiopago owner is operating, then explicitly reconcile stale state`
         );
         return Object.freeze(metadata);
       }
@@ -728,86 +705,26 @@ var init_plan_store = __esm({
         const deadlineOwnerKey = `${metadata.ownership_nonce}\0${metadata.pid}\0${metadata.process_identity}`;
         const verifiedOwners = deadline && process.platform === "win32" ? deadlineVerifiedLockOwners.get(deadline) ?? /* @__PURE__ */ new Set() : null;
         if (verifiedOwners && !deadlineVerifiedLockOwners.has(deadline)) deadlineVerifiedLockOwners.set(deadline, verifiedOwners);
-        if (verifiedOwners?.has(deadlineOwnerKey)) {
-          if (positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
-          throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains held by an invocation-locally verified owner instance");
-        }
-        if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS) {
-          if (process.platform === "win32" && positiveNativeProcessAbsence(metadata.pid) === true) return "DEAD";
-          throw this.#lockError("PLAN_WRITE_LOCKED", "Plan lock remains coordinated because the exact owner cannot be re-probed inside the remaining deadline budget");
-        }
+        if (verifiedOwners?.has(deadlineOwnerKey)) return "LIVE";
         const observed = this.#processIdentityProbe(metadata.pid, { timeoutMs: remaining === null ? 5e3 : Math.min(5e3, remaining) });
         invariant(observed && ["LIVE", "DEAD", "UNKNOWN"].includes(observed.status), "PLAN_PROCESS_IDENTITY_UNAVAILABLE");
         if (observed.status === "LIVE" && observed.identity === metadata.process_identity) {
           verifiedOwners?.add(deadlineOwnerKey);
           return "LIVE";
         }
-        if (process.platform === "win32") {
-          return positiveNativeProcessAbsence(metadata.pid) === true ? "DEAD" : "UNKNOWN";
-        }
-        if (observed.status === "DEAD") return "DEAD";
-        return "UNKNOWN";
+        return observed.status === "DEAD" ? "DEAD" : "UNKNOWN";
       }
-      #assertDeadLock(record, path, deadline = null) {
-        const metadata = this.#parseLock(record, path);
-        const state = this.#ownerState(metadata, deadline);
-        if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
-        if (state !== "DEAD") throw this.#lockError("PLAN_LOCK_OWNER_UNVERIFIED", "Plan lock owner identity cannot be proven live or dead; explicit human reconciliation is required");
-        return metadata;
-      }
-      #completeStaleRecovery(expected = null, deadline = null) {
+      #rejectExistingLock(deadline = null) {
         deadlineRemaining(deadline);
-        let marker;
-        try {
-          marker = this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true });
-        } catch (error) {
-          if (error?.code === "ENOENT") return false;
-          throw error;
+        if (this.#pathExists(this.lockRecoveryPath)) {
+          try {
+            this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true });
+          } catch (error) {
+            if (error?.code === "ENOENT") return true;
+            throw error;
+          }
+          throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "A plan-lock recovery marker exists; verify that no Aiopago owner is operating, then explicitly reconcile the lock and marker");
         }
-        this.#assertDeadLock(marker, this.lockRecoveryPath, deadline);
-        if (expected) invariant(
-          sameFilesystemIdentity(marker.identity, expected.identity) && marker.bytes.equals(expected.bytes),
-          "PLAN_LOCK_RECOVERY_RACED",
-          "The stale-lock recovery marker no longer identifies the observed dead lock"
-        );
-        let current = null;
-        try {
-          current = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true });
-        } catch (error) {
-          if (error?.code !== "ENOENT") throw error;
-        }
-        if (current) {
-          invariant(
-            sameFilesystemIdentity(current.identity, marker.identity) && current.bytes.equals(marker.bytes),
-            "PLAN_LOCK_RECOVERY_RACED",
-            "A replacement plan lock appeared during stale cleanup and was not removed"
-          );
-          this.#io.unlinkSync(this.lockPath);
-          syncDirectory(this.#io, dirname(this.lockPath));
-        }
-        let markerAgain;
-        try {
-          markerAgain = this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true });
-        } catch (error) {
-          if (error?.code === "ENOENT") return true;
-          throw error;
-        }
-        invariant(
-          sameFilesystemIdentity(markerAgain.identity, marker.identity) && markerAgain.bytes.equals(marker.bytes),
-          "PLAN_LOCK_RECOVERY_RACED",
-          "The stale-lock recovery marker changed before cleanup"
-        );
-        try {
-          this.#io.unlinkSync(this.lockRecoveryPath);
-        } catch (error) {
-          if (error?.code !== "ENOENT") throw error;
-        }
-        syncDirectory(this.#io, dirname(this.lockRecoveryPath));
-        return true;
-      }
-      #recoverExistingLock(deadline = null) {
-        deadlineRemaining(deadline);
-        if (this.#pathExists(this.lockRecoveryPath)) return this.#completeStaleRecovery(null, deadline);
         let observed;
         try {
           observed = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_INVALID" });
@@ -815,16 +732,10 @@ var init_plan_store = __esm({
           if (error?.code === "ENOENT") return true;
           throw error;
         }
-        this.#assertDeadLock(observed, this.lockPath, deadline);
-        try {
-          this.#io.linkSync(this.lockPath, this.lockRecoveryPath);
-        } catch (error) {
-          if (error?.code === "EEXIST") return this.#completeStaleRecovery(null, deadline);
-          if (error?.code === "ENOENT") return true;
-          throw error;
-        }
-        syncDirectory(this.#io, dirname(this.lockPath));
-        return this.#completeStaleRecovery(observed, deadline);
+        const metadata = this.#parseLock(observed, this.lockPath);
+        const state = this.#ownerState(metadata, deadline);
+        if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
+        throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", `Plan lock owner is ${state.toLowerCase()}; verify that no Aiopago owner is operating, then explicitly reconcile stale state`);
       }
       #publishLock(bytes, deadline = null) {
         deadlineRemaining(deadline);
@@ -867,11 +778,8 @@ var init_plan_store = __esm({
       #acquireLock(deadline = null) {
         deadlineRemaining(deadline);
         this.#ensureRealDirectory(this.guardianRoot);
+        if (this.#pathExists(this.lockRecoveryPath) || this.#pathExists(this.lockPath)) this.#rejectExistingLock(deadline);
         const remaining = deadlineRemaining(deadline);
-        const ownIdentityAlreadyCached = this.#processIdentityProbe === defaultProcessIdentityProbe && cachedCurrentProcessIdentity?.status === "LIVE";
-        if (remaining !== null && remaining < MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS && !ownIdentityAlreadyCached) {
-          throw new GuardianError("PLAN_COORDINATION_DEADLINE_EXCEEDED", "Insufficient remaining coordination budget for a bounded current-process identity probe");
-        }
         const own = this.#processIdentityProbe(process.pid, { timeoutMs: remaining === null ? 5e3 : Math.min(5e3, remaining) });
         invariant(own?.status === "LIVE" && typeof own.identity === "string", "PLAN_PROCESS_IDENTITY_UNAVAILABLE", "Cannot establish the current process start identity for plan locking");
         const bytes = Buffer.from(`${JSON.stringify({
@@ -890,10 +798,10 @@ var init_plan_store = __esm({
             return this.#publishLock(bytes, deadline);
           } catch (error) {
             if (error?.code !== "EEXIST") throw error;
-            if (!this.#recoverExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
+            if (!this.#rejectExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
           }
         }
-        throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination after stale-lock recovery");
+        throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination");
       }
       #attestLock(lock) {
         let current;
@@ -1695,7 +1603,7 @@ var init_ledger = __esm({
 });
 
 // src/pi-loader.mjs
-import { access, lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname as dirname2, join as join2, resolve as resolve3 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 function samePath2(left, right) {
@@ -1744,32 +1652,16 @@ async function trustedPiRoot() {
   }
   return null;
 }
-function versionParts(version) {
-  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
-  return match ? match.slice(1).map(Number) : null;
-}
 function isSupportedPiVersion(version) {
-  const parts = versionParts(version);
-  return Boolean(parts && parts[0] === 0 && parts[1] === 83);
+  return version === SUPPORTED_PI_VERSION;
 }
-async function resolvePiRoot(options = {}) {
-  const configuredRoot = options.trustedInstallationOnly === true ? null : options.root ?? process.env.PI_CODING_AGENT_ROOT;
-  if (configuredRoot) {
-    const root = resolve3(configuredRoot);
-    try {
-      await access(join2(root, "package.json"));
-      return root;
-    } catch {
-      invariant(false, "PI_UNAVAILABLE", `Configured Pi root is unavailable: ${root}`);
-    }
-  }
+async function resolvePiRoot() {
   const trusted = await trustedPiRoot();
   if (trusted) return trusted;
-  const guidance = options.trustedInstallationOnly === true ? "install Pi 0.83.x as Aiopago's physical npm dependency" : "install Pi 0.83.x beside Aiopago or set PI_CODING_AGENT_ROOT";
-  invariant(false, "PI_UNAVAILABLE", `Cannot locate @earendil-works/pi-coding-agent beside Aiopago; ${guidance}`);
+  invariant(false, "PI_UNAVAILABLE", `Aiopago's exact Pi ${SUPPORTED_PI_VERSION} dependency is missing; reinstall Aiopago`);
 }
-async function inspectPi(options = {}) {
-  const root = await resolvePiRoot(options);
+async function inspectPi() {
+  const root = await resolvePiRoot();
   let manifest;
   try {
     manifest = JSON.parse(await readFile(join2(root, "package.json"), "utf8"));
@@ -1777,42 +1669,36 @@ async function inspectPi(options = {}) {
     invariant(false, "PI_PACKAGE_INVALID", `${root}: ${error.message}`);
   }
   invariant(manifest.name === "@earendil-works/pi-coding-agent", "PI_PACKAGE_INVALID", `Unexpected package at ${root}`);
-  invariant(isSupportedPiVersion(manifest.version), "PI_VERSION_UNSUPPORTED", `Pi ${manifest.version} is unsupported; expected ${SUPPORTED_PI_RANGE}`);
+  invariant(isSupportedPiVersion(manifest.version), "PI_VERSION_UNSUPPORTED", `Pi ${manifest.version} is unsupported; expected exactly ${SUPPORTED_PI_VERSION}; reinstall Aiopago`);
   return Object.freeze({ root, version: manifest.version, name: manifest.name });
 }
-async function loadPi(options = {}) {
-  const info = await inspectPi(options);
-  const aiRoots = [
+async function loadPi() {
+  const info = await inspectPi();
+  const aiRoot = await trustedDirectory(
     join2(info.root, "node_modules", "@earendil-works", "pi-ai"),
-    join2(dirname2(info.root), "pi-ai")
-  ];
-  let aiRoot = null;
-  for (const candidate of aiRoots) {
-    if (options.trustedInstallationOnly === true) {
-      const trusted = await trustedDirectory(candidate, "Trusted pi-ai installation");
-      if (trusted) {
-        aiRoot = trusted;
-        break;
-      }
-    } else {
-      try {
-        await access(join2(candidate, "dist", "index.js"));
-        aiRoot = candidate;
-        break;
-      } catch {
-      }
-    }
+    "Trusted pi-ai installation"
+  );
+  invariant(aiRoot, "PI_PACKAGE_INVALID", `Aiopago's trusted Pi dependency is missing its pinned pi-ai runtime; reinstall Aiopago`);
+  let aiManifest;
+  try {
+    aiManifest = JSON.parse(await readFile(join2(aiRoot, "package.json"), "utf8"));
+  } catch (error) {
+    invariant(false, "PI_PACKAGE_INVALID", `${aiRoot}: ${error.message}`);
   }
-  invariant(aiRoot, "PI_PACKAGE_INVALID", `Cannot resolve @earendil-works/pi-ai from ${info.root}`);
+  invariant(
+    aiManifest.name === "@earendil-works/pi-ai" && aiManifest.version === SUPPORTED_PI_VERSION,
+    "PI_VERSION_UNSUPPORTED",
+    `pi-ai ${aiManifest.version ?? "unknown"} is unsupported; expected exactly ${SUPPORTED_PI_VERSION}; reinstall Aiopago`
+  );
   const ai = await import(pathToFileURL(join2(aiRoot, "dist", "index.js")));
   const coding = await import(pathToFileURL(join2(info.root, "dist", "index.js")));
   return { ...info, coding, ai };
 }
-var SUPPORTED_PI_RANGE, INSTALLATION_ROOT;
+var SUPPORTED_PI_VERSION, INSTALLATION_ROOT;
 var init_pi_loader = __esm({
   "src/pi-loader.mjs"() {
     init_errors();
-    SUPPORTED_PI_RANGE = ">=0.83.0 <0.84.0";
+    SUPPORTED_PI_VERSION = "0.83.0";
     INSTALLATION_ROOT = resolve3(dirname2(fileURLToPath(import.meta.url)), "..");
   }
 });
@@ -8887,9 +8773,9 @@ async function runCli(argv = process.argv.slice(2), options = {}) {
   }
   return { action: "launch", repository };
 }
-function formatCliError(error, commandName = "aio") {
+function formatCliError(error, commandName2 = "aio") {
   const code = error?.code ? `${error.code}: ` : "";
-  return `${commandName}: ${code}${error?.message ?? String(error)}`;
+  return `${commandName2}: ${code}${error?.message ?? String(error)}`;
 }
 var AIO_VERSION, HELP, COMMANDS, READ_ONLY_COMMANDS, PLAN_OPTIONS;
 var init_cli = __esm({
@@ -8933,13 +8819,13 @@ function isSupportedNode() {
   const current = process.versions.node.split(".").map(Number);
   return current.some((value, index) => value > MINIMUM_NODE_VERSION2[index] && current.slice(0, index).every((part, prior) => part === MINIMUM_NODE_VERSION2[prior])) || current.every((value, index) => value === MINIMUM_NODE_VERSION2[index]);
 }
-async function runCliEntrypoint({ commandName = "aio", deprecated = false } = {}) {
-  if (deprecated) console.error("eio is deprecated; use aio instead.");
-  if (!isSupportedNode()) {
-    console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
-    process.exitCode = 1;
-    return;
-  }
+var deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
+var commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
+if (deprecated) console.error("eio is deprecated; use aio instead.");
+if (!isSupportedNode()) {
+  console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
+  process.exitCode = 1;
+} else {
   const { formatCliError: formatCliError2, runCli: runCli2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
   try {
     await runCli2();
@@ -8948,6 +8834,3 @@ async function runCliEntrypoint({ commandName = "aio", deprecated = false } = {}
     process.exitCode = 1;
   }
 }
-export {
-  runCliEntrypoint
-};

@@ -954,71 +954,43 @@ test("runCli start deny, missing objective, whitespace, leading hyphen and help 
   assert.match(help[0], /never begins autonomous implementation/);
 });
 
-test("true aio CLI denies every piped or redirected production stdin input", () => {
-  const piRoot = fakePiRoot();
-  for (const input of ["yes\n", "y\r\n", "yes", "yes\nno\n", ""]) {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Deny non-interactive objective", input);
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Interactive confirmation required\./);
-    assert.match(result.stdout, /Plan not applied\./);
-    assert.deepEqual(readFileSync(x.path), x.bytes, JSON.stringify(input));
-    assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), false);
-  }
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Provider error", "yes\n", { FAKE_PI_ERROR: "1" });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /START_PLANNER_UNAVAILABLE/);
-    assert.deepEqual(readFileSync(x.path), x.bytes);
-  }
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = spawnAio("bin/aio.mjs", x, piRoot, "Stale objective", "yes\n", { FAKE_PI_STALE: "1" });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /PLAN_PROPOSAL_STALE/);
-    assert.doesNotMatch(result.stdout, /Apply this plan/);
-    assert.equal(createPlanAdapter(x.path).observe().plan.plan_revision_id, "PLAN-CLI-CONCURRENT-C");
-  }
-});
-
-test("real canonical PTY blocks the old multiline paste and supports post-prompt challenge confirmation", { skip: process.platform === "win32" ? "Unix PTY regression" : false }, (t) => {
-  if (spawnSync("python3", ["--version"]).status !== 0) return t.skip("python3 PTY harness unavailable");
-  const piRoot = fakePiRoot();
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = runAioInPty(x, piRoot, "PTY prebuffered paste", "paste");
-    assert.equal(result.status, 0, result.output);
-    assert.match(result.output, /Confirm [A-HJ-NP-Z2-9]{8,12}:/);
-    assert.match(result.output, /Plan not applied\./);
-    assert.deepEqual(readFileSync(x.path), x.bytes);
-    assert.equal(existsSync(join(x.root, ".guardian", "plan-proposals")), false);
-  }
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = runAioInPty(x, piRoot, "PTY happy objective", "happy");
-    assert.equal(result.status, 0, result.output);
-    assert.equal(result.sent_first, true);
-    assert.equal(result.sent_second, true);
-    assert.match(result.output, /Confirm [A-HJ-NP-Z2-9]{8,12}:/);
-    assert.match(result.output, /Plan applied:\s+PLAN-CLI-FAKE-2/);
-    assert.equal(createPlanAdapter(x.path).observe().plan.objective, "PTY happy objective");
-  }
-  {
-    const x = fixture(); initializeFixtureRepository(x);
-    const result = runAioInPty(x, piRoot, "PTY wrong challenge", "wrong");
-    assert.equal(result.status, 0, result.output);
-    assert.match(result.output, /Plan not applied\./);
-    assert.deepEqual(readFileSync(x.path), x.bytes);
-  }
-});
-
-test("deprecated eio executable delegates start to the same safe flow", () => {
-  const piRoot = fakePiRoot();
+test("source CLI dependency injection remains test-only while executable start validates before privileged loading", async () => {
   const x = fixture(); initializeFixtureRepository(x);
-  const result = spawnAio("bin/eio.mjs", x, piRoot, "Alias objective", "no\n");
+  const before = readFileSync(x.path);
+  const planner = fakePlanner(candidate(x.base));
+  const denied = await runCli(["start", "Non-interactive source test", "--target", x.root], {
+    planner,
+    authorize: () => false,
+    stdout: () => {},
+  });
+  assert.equal(denied.result.status, "CANCELLED");
+  assert.deepEqual(readFileSync(x.path), before);
+
+  const result = spawnSync(process.execPath, ["bin/aio.mjs", "start"], {
+    cwd: join(import.meta.dirname, ".."), encoding: "utf8",
+    env: { ...process.env, PI_CODING_AGENT_ROOT: fakePiRoot() },
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /START_OBJECTIVE_INVALID/);
+});
+
+test("production authorizer retains exact two-record TTY semantics independently of planner injection", async () => {
+  const challenge = "ABCD2345";
+  const input = Readable.from(["yes\n", `${challenge}\n`]);
+  Object.defineProperty(input, "isTTY", { value: true });
+  const authorizer = createStdinAuthorizer({
+    input,
+    output: new PassThrough(),
+    challengeFactory: () => challenge,
+  });
+  assert.equal(await authorizer({}), true);
+});
+
+test("deprecated eio executable delegates through the same fresh-child bootstrap", () => {
+  const result = spawnSync(process.execPath, ["bin/eio.mjs", "--version"], {
+    cwd: join(import.meta.dirname, ".."), encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_ROOT: fakePiRoot() },
+  });
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "0.1.0");
   assert.match(result.stderr, /eio is deprecated; use aio instead/);
-  assert.match(result.stdout, /Plan not applied\./);
-  assert.deepEqual(readFileSync(x.path), x.bytes);
 });
