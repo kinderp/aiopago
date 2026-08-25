@@ -489,8 +489,9 @@ function windowsProcessIdentityProbe(pid, { timeoutMs = 5e3, spawn = spawnSync, 
     "$probeErrors=@()",
     `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
     "if ($null -eq $p) {",
-    "  $notFound=@($probeErrors | Where-Object { $_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId,*' })",
-    `  if ($probeErrors.Count -gt 0 -and $notFound.Count -eq $probeErrors.Count) { [Console]::Out.Write('${WINDOWS_DEAD_SENTINEL}'); exit 3 }`,
+    // PowerShell is user-space identity diagnostics only. Even its exact
+    // not-found classification cannot authorize stale-lock deletion; a later
+    // native process.kill(pid, 0) ESRCH observation supplies that authority.
     `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
     "}",
     "try {",
@@ -511,7 +512,6 @@ function windowsProcessIdentityProbe(pid, { timeoutMs = 5e3, spawn = spawnSync, 
     const ticks = stdout.slice(WINDOWS_LIVE_SENTINEL.length);
     return /^\d+$/.test(ticks) ? PROCESS_LIVE(`win32:${ticks}`) : PROCESS_UNKNOWN;
   }
-  if (result?.status === 3 && stdout === WINDOWS_DEAD_SENTINEL) return PROCESS_DEAD;
   return PROCESS_UNKNOWN;
 }
 function processIdentityProbe(pid, options = {}) {
@@ -583,7 +583,7 @@ function canonicalIsoTimestamp(value) {
 function temporaryPath(path, label) {
   return `${path}.${process.pid}.${randomBytes(16).toString("hex")}.${label}.tmp`;
 }
-var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_DEAD_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
+var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
 var init_plan_store = __esm({
   "src/plan-store.mjs"() {
     init_canonical();
@@ -625,7 +625,6 @@ var init_plan_store = __esm({
     PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
     PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
     WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
-    WINDOWS_DEAD_SENTINEL = "AIOPAGO_PROCESS_DEAD_V1";
     WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
     MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3e3;
     cachedCurrentProcessIdentity = null;
@@ -725,7 +724,10 @@ var init_plan_store = __esm({
           verifiedOwners?.add(deadlineOwnerKey);
           return "LIVE";
         }
-        if (observed.status === "DEAD" || observed.status === "LIVE" && observed.identity !== metadata.process_identity) return "DEAD";
+        if (process.platform === "win32") {
+          return positiveNativeProcessAbsence(metadata.pid) === true ? "DEAD" : "UNKNOWN";
+        }
+        if (observed.status === "DEAD") return "DEAD";
         return "UNKNOWN";
       }
       #assertDeadLock(record, path, deadline = null) {
@@ -1712,7 +1714,7 @@ function isSupportedPiVersion(version) {
   return Boolean(parts && parts[0] === 0 && parts[1] === 83);
 }
 async function resolvePiRoot(options = {}) {
-  const configuredRoot = options.root ?? process.env.PI_CODING_AGENT_ROOT;
+  const configuredRoot = options.trustedInstallationOnly === true ? null : options.root ?? process.env.PI_CODING_AGENT_ROOT;
   if (configuredRoot) {
     const root = resolve3(configuredRoot);
     try {
@@ -8068,7 +8070,118 @@ function trustedRunnerFacade(runner) {
   trustedRunnerFacades.set(runner, facade);
   return facade;
 }
-var DEFAULT_PORTABLE_TOOLS, runnerInternals, trustedRunnerFacades, RUNNER_INTERNAL_AUTHORITY, TRUSTED_RUNNER_AUTHORITY_INDEX, ledgerReadFacades, storageReadFacades, GuardianRunner;
+function hasOption(options, name) {
+  return Reflect.has(options, name);
+}
+function injectedOption(options, name, authority, fallback) {
+  return authority === sourceTestCreateAuthority && hasOption(options, name) ? options[name] : fallback();
+}
+async function createGuardianRunner(options, authority = null) {
+  const repository = options.repository ?? null;
+  const requestedRoot = repository?.targetRoot ?? options.cwd;
+  invariant(requestedRoot, "REPOSITORY_CONTEXT_REQUIRED", "Pass a validated repository context (or an explicit cwd for internal runners)");
+  const cwd = resolve12(requestedRoot);
+  const pi = authority === sourceTestCreateAuthority && hasOption(options, "pi") ? options.pi : await loadPi({ trustedInstallationOnly: true });
+  const ledger = injectedOption(
+    options,
+    "ledger",
+    authority,
+    () => new TaskLedger(options.ledgerPath ?? repository?.taskLedgerPath ?? join9(cwd, "TASK_PLAN.md"))
+  );
+  const plan2 = ledger.read();
+  const storage = injectedOption(
+    options,
+    "storage",
+    authority,
+    () => new GuardianStorage(options.storagePath ?? join9(repository?.runtimeRoot ?? join9(cwd, ".guardian", "runtime"), "guardian.sqlite"))
+  );
+  if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
+  storage.ensureLatch(plan2.task_id);
+  const artifacts = injectedOption(
+    options,
+    "artifacts",
+    authority,
+    () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage)
+  );
+  const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
+  const gate = new AdmissionGate(storage, plan2.task_id);
+  gate.install(modelRuntime);
+  const modelPolicy = options.modelPolicy ?? plan2.model_policy ?? null;
+  const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
+  const model = injectedOption(
+    options,
+    "model",
+    authority,
+    () => policyProvider && policyModel ? modelRuntime.getModel(policyProvider, policyModel) : void 0
+  );
+  const reasoningPolicy = options.reasoningPolicy ?? plan2.reasoning_policy ?? "high";
+  if (!options.allowMissingModel && modelPolicy) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
+  const settingsManager = injectedOption(
+    options,
+    "settingsManager",
+    authority,
+    () => pi.coding.SettingsManager.create(cwd, options.agentDir)
+  );
+  settingsManager.applyOverrides({
+    compaction: { enabled: false },
+    retry: { enabled: false }
+  });
+  const environmentThreshold = contextHandoffThresholdEnvironment(options.processEnv ?? process.env, { warn: options.environmentWarning });
+  const contextAdvisor = injectedOption(options, "contextAdvisor", authority, () => new ContextHandoffAdvisor({
+    thresholdPercent: options.contextHandoffThresholdPercent ?? environmentThreshold
+  }));
+  const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
+  const roots = Object.freeze({
+    installationRoot: repository?.installationRoot ?? null,
+    targetRoot: cwd,
+    configRoot: repository?.configRoot ?? join9(cwd, ".guardian"),
+    runtimeRoot: repository?.runtimeRoot ?? join9(cwd, ".guardian", "runtime"),
+    artifactRoot: repository?.artifactRoot ?? join9(cwd, ".guardian")
+  });
+  const tools = injectedOption(options, "tools", authority, () => DEFAULT_PORTABLE_TOOLS);
+  const sessionManager = injectedOption(
+    options,
+    "sessionManager",
+    authority,
+    () => pi.coding.SessionManager.create(cwd, options.sessionDir)
+  );
+  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
+  const runner = trustedRunnerFacade(publicRunner);
+  runner.metrics = injectedOption(options, "metrics", authority, () => new MeasurementInstrumentation({
+    storage,
+    ledger,
+    runnerInstanceId,
+    thresholdPercent: contextAdvisor.thresholdPercent,
+    retention: options.metricsRetention
+  }));
+  runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id);
+  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate });
+  const callerObserveGit = options.observeGit;
+  const observeGit = typeof callerObserveGit === "function" ? () => Reflect.apply(callerObserveGit, void 0, []) : () => observeGitState(cwd);
+  runner.handoffService = new HandoffService({
+    storage,
+    artifacts,
+    ledger,
+    observeGit,
+    safePoint: runner.safePoint,
+    runnerInstanceId,
+    modelPolicy,
+    reasoningPolicy,
+    telemetry: runner.metrics
+  });
+  await runner.createRuntime(options, authority);
+  if (!modelPolicy) {
+    const selected = runner.runtime.session.model;
+    invariant(selected?.provider && selected?.id, "MODEL_POLICY_UNAVAILABLE", "Pi did not select a model");
+    runner.handoffService.modelPolicy = `${selected.provider}/${selected.id}`;
+  }
+  if (runner.calibration) {
+    runner.requireCalibrationRuntime();
+    gate.setPreflightVerifier((requestModel) => runner.requireCalibrationRuntime(requestModel));
+  }
+  return publicRunner;
+}
+var DEFAULT_PORTABLE_TOOLS, runnerInternals, trustedRunnerFacades, RUNNER_INTERNAL_AUTHORITY, TRUSTED_RUNNER_AUTHORITY_INDEX, ledgerReadFacades, storageReadFacades, TEST_RUNTIME_DEPENDENCY_KEYS, sourceTestCreateAuthority, GuardianRunner;
 var init_runner = __esm({
   "src/runner.mjs"() {
     init_artifact_store();
@@ -8114,77 +8227,30 @@ var init_runner = __esm({
     }));
     ledgerReadFacades = /* @__PURE__ */ new WeakMap();
     storageReadFacades = /* @__PURE__ */ new WeakMap();
-    GuardianRunner = class _GuardianRunner {
+    TEST_RUNTIME_DEPENDENCY_KEYS = Object.freeze([
+      "artifacts",
+      "contextAdvisor",
+      "ledger",
+      "metrics",
+      "model",
+      "modelRuntime",
+      "sessionManager",
+      "settingsManager",
+      "storage",
+      "tools"
+    ]);
+    sourceTestCreateAuthority = Object.freeze({});
+    GuardianRunner = class {
       static async create(options = {}) {
-        const repository = options.repository ?? null;
-        const requestedRoot = repository?.targetRoot ?? options.cwd;
-        invariant(requestedRoot, "REPOSITORY_CONTEXT_REQUIRED", "Pass a validated repository context (or an explicit cwd for internal runners)");
-        const cwd = resolve12(requestedRoot);
-        const pi = options.pi ?? await loadPi({ searchRoot: cwd });
-        const ledger = options.ledger ?? new TaskLedger(options.ledgerPath ?? repository?.taskLedgerPath ?? join9(cwd, "TASK_PLAN.md"));
-        const plan2 = ledger.read();
-        const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join9(repository?.runtimeRoot ?? join9(cwd, ".guardian", "runtime"), "guardian.sqlite"));
-        if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
-        storage.ensureLatch(plan2.task_id);
-        const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage);
-        const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
-        const gate = new AdmissionGate(storage, plan2.task_id);
-        gate.install(modelRuntime);
-        const modelPolicy = options.modelPolicy ?? plan2.model_policy ?? null;
-        const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
-        const model = options.model ?? (policyProvider && policyModel ? modelRuntime.getModel(policyProvider, policyModel) : void 0);
-        const reasoningPolicy = options.reasoningPolicy ?? plan2.reasoning_policy ?? "high";
-        if (!options.allowMissingModel && modelPolicy) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
-        const settingsManager = options.settingsManager ?? pi.coding.SettingsManager.create(cwd, options.agentDir);
-        settingsManager.applyOverrides({
-          compaction: { enabled: false },
-          retry: { enabled: false }
-        });
-        const environmentThreshold = contextHandoffThresholdEnvironment(options.processEnv ?? process.env, { warn: options.environmentWarning });
-        const contextAdvisor = options.contextAdvisor ?? new ContextHandoffAdvisor({
-          thresholdPercent: options.contextHandoffThresholdPercent ?? environmentThreshold
-        });
-        const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
-        const roots = Object.freeze({
-          installationRoot: repository?.installationRoot ?? null,
-          targetRoot: cwd,
-          configRoot: repository?.configRoot ?? join9(cwd, ".guardian"),
-          runtimeRoot: repository?.runtimeRoot ?? join9(cwd, ".guardian", "runtime"),
-          artifactRoot: repository?.artifactRoot ?? join9(cwd, ".guardian")
-        });
-        const publicRunner = new _GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
-        const runner = trustedRunnerFacade(publicRunner);
-        runner.metrics = options.metrics ?? new MeasurementInstrumentation({
-          storage,
-          ledger,
-          runnerInstanceId,
-          thresholdPercent: contextAdvisor.thresholdPercent,
-          retention: options.metricsRetention
-        });
-        runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id);
-        runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate });
-        runner.handoffService = new HandoffService({
-          storage,
-          artifacts,
-          ledger,
-          observeGit: options.observeGit ?? (() => observeGitState(cwd)),
-          safePoint: runner.safePoint,
-          runnerInstanceId,
-          modelPolicy,
-          reasoningPolicy,
-          telemetry: runner.metrics
-        });
-        await runner.createRuntime(options);
-        if (!modelPolicy) {
-          const selected = runner.runtime.session.model;
-          invariant(selected?.provider && selected?.id, "MODEL_POLICY_UNAVAILABLE", "Pi did not select a model");
-          runner.handoffService.modelPolicy = `${selected.provider}/${selected.id}`;
+        invariant(options !== null && typeof options === "object", "RUNNER_OPTIONS_INVALID");
+        if (hasOption(options, "pi")) {
+          throw new GuardianError("RUNNER_PI_INJECTION_FORBIDDEN", "GuardianRunner production owns the trusted Pi runtime that receives privileged extension factories");
         }
-        if (runner.calibration) {
-          runner.requireCalibrationRuntime();
-          gate.setPreflightVerifier((requestModel) => runner.requireCalibrationRuntime(requestModel));
+        const forbidden = TEST_RUNTIME_DEPENDENCY_KEYS.filter((name) => hasOption(options, name));
+        if (forbidden.length > 0) {
+          throw new GuardianError("RUNNER_RUNTIME_INJECTION_FORBIDDEN", `GuardianRunner production does not accept test/runtime dependency injection: ${forbidden.join(", ")}`, { options: forbidden });
         }
-        return publicRunner;
+        return createGuardianRunner(options);
       }
       constructor(fields = {}) {
         const internal = {
@@ -8231,7 +8297,7 @@ var init_runner = __esm({
         requireRunnerAuthority(authority);
         const { coding } = this.pi;
         const inline = { name: "aiopago", factory: createGuardianExtension(this) };
-        const createRuntime = async ({ cwd, sessionManager: sessionManager2, sessionStartEvent }) => {
+        const createRuntime = async ({ cwd, sessionManager, sessionStartEvent }) => {
           const services = await coding.createAgentSessionServices({
             cwd,
             agentDir: options.agentDir,
@@ -8247,7 +8313,7 @@ var init_runner = __esm({
           return {
             ...await coding.createAgentSessionFromServices({
               services,
-              sessionManager: sessionManager2,
+              sessionManager,
               sessionStartEvent,
               model: this.model,
               thinkingLevel: this.reasoningPolicy,
@@ -8258,11 +8324,10 @@ var init_runner = __esm({
             diagnostics: services.diagnostics
           };
         };
-        const sessionManager = options.sessionManager ?? coding.SessionManager.create(this.cwd, options.sessionDir);
         this.runtime = await coding.createAgentSessionRuntime(createRuntime, {
           cwd: this.cwd,
           agentDir: options.agentDir ?? coding.getAgentDir(),
-          sessionManager
+          sessionManager: this.sessionManager
         });
         this.ensureCurrentSessionLifecycle(this.runtime.session);
         this.recoverySourceSession = this.runtime.session;

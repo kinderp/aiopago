@@ -7,7 +7,6 @@ export * from "./calibration-finalizer.mjs";
 export * from "./calibration-quality.mjs";
 export * from "./context-advisor.mjs";
 export * from "./errors.mjs";
-export * from "./extension.mjs";
 export * from "./git-state.mjs";
 export * from "./handoff.mjs";
 export * from "./human-workflow.mjs";

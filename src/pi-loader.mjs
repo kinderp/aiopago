@@ -40,7 +40,9 @@ export function isSupportedPiVersion(version) {
 }
 
 export async function resolvePiRoot(options = {}) {
-  const configuredRoot = options.root ?? process.env.PI_CODING_AGENT_ROOT;
+  const configuredRoot = options.trustedInstallationOnly === true
+    ? null
+    : options.root ?? process.env.PI_CODING_AGENT_ROOT;
   if (configuredRoot) {
     const root = resolve(configuredRoot);
     try { await access(join(root, "package.json")); return root; }

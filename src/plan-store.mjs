@@ -174,7 +174,6 @@ const PROCESS_LIVE = (identity) => Object.freeze({ status: "LIVE", identity });
 const PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
 const PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
 const WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
-const WINDOWS_DEAD_SENTINEL = "AIOPAGO_PROCESS_DEAD_V1";
 const WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
 // Node's synchronous child termination after a Windows timeout can itself take
 // a short scheduling interval. Near a takeover deadline, do not start a new OS
@@ -199,8 +198,9 @@ function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync
     "$probeErrors=@()",
     `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
     "if ($null -eq $p) {",
-    "  $notFound=@($probeErrors | Where-Object { $_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId,*' })",
-    `  if ($probeErrors.Count -gt 0 -and $notFound.Count -eq $probeErrors.Count) { [Console]::Out.Write('${WINDOWS_DEAD_SENTINEL}'); exit 3 }`,
+    // PowerShell is user-space identity diagnostics only. Even its exact
+    // not-found classification cannot authorize stale-lock deletion; a later
+    // native process.kill(pid, 0) ESRCH observation supplies that authority.
     `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
     "}",
     "try {",
@@ -221,7 +221,6 @@ function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync
     const ticks = stdout.slice(WINDOWS_LIVE_SENTINEL.length);
     return /^\d+$/.test(ticks) ? PROCESS_LIVE(`win32:${ticks}`) : PROCESS_UNKNOWN;
   }
-  if (result?.status === 3 && stdout === WINDOWS_DEAD_SENTINEL) return PROCESS_DEAD;
   return PROCESS_UNKNOWN;
 }
 
@@ -404,7 +403,15 @@ export class PlanRevisionWriter {
       verifiedOwners?.add(deadlineOwnerKey);
       return "LIVE";
     }
-    if (observed.status === "DEAD" || (observed.status === "LIVE" && observed.identity !== metadata.process_identity)) return "DEAD";
+    if (process.platform === "win32") {
+      // The only Windows cleanup authority is a fresh positive native absence
+      // observation. PowerShell DEAD output, process-start mismatch, PATH/PATHEXT
+      // or cwd shadowing, and every other user-space ambiguity preserve the lock.
+      return positiveNativeProcessAbsence(metadata.pid) === true ? "DEAD" : "UNKNOWN";
+    }
+    if (observed.status === "DEAD") return "DEAD";
+    // A different start identity while the PID exists is conservative PID-reuse
+    // ambiguity, not proof that the recorded owner is absent.
     return "UNKNOWN";
   }
 

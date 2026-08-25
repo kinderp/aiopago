@@ -7,7 +7,7 @@ import test from "node:test";
 import { runCli } from "../src/cli.mjs";
 import { formatGuardianStatus } from "../src/extension.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
-import { GuardianRunner, runnerForInternalTest } from "../src/runner.mjs";
+import { createRunnerForInternalTest, runnerForInternalTest } from "../src/runner.mjs";
 import { RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
 
 function git(cwd, args) {
@@ -167,7 +167,7 @@ test("P0-B external repo: aio launch owns Pi and completes portable A-to-B hando
       createRunner: async ({ repository }) => {
         assert.notEqual(repository.installationRoot.toLowerCase(), repository.targetRoot.toLowerCase());
         assert.equal(normalized(repository.targetRoot), normalized(root));
-        const runner = runnerForInternalTest(await GuardianRunner.create({
+        const runner = runnerForInternalTest(await createRunnerForInternalTest({
           repository, pi, modelRuntime: offline.modelRuntime, model: offline.model,
           reasoningPolicy: "off", settingsManager: settings, sessionDir: sessions,
         }));

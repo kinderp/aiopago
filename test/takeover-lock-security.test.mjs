@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, linkSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -112,6 +112,15 @@ function lockOwnerChild(x, holdMs) {
     child.once("exit", (code, signal) => code === 0 || signal === "SIGKILL" ? resolveDone({ code, signal }) : reject(new Error(`lock owner exit ${code}`)));
   });
   return { child, ready, done };
+}
+
+function fakePowerShell(root) {
+  const directory = join(root, "fake-powershell");
+  mkdirSync(directory);
+  const source = join(directory, "FakePowerShell.cs");
+  writeFileSync(source, `using System; using System.IO; class FakePowerShell { static int Main() { var marker=Environment.GetEnvironmentVariable("AIOPAGO_FAKE_MARKER"); if (!String.IsNullOrEmpty(marker)) File.WriteAllText(marker, "invoked"); Console.Out.Write(Environment.GetEnvironmentVariable("AIOPAGO_FAKE_OUTPUT") ?? ""); return Int32.Parse(Environment.GetEnvironmentVariable("AIOPAGO_FAKE_EXIT") ?? "0"); } }`);
+  execFileSync("C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe", ["/nologo", `/out:${join(directory, "powershell.exe")}`, source]);
+  return directory;
 }
 
 function lockSnapshot(path) {
@@ -264,9 +273,66 @@ test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot s
       ["empty stdout", { status: 0, stdout: "", stderr: "" }],
       ["dead exit without sentinel", { status: 3, stdout: "", stderr: "" }],
     ]) assert.deepEqual(spawnCase(result), { status: "UNKNOWN", identity: null }, name);
-    assert.deepEqual(spawnCase({ status: 3, stdout: "AIOPAGO_PROCESS_DEAD_V1", stderr: "" }), { status: "DEAD", identity: null });
+    assert.deepEqual(spawnCase({ status: 3, stdout: "AIOPAGO_PROCESS_DEAD_V1", stderr: "" }), { status: "UNKNOWN", identity: null }, "a syntactically exact user-space DEAD sentinel has no cleanup authority");
     assert.equal(processIdentityProbeForInternalTest(process.pid).status, "LIVE");
     assert.deepEqual(processIdentityProbeForInternalTest(2_147_483_000), { status: "DEAD", identity: null }, "native ESRCH is positive absence evidence");
+  });
+
+  await t.test("PATH/PATHEXT/cwd-shadowed PowerShell cannot steal a real live owner lock", async () => {
+    const x = fixture();
+    const writer = new PlanRevisionWriter(x.planPath);
+    writer.coordinate({ validate: validateTaskLedger, use() {} });
+    const owner = lockOwnerChild(x, 30_000);
+    const lockPath = join(x.root, ".guardian", "plan-write.lock");
+    const fakeDirectory = fakePowerShell(x.root);
+    const original = { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT, cwd: process.cwd() };
+    try {
+      await waitFor(owner.ready);
+      const before = lockSnapshot(lockPath);
+      const ownerMetadata = JSON.parse(before.bytes.toString("utf8"));
+      const exactTicks = ownerMetadata.process_identity.slice("win32:".length);
+      const cases = [
+        ["fake DEAD", "AIOPAGO_PROCESS_DEAD_V1", "3", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["fake LIVE wrong ticks", "AIOPAGO_PROCESS_LIVE_V1:1", "0", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["fake LIVE exact ticks", `AIOPAGO_PROCESS_LIVE_V1:${exactTicks}`, "0", false, false, "PLAN_WRITE_LOCKED"],
+        ["malformed fake sentinel", "AIOPAGO_PROCESS_LIVE_V1:not-ticks", "0", false, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["PATHEXT manipulation", "AIOPAGO_PROCESS_DEAD_V1", "3", true, false, "PLAN_LOCK_OWNER_UNVERIFIED"],
+        ["working-directory shadow", "AIOPAGO_PROCESS_DEAD_V1", "3", false, true, "PLAN_LOCK_OWNER_UNVERIFIED"],
+      ];
+      for (const [name, output, exit, pathext, cwdShadow, expectedCode] of cases) {
+        const marker = join(x.root, `fake-${name.replaceAll(/[^A-Za-z]/g, "-")}`);
+        process.env.AIOPAGO_FAKE_OUTPUT = output;
+        process.env.AIOPAGO_FAKE_EXIT = exit;
+        process.env.AIOPAGO_FAKE_MARKER = marker;
+        process.env.PATHEXT = pathext ? ".COM;.BAT;.CMD" : original.PATHEXT;
+        process.env.PATH = cwdShadow ? "" : `${fakeDirectory};${original.PATH}`;
+        if (cwdShadow) process.chdir(fakeDirectory);
+        let callbacks = 0;
+        assert.throws(
+          () => new PlanRevisionWriter(x.planPath).coordinate({ validate: validateTaskLedger, use() { callbacks += 1; writeFileSync(x.planPath, "forged\n"); } }),
+          (error) => error.code === expectedCode,
+          name,
+        );
+        if (cwdShadow) process.chdir(original.cwd);
+        assert.equal(existsSync(marker), true, `${name}: the shadow executable ran`);
+        assert.equal(callbacks, 0, `${name}: no overlapping coordination callback`);
+        assert.equal(owner.child.exitCode, null, `${name}: original owner remains alive`);
+        assert.equal(sameLockSnapshot(lockPath, before), true, `${name}: owner nonce, bytes, inode and device remain exact`);
+        assert.equal(existsSync(`${lockPath}.recovery`), false, `${name}: no recovery marker cleanup`);
+        assert.equal(x.ledger.read().plan_revision_id, "PLAN-P1", `${name}: no plan mutation`);
+        assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED", `${name}: no latch mutation`);
+      }
+    } finally {
+      process.chdir(original.cwd);
+      process.env.PATH = original.PATH;
+      process.env.PATHEXT = original.PATHEXT;
+      delete process.env.AIOPAGO_FAKE_OUTPUT;
+      delete process.env.AIOPAGO_FAKE_EXIT;
+      delete process.env.AIOPAGO_FAKE_MARKER;
+      if (owner.child.exitCode === null) owner.child.kill("SIGKILL");
+      await owner.done;
+      x.close();
+    }
   });
 
   await t.test("real live owner with powershell.exe unavailable", async () => {
@@ -426,18 +492,19 @@ test("R1-M-07 process-start identity handles PID reuse and unknown proof without
   const x = fixture();
   const lockPath = join(x.root, ".guardian", "plan-write.lock");
   try {
-    writeFileSync(lockPath, lockMetadata(x.planPath, { pid: 999, identity: "old-process-start" }));
+    writeFileSync(lockPath, lockMetadata(x.planPath, { pid: process.ppid, identity: "old-process-start" }));
     const unknown = new PlanRevisionWriter(x.planPath, { processIdentityProbe: (pid) => pid === process.pid
       ? ({ status: "LIVE", identity: "current-process-start" })
       : ({ status: "UNKNOWN", identity: null }) });
     assert.throws(() => unknown.coordinate({ validate: validateTaskLedger, use() {} }), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
     assert.equal(existsSync(lockPath), true, "PID existence alone cannot authorize cleanup");
 
+    writeFileSync(lockPath, lockMetadata(x.planPath, { pid: process.ppid, identity: "old-process-start" }));
     const reused = new PlanRevisionWriter(x.planPath, { processIdentityProbe(pid) {
-      return pid === 999 ? { status: "LIVE", identity: "new-unrelated-process-start" } : { status: "LIVE", identity: "current-process-start" };
+      return pid === process.ppid ? { status: "LIVE", identity: "new-unrelated-process-start" } : { status: "LIVE", identity: "current-process-start" };
     } });
-    assert.equal(reused.coordinate({ validate: validateTaskLedger, use: () => "recovered" }), "recovered");
-    assert.equal(existsSync(lockPath), false, "different process-start identity proves the recorded owner is dead");
+    assert.throws(() => reused.coordinate({ validate: validateTaskLedger, use: () => "forbidden" }), (error) => error.code === "PLAN_LOCK_OWNER_UNVERIFIED");
+    assert.equal(existsSync(lockPath), true, "a live reused PID with different start identity remains conservative UNKNOWN");
   } finally { x.close(); }
 });
 
