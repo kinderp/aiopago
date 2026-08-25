@@ -361,7 +361,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { TextDecoder } from "node:util";
+import { getSystemErrorName, TextDecoder } from "node:util";
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -471,12 +471,27 @@ function sameFilesystemIdentity(left, right) {
 function randomToken() {
   return randomBytes(32).toString("hex");
 }
-function positiveNativeProcessAbsence(pid, kill = process.kill.bind(process)) {
+function positiveNativeProcessAbsence(pid, kill = void 0) {
+  if (kill !== void 0) {
+    try {
+      kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error?.code === "ESRCH") return true;
+      return null;
+    }
+  }
+  if (!nativeProcessKill) return null;
+  let errno;
   try {
-    kill(pid, 0);
-    return false;
-  } catch (error) {
-    if (error?.code === "ESRCH") return true;
+    errno = nativeProcessKill(pid, 0);
+  } catch {
+    return null;
+  }
+  if (errno === 0) return false;
+  try {
+    return getSystemErrorName(errno) === "ESRCH" ? true : null;
+  } catch {
     return null;
   }
 }
@@ -583,7 +598,7 @@ function canonicalIsoTimestamp(value) {
 function temporaryPath(path, label) {
   return `${path}.${process.pid}.${randomBytes(16).toString("hex")}.${label}.tmp`;
 }
-var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
+var TASK_LEDGER_SCHEMA, LEGACY_TASK_LEDGER_SCHEMA, LEDGER_BLOCK, SCHEMA_HEADER, MAX_PLAN_BYTES, MAX_PLAN_STATE_BYTES, LOCK_SCHEMA, LOCK_METADATA_KEYS, DEFAULT_IO, PROCESS_LIVE, PROCESS_DEAD, PROCESS_UNKNOWN, WINDOWS_LIVE_SENTINEL, WINDOWS_UNKNOWN_SENTINEL, MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS, intrinsicFunctionToString, processKillDescriptor, nativeProcessKill, cachedCurrentProcessIdentity, deadlineVerifiedLockOwners, PlanRevisionWriter;
 var init_plan_store = __esm({
   "src/plan-store.mjs"() {
     init_canonical();
@@ -627,6 +642,9 @@ var init_plan_store = __esm({
     WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
     WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
     MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3e3;
+    intrinsicFunctionToString = Function.prototype.toString;
+    processKillDescriptor = Object.getOwnPropertyDescriptor(process, "_kill");
+    nativeProcessKill = processKillDescriptor && typeof processKillDescriptor.value === "function" && intrinsicFunctionToString.call(processKillDescriptor.value).includes("[native code]") ? processKillDescriptor.value.bind(process) : null;
     cachedCurrentProcessIdentity = null;
     deadlineVerifiedLockOwners = /* @__PURE__ */ new WeakMap();
     PlanRevisionWriter = class {
@@ -1677,33 +1695,54 @@ var init_ledger = __esm({
 });
 
 // src/pi-loader.mjs
-import { access, readFile } from "node:fs/promises";
-import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
-import { createRequire } from "node:module";
+import { access, lstat, readFile, realpath } from "node:fs/promises";
 import { dirname as dirname2, join as join2, resolve as resolve3 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-function packageRootFromEntry(entry) {
-  let current = dirname2(resolve3(entry));
-  while (true) {
-    const manifestPath = join2(current, "package.json");
-    if (existsSync2(manifestPath)) {
-      try {
-        if (JSON.parse(readFileSync2(manifestPath, "utf8")).name === "@earendil-works/pi-coding-agent") return current;
-      } catch {
-      }
-    }
-    const parent = dirname2(current);
-    if (parent === current) return null;
-    current = parent;
-  }
+function samePath2(left, right) {
+  const a = resolve3(left);
+  const b = resolve3(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
-function resolutionCandidate(base) {
+async function trustedDirectory(path, label) {
+  const root = resolve3(path);
+  let stat;
   try {
-    const require3 = createRequire(join2(resolve3(base), "package.json"));
-    return packageRootFromEntry(require3.resolve("@earendil-works/pi-coding-agent"));
-  } catch {
-    return null;
+    stat = await lstat(root);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
+  invariant(stat.isDirectory() && !stat.isSymbolicLink(), "PI_TRUSTED_INSTALLATION_REDIRECTED", `${label} must be a physical directory: ${root}`);
+  let canonical;
+  try {
+    canonical = await realpath(root);
+  } catch (error) {
+    invariant(false, "PI_TRUSTED_INSTALLATION_REDIRECTED", `${label} cannot be canonically resolved: ${root}: ${error.message}`);
+  }
+  invariant(samePath2(canonical, root), "PI_TRUSTED_INSTALLATION_REDIRECTED", `${label} must not traverse a symlink or junction: ${root}`);
+  for (const relativePath of ["package.json", join2("dist", "index.js")]) {
+    const file = join2(root, relativePath);
+    let fileStat;
+    try {
+      fileStat = await lstat(file);
+    } catch (error) {
+      invariant(false, "PI_PACKAGE_INVALID", `${label} is incomplete: ${file}: ${error.message}`);
+    }
+    invariant(fileStat.isFile() && !fileStat.isSymbolicLink(), "PI_TRUSTED_INSTALLATION_REDIRECTED", `${label} entry must be a physical regular file: ${file}`);
+    invariant(samePath2(await realpath(file), file), "PI_TRUSTED_INSTALLATION_REDIRECTED", `${label} entry must not be redirected: ${file}`);
+  }
+  return root;
+}
+async function trustedPiRoot() {
+  const candidates = [
+    join2(INSTALLATION_ROOT, "node_modules", "@earendil-works", "pi-coding-agent"),
+    join2(dirname2(INSTALLATION_ROOT), "@earendil-works", "pi-coding-agent")
+  ];
+  for (const candidate of candidates) {
+    const trusted = await trustedDirectory(candidate, "Trusted Pi installation");
+    if (trusted) return trusted;
+  }
+  return null;
 }
 function versionParts(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
@@ -1724,23 +1763,10 @@ async function resolvePiRoot(options = {}) {
       invariant(false, "PI_UNAVAILABLE", `Configured Pi root is unavailable: ${root}`);
     }
   }
-  const candidates = [
-    resolutionCandidate(dirname2(fileURLToPath(import.meta.url))),
-    join2(dirname2(process.execPath), "node_modules", "@earendil-works", "pi-coding-agent")
-  ].filter(Boolean);
-  const visited = /* @__PURE__ */ new Set();
-  for (const candidate of candidates) {
-    const root = resolve3(candidate);
-    const key = process.platform === "win32" ? root.toLowerCase() : root;
-    if (visited.has(key)) continue;
-    visited.add(key);
-    try {
-      await access(join2(root, "package.json"));
-      return root;
-    } catch {
-    }
-  }
-  invariant(false, "PI_UNAVAILABLE", "Cannot locate @earendil-works/pi-coding-agent beside Aiopago; install Pi 0.83.x or set PI_CODING_AGENT_ROOT");
+  const trusted = await trustedPiRoot();
+  if (trusted) return trusted;
+  const guidance = options.trustedInstallationOnly === true ? "install Pi 0.83.x as Aiopago's physical npm dependency" : "install Pi 0.83.x beside Aiopago or set PI_CODING_AGENT_ROOT";
+  invariant(false, "PI_UNAVAILABLE", `Cannot locate @earendil-works/pi-coding-agent beside Aiopago; ${guidance}`);
 }
 async function inspectPi(options = {}) {
   const root = await resolvePiRoot(options);
@@ -1756,35 +1782,44 @@ async function inspectPi(options = {}) {
 }
 async function loadPi(options = {}) {
   const info = await inspectPi(options);
-  const coding = await import(pathToFileURL(join2(info.root, "dist", "index.js")));
-  const aiCandidates = [
-    join2(info.root, "node_modules", "@earendil-works", "pi-ai", "dist", "index.js"),
-    join2(dirname2(info.root), "pi-ai", "dist", "index.js")
+  const aiRoots = [
+    join2(info.root, "node_modules", "@earendil-works", "pi-ai"),
+    join2(dirname2(info.root), "pi-ai")
   ];
-  let aiEntry = null;
-  for (const candidate of aiCandidates) {
-    try {
-      await access(candidate);
-      aiEntry = candidate;
-      break;
-    } catch {
+  let aiRoot = null;
+  for (const candidate of aiRoots) {
+    if (options.trustedInstallationOnly === true) {
+      const trusted = await trustedDirectory(candidate, "Trusted pi-ai installation");
+      if (trusted) {
+        aiRoot = trusted;
+        break;
+      }
+    } else {
+      try {
+        await access(join2(candidate, "dist", "index.js"));
+        aiRoot = candidate;
+        break;
+      } catch {
+      }
     }
   }
-  invariant(aiEntry, "PI_PACKAGE_INVALID", `Cannot resolve @earendil-works/pi-ai from ${info.root}`);
-  const ai = await import(pathToFileURL(aiEntry));
+  invariant(aiRoot, "PI_PACKAGE_INVALID", `Cannot resolve @earendil-works/pi-ai from ${info.root}`);
+  const ai = await import(pathToFileURL(join2(aiRoot, "dist", "index.js")));
+  const coding = await import(pathToFileURL(join2(info.root, "dist", "index.js")));
   return { ...info, coding, ai };
 }
-var SUPPORTED_PI_RANGE;
+var SUPPORTED_PI_RANGE, INSTALLATION_ROOT;
 var init_pi_loader = __esm({
   "src/pi-loader.mjs"() {
     init_errors();
     SUPPORTED_PI_RANGE = ">=0.83.0 <0.84.0";
+    INSTALLATION_ROOT = resolve3(dirname2(fileURLToPath(import.meta.url)), "..");
   }
 });
 
 // src/repository.mjs
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync3, lstatSync as lstatSync2, readFileSync as readFileSync3, realpathSync as realpathSync2, statSync } from "node:fs";
+import { existsSync as existsSync2, lstatSync as lstatSync2, readFileSync as readFileSync2, realpathSync as realpathSync2, statSync } from "node:fs";
 import { dirname as dirname3, isAbsolute, join as join3, relative as relative2, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 function boundedErrorText(value) {
@@ -1826,14 +1861,14 @@ Aiopago does not modify Git global configuration automatically.`);
     invariant(false, "TARGET_NOT_GIT_WORKTREE", `Target is not a supported Git worktree: ${cwd}`);
   }
 }
-function samePath2(left, right) {
+function samePath3(left, right) {
   const a = resolve4(left);
   const b = resolve4(right);
   return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 function realDirectory(path) {
   const absolute = resolve4(path);
-  invariant(existsSync3(absolute), "TARGET_PATH_NOT_FOUND", `Target path does not exist: ${absolute}`);
+  invariant(existsSync2(absolute), "TARGET_PATH_NOT_FOUND", `Target path does not exist: ${absolute}`);
   invariant(statSync(absolute).isDirectory(), "TARGET_PATH_NOT_DIRECTORY", `Target path is not a directory: ${absolute}`);
   return realpathSync2(absolute);
 }
@@ -1847,7 +1882,7 @@ function inspectReservedPath(path, expectedType) {
   }
   invariant(!stat.isSymbolicLink(), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Aiopago state path: ${path}`);
   invariant(expectedType === "directory" ? stat.isDirectory() : stat.isFile(), "REPOSITORY_STATE_PATH_TYPE_INVALID", `${path} must be a ${expectedType}`);
-  invariant(samePath2(realpathSync2(path), path), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Aiopago state path: ${path}`);
+  invariant(samePath3(realpathSync2(path), path), "REPOSITORY_STATE_PATH_REDIRECTED", `Refusing redirected Aiopago state path: ${path}`);
 }
 function validateRepositoryStateBoundaries(targetRoot) {
   const reserved = [
@@ -1876,7 +1911,7 @@ function discoverTargetRepository(input = process.cwd(), options = {}) {
   const gitRoot = runGit(startPath, ["rev-parse", "--show-toplevel"], options.execFile);
   const targetRoot = realDirectory(gitRoot);
   const observedAgain = runGit(targetRoot, ["rev-parse", "--show-toplevel"], options.execFile);
-  invariant(samePath2(realDirectory(observedAgain), targetRoot), "GIT_WORKTREE_MISMATCH", `Git root changed while discovering target: ${targetRoot}`);
+  invariant(samePath3(realDirectory(observedAgain), targetRoot), "GIT_WORKTREE_MISMATCH", `Git root changed while discovering target: ${targetRoot}`);
   return targetRoot;
 }
 function resolveInside(targetRoot, configuredPath, field) {
@@ -1899,7 +1934,7 @@ function validateRepositoryConfig(config, targetRoot) {
   invariant(runtimeRoot !== configRoot && runtimeRoot !== targetRoot, "REPOSITORY_CONFIG_ROOT_INVALID", "runtime_root must be separate from config and target roots");
   invariant(artifactRoot !== targetRoot, "REPOSITORY_CONFIG_ROOT_INVALID", "artifact_root must not be the target root");
   return Object.freeze({
-    installationRoot: INSTALLATION_ROOT,
+    installationRoot: INSTALLATION_ROOT2,
     targetRoot,
     configRoot,
     configPath: join3(targetRoot, REPOSITORY_CONFIG_FILE),
@@ -1912,10 +1947,10 @@ function validateRepositoryConfig(config, targetRoot) {
 function readRepositoryConfig(targetRoot) {
   validateRepositoryStateBoundaries(targetRoot);
   const path = join3(targetRoot, REPOSITORY_CONFIG_FILE);
-  invariant(existsSync3(path), "REPOSITORY_NOT_INITIALIZED", `Aiopago is not initialized in ${targetRoot}; run 'aio init' first`);
+  invariant(existsSync2(path), "REPOSITORY_NOT_INITIALIZED", `Aiopago is not initialized in ${targetRoot}; run 'aio init' first`);
   let config;
   try {
-    config = JSON.parse(readFileSync3(path, "utf8"));
+    config = JSON.parse(readFileSync2(path, "utf8"));
   } catch (error) {
     invariant(false, "REPOSITORY_CONFIG_JSON_INVALID", `${path}: ${error.message}`);
   }
@@ -1924,14 +1959,14 @@ function readRepositoryConfig(targetRoot) {
 function loadRepositoryContext(input = process.cwd(), options = {}) {
   return readRepositoryConfig(discoverTargetRepository(input, options));
 }
-var REPOSITORY_CONFIG_SCHEMA, LEGACY_REPOSITORY_CONFIG_SCHEMA, REPOSITORY_CONFIG_FILE, INSTALLATION_ROOT, DEFAULT_REPOSITORY_CONFIG, GIT_FAILURE_INSPECTION_LIMIT;
+var REPOSITORY_CONFIG_SCHEMA, LEGACY_REPOSITORY_CONFIG_SCHEMA, REPOSITORY_CONFIG_FILE, INSTALLATION_ROOT2, DEFAULT_REPOSITORY_CONFIG, GIT_FAILURE_INSPECTION_LIMIT;
 var init_repository = __esm({
   "src/repository.mjs"() {
     init_errors();
     REPOSITORY_CONFIG_SCHEMA = "aiopago.repository/1.0.0";
     LEGACY_REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
     REPOSITORY_CONFIG_FILE = ".guardian/config.json";
-    INSTALLATION_ROOT = resolve4(dirname3(fileURLToPath2(import.meta.url)), "..");
+    INSTALLATION_ROOT2 = resolve4(dirname3(fileURLToPath2(import.meta.url)), "..");
     DEFAULT_REPOSITORY_CONFIG = Object.freeze({
       schema_version: REPOSITORY_CONFIG_SCHEMA,
       task_ledger: "TASK_PLAN.md",
@@ -1944,7 +1979,7 @@ var init_repository = __esm({
 
 // src/bootstrap.mjs
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { appendFileSync, existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync4, writeFileSync as writeFileSync2 } from "node:fs";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename, join as join4 } from "node:path";
 import { randomUUID as randomUUID2 } from "node:crypto";
 function parseVersion(version) {
@@ -2040,18 +2075,18 @@ function validateExistingState(targetRoot) {
   const ledgerPath = join4(targetRoot, "TASK_PLAN.md");
   const gitignorePath = join4(targetRoot, ".gitignore");
   validateRepositoryStateBoundaries(targetRoot);
-  if (existsSync4(configPath)) readRepositoryConfig(targetRoot);
-  if (existsSync4(ledgerPath)) {
+  if (existsSync3(configPath)) readRepositoryConfig(targetRoot);
+  if (existsSync3(ledgerPath)) {
     try {
-      const text = readFileSync4(ledgerPath, "utf8");
+      const text = readFileSync3(ledgerPath, "utf8");
       invariant(text.split("```json task-ledger").length - 1 === 1, "LEDGER_FORMAT_AMBIGUOUS", "TASK_PLAN.md must contain exactly one json task-ledger block");
       new TaskLedger(ledgerPath).read();
     } catch (error) {
       throw new GuardianError("TASK_PLAN_NOT_AIOPAGO_LEDGER", `Existing TASK_PLAN.md is not a compatible Aiopago Ledger; preserved without changes (${error.code ?? error.message})`);
     }
   }
-  if (existsSync4(gitignorePath)) {
-    const text = readFileSync4(gitignorePath, "utf8");
+  if (existsSync3(gitignorePath)) {
+    const text = readFileSync3(gitignorePath, "utf8");
     const eol = text.includes("\r\n") ? "\r\n" : "\n";
     const blocks = [
       { start: GITIGNORE_START, end: GITIGNORE_END, lines: GITIGNORE_LINES },
@@ -2072,8 +2107,8 @@ function validateExistingState(targetRoot) {
 }
 function ensureGitignore(targetRoot, actions) {
   const path = join4(targetRoot, ".gitignore");
-  const existed = existsSync4(path);
-  const prior = existed ? readFileSync4(path, "utf8") : "";
+  const existed = existsSync3(path);
+  const prior = existed ? readFileSync3(path, "utf8") : "";
   if (prior.includes(GITIGNORE_START)) {
     actions.preserved.push(".gitignore (Aiopago block already present)");
     return;
@@ -2107,26 +2142,26 @@ async function initializeRepository(input = process.cwd(), options = {}) {
   const configPath = join4(targetRoot, REPOSITORY_CONFIG_FILE);
   const ledgerPath = join4(targetRoot, "TASK_PLAN.md");
   const runtimeRoot = join4(guardianRoot, "runtime");
-  if (!existsSync4(guardianRoot)) {
+  if (!existsSync3(guardianRoot)) {
     mkdirSync2(guardianRoot, { recursive: true });
     actions.created.push(".guardian/");
   } else actions.preserved.push(".guardian/");
-  if (!existsSync4(configPath)) {
+  if (!existsSync3(configPath)) {
     writeFileSync2(configPath, `${JSON.stringify(DEFAULT_REPOSITORY_CONFIG, null, 2)}
 `, { encoding: "utf8", flag: "wx" });
     actions.created.push(REPOSITORY_CONFIG_FILE);
   } else actions.preserved.push(REPOSITORY_CONFIG_FILE);
-  if (!existsSync4(ledgerPath)) {
+  if (!existsSync3(ledgerPath)) {
     writeFileSync2(ledgerPath, createLedgerTemplate(targetRoot, options.now), { encoding: "utf8", flag: "wx" });
     new TaskLedger(ledgerPath).read();
     actions.created.push("TASK_PLAN.md");
   } else actions.preserved.push("TASK_PLAN.md (valid Aiopago Ledger)");
-  if (!existsSync4(runtimeRoot)) {
+  if (!existsSync3(runtimeRoot)) {
     mkdirSync2(runtimeRoot, { recursive: true });
     actions.created.push(".guardian/runtime/");
   } else actions.preserved.push(".guardian/runtime/ (existing state retained)");
   ensureGitignore(targetRoot, actions);
-  const context = validateRepositoryConfig(existsSync4(configPath) ? JSON.parse(readFileSync4(configPath, "utf8")) : DEFAULT_REPOSITORY_CONFIG, targetRoot);
+  const context = validateRepositoryConfig(existsSync3(configPath) ? JSON.parse(readFileSync3(configPath, "utf8")) : DEFAULT_REPOSITORY_CONFIG, targetRoot);
   return Object.freeze({ ...context, environment, actions: Object.freeze(actions) });
 }
 var MINIMUM_NODE_VERSION, GITIGNORE_START, GITIGNORE_END, LEGACY_GITIGNORE_START, LEGACY_GITIGNORE_END, MANAGED_GITIGNORE_BODY, GITIGNORE_LINES, LEGACY_GITIGNORE_LINES;
@@ -3607,7 +3642,7 @@ var init_handoff_consent = __esm({
 });
 
 // src/runtime-reader.mjs
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
+import { existsSync as existsSync4, readFileSync as readFileSync4 } from "node:fs";
 import { resolve as resolve6 } from "node:path";
 function boundedRuntimeError(error) {
   return Object.freeze({
@@ -3620,8 +3655,8 @@ function runtimeFailure(code, message2) {
 }
 function defaultProbe(path) {
   return Object.freeze({
-    database: existsSync5(path),
-    sidecars: SIDECAR_SUFFIXES.filter((suffix) => existsSync5(`${path}${suffix}`))
+    database: existsSync4(path),
+    sidecars: SIDECAR_SUFFIXES.filter((suffix) => existsSync4(`${path}${suffix}`))
   });
 }
 function assertStableCleanProbes(first, second) {
@@ -3641,7 +3676,7 @@ function notVerified(available, condition, message2) {
 function readRuntimeProjection(path, _plan = null, options = {}) {
   const absolute = resolve6(path);
   const probe = options.probeRuntimeFiles ?? defaultProbe;
-  const readBytes = options.readFile ?? readFileSync5;
+  const readBytes = options.readFile ?? readFileSync4;
   const absentFirst = probe(absolute);
   const absentSecond = probe(absolute);
   if (!absentFirst.database && !absentSecond.database && absentFirst.sidecars.length === 0 && absentSecond.sidecars.length === 0) {
@@ -3703,7 +3738,7 @@ __export(human_workflow_exports, {
   sameGuidedHandoffEligibility: () => sameGuidedHandoffEligibility,
   validateRuntimeObservation: () => validateRuntimeObservation
 });
-import { existsSync as existsSync6, readFileSync as readFileSync6 } from "node:fs";
+import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
 import { join as join6 } from "node:path";
 function boundedText(value, length = 320) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, length);
@@ -3744,12 +3779,12 @@ function deepFreeze4(value, seen = /* @__PURE__ */ new Set()) {
   return Object.freeze(value);
 }
 function observeRawTaskPlan(path) {
-  if (!existsSync6(path)) {
+  if (!existsSync5(path)) {
     const error = new GuardianError("LEDGER_NOT_FOUND", `Authoritative task plan not found: ${path}`);
     return Object.freeze({ path, exists: false, valid: null, bytes: null, text: null, digest: null, plan: null, error: diagnostic(error) });
   }
   try {
-    const bytes = readFileSync6(path);
+    const bytes = readFileSync5(path);
     return Object.freeze({ path, exists: true, valid: null, bytes, text: bytes.toString("utf8"), digest: sha256(bytes), plan: null, error: null });
   } catch (error) {
     return Object.freeze({ path, exists: true, valid: null, bytes: null, text: null, digest: null, plan: null, error: diagnostic(error, "LEDGER_READ_FAILED") });
@@ -3769,7 +3804,7 @@ function observeTaskPlan(path, options = {}) {
 function observeHumanWorkflow(input = process.cwd(), options = {}) {
   const targetRoot = (options.discoverTargetRepository ?? discoverTargetRepository)(input, options.repositoryOptions);
   const configPath = join6(targetRoot, REPOSITORY_CONFIG_FILE);
-  if (!existsSync6(configPath)) {
+  if (!existsSync5(configPath)) {
     return Object.freeze({ initialized: false, targetRoot, repository: null, configError: null, plan: null, runtime: EMPTY_RUNTIME });
   }
   let repository;
@@ -4504,7 +4539,7 @@ var init_human_workflow = __esm({
 });
 
 // src/artifact-store.mjs
-import { closeSync as closeSync2, existsSync as existsSync7, fsyncSync as fsyncSync2, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync7, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync6, fsyncSync as fsyncSync2, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
 import { dirname as dirname5, join as join7, resolve as resolve7 } from "node:path";
 function scan(value, path = "$") {
   if (Array.isArray(value)) return value.forEach((item, index) => scan(item, `${path}[${index}]`));
@@ -4551,8 +4586,8 @@ var init_artifact_store = __esm({
         const directory = join7(this.root, kind === "checkpoint" ? "checkpoints" : "manifests");
         mkdirSync3(directory, { recursive: true });
         const path = join7(directory, `${id}.json`);
-        if (existsSync7(path)) {
-          const prior = readFileSync7(path);
+        if (existsSync6(path)) {
+          const prior = readFileSync6(path);
           invariant(prior.equals(bytes), "ARTIFACT_ID_CONFLICT", `${id} already exists with different bytes`);
         } else {
           const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
@@ -4572,7 +4607,7 @@ var init_artifact_store = __esm({
             }
           } catch (error) {
             if (fd !== void 0) closeSync2(fd);
-            if (existsSync7(temp)) unlinkSync2(temp);
+            if (existsSync6(temp)) unlinkSync2(temp);
             throw error;
           }
         }
@@ -4582,7 +4617,7 @@ var init_artifact_store = __esm({
       verify(kind, id, expectedDigest = void 0) {
         const index = this.storage.getArtifact(kind, id);
         invariant(index && !index.superseded, index?.superseded ? "SUPERSEDED_CHECKPOINT" : "ARTIFACT_NOT_FOUND", id);
-        const bytes = readFileSync7(index.path);
+        const bytes = readFileSync6(index.path);
         const digest = sha256(bytes);
         invariant(digest === index.digest && (!expectedDigest || digest === expectedDigest), kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH");
         const envelope = JSON.parse(bytes.toString("utf8"));
@@ -4659,7 +4694,7 @@ var init_context_advisor = __esm({
 import { execFileSync as execFileSync4 } from "node:child_process";
 import {
   mkdirSync as mkdirSync4,
-  readFileSync as readFileSync8,
+  readFileSync as readFileSync7,
   statSync as statSync2,
   writeFileSync as writeFileSync4
 } from "node:fs";
@@ -4670,7 +4705,7 @@ function digestHex(bytes) {
 function slash(path) {
   return resolve8(path).replaceAll("\\", "/");
 }
-function samePath3(a, b) {
+function samePath4(a, b) {
   return slash(a).toLowerCase() === slash(b).toLowerCase();
 }
 function git(cwd, args, encoding = "utf8") {
@@ -4689,13 +4724,13 @@ function reason(code, details = void 0) {
   return { code, details: JSON.parse(JSON.stringify(details, (_key, value) => value === void 0 ? null : value)) };
 }
 function readPiVersion(piRoot) {
-  const pkg = JSON.parse(readFileSync8(join8(piRoot, "package.json"), "utf8"));
+  const pkg = JSON.parse(readFileSync7(join8(piRoot, "package.json"), "utf8"));
   return pkg.version;
 }
 function loadCalibrationAttestation(attestationPath) {
   let bytes;
   try {
-    bytes = readFileSync8(attestationPath);
+    bytes = readFileSync7(attestationPath);
   } catch (error) {
     throw new GuardianError("CALIBRATION_ATTESTATION_MISSING", error.message);
   }
@@ -4713,8 +4748,8 @@ function verifyCalibrationRuntimeState({ runner, attestationPath, processEnv = p
   const failures = [];
   const mismatch = (code, expected, actual) => failures.push(reason(code, { expected, actual }));
   if (attestation.preflight_result !== "PASS" || attestation.failure_reasons.length !== 0) failures.push(reason("CALIBRATION_PREFLIGHT_NOT_PASSED"));
-  if (!samePath3(attestation.worktree, runner.cwd)) mismatch("RUNTIME_WORKTREE_MISMATCH", attestation.worktree, runner.cwd);
-  if (!samePath3(attestation.runtime_store.path, runner.storage.path)) mismatch("RUNTIME_STORE_PATH_MISMATCH", attestation.runtime_store.path, runner.storage.path);
+  if (!samePath4(attestation.worktree, runner.cwd)) mismatch("RUNTIME_WORKTREE_MISMATCH", attestation.worktree, runner.cwd);
+  if (!samePath4(attestation.runtime_store.path, runner.storage.path)) mismatch("RUNTIME_STORE_PATH_MISMATCH", attestation.runtime_store.path, runner.storage.path);
   const identity2 = runner.storage.getCalibrationRuntimeIdentity?.();
   if (!identity2 || identity2.run_id !== attestation.run_id || identity2.runtime_store_id !== attestation.runtime_store.identity || identity2.attestation_sha256 !== digest) {
     mismatch("RUNTIME_IDENTITY_MISMATCH", { run_id: attestation.run_id, runtime_store_id: attestation.runtime_store.identity, attestation_sha256: digest }, identity2);
@@ -4723,17 +4758,17 @@ function verifyCalibrationRuntimeState({ runner, attestationPath, processEnv = p
   let protocolCopy = null;
   let workloadProtocolCopy = null;
   try {
-    protocolSource = readFileSync8(attestation.protocol_source_path);
+    protocolSource = readFileSync7(attestation.protocol_source_path);
   } catch {
     failures.push(reason("PROTOCOL_SOURCE_MISSING"));
   }
   try {
-    protocolCopy = readFileSync8(attestation.protocol_copy_path);
+    protocolCopy = readFileSync7(attestation.protocol_copy_path);
   } catch {
     failures.push(reason("PROTOCOL_COPY_MISSING"));
   }
   try {
-    workloadProtocolCopy = readFileSync8(attestation.workload_protocol_path);
+    workloadProtocolCopy = readFileSync7(attestation.workload_protocol_path);
   } catch {
     failures.push(reason("WORKLOAD_PROTOCOL_COPY_MISSING"));
   }
@@ -4751,7 +4786,7 @@ function verifyCalibrationRuntimeState({ runner, attestationPath, processEnv = p
       const variant = frozen.runs?.find((item) => (item.variant_id ?? item.run_id) === attestation.variant_id);
       if (variant?.threshold_percent !== attestation.requested_threshold) mismatch("REQUESTED_THRESHOLD_MISMATCH", attestation.requested_threshold, variant?.threshold_percent);
       if (variant?.branch !== attestation.branch) mismatch("ATTESTED_BRANCH_PROTOCOL_MISMATCH", variant?.branch, attestation.branch);
-      if (variant?.worktree && !samePath3(variant.worktree, attestation.worktree)) mismatch("ATTESTED_WORKTREE_PROTOCOL_MISMATCH", variant.worktree, attestation.worktree);
+      if (variant?.worktree && !samePath4(variant.worktree, attestation.worktree)) mismatch("ATTESTED_WORKTREE_PROTOCOL_MISMATCH", variant.worktree, attestation.worktree);
       if (frozen.protocol_id !== attestation.experiment_id) mismatch("EXPERIMENT_ID_MISMATCH", frozen.protocol_id, attestation.experiment_id);
       if (frozen.workload?.id !== attestation.workload_id) mismatch("WORKLOAD_ID_MISMATCH", frozen.workload?.id, attestation.workload_id);
       if (frozen.application_baseline_commit !== attestation.application_baseline_commit) mismatch("APPLICATION_BASELINE_MISMATCH", frozen.application_baseline_commit, attestation.application_baseline_commit);
@@ -5036,7 +5071,7 @@ var init_extension = __esm({
 
 // src/git-state.mjs
 import { execFileSync as execFileSync5 } from "node:child_process";
-import { lstatSync as lstatSync3, readFileSync as readFileSync9, readlinkSync, realpathSync as realpathSync3 } from "node:fs";
+import { lstatSync as lstatSync3, readFileSync as readFileSync8, readlinkSync, realpathSync as realpathSync3 } from "node:fs";
 import { resolve as resolve9 } from "node:path";
 function git2(cwd, args, { optional = false } = {}) {
   try {
@@ -5065,7 +5100,7 @@ function worktreeDigest(workdir) {
         bytes = Buffer.from(readlinkSync(absolute), "utf8");
       } else if (stat.isFile()) {
         kind = "file";
-        bytes = readFileSync9(absolute);
+        bytes = readFileSync8(absolute);
       } else if (stat.isDirectory()) {
         kind = "directory";
       } else {
@@ -5645,7 +5680,7 @@ var init_runner_ownership = __esm({
 });
 
 // src/handoff.mjs
-import { existsSync as existsSync8, realpathSync as realpathSync4 } from "node:fs";
+import { existsSync as existsSync7, realpathSync as realpathSync4 } from "node:fs";
 import { dirname as dirname7, isAbsolute as isAbsolute3, relative as relative5, resolve as resolve10, sep } from "node:path";
 import { performance as performance3 } from "node:perf_hooks";
 function normalizePath(path) {
@@ -5720,7 +5755,7 @@ function verifyRequiredLocalPaths(repositoryRoot, paths) {
   const root = realpathSync4(repositoryRoot);
   for (const path of paths) {
     const candidate = resolve10(root, path);
-    if (!existsSync8(candidate)) throw new GuardianError("REQUIRED_LOCAL_PATH_MISSING", `required local path unavailable: ${path}`);
+    if (!existsSync7(candidate)) throw new GuardianError("REQUIRED_LOCAL_PATH_MISSING", `required local path unavailable: ${path}`);
     const actual = realpathSync4(candidate);
     const fromRoot = relative5(root, actual);
     invariant(fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute3(fromRoot), "REQUIRED_LOCAL_PATH_INVALID", `required local path resolves outside repository: ${path}`);
@@ -7067,7 +7102,7 @@ var init_task_operation_internal = __esm({
 
 // src/storage.mjs
 import { mkdirSync as mkdirSync5 } from "node:fs";
-import { createRequire as createRequire2 } from "node:module";
+import { createRequire } from "node:module";
 import { dirname as dirname8, resolve as resolve11 } from "node:path";
 function database(storage) {
   const value = storageDatabases.get(storage);
@@ -7276,7 +7311,7 @@ var init_storage = __esm({
     init_handoff_plan_internal();
     init_plan_semantics_internal();
     init_task_operation_internal();
-    require2 = createRequire2(import.meta.url);
+    require2 = createRequire(import.meta.url);
     TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
     storageDatabases = /* @__PURE__ */ new WeakMap();
     HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([

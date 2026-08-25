@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import { TextDecoder } from "node:util";
+import { getSystemErrorName, TextDecoder } from "node:util";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 
@@ -181,12 +181,33 @@ const WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
 // budget. The deadline itself remains start + timeoutMs.
 const MIN_BOUNDED_PROCESS_PROBE_BUDGET_MS = 3_000;
 
-function positiveNativeProcessAbsence(pid, kill = process.kill.bind(process)) {
-  try { kill(pid, 0); return false; }
-  catch (error) {
-    if (error?.code === "ESRCH") return true;
-    return null;
+// process.kill is a writable ambient wrapper. In particular, a package
+// consumer can replace it before or after importing Aiopago and forge ESRCH.
+// Node's own process.kill implementation delegates to this native binding;
+// capture the genuine binding once and fail closed if startup code replaced it.
+const intrinsicFunctionToString = Function.prototype.toString;
+const processKillDescriptor = Object.getOwnPropertyDescriptor(process, "_kill");
+const nativeProcessKill = processKillDescriptor
+  && typeof processKillDescriptor.value === "function"
+  && intrinsicFunctionToString.call(processKillDescriptor.value).includes("[native code]")
+  ? processKillDescriptor.value.bind(process)
+  : null;
+
+function positiveNativeProcessAbsence(pid, kill = undefined) {
+  if (kill !== undefined) {
+    try { kill(pid, 0); return false; }
+    catch (error) {
+      if (error?.code === "ESRCH") return true;
+      return null;
+    }
   }
+  if (!nativeProcessKill) return null;
+  let errno;
+  try { errno = nativeProcessKill(pid, 0); }
+  catch { return null; }
+  if (errno === 0) return false;
+  try { return getSystemErrorName(errno) === "ESRCH" ? true : null; }
+  catch { return null; }
 }
 
 function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync, kill } = {}) {

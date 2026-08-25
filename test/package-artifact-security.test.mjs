@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -285,4 +285,58 @@ test("R1-M-08 real npm tarball has one bundled lexical authority boundary under 
   writeFileSync(join(consumer, "attack.mjs"), script);
   execFileSync(process.execPath, ["attack.mjs"], { cwd: consumer, stdio: "pipe" });
   assert.ok(readFileSync(tarball).length > 0);
+});
+
+test("R1-M-12 real tarball ignores NODE_PATH Pi and rejects redirected adjacent Pi before factory publication", () => {
+  const root = mkdtempSync(join(tmpdir(), "aiopago-packed-pi-resolution-"));
+  const npmOptions = { shell: process.platform === "win32" };
+  const packedName = execFileSync("npm", ["pack", "--silent", "--pack-destination", root], {
+    cwd: process.cwd(), encoding: "utf8", ...npmOptions,
+  }).trim().split(/\r?\n/).at(-1);
+  const tarball = join(root, packedName);
+  const fakeModules = join(root, "fake-node-modules");
+  const fakePi = join(fakeModules, "@earendil-works", "pi-coding-agent");
+  const fakeAi = join(fakeModules, "@earendil-works", "pi-ai");
+  mkdirSync(join(fakePi, "dist"), { recursive: true });
+  mkdirSync(join(fakeAi, "dist"), { recursive: true });
+  writeFileSync(join(fakePi, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.83.77", type: "module", main: "dist/index.js" }));
+  writeFileSync(join(fakeAi, "package.json"), JSON.stringify({ name: "@earendil-works/pi-ai", version: "0.83.77", type: "module", main: "dist/index.js" }));
+  const fakeModule = `import { writeFileSync } from "node:fs"; writeFileSync(process.env.AIOPAGO_FAKE_PI_CAPTURE, "evaluated"); export const attacker = true;\n`;
+  writeFileSync(join(fakePi, "dist", "index.js"), fakeModule);
+  writeFileSync(join(fakeAi, "dist", "index.js"), fakeModule);
+
+  for (const mode of ["NODE_PATH", "adjacent-junction"]) {
+    const consumer = join(root, `consumer-${mode.toLowerCase()}`);
+    mkdirSync(consumer);
+    writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "packed-pi-attacker", private: true, type: "module" }));
+    execFileSync("npm", ["install", "--offline", "--ignore-scripts", "--legacy-peer-deps", "--no-package-lock", tarball], {
+      cwd: consumer, stdio: "pipe", ...npmOptions,
+    });
+    if (mode === "adjacent-junction") {
+      const scope = join(consumer, "node_modules", "@earendil-works");
+      mkdirSync(scope, { recursive: true });
+      symlinkSync(fakePi, join(scope, "pi-coding-agent"), "junction");
+      symlinkSync(fakeAi, join(scope, "pi-ai"), "junction");
+    }
+    const planPath = join(consumer, "TASK_PLAN.md");
+    writeFileSync(planPath, `# Packed Pi resolution fixture\n\n\`\`\`json task-ledger\n${JSON.stringify(blockedTask(), null, 2)}\n\`\`\`\n`);
+    const attack = `
+      import { existsSync } from "node:fs";
+      import { join } from "node:path";
+      import { GuardianRunner } from "aiopago";
+      let code = null; let message = null;
+      try { await GuardianRunner.create({ cwd: process.cwd() }); }
+      catch (error) { code = error.code ?? null; message = error.message; }
+      process.stdout.write(JSON.stringify({ code, message, runtime: existsSync(join(process.cwd(), ".guardian", "runtime", "guardian.sqlite")) }));
+    `;
+    writeFileSync(join(consumer, "attack.mjs"), attack);
+    const capture = join(root, `capture-${mode}.txt`);
+    const env = { ...process.env, AIOPAGO_FAKE_PI_CAPTURE: capture };
+    if (mode === "NODE_PATH") env.NODE_PATH = fakeModules;
+    const result = JSON.parse(execFileSync(process.execPath, ["attack.mjs"], { cwd: consumer, env, encoding: "utf8" }));
+    assert.equal(result.code, mode === "NODE_PATH" ? "PI_UNAVAILABLE" : "PI_TRUSTED_INSTALLATION_REDIRECTED", mode);
+    assert.equal(result.runtime, false, `${mode}: reject before durable Runner mutation`);
+    assert.equal(existsSync(capture), false, `${mode}: neither fake Pi nor fake pi-ai is evaluated`);
+    if (mode === "NODE_PATH") assert.doesNotMatch(result.message, /PI_CODING_AGENT_ROOT/, "privileged loading must not recommend an ignored override");
+  }
 });

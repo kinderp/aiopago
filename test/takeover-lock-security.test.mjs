@@ -360,6 +360,44 @@ test("R1-M-09 Windows probe failures are UNKNOWN and PowerShell absence cannot s
   });
 });
 
+test("R1-H-12 process.kill forgery before or after import cannot steal a real live Windows lock", async (t) => {
+  if (process.platform !== "win32") return t.skip("Windows native liveness regression");
+  for (const patchTiming of ["before-import", "after-import"]) await t.test(patchTiming, async () => {
+    const x = fixture();
+    const owner = lockOwnerChild(x, 30_000);
+    const competitorScript = join(x.root, `process-kill-forgery-${patchTiming}.mjs`);
+    const lockPath = join(x.root, ".guardian", "plan-write.lock");
+    try {
+      await waitFor(owner.ready);
+      const before = lockSnapshot(lockPath);
+      writeFileSync(competitorScript, `
+        const originalKill = process.kill;
+        const patch = () => { process.kill = function forgedSelectiveEsrch(pid, signal) {
+          if (pid === ${owner.child.pid} && signal === 0) throw Object.assign(new Error("forged ESRCH"), { code: "ESRCH" });
+          return Reflect.apply(originalKill, process, [pid, signal]);
+        }; };
+        if (${JSON.stringify(patchTiming)} === "before-import") patch();
+        const { PlanRevisionWriter } = await import(${JSON.stringify(new URL("../src/plan-store.mjs", import.meta.url).href)});
+        if (${JSON.stringify(patchTiming)} === "after-import") patch();
+        let callbacks = 0; let code = null;
+        try { new PlanRevisionWriter(${JSON.stringify(x.planPath)}).coordinate({ validate() {}, use() { callbacks += 1; } }); }
+        catch (error) { code = error.code ?? null; }
+        process.stdout.write(JSON.stringify({ code, callbacks }));
+      `);
+      const result = JSON.parse(execFileSync(process.execPath, [competitorScript], { encoding: "utf8" }));
+      assert.deepEqual(result, { code: "PLAN_WRITE_LOCKED", callbacks: 0 });
+      assert.equal(owner.child.exitCode, null, "the original lock owner remains alive");
+      assert.equal(sameLockSnapshot(lockPath, before), true, "the exact live lock remains byte- and identity-stable");
+      assert.equal(existsSync(`${lockPath}.recovery`), false);
+      assert.equal(x.storage.getLatch("TASK-TAKEOVER").state, "RELEASED");
+    } finally {
+      if (owner.child.exitCode === null) owner.child.kill("SIGKILL");
+      await owner.done;
+      x.close();
+    }
+  });
+});
+
 test("R1-L-09 takeover coordination authority obeys one 10-second monotonic deadline", async (t) => {
   if (process.platform !== "win32") return t.skip("Windows deadline boundary regression");
   for (const holdMs of [9_000, 9_800, 9_950, 11_000]) {
