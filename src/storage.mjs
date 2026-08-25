@@ -8,7 +8,9 @@ import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal
 import { planSemanticDigest, sameCanonicalJson } from "./plan-semantics-internal.mjs";
 import { taskOperationBlocksNewHandoff, taskOperationDisposition } from "./task-operation-internal.mjs";
 
-const require = createRequire(import.meta.url);
+const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
+  ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
+  : import.meta.url);
 const TERMINAL_HANDOFF = new Set(["RESUMED"]);
 const TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
 // @source-test-support-start

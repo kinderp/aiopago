@@ -7,7 +7,10 @@ import { invariant } from "./errors.mjs";
 export const REPOSITORY_CONFIG_SCHEMA = "aiopago.repository/1.0.0";
 export const LEGACY_REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
 export const REPOSITORY_CONFIG_FILE = ".guardian/config.json";
-export const INSTALLATION_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const INSTALLATION_URL = typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
+  ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
+  : import.meta.url;
+export const INSTALLATION_ROOT = resolve(dirname(fileURLToPath(INSTALLATION_URL)), "..");
 
 export const DEFAULT_REPOSITORY_CONFIG = Object.freeze({
   schema_version: REPOSITORY_CONFIG_SCHEMA,

@@ -7,13 +7,13 @@ function isSupportedNode() {
     || current.every((value, index) => value === MINIMUM_NODE_VERSION[index]);
 }
 
-// `import.meta.main` is assigned by Node's ESM loader from the process entry
-// module; unlike argv, environment variables, globals, or module exports, an
-// importing consumer cannot set this module-local value. The bin bootstrap
-// executes this file as the entry module in a sanitized fresh Node process.
-// Absolute/deep imports therefore evaluate an inert module and cannot construct
-// Runner, Pi extension, handler, storage, or mutation authority in the caller.
-if (import.meta.main) {
+// This function is deliberately not invoked by the shipped module. The package
+// build retains its lexical body but removes the source-only invocation below.
+// A bin bootstrap asks a fresh sanitized Node process to read the exact physical
+// bundle and invoke it there. Consequently importing this file, or selecting it
+// as a Worker entry, can only define dormant lexical code: no JavaScript oracle
+// in the caller's process decides whether privileged initialization may run.
+async function aiopagoOperationalEntrypoint() {
   const deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
   const commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
   if (deprecated) console.error("eio is deprecated; use aio instead.");
@@ -29,3 +29,7 @@ if (import.meta.main) {
     }
   }
 }
+
+// @package-operational-invocation — removed from dist/cli-entry.mjs by the
+// deterministic package build; retained in source for direct source execution.
+await aiopagoOperationalEntrypoint();

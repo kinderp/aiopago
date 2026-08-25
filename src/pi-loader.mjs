@@ -6,7 +6,14 @@ import { invariant } from "./errors.mjs";
 export const SUPPORTED_PI_VERSION = "0.83.0";
 export const SUPPORTED_PI_RANGE = SUPPORTED_PI_VERSION;
 
-const INSTALLATION_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// The packed operational bundle is dormant on disk and is activated only from
+// source read by the sanitized child. Its data-URL evaluation receives this
+// lexical physical URL from that child launcher; ordinary source execution and
+// the public bundle continue to use their own module URL.
+const INSTALLATION_URL = typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
+  ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
+  : import.meta.url;
+const INSTALLATION_ROOT = resolve(dirname(fileURLToPath(INSTALLATION_URL)), "..");
 
 function samePath(left, right) {
   const a = resolve(left);

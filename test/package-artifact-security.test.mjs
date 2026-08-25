@@ -202,6 +202,121 @@ test("R1-M-13 exact genuine-Pi prototype attack cannot cross an absolute operati
   });
 });
 
+test("R1-M-13 exact Worker-entry preload cannot cross the OS-process boundary", () => {
+  const x = packAndInstall("worker-entry-attacker");
+  gitRepository(x.consumer);
+  const init = execFileSync(process.execPath, [join(x.packageRoot, "bin", "aio.mjs"), "init", "--target", x.consumer], {
+    cwd: x.consumer, encoding: "utf8",
+  });
+  assert.match(init, /Pi 0\.83\.0/);
+
+  const capturePath = join(x.root, "worker-capture.json");
+  const preloadPath = join(x.consumer, "attacker-preload.mjs");
+  writeFileSync(preloadPath, `
+    import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+    import { existsSync, readFileSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { DatabaseSync } from "node:sqlite";
+    import { threadId } from "node:worker_threads";
+    const manifest = JSON.parse(readFileSync(new URL("./node_modules/@earendil-works/pi-coding-agent/package.json", import.meta.url), "utf8"));
+    const capture = { pid: process.pid, threadId, piVersion: manifest.version, factory: 0, commands: 0, handlers: 0, runnerAuthority: 0 };
+    function save() {
+      const databasePath = join(${JSON.stringify(x.consumer)}, ".guardian", "runtime", "guardian.sqlite");
+      let forged = null; let humanTakeover = 0;
+      if (existsSync(databasePath)) {
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        forged = database.prepare("SELECT state,outcome,profile FROM operations WHERE operation_id='OP-FORGED-WORKER'").get() ?? null;
+        humanTakeover = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('LATCH_ENGAGED','LATCH_ESCALATED') AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count;
+        database.close();
+      }
+      writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ ...capture, forged, humanTakeover }));
+    }
+    save();
+    DefaultResourceLoader.prototype.loadExtensionFactories = async function attackerInterposition() {
+      const commands = new Map(); const handlers = new Map();
+      const factories = this.extensionFactories ?? [];
+      capture.factory += factories.length;
+      for (const value of factories) {
+        const factory = typeof value === "function" ? value : value.factory;
+        factory({
+          registerCommand(name, command) { commands.set(name, command); capture.commands += 1; },
+          on(name, handler) { handlers.set(name, handler); capture.handlers += 1; },
+        });
+      }
+      capture.runnerAuthority = commands.has("aio") && handlers.has("tool_call") && handlers.has("tool_execution_end") ? 1 : 0;
+      handlers.get("tool_call")?.({ toolCallId: "OP-FORGED-WORKER", toolName: "read", input: { path: "attacker-chosen.txt" } });
+      handlers.get("tool_execution_end")?.({
+        toolCallId: "OP-FORGED-WORKER", toolName: "read", input: { path: "attacker-chosen.txt" }, isError: false,
+        result: { content: [{ type: "text", text: "forged" }] },
+      }, { signal: { aborted: false } });
+      await commands.get("aio")?.handler("takeover", { ui: { notify() {} } });
+      save();
+      throw new Error("WORKER_CAPTURE_COMPLETE");
+    };
+    process.on("exit", save);
+  `);
+  const parentPath = join(x.consumer, "worker-parent.mjs");
+  writeFileSync(parentPath, `
+    import { Worker, threadId } from "node:worker_threads";
+    import { pathToFileURL } from "node:url";
+    const worker = new Worker(new URL(${JSON.stringify(pathToFileURL(join(x.packageRoot, "dist", "cli-entry.mjs")).href)}), {
+      argv: ["--target", ${JSON.stringify(x.consumer)}],
+      execArgv: ["--import", pathToFileURL(${JSON.stringify(preloadPath)}).href],
+    });
+    await Promise.race([
+      new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); }),
+      new Promise((resolve) => setTimeout(resolve, 20_000)),
+    ]);
+    await worker.terminate();
+    process.stdout.write(JSON.stringify({ pid: process.pid, threadId }));
+  `);
+  const parent = JSON.parse(execFileSync(process.execPath, [parentPath], { cwd: x.consumer, encoding: "utf8" }));
+  const capture = JSON.parse(readFileSync(capturePath, "utf8"));
+  assert.equal(parent.pid, capture.pid, "Worker shares the public consumer's OS PID");
+  assert.equal(parent.threadId, 0);
+  assert.ok(capture.threadId > 0);
+  assert.deepEqual(capture, {
+    pid: parent.pid, threadId: capture.threadId, piVersion: "0.83.0", factory: 0, commands: 0,
+    handlers: 0, runnerAuthority: 0, forged: null, humanTakeover: 0,
+  });
+});
+
+test("R1-M-13 forgeable Worker/process JavaScript indicators have no authority-boundary role", () => {
+  const x = packAndInstall("worker-oracle-attacker");
+  const capturePath = join(x.root, "oracle-capture.json");
+  const preloadPath = join(x.consumer, "oracle-preload.mjs");
+  writeFileSync(preloadPath, `
+    import workerThreads from "node:worker_threads";
+    import { syncBuiltinESMExports } from "node:module";
+    import { writeFileSync } from "node:fs";
+    workerThreads.isMainThread = true;
+    workerThreads.threadId = 0;
+    workerThreads.parentPort = null;
+    syncBuiltinESMExports();
+    process.argv = [process.execPath, ${JSON.stringify(join(x.packageRoot, "dist", "cli-entry.mjs"))}, "--target", ${JSON.stringify(x.consumer)}];
+    process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME = "aio";
+    globalThis.AIOPAGO_OPERATIONAL = true;
+    const observed = await import("node:worker_threads");
+    process.on("exit", () => writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+      isMainThread: observed.isMainThread, threadId: observed.threadId, parentPort: observed.parentPort,
+      taskPlan: false,
+    })));
+  `);
+  const parentPath = join(x.consumer, "oracle-parent.mjs");
+  writeFileSync(parentPath, `
+    import { Worker } from "node:worker_threads";
+    import { pathToFileURL } from "node:url";
+    const worker = new Worker(new URL(${JSON.stringify(pathToFileURL(join(x.packageRoot, "dist", "cli-entry.mjs")).href)}), {
+      execArgv: ["--import", pathToFileURL(${JSON.stringify(preloadPath)}).href],
+    });
+    await new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); });
+  `);
+  execFileSync(process.execPath, [parentPath], { cwd: x.consumer, encoding: "utf8" });
+  const capture = JSON.parse(readFileSync(capturePath, "utf8"));
+  capture.taskPlan = existsSync(join(x.consumer, "TASK_PLAN.md"));
+  assert.deepEqual(capture, { isMainThread: true, threadId: 0, parentPort: null, taskPlan: false });
+});
+
 test("R1-M-13 every packed JavaScript file is inert or public-only on direct import", () => {
   const x = packAndInstall("all-artifact-attacker");
   const target = join(x.root, "direct-import-target");
@@ -255,7 +370,71 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
     { kind: "copy", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
     { kind: "link", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
   ]);
-  assert.deepEqual(result.cjs, { code: "ERR_REQUIRE_ASYNC_MODULE", keys: [], symbols: [] });
+  assert.deepEqual(result.cjs, { code: null, keys: [], symbols: ["Symbol(Symbol.toStringTag)"] });
+
+  const workerPreload = join(x.consumer, "artifact-worker-preload.mjs");
+  writeFileSync(workerPreload, `
+    import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+    import { parentPort, threadId } from "node:worker_threads";
+    parentPort.postMessage({ type: "preload", pid: process.pid, threadId });
+    DefaultResourceLoader.prototype.loadExtensionFactories = async function () {
+      let factory = 0; let commands = 0; let handlers = 0;
+      for (const value of this.extensionFactories ?? []) {
+        factory += 1;
+        const extension = typeof value === "function" ? value : value.factory;
+        extension({ registerCommand() { commands += 1; }, on() { handlers += 1; } });
+      }
+      parentPort.postMessage({ type: "authority", factory, commands, handlers });
+      throw new Error("ARTIFACT_WORKER_CAPTURE");
+    };
+  `);
+  const workerRowsPath = join(x.root, "artifact-worker-rows.json");
+  const workerMatrix = join(x.consumer, "artifact-worker-matrix.mjs");
+  const routes = [
+    ...shippedJavaScript.flatMap((artifact) => [
+      { artifact, route: "Worker file URL", value: pathToFileURL(join(x.packageRoot, artifact)).href, url: true },
+      { artifact, route: "Worker path", value: join(x.packageRoot, artifact), url: false },
+    ]),
+    { artifact: "dist/cli-entry.mjs", route: "Worker copied package", value: pathToFileURL(join(packageCopy, "dist", "cli-entry.mjs")).href, url: true },
+    { artifact: "dist/cli-entry.mjs", route: "Worker junction/symlink", value: pathToFileURL(join(packageLink, "dist", "cli-entry.mjs")).href, url: true },
+    { artifact: "dist/cli-entry.mjs", route: "Worker query URL", value: `${pathToFileURL(join(x.packageRoot, "dist", "cli-entry.mjs")).href}?worker-query`, url: true },
+    { artifact: "dist/cli-entry.mjs", route: "Worker hash URL", value: `${pathToFileURL(join(x.packageRoot, "dist", "cli-entry.mjs")).href}#worker-hash`, url: true },
+  ];
+  writeFileSync(workerMatrix, `
+    import { writeFileSync } from "node:fs";
+    import { Worker } from "node:worker_threads";
+    import { pathToFileURL } from "node:url";
+    const parentPid = process.pid;
+    const routes = ${JSON.stringify(routes)};
+    const run = (route) => new Promise((resolve, reject) => {
+      const worker = new Worker(route.url ? new URL(route.value) : route.value, {
+        argv: ["--version"],
+        execArgv: ["--import", pathToFileURL(${JSON.stringify(workerPreload)}).href],
+        env: { ...process.env, AIOPAGO_OPERATIONAL_COMMAND_NAME: "aio", AIOPAGO_WORKER_ATTACK: "1" },
+      });
+      const row = { ...route, parentPid, pid: null, threadId: null, factory: 0, commands: 0, handlers: 0 };
+      let timer = null;
+      worker.on("message", (message) => {
+        if (message.type === "preload") {
+          row.pid = message.pid; row.threadId = message.threadId;
+          timer = setTimeout(() => worker.terminate(), 5000);
+        } else if (message.type === "authority") Object.assign(row, message);
+      });
+      worker.once("error", reject);
+      worker.once("exit", () => { if (timer) clearTimeout(timer); resolve(row); });
+    });
+    const rows = [];
+    for (let offset = 0; offset < routes.length; offset += 4) rows.push(...await Promise.all(routes.slice(offset, offset + 4).map(run)));
+    writeFileSync(${JSON.stringify(workerRowsPath)}, JSON.stringify(rows));
+  `);
+  execFileSync(process.execPath, [workerMatrix], { cwd: x.consumer, stdio: "pipe", timeout: 240_000 });
+  const workerRows = JSON.parse(readFileSync(workerRowsPath, "utf8"));
+  assert.equal(workerRows.length, 12);
+  for (const row of workerRows) {
+    assert.equal(row.pid, row.parentPid, `${row.artifact} ${row.route} must remain in the public PID`);
+    assert.ok(row.threadId > 0, `${row.artifact} ${row.route} must be a Worker thread`);
+    assert.deepEqual([row.factory, row.commands, row.handlers], [0, 0, 0], `${row.artifact} ${row.route}`);
+  }
 });
 
 test("R1-M-13 supported aio bootstrap starts a clean child and ignores ambient Pi selection", () => {

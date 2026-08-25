@@ -1,3 +1,4 @@
+const __AIOPAGO_OPERATIONAL_ENTRY_URL__ = import.meta.url;
 var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -1694,12 +1695,13 @@ async function loadPi() {
   const coding = await import(pathToFileURL(join2(info.root, "dist", "index.js")));
   return { ...info, coding, ai };
 }
-var SUPPORTED_PI_VERSION, INSTALLATION_ROOT;
+var SUPPORTED_PI_VERSION, INSTALLATION_URL, INSTALLATION_ROOT;
 var init_pi_loader = __esm({
   "src/pi-loader.mjs"() {
     init_errors();
     SUPPORTED_PI_VERSION = "0.83.0";
-    INSTALLATION_ROOT = resolve3(dirname2(fileURLToPath(import.meta.url)), "..");
+    INSTALLATION_URL = typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url;
+    INSTALLATION_ROOT = resolve3(dirname2(fileURLToPath(INSTALLATION_URL)), "..");
   }
 });
 
@@ -1845,14 +1847,15 @@ function readRepositoryConfig(targetRoot) {
 function loadRepositoryContext(input = process.cwd(), options = {}) {
   return readRepositoryConfig(discoverTargetRepository(input, options));
 }
-var REPOSITORY_CONFIG_SCHEMA, LEGACY_REPOSITORY_CONFIG_SCHEMA, REPOSITORY_CONFIG_FILE, INSTALLATION_ROOT2, DEFAULT_REPOSITORY_CONFIG, GIT_FAILURE_INSPECTION_LIMIT;
+var REPOSITORY_CONFIG_SCHEMA, LEGACY_REPOSITORY_CONFIG_SCHEMA, REPOSITORY_CONFIG_FILE, INSTALLATION_URL2, INSTALLATION_ROOT2, DEFAULT_REPOSITORY_CONFIG, GIT_FAILURE_INSPECTION_LIMIT;
 var init_repository = __esm({
   "src/repository.mjs"() {
     init_errors();
     REPOSITORY_CONFIG_SCHEMA = "aiopago.repository/1.0.0";
     LEGACY_REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
     REPOSITORY_CONFIG_FILE = ".guardian/config.json";
-    INSTALLATION_ROOT2 = resolve4(dirname3(fileURLToPath2(import.meta.url)), "..");
+    INSTALLATION_URL2 = typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url;
+    INSTALLATION_ROOT2 = resolve4(dirname3(fileURLToPath2(INSTALLATION_URL2)), "..");
     DEFAULT_REPOSITORY_CONFIG = Object.freeze({
       schema_version: REPOSITORY_CONFIG_SCHEMA,
       task_ledger: "TASK_PLAN.md",
@@ -7197,7 +7200,7 @@ var init_storage = __esm({
     init_handoff_plan_internal();
     init_plan_semantics_internal();
     init_task_operation_internal();
-    require2 = createRequire(import.meta.url);
+    require2 = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url);
     TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
     storageDatabases = /* @__PURE__ */ new WeakMap();
     HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
@@ -8819,7 +8822,7 @@ function isSupportedNode() {
   const current = process.versions.node.split(".").map(Number);
   return current.some((value, index) => value > MINIMUM_NODE_VERSION2[index] && current.slice(0, index).every((part, prior) => part === MINIMUM_NODE_VERSION2[prior])) || current.every((value, index) => value === MINIMUM_NODE_VERSION2[index]);
 }
-if (import.meta.main) {
+async function aiopagoOperationalEntrypoint() {
   const deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
   const commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
   if (deprecated) console.error("eio is deprecated; use aio instead.");

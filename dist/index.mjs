@@ -1,3 +1,5 @@
+const __AIOPAGO_OPERATIONAL_ENTRY_URL__ = import.meta.url;
+
 // src/canonical.mjs
 import { createHash, randomUUID } from "node:crypto";
 var MAX_JSON_DEPTH = 128;
@@ -1601,7 +1603,8 @@ import { fileURLToPath } from "node:url";
 var REPOSITORY_CONFIG_SCHEMA = "aiopago.repository/1.0.0";
 var LEGACY_REPOSITORY_CONFIG_SCHEMA = "eiopago.repository/1.0.0";
 var REPOSITORY_CONFIG_FILE = ".guardian/config.json";
-var INSTALLATION_ROOT = resolve4(dirname2(fileURLToPath(import.meta.url)), "..");
+var INSTALLATION_URL = typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url;
+var INSTALLATION_ROOT = resolve4(dirname2(fileURLToPath(INSTALLATION_URL)), "..");
 var DEFAULT_REPOSITORY_CONFIG = Object.freeze({
   schema_version: REPOSITORY_CONFIG_SCHEMA,
   task_ledger: "TASK_PLAN.md",
