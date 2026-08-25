@@ -8773,9 +8773,9 @@ async function runCli(argv = process.argv.slice(2), options = {}) {
   }
   return { action: "launch", repository };
 }
-function formatCliError(error, commandName2 = "aio") {
+function formatCliError(error, commandName = "aio") {
   const code = error?.code ? `${error.code}: ` : "";
-  return `${commandName2}: ${code}${error?.message ?? String(error)}`;
+  return `${commandName}: ${code}${error?.message ?? String(error)}`;
 }
 var AIO_VERSION, HELP, COMMANDS, READ_ONLY_COMMANDS, PLAN_OPTIONS;
 var init_cli = __esm({
@@ -8819,18 +8819,20 @@ function isSupportedNode() {
   const current = process.versions.node.split(".").map(Number);
   return current.some((value, index) => value > MINIMUM_NODE_VERSION2[index] && current.slice(0, index).every((part, prior) => part === MINIMUM_NODE_VERSION2[prior])) || current.every((value, index) => value === MINIMUM_NODE_VERSION2[index]);
 }
-var deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
-var commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
-if (deprecated) console.error("eio is deprecated; use aio instead.");
-if (!isSupportedNode()) {
-  console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
-  process.exitCode = 1;
-} else {
-  const { formatCliError: formatCliError2, runCli: runCli2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
-  try {
-    await runCli2();
-  } catch (error) {
-    console.error(formatCliError2(error, commandName));
+if (import.meta.main) {
+  const deprecated = process.env.AIOPAGO_OPERATIONAL_COMMAND_NAME === "legacy";
+  const commandName = deprecated ? ["e", "i", "o"].join("") : "aio";
+  if (deprecated) console.error("eio is deprecated; use aio instead.");
+  if (!isSupportedNode()) {
+    console.error(`${commandName}: NODE_VERSION_UNSUPPORTED: Node ${process.versions.node} is unsupported; expected >=22.19.0`);
     process.exitCode = 1;
+  } else {
+    const { formatCliError: formatCliError2, runCli: runCli2 } = await Promise.resolve().then(() => (init_cli(), cli_exports));
+    try {
+      await runCli2();
+    } catch (error) {
+      console.error(formatCliError2(error, commandName));
+      process.exitCode = 1;
+    }
   }
 }

@@ -159,7 +159,9 @@ function lockMetadata(planPath, { pid, identity, nonce = "a".repeat(64), schema 
 test("R1-M-06 owner-first contention keeps one takeover command alive until HUMAN_TAKEOVER is canonical", async () => {
   const x = fixture();
   try {
-    const owner = ownerChild(x, 650);
+    // Keep the owner alive across the real Windows process-identity probe; a
+    // cold Get-CimInstance can legitimately take several seconds.
+    const owner = ownerChild(x, 3_500);
     await waitFor(owner.ready);
     const pending = x.runner.takeoverFromCommand(x.ctx);
     const ownerResult = await owner.done;

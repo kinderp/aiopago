@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -13,8 +14,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 const PUBLIC_ROOT_EXPORTS = [
   "CONTEXT_HANDOFF_THRESHOLD_ENV", "ContextHandoffAdvisor", "DEFAULT_CONTEXT_HANDOFF_THRESHOLD_PERCENT",
@@ -133,39 +135,193 @@ test("R1-M-08/R1-M-13 real tarball root exposes only the enumerated read/data an
   assert.ok(readFileSync(x.tarball).length > 0);
 });
 
+test("R1-M-13 exact genuine-Pi prototype attack cannot cross an absolute operational import", () => {
+  const x = packAndInstall("absolute-operational-attacker");
+  gitRepository(x.consumer);
+  const init = execFileSync(process.execPath, [join(x.packageRoot, "bin", "aio.mjs"), "init", "--target", x.consumer], {
+    cwd: x.consumer, encoding: "utf8",
+  });
+  assert.match(init, /Pi 0\.83\.0/);
+
+  const piManifest = join(x.consumer, "node_modules", "@earendil-works", "pi-coding-agent", "package.json");
+  const attack = `
+    import { AgentSession, AgentSessionRuntime, DefaultResourceLoader, ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
+    import { existsSync, readFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { DatabaseSync } from "node:sqlite";
+    const manifest = JSON.parse(readFileSync(${JSON.stringify(piManifest)}, "utf8"));
+    const captures = { factoryCapture: 0, registeredHandlers: 0, registeredCommands: 0, runnerAuthority: 0, prototypeCalls: 0 };
+    for (const [prototype, names] of [
+      [DefaultResourceLoader.prototype, ["reload", "loadProjectTrustExtensions"]],
+      [SessionManager.prototype, ["newSession"]],
+      [ExtensionRunner.prototype, ["bindCore", "emit"]],
+      [AgentSession.prototype, ["bindExtensions", "subscribe"]],
+      [AgentSessionRuntime.prototype, ["apply"]],
+    ]) for (const name of names) {
+      const original = prototype[name];
+      prototype[name] = function (...args) { captures.prototypeCalls += 1; return Reflect.apply(original, this, args); };
+    }
+    const handlers = new Map();
+    const commands = new Map();
+    DefaultResourceLoader.prototype.loadExtensionFactories = async function attackerInterposition() {
+      const factories = this.extensionFactories ?? [];
+      captures.factoryCapture += factories.length;
+      for (const value of factories) {
+        const factory = typeof value === "function" ? value : value.factory;
+        factory({
+          registerCommand(name, command) { commands.set(name, command); captures.registeredCommands += 1; },
+          on(name, handler) { handlers.set(name, handler); captures.registeredHandlers += 1; },
+        });
+      }
+      captures.runnerAuthority = commands.has("aio") && handlers.has("tool_call") && handlers.has("tool_execution_end") ? 1 : 0;
+      handlers.get("tool_call")?.({ toolCallId: "OP-FORGED", toolName: "read", input: { path: "attacker-chosen.txt" } });
+      handlers.get("tool_execution_end")?.({
+        toolCallId: "OP-FORGED", toolName: "read", input: { path: "attacker-chosen.txt" }, isError: false,
+        result: { content: [{ type: "text", text: "forged" }] },
+      }, { signal: { aborted: false } });
+      throw new Error("REVIEW_CAPTURE_COMPLETE");
+    };
+    process.argv = [process.execPath, ${JSON.stringify(join(x.packageRoot, "dist", "cli-entry.mjs"))}, "--target", ${JSON.stringify(x.consumer)}];
+    const namespace = await import(${JSON.stringify(pathToFileURL(join(x.packageRoot, "dist", "cli-entry.mjs")).href)});
+    process.exitCode = 0;
+    const databasePath = join(${JSON.stringify(x.consumer)}, ".guardian", "runtime", "guardian.sqlite");
+    let forged = null; let humanTakeover = 0;
+    if (existsSync(databasePath)) {
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      forged = database.prepare("SELECT operation_id,state,outcome,profile FROM operations WHERE operation_id='OP-FORGED'").get() ?? null;
+      humanTakeover = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('LATCH_ENGAGED','LATCH_ESCALATED') AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count;
+      database.close();
+    }
+    process.stdout.write(JSON.stringify({ piVersion: manifest.version, exports: Object.keys(namespace), ...captures, forged, humanTakeover }));
+  `;
+  writeFileSync(join(x.consumer, "attack.mjs"), attack);
+  const result = JSON.parse(execFileSync(process.execPath, ["attack.mjs"], { cwd: x.consumer, encoding: "utf8" }));
+  assert.deepEqual(result, {
+    piVersion: "0.83.0", exports: [], factoryCapture: 0, registeredHandlers: 0,
+    registeredCommands: 0, runnerAuthority: 0, prototypeCalls: 0, forged: null, humanTakeover: 0,
+  });
+});
+
+test("R1-M-13 every packed JavaScript file is inert or public-only on direct import", () => {
+  const x = packAndInstall("all-artifact-attacker");
+  const target = join(x.root, "direct-import-target");
+  const packageCopy = join(x.root, "package-copy");
+  const packageLink = join(x.root, "package-link");
+  mkdirSync(target);
+  cpSync(x.packageRoot, packageCopy, { recursive: true });
+  symlinkSync(x.packageRoot, packageLink, process.platform === "win32" ? "junction" : "dir");
+  const shippedJavaScript = walk(x.packageRoot).filter((name) => /\.(?:c?js|mjs)$/.test(name)).sort();
+  assert.deepEqual(shippedJavaScript, ["bin/aio.mjs", "bin/eio.mjs", "dist/cli-entry.mjs", "dist/index.mjs"]);
+  const script = `
+    import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+    import { existsSync } from "node:fs";
+    import { createRequire } from "node:module";
+    let factoryCapture = 0; let registeredHandlers = 0;
+    DefaultResourceLoader.prototype.loadExtensionFactories = async function () {
+      factoryCapture += (this.extensionFactories ?? []).length;
+      for (const value of this.extensionFactories ?? []) {
+        const factory = typeof value === "function" ? value : value.factory;
+        factory({ registerCommand() {}, on() { registeredHandlers += 1; } });
+      }
+      throw new Error("ARTIFACT_AUTHORITY_CAPTURED");
+    };
+    const artifacts = ${JSON.stringify(shippedJavaScript)};
+    const rows = [];
+    for (const artifact of artifacts) {
+      process.argv = [process.execPath, ${JSON.stringify(x.packageRoot)} + "/" + artifact, "init", "--target", ${JSON.stringify(target)}];
+      const namespace = await import(new URL("file:///" + (${JSON.stringify(x.packageRoot)} + "/" + artifact).replaceAll("\\\\", "/")));
+      rows.push({ artifact, exports: Object.keys(namespace).sort(), factoryCapture, registeredHandlers });
+    }
+    const aliases = [];
+    for (const [kind, root] of [["copy", ${JSON.stringify(packageCopy)}], ["link", ${JSON.stringify(packageLink)}]]) {
+      const namespace = await import(new URL("file:///" + (root + "/dist/cli-entry.mjs?" + kind).replaceAll("\\\\", "/")));
+      aliases.push({ kind, exports: Reflect.ownKeys(namespace).map(String), prototype: Object.getPrototypeOf(namespace) === null });
+    }
+    const require = createRequire(import.meta.url);
+    let cjs;
+    try {
+      const cjsNamespace = require(${JSON.stringify(join(x.packageRoot, "dist", "cli-entry.mjs"))});
+      cjs = { code: null, keys: Object.keys(cjsNamespace), symbols: Reflect.ownKeys(cjsNamespace).filter((key) => typeof key === "symbol").map(String) };
+    } catch (error) { cjs = { code: error.code, keys: [], symbols: [] }; }
+    process.stdout.write(JSON.stringify({ rows, aliases, cjs, mutated: existsSync(${JSON.stringify(join(target, "TASK_PLAN.md"))}) }));
+  `;
+  writeFileSync(join(x.consumer, "all-artifacts.mjs"), script);
+  const result = JSON.parse(execFileSync(process.execPath, ["all-artifacts.mjs"], { cwd: x.consumer, encoding: "utf8" }));
+  assert.equal(result.mutated, false, "directly imported bins and operational bundle perform no CLI mutation");
+  assert.equal(result.rows.every((row) => row.factoryCapture === 0 && row.registeredHandlers === 0), true);
+  assert.deepEqual(result.rows.slice(0, 3).map((row) => row.exports), [[], [], []]);
+  assert.deepEqual(result.rows[3].exports, PUBLIC_ROOT_EXPORTS);
+  assert.deepEqual(result.aliases, [
+    { kind: "copy", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
+    { kind: "link", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
+  ]);
+  assert.deepEqual(result.cjs, { code: "ERR_REQUIRE_ASYNC_MODULE", keys: [], symbols: [] });
+});
+
 test("R1-M-13 supported aio bootstrap starts a clean child and ignores ambient Pi selection", () => {
   const x = packAndInstall("cli-boundary-attacker");
   const fakeModules = makeFakePi(x.root);
   const capture = join(x.root, "ambient-fake-pi-evaluated");
-  const preloadCapture = join(x.root, "node-options-child-preload");
+  const preloadCapture = join(x.root, "node-options-processes");
   const preload = join(x.root, "preload.mjs");
-  writeFileSync(preload, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(preloadCapture)}, "preloaded");\n`);
+  writeFileSync(preload, `import { appendFileSync } from "node:fs"; appendFileSync(${JSON.stringify(preloadCapture)}, String(process.argv[1])+"\\n");\n`);
   gitRepository(x.consumer);
 
+  const embeddedTarget = join(x.root, "embedded-target");
+  mkdirSync(embeddedTarget);
   const embed = `
     import fsPromises from "node:fs/promises";
+    import childProcess from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
     fsPromises.lstat = async () => { throw new Error("ATTACKER_FS_PROMISES"); };
     fsPromises.realpath = async () => "attacker";
-    const originalKill = process._kill;
-    process._kill = new Proxy(originalKill, { apply() { return -3; } });
-    Function.prototype.toString = new Proxy(Function.prototype.toString, { apply() { return "function () { [native code] }"; } });
-    process.env.NODE_OPTIONS = "--import=" + ${JSON.stringify(preload)};
-    process.env.NODE_PATH = ${JSON.stringify(fakeModules)};
-    process.env.PI_CODING_AGENT_ROOT = ${JSON.stringify(join(fakeModules, "@earendil-works", "pi-coding-agent"))};
-    process.argv = [process.execPath, ${JSON.stringify(join(x.packageRoot, "bin", "aio.mjs"))}, "init", "--target", ${JSON.stringify(x.consumer)}];
-    await import(new URL("file:///" + ${JSON.stringify(join(x.packageRoot, "bin", "aio.mjs"))}.replaceAll("\\\\", "/")));
+    childProcess.spawnSync = () => { throw new Error("ATTACKER_SPAWN"); };
+    syncBuiltinESMExports();
+    process.argv = [process.execPath, ${JSON.stringify(join(x.packageRoot, "bin", "aio.mjs"))}, "init", "--target", ${JSON.stringify(embeddedTarget)}];
+    await import(${JSON.stringify(pathToFileURL(join(x.packageRoot, "bin", "aio.mjs")).href)});
   `;
   writeFileSync(join(x.consumer, "embed.mjs"), embed);
-  const output = execFileSync(process.execPath, ["embed.mjs"], {
+  execFileSync(process.execPath, ["embed.mjs"], { cwd: x.consumer, encoding: "utf8" });
+  assert.equal(existsSync(join(embeddedTarget, "TASK_PLAN.md")), false, "same-process bin import is inert despite process/fs patches");
+
+  const output = execFileSync(process.execPath, [join(x.packageRoot, "bin", "aio.mjs"), "init", "--target", x.consumer], {
     cwd: x.consumer,
-    env: { ...process.env, AIOPAGO_FAKE_PI_CAPTURE: capture },
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+      NODE_PATH: fakeModules,
+      PI_CODING_AGENT_ROOT: join(fakeModules, "@earendil-works", "pi-coding-agent"),
+      AIOPAGO_FAKE_PI_CAPTURE: capture,
+    },
     encoding: "utf8",
   });
   assert.match(output, /Aiopago init complete/);
   assert.match(output, /Pi 0\.83\.0/);
   assert.equal(existsSync(capture), false);
-  assert.equal(existsSync(preloadCapture), false, "fresh privileged child strips inherited NODE_OPTIONS");
+  assert.equal(readFileSync(preloadCapture, "utf8").trim(), join(x.packageRoot, "bin", "aio.mjs"), "NODE_OPTIONS reaches only the non-privileged bootstrap");
   assert.equal(existsSync(join(x.consumer, "TASK_PLAN.md")), true);
+
+  const targetShadow = join(x.root, "target-shadow");
+  mkdirSync(targetShadow);
+  renameSync(makeFakePi(targetShadow), join(targetShadow, "node_modules"));
+  gitRepository(targetShadow);
+  const ancestorShadow = join(x.root, "ancestor-shadow");
+  const ancestorTarget = join(ancestorShadow, "project");
+  mkdirSync(ancestorTarget, { recursive: true });
+  renameSync(makeFakePi(ancestorShadow), join(ancestorShadow, "node_modules"));
+  gitRepository(ancestorTarget);
+  for (const target of [targetShadow, ancestorTarget]) {
+    const shadowed = execFileSync(process.execPath, [join(x.packageRoot, "bin", "aio.mjs"), "init", "--target", target], {
+      cwd: target, env: { ...process.env, AIOPAGO_FAKE_PI_CAPTURE: capture }, encoding: "utf8",
+    });
+    assert.match(shadowed, /Pi 0\.83\.0/);
+  }
+  assert.equal(existsSync(capture), false, "target, nested and ancestor node_modules cannot shadow Aiopago-owned Pi");
+  const linkedPackage = join(x.root, "linked-aiopago");
+  symlinkSync(x.packageRoot, linkedPackage, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(execFileSync(process.execPath, [join(linkedPackage, "bin", "aio.mjs"), "--version"], {
+    cwd: ancestorTarget, encoding: "utf8",
+  }).trim(), "0.1.0");
 
   for (const command of [["status"], ["why"], ["next"], ["plan", "--check"], ["plan"], ["--version"], ["--help"]]) {
     const result = execFileSync(process.execPath, [join(x.packageRoot, "bin", "aio.mjs"), ...command], {
@@ -181,11 +337,6 @@ test("R1-M-13 supported aio bootstrap starts a clean child and ignores ambient P
     assert.ok(result.length > 0, command.join(" "));
   }
   assert.equal(existsSync(capture), false);
-
-  const directEntry = `process.argv=[process.execPath,${JSON.stringify(join(x.packageRoot, "dist", "cli-entry.mjs"))},"--version"]; const ns=await import(${JSON.stringify(new URL(`file:///${join(x.packageRoot, "dist", "cli-entry.mjs").replaceAll("\\", "/")}`).href)}); process.stdout.write("\\nEXPORTS="+JSON.stringify(Object.keys(ns)));`;
-  writeFileSync(join(x.consumer, "absolute-cli.mjs"), directEntry);
-  const direct = execFileSync(process.execPath, ["absolute-cli.mjs"], { cwd: x.consumer, encoding: "utf8" });
-  assert.match(direct, /EXPORTS=\[\]$/);
 });
 
 test("trusted-process Pi layout validation rejects redirected, missing and wrong-version owned slots", () => {

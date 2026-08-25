@@ -39,7 +39,7 @@ const fullAllowlist = new Map(Object.entries({
 }));
 
 const shortAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [28, "rename closure compatibility summary, 0.2-D alias evidence, immutable history, and current alias boundary"],
+  "CHECKPOINT.md": [29, "rename closure compatibility summary, 0.2-D alias evidence, immutable history, and current package-artifact matrix"],
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
   [["bin", `${legacyShort}.mjs`].join("/")]: [0, "deprecated thin CLI wrapper path only"],
@@ -60,7 +60,7 @@ const shortAllowlist = new Map(Object.entries({
   "test/core.test.mjs": [5, "legacy environment, Ledger and TUI tests"],
   "test/fixtures/historical-owner-gate-b317f79.md": [2, "exact historical owner-gate command and actor fixture"],
   "test/plan-proposal.test.mjs": [6, "legacy owner-command alias compatibility tests"],
-  "test/package-artifact-security.test.mjs": [1, "real tarball inventories the deprecated compatibility executable"],
+  "test/package-artifact-security.test.mjs": [2, "real tarball inventory and direct-import security matrix include the deprecated compatibility executable"],
   "test/portable-alpha.test.mjs": [5, "deprecated CLI and package tests"],
   "test/start-objective.test.mjs": [3, "deprecated CLI start compatibility test"],
 }));
