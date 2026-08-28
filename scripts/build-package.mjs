@@ -36,6 +36,7 @@ const common = {
 await Promise.all([
   build({ ...common, entryPoints: ["src/index.mjs"], outfile: "dist/index.mjs" }),
   build({ ...common, entryPoints: ["src/cli-entry.mjs"], outfile: "dist/cli-entry.mjs" }),
+  build({ ...common, entryPoints: ["src/operation-authority-worker.mjs"], outfile: "dist/operation-authority-worker.mjs" }),
 ]);
 
 // The shipped operational artifact must be inert even when Node selects it as

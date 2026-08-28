@@ -1,5 +1,6 @@
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
+import { portableOperationAuthority } from "./operation-authority.mjs";
 
 const TOOL_PROFILES = Object.freeze({
   read: "READ_ONLY",
@@ -93,8 +94,10 @@ export class AdmissionGate {
 }
 
 export class ToolOperationTracker {
-  constructor(storage, taskId) {
+  constructor(storage, taskId, { operationAuthority = null } = {}) {
     this.storage = storage;
+    this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+    this.authoritySecurity = this.operationAuthority.security;
     this.taskId = taskId;
     this.admittedTools = new Map();
     this.effectReferences = new Map();
@@ -103,7 +106,7 @@ export class ToolOperationTracker {
     const profile = TOOL_PROFILES[toolName];
     invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
     const latch = this.storage.ensureLatch(this.taskId);
-    this.storage.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
+    this.operationAuthority.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
     this.admittedTools.set(toolCallId, toolName);
     if (toolName === "bash") {
       this.effectReferences.set(toolCallId, shellEffectReference(toolCallId));
@@ -119,18 +122,19 @@ export class ToolOperationTracker {
     const effectReference = outcome === "KNOWN_SUCCESS" ? this.effectReferences.get(toolCallId) ?? null : null;
     this.admittedTools.delete(toolCallId);
     this.effectReferences.delete(toolCallId);
-    this.storage.finishOperation(toolCallId, outcome, effectReference);
+    this.operationAuthority.finishOperation(toolCallId, outcome, effectReference);
   }
   unknown(toolCallId) {
     this.admittedTools.delete(toolCallId);
     this.effectReferences.delete(toolCallId);
-    this.storage.finishOperation(toolCallId, "UNKNOWN");
+    this.operationAuthority.finishOperation(toolCallId, "UNKNOWN");
   }
 }
 
 export class SafePointCoordinator {
-  constructor({ storage, taskId, gate }) {
+  constructor({ storage, taskId, gate, operationAuthority = null }) {
     this.storage = storage;
+    this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
     this.taskId = taskId;
     this.gate = gate;
   }
@@ -171,7 +175,7 @@ export class SafePointCoordinator {
     session.abortRetry();
     session.abortCompaction();
     session.abortBranchSummary?.();
-    const admittedBeforeLatch = this.storage.operationsForTask(this.taskId).filter((operation) => operation.state === "ACTIVE");
+    const admittedBeforeLatch = this.operationAuthority.operationsForTask(this.taskId).filter((operation) => operation.state === "ACTIVE");
     // FINISH CURRENT ATOMIC OPERATION: abort only a bare LLM stream. An admitted
     // tool keeps its signal and is allowed to reach its declared terminal boundary;
     // the closed transport gate rejects the subsequent LLM continuation.
@@ -183,7 +187,7 @@ export class SafePointCoordinator {
     this.acquiredLatch(latch, reason);
     await this.gate.waitForNoStreams();
     this.acquiredLatch(latch, reason);
-    const operations = this.storage.operationsForTask(this.taskId);
+    const operations = this.operationAuthority.operationsForTask(this.taskId);
     const active = operations.filter((operation) => operation.state === "ACTIVE");
     if (active.length > 0) throw new GuardianError("SAFE_POINT_ACTIVE_OPERATION", "FINISH CURRENT ATOMIC OPERATION has not reached a terminal boundary", active.map((row) => row.operation_id));
     const unknown = operations.filter((operation) => operation.outcome === "UNKNOWN" || (operation.outcome === "KNOWN_SUCCESS" && operation.profile !== "READ_ONLY" && !operation.effect_reference));

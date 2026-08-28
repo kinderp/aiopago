@@ -1,0 +1,129 @@
+{
+  "schema": "aiopago.r1-m-13-windows-elevated-oracle/1",
+  "scope": "non-production foundation PoC",
+  "startingHead": "7ef2d831caaa16c5cf6ce44edae0c671a7e20e6f",
+  "remoteHead": "7ef2d831caaa16c5cf6ce44edae0c671a7e20e6f",
+  "branch": "feat/unified-human-ux-0.2-e",
+  "elevation": {
+    "pid": 23636,
+    "userSid": "S-1-5-21-1268775888-3906723769-323924214-1001",
+    "integritySid": "S-1-16-12288",
+    "administratorEnabled": true,
+    "netSessionExit": 0,
+    "scmCreateQueryDelete": [0, 0, 0],
+    "scmQueryAfterDelete": 1060
+  },
+  "service": {
+    "name": "AiopagoR1M13Poc",
+    "account": "NT AUTHORITY\\LocalService",
+    "userSid": "S-1-5-19",
+    "serviceSid": "S-1-5-80-1929571751-1865767387-1503916280-2855656575-2487379996",
+    "serviceSidName": "NT SERVICE\\AiopagoR1M13Poc",
+    "integritySid": "S-1-16-16384",
+    "sidTypeTestedFirst": "RESTRICTED",
+    "restrictedResult": "service entered, but dynamically linked Node/whoami children failed loader initialization with 0xc0000142",
+    "sidTypePassingOracle": "UNRESTRICTED",
+    "sharedLocalServiceSidGrantedOnProtectedDacl": false,
+    "binary": "C:\\ProgramData\\Aiopago\\R1M13Poc\\bin\\broker-service.exe",
+    "binarySha256": "bf74836fda78697fe632e20cb089f951ae6240ec323c1c14f90c8f519d8430e2"
+  },
+  "protectedStorage": {
+    "root": "C:\\ProgramData\\Aiopago\\R1M13Poc",
+    "owner": "BUILTIN\\Administrators",
+    "protectedDaclPrincipals": ["SYSTEM", "BUILTIN\\Administrators", "NT SERVICE\\AiopagoR1M13Poc"],
+    "canonical": "C:\\ProgramData\\Aiopago\\R1M13Poc\\canonical",
+    "publicProjection": "C:\\ProgramData\\Aiopago\\R1M13PocPublic\\projection.json",
+    "publicProjectionCanonicalInput": false
+  },
+  "identity": {
+    "p0PrimaryPid": 37672,
+    "p0UserSid": "S-1-5-21-1268775888-3906723769-323924214-1001",
+    "p0IntegritySid": "S-1-16-8192",
+    "p0AdministratorsDenyOnly": true,
+    "p1BeforePid": 37932,
+    "p1AfterPid": 28668,
+    "p1CrashPid": 35216,
+    "p1RecoveryPid": 2252,
+    "p2BeforePid": 35104,
+    "p2AfterPid": 7612,
+    "p2ParentCheckEnforcedByPrivateProtocol": true
+  },
+  "authority": {
+    "algorithm": "Ed25519 raw 64-byte service-created private key file",
+    "fingerprintBefore": "d33e4cb16aa25db116145190b004a981ba34cbc47875fe4560c53c080901bcf1",
+    "fingerprintAfter": "d33e4cb16aa25db116145190b004a981ba34cbc47875fe4560c53c080901bcf1",
+    "privateBytesRecorded": false,
+    "privateVisibleToP0": false,
+    "capabilityInArgv": false,
+    "capabilityInEnvironment": false
+  },
+  "canonicalRecords": [
+    {
+      "sequence": 1,
+      "requestId": "OP-POC-BEFORE-RESTART",
+      "payloadDigest": "c4bee84ee5ac5b8b1c5b167629206617c6a001d7e965146900898dc842f32cf3",
+      "previousDigest": "GENESIS",
+      "recordDigest": "fd76d4dd45ff5dac4e5a4d517c4eb7a80c80fa2b4712411c0b3e9cae19f50c0e"
+    },
+    {
+      "sequence": 2,
+      "requestId": "OP-POC-AFTER-RESTART",
+      "payloadDigest": "26343f91484ef07618cbb9c63da52cd391c796754fde86fe78e731d2efa479cc",
+      "previousDigest": "fd76d4dd45ff5dac4e5a4d517c4eb7a80c80fa2b4712411c0b3e9cae19f50c0e",
+      "recordDigest": "52eaba55a5619e1f2d21ae51a58b2980dab3cd787047f9cca749a239eaaf47e1"
+    }
+  ],
+  "p0": {
+    "keyReadUseCopyDeleteReplaceRenameAcl": "DENIED (EPERM or Win32 exit 5)",
+    "canonicalReadWriteDeleteReplaceRenameAcl": "DENIED (EPERM or Win32 exit 5)",
+    "binaryReadOverwriteRenameReplaceDirectoryAcl": "DENIED (EPERM or Win32 exit 5)",
+    "serviceConfigAccountSidDaclDeleteStart": "DENIED (Win32 exit 5)",
+    "serviceQuery": "ALLOWED lifecycle observation only",
+    "junctionsCreatedInPublicArea": true,
+    "junctionAccessOrRenameOverProtectedTargets": "DENIED (EPERM)",
+    "projectionForgeryAndReplacement": "ALLOWED as expected for derived data",
+    "directPrivilegedMutationAccepted": 0
+  },
+  "restart": {
+    "loadedSequence": 1,
+    "finalSequence": 2,
+    "fingerprintStable": true,
+    "preRestartAccepted": true,
+    "postRestartAccepted": true,
+    "forgedCanonicalRecordCount": 0,
+    "projectionConsumedAsCanonical": false,
+    "duplicate": "IDEMPOTENT_RECORDED_RESULT",
+    "changedPayloadSameId": "REQUEST_ID_CONFLICT",
+    "result": "PASS"
+  },
+  "crash": {
+    "point": "AFTER_COMPLETE_TEMPORARY_WRITE_BEFORE_ATOMIC_REPLACE",
+    "preCanonicalSha256": "1f7174f0ccf1be4142c16e24aa69ebaae06bf1ef4648f5f9753179df1bde61d5",
+    "postCrashCanonicalSha256": "1f7174f0ccf1be4142c16e24aa69ebaae06bf1ef4648f5f9753179df1bde61d5",
+    "temporarySha256": "a55c17e929816bd4a64bfc08fccecf30b0a7b378127b2551af90bf02cff11dc8",
+    "temporaryWasStructurallyValid": true,
+    "temporaryAccepted": false,
+    "recoverySequence": 2,
+    "result": "PASS"
+  },
+  "confusedDeputy": {
+    "publicSemanticEndpoint": false,
+    "p0FabricatedRequestFileIgnored": true,
+    "p0ScmStartExit": 5,
+    "brokerMutation": false,
+    "result": "PASS"
+  },
+  "cleanup": {
+    "serviceStopped": true,
+    "serviceDeleted": true,
+    "queryAfterDelete": 1060,
+    "protectedRootRemoved": true,
+    "publicRootRemoved": true,
+    "parentRemoved": true,
+    "processesRemaining": 0,
+    "secretsRetained": false,
+    "result": "PASS"
+  },
+  "gate": "0/2",
+  "productionWritersMigrated": false
+}

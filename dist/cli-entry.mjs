@@ -6738,6 +6738,86 @@ var init_handoff = __esm({
   }
 });
 
+// src/operation-authority.mjs
+function operationIdentifier(value, code, field) {
+  invariant(typeof value === "string" && IDENTIFIER.test(value), code, `${field} is invalid`);
+  return value;
+}
+function validateOperationAdmission(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "OPERATION_ADMISSION_INVALID");
+  const operationId = operationIdentifier(request.operationId, "OPERATION_ID_INVALID", "operationId");
+  const taskId2 = operationIdentifier(request.taskId, "OPERATION_TASK_INVALID", "taskId");
+  invariant(Number.isSafeInteger(request.generation) && request.generation >= 0, "OPERATION_GENERATION_INVALID");
+  invariant(PROFILES.has(request.profile), "OPERATION_PROFILE_INVALID");
+  return Object.freeze({ operationId, taskId: taskId2, generation: request.generation, profile: request.profile });
+}
+function validateOperationTerminal(operationId, outcome, effectReference) {
+  operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+  invariant(OUTCOMES.has(outcome), "OPERATION_OUTCOME_INVALID");
+  invariant(effectReference === null || typeof effectReference === "string" && EFFECT_REFERENCE.test(effectReference), "OPERATION_EFFECT_REFERENCE_INVALID");
+  if (outcome !== "KNOWN_SUCCESS") invariant(effectReference === null, "OPERATION_EFFECT_REFERENCE_INVALID", "Only known success may carry effect evidence");
+  return Object.freeze({ operationId, outcome, effectReference });
+}
+function detachedOperation(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function portableOperationAuthority(storage) {
+  return new PortableOperationAuthority(storage);
+}
+var OPERATION_AUTHORITY_MODES, PROFILES, OUTCOMES, IDENTIFIER, EFFECT_REFERENCE, SECURE_OPERATION_AUTHORITY_LABEL, PORTABLE_LABEL, PortableOperationAuthority;
+var init_operation_authority = __esm({
+  "src/operation-authority.mjs"() {
+    init_errors();
+    OPERATION_AUTHORITY_MODES = Object.freeze({
+      SECURE: "SECURE",
+      PORTABLE: "PORTABLE"
+    });
+    PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
+    OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
+    IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
+    EFFECT_REFERENCE = /^(?:file|shell):[^\r\n]{1,2048}$/;
+    SECURE_OPERATION_AUTHORITY_LABEL = Object.freeze({
+      mode: OPERATION_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_operation_isolation: true
+    });
+    PORTABLE_LABEL = Object.freeze({
+      mode: OPERATION_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_operation_isolation: false
+    });
+    PortableOperationAuthority = class {
+      constructor(storage) {
+        invariant(storage && typeof storage.admitOperation === "function" && typeof storage.finishOperation === "function" && typeof storage.operationsForTask === "function", "PORTABLE_OPERATION_AUTHORITY_INVALID");
+        this.storage = storage;
+        this.security = PORTABLE_LABEL;
+      }
+      admitOperation(request) {
+        const value = validateOperationAdmission(request);
+        this.storage.admitOperation(value);
+        return detachedOperation(this.storage.operationsForTask(value.taskId).find((row) => row.operation_id === value.operationId));
+      }
+      finishOperation(operationId, outcome, effectReference = null) {
+        const value = validateOperationTerminal(operationId, outcome, effectReference);
+        this.storage.finishOperation(value.operationId, value.outcome, value.effectReference);
+        return null;
+      }
+      operationsForTask(taskId2) {
+        operationIdentifier(taskId2, "OPERATION_TASK_INVALID", "taskId");
+        return Object.freeze(this.storage.operationsForTask(taskId2).map(detachedOperation));
+      }
+      getOperation(operationId) {
+        operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+        return null;
+      }
+      close() {
+      }
+    };
+  }
+});
+
 // src/safety.mjs
 function shellEffectReference(toolCallId) {
   return `shell:${sha256(Buffer.from(toolCallId, "utf8"))}`;
@@ -6755,6 +6835,7 @@ var init_safety = __esm({
   "src/safety.mjs"() {
     init_canonical();
     init_errors();
+    init_operation_authority();
     TOOL_PROFILES = Object.freeze({
       read: "READ_ONLY",
       grep: "READ_ONLY",
@@ -6835,8 +6916,10 @@ var init_safety = __esm({
       }
     };
     ToolOperationTracker = class {
-      constructor(storage, taskId2) {
+      constructor(storage, taskId2, { operationAuthority = null } = {}) {
         this.storage = storage;
+        this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+        this.authoritySecurity = this.operationAuthority.security;
         this.taskId = taskId2;
         this.admittedTools = /* @__PURE__ */ new Map();
         this.effectReferences = /* @__PURE__ */ new Map();
@@ -6845,7 +6928,7 @@ var init_safety = __esm({
         const profile = TOOL_PROFILES[toolName];
         invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
         const latch = this.storage.ensureLatch(this.taskId);
-        this.storage.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
+        this.operationAuthority.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
         this.admittedTools.set(toolCallId, toolName);
         if (toolName === "bash") {
           this.effectReferences.set(toolCallId, shellEffectReference(toolCallId));
@@ -6859,17 +6942,18 @@ var init_safety = __esm({
         const effectReference = outcome === "KNOWN_SUCCESS" ? this.effectReferences.get(toolCallId) ?? null : null;
         this.admittedTools.delete(toolCallId);
         this.effectReferences.delete(toolCallId);
-        this.storage.finishOperation(toolCallId, outcome, effectReference);
+        this.operationAuthority.finishOperation(toolCallId, outcome, effectReference);
       }
       unknown(toolCallId) {
         this.admittedTools.delete(toolCallId);
         this.effectReferences.delete(toolCallId);
-        this.storage.finishOperation(toolCallId, "UNKNOWN");
+        this.operationAuthority.finishOperation(toolCallId, "UNKNOWN");
       }
     };
     SafePointCoordinator = class {
-      constructor({ storage, taskId: taskId2, gate }) {
+      constructor({ storage, taskId: taskId2, gate, operationAuthority = null }) {
         this.storage = storage;
+        this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
         this.taskId = taskId2;
         this.gate = gate;
       }
@@ -6917,7 +7001,7 @@ var init_safety = __esm({
         session.abortRetry();
         session.abortCompaction();
         session.abortBranchSummary?.();
-        const admittedBeforeLatch = this.storage.operationsForTask(this.taskId).filter((operation) => operation.state === "ACTIVE");
+        const admittedBeforeLatch = this.operationAuthority.operationsForTask(this.taskId).filter((operation) => operation.state === "ACTIVE");
         if (admittedBeforeLatch.length === 0 && (!session.isIdle || session.isStreaming)) {
           await session.abort();
           this.acquiredLatch(latch, reason2);
@@ -6926,7 +7010,7 @@ var init_safety = __esm({
         this.acquiredLatch(latch, reason2);
         await this.gate.waitForNoStreams();
         this.acquiredLatch(latch, reason2);
-        const operations = this.storage.operationsForTask(this.taskId);
+        const operations = this.operationAuthority.operationsForTask(this.taskId);
         const active = operations.filter((operation) => operation.state === "ACTIVE");
         if (active.length > 0) throw new GuardianError("SAFE_POINT_ACTIVE_OPERATION", "FINISH CURRENT ATOMIC OPERATION has not reached a terminal boundary", active.map((row) => row.operation_id));
         const unknown = operations.filter((operation) => operation.outcome === "UNKNOWN" || operation.outcome === "KNOWN_SUCCESS" && operation.profile !== "READ_ONLY" && !operation.effect_reference);
@@ -7428,19 +7512,22 @@ var init_storage = __esm({
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
         ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Guardian SQLite canonical runtime','1.0.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
-        ('operations','Guardian SQLite canonical runtime','1.0.0'),
+        ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
         ('metric_sessions','Guardian SQLite bounded measurement summary','1.0.0'),
         ('metric_samples','Guardian SQLite bounded per-call measurement','1.0.0'),
         ('metric_handoff_events','Guardian SQLite bounded measurement events; journal remains operational authority','1.0.0'),
         ('metric_diagnostics','Guardian SQLite bounded collection diagnostics','1.0.0'),
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
+      UPDATE authorities SET authority='Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='operations' AND authority='Guardian SQLite canonical runtime';
     `);
       }
       getCalibrationRuntimeIdentity() {
@@ -8078,8 +8165,9 @@ async function createGuardianRunner(options, authority = null) {
     thresholdPercent: contextAdvisor.thresholdPercent,
     retention: options.metricsRetention
   }));
-  runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id);
-  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate });
+  const operationAuthority = portableOperationAuthority(storage);
+  runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id, { operationAuthority });
+  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate, operationAuthority });
   const callerObserveGit = options.observeGit;
   const observeGit = typeof callerObserveGit === "function" ? () => Reflect.apply(callerObserveGit, void 0, []) : () => observeGitState(cwd);
   runner.handoffService = new HandoffService({
@@ -8120,6 +8208,7 @@ var init_runner = __esm({
     init_handoff_plan_internal();
     init_ledger();
     init_metrics();
+    init_operation_authority();
     init_runner_ownership();
     init_pi_loader();
     init_safety();

@@ -42,6 +42,7 @@ const PRIVILEGED_ROOT_NAMES = [
   "storageDatabaseForInternalUse", "storageDatabaseForInternalTest", "runnerForInternalTest", "createRunnerForInternalTest",
   "claimTrustedHumanTakeoverCurrentPlan", "reserveTrustedHandoffPlan", "prepareTrustedContinuityRecovery",
   "authorizeTrustedResume", "taskOperationDisposition", "canonicalPlanSemantics", "planSemanticDigest",
+  "ProtectedSqliteOperationAuthority", "PortableOperationAuthority", "requireSecureOperationAuthority",
 ];
 
 function npmOptions() { return { shell: process.platform === "win32" }; }
@@ -127,7 +128,7 @@ test("R1-M-08/R1-M-13 real tarball root exposes only the enumerated read/data an
 
   const files = walk(x.packageRoot).sort();
   assert.deepEqual(files, [
-    "README.md", "bin/aio.mjs", "bin/eio.mjs", "dist/cli-entry.mjs", "dist/index.mjs",
+    "README.md", "bin/aio.mjs", "bin/eio.mjs", "dist/cli-entry.mjs", "dist/index.mjs", "dist/operation-authority-worker.mjs",
     "docs/0.2-b-plan-proposal-foundation.md", "docs/0.2-c-intent-adapter.md", "docs/0.2-d-start-objective.md",
     "docs/0.2-e-unified-human-ux.md", "docs/portable-alpha.md", "docs/rename-aiopago-migration.md", "package.json",
   ].sort());
@@ -326,7 +327,7 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
   cpSync(x.packageRoot, packageCopy, { recursive: true });
   symlinkSync(x.packageRoot, packageLink, process.platform === "win32" ? "junction" : "dir");
   const shippedJavaScript = walk(x.packageRoot).filter((name) => /\.(?:c?js|mjs)$/.test(name)).sort();
-  assert.deepEqual(shippedJavaScript, ["bin/aio.mjs", "bin/eio.mjs", "dist/cli-entry.mjs", "dist/index.mjs"]);
+  assert.deepEqual(shippedJavaScript, ["bin/aio.mjs", "bin/eio.mjs", "dist/cli-entry.mjs", "dist/index.mjs", "dist/operation-authority-worker.mjs"]);
   const script = `
     import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
     import { existsSync } from "node:fs";
@@ -366,6 +367,7 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
   assert.equal(result.rows.every((row) => row.factoryCapture === 0 && row.registeredHandlers === 0), true);
   assert.deepEqual(result.rows.slice(0, 3).map((row) => row.exports), [[], [], []]);
   assert.deepEqual(result.rows[3].exports, PUBLIC_ROOT_EXPORTS);
+  assert.deepEqual(result.rows[4].exports, []);
   assert.deepEqual(result.aliases, [
     { kind: "copy", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
     { kind: "link", exports: ["Symbol(Symbol.toStringTag)"], prototype: true },
@@ -388,10 +390,10 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
       throw new Error("ARTIFACT_WORKER_CAPTURE");
     };
   `);
-  const workerRowsPath = join(x.root, "artifact-worker-rows.json");
   const workerMatrix = join(x.consumer, "artifact-worker-matrix.mjs");
+  const generalWorkerJavaScript = shippedJavaScript.filter((artifact) => artifact !== "dist/operation-authority-worker.mjs");
   const routes = [
-    ...shippedJavaScript.flatMap((artifact) => [
+    ...generalWorkerJavaScript.flatMap((artifact) => [
       { artifact, route: "Worker file URL", value: pathToFileURL(join(x.packageRoot, artifact)).href, url: true },
       { artifact, route: "Worker path", value: join(x.packageRoot, artifact), url: false },
     ]),
@@ -423,18 +425,64 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
       worker.once("error", reject);
       worker.once("exit", () => { if (timer) clearTimeout(timer); resolve(row); });
     });
-    const rows = [];
-    for (let offset = 0; offset < routes.length; offset += 4) rows.push(...await Promise.all(routes.slice(offset, offset + 4).map(run)));
-    writeFileSync(${JSON.stringify(workerRowsPath)}, JSON.stringify(rows));
+    const index = Number(process.argv[2]);
+    if (!Number.isSafeInteger(index) || index < 0 || index >= routes.length) throw new Error("ROUTE_INDEX_INVALID");
+    process.stdout.write(JSON.stringify(await run(routes[index])));
   `);
-  execFileSync(process.execPath, [workerMatrix], { cwd: x.consumer, stdio: "pipe", timeout: 240_000 });
-  const workerRows = JSON.parse(readFileSync(workerRowsPath, "utf8"));
+  // One fresh process per route avoids making Node 22.19's cumulative native
+  // Windows Worker teardown a security oracle. Every route still uses genuine
+  // Pi preload interposition and must independently remain inert.
+  const workerRows = [];
+  for (let index = 0; index < routes.length; index += 1) {
+    let output = null; let lastError = null;
+    for (let attempt = 0; attempt < 3 && output === null; attempt += 1) {
+      try {
+        output = execFileSync(process.execPath, [workerMatrix, String(index)], {
+          cwd: x.consumer, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000,
+        });
+      } catch (error) {
+        lastError = error;
+        // Windows Node 22.19 occasionally aborts during native Worker teardown
+        // after genuine Pi loading. A fresh process retry cannot turn a captured
+        // authority into a pass; all returned rows are still checked exactly.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+      }
+    }
+    if (output === null) throw lastError;
+    workerRows.push(JSON.parse(output.trim().split(/\r?\n/).at(-1)));
+  }
   assert.equal(workerRows.length, 12);
   for (const row of workerRows) {
     assert.equal(row.pid, row.parentPid, `${row.artifact} ${row.route} must remain in the public PID`);
     assert.ok(row.threadId > 0, `${row.artifact} ${row.route} must be a Worker thread`);
     assert.deepEqual([row.factory, row.commands, row.handlers], [0, 0, 0], `${row.artifact} ${row.route}`);
   }
+
+  // Keep the protected worker in its own fresh Node process. Node 22.19 on
+  // Windows can abort natively after the historical 12-route genuine-Pi Worker
+  // matrix when a thirteenth distinct ESM graph is added; process isolation is
+  // also the deployed P1S->P2 shape and retains the same preload attack.
+  const protectedWorkerProbe = join(x.consumer, "protected-worker-probe.mjs");
+  writeFileSync(protectedWorkerProbe, `
+    import { Worker } from "node:worker_threads";
+    import { pathToFileURL } from "node:url";
+    const parentPid = process.pid;
+    const worker = new Worker(pathToFileURL(${JSON.stringify(join(x.packageRoot, "dist", "operation-authority-worker.mjs"))}), {
+      execArgv: ["--import", pathToFileURL(${JSON.stringify(workerPreload)}).href],
+      env: { ...process.env, AIOPAGO_OPERATIONAL_COMMAND_NAME: "aio", AIOPAGO_WORKER_ATTACK: "1" },
+    });
+    const row = { parentPid, pid: null, threadId: null, factory: 0, commands: 0, handlers: 0 };
+    worker.on("message", (message) => {
+      if (message.type === "preload") { row.pid = message.pid; row.threadId = message.threadId; }
+      else if (message.type === "authority") Object.assign(row, message);
+    });
+    await new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); });
+    process.stdout.write(JSON.stringify(row));
+  `);
+  const protectedWorker = JSON.parse(execFileSync(process.execPath, [protectedWorkerProbe], { cwd: x.consumer, encoding: "utf8" }));
+  assert.equal(protectedWorker.pid, protectedWorker.parentPid);
+  assert.ok(protectedWorker.threadId > 0);
+  assert.deepEqual([protectedWorker.factory, protectedWorker.commands, protectedWorker.handlers], [0, 0, 0]);
 });
 
 test("R1-M-13 supported aio bootstrap starts a clean child and ignores ambient Pi selection", () => {

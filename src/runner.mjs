@@ -12,6 +12,7 @@ import { HandoffService } from "./handoff.mjs";
 import { claimTrustedHumanTakeoverCurrentPlan } from "./handoff-plan-internal.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
+import { portableOperationAuthority } from "./operation-authority.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
@@ -225,8 +226,12 @@ async function createGuardianRunner(options, authority = null) {
     thresholdPercent: contextAdvisor.thresholdPercent,
     retention: options.metricsRetention,
   }));
-  runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
-  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
+  // Ordinary npm execution is explicitly PORTABLE authority. SECURE authority
+  // is constructed only inside the P1S-launched protected worker; failure to
+  // obtain that authority never routes back through this project SQLite path.
+  const operationAuthority = portableOperationAuthority(storage);
+  runner.toolTracker = new ToolOperationTracker(storage, plan.task_id, { operationAuthority });
+  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate, operationAuthority });
   const callerObserveGit = options.observeGit;
   const observeGit = typeof callerObserveGit === "function"
     ? () => Reflect.apply(callerObserveGit, undefined, [])
