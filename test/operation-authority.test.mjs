@@ -60,10 +60,10 @@ test("protected operation authority preserves Tracker profiles, outcomes, idempo
   assert.equal(requireSecureOperationAuthority(authority), authority);
   assert.deepEqual(authority.status(), {
     mode: "SECURE", canonical: true, isolation: "OS_PROTECTED_DISTINCT_IDENTITY", r1_m_13_operation_isolation: true,
-    schema: "aiopago.operation-authority/1.0.0", journal_mode: "WAL", path: join(canonical, "operations.sqlite"),
+    latch_canonical: true, schema: "aiopago.operation-authority/1.1.0", journal_mode: "WAL", path: join(canonical, "operations.sqlite"),
   });
 
-  const tracker = new ToolOperationTracker(releasedLatch(7), "TASK-SECURE", { operationAuthority: authority });
+  const tracker = new ToolOperationTracker(authority, "TASK-SECURE", { operationAuthority: authority, latchAuthority: authority });
   assert.equal(tracker.authoritySecurity.mode, "SECURE");
   tracker.admit("OP-READ", "read", { path: "attacker-readable.txt" });
   tracker.finish("OP-READ", false, { content: [{ type: "text", text: "ok" }] });
@@ -72,13 +72,13 @@ test("protected operation authority preserves Tracker profiles, outcomes, idempo
   assert.equal(read.outcome, "KNOWN_SUCCESS");
   assert.equal(read.profile, "READ_ONLY");
   assert.equal(read.effect_reference, null);
-  assert.equal(read.latch_generation, 7);
+  assert.equal(read.latch_generation, 0);
 
-  const exactAdmission = authority.admitOperation({ operationId: "OP-READ", taskId: "TASK-SECURE", generation: 7, profile: "READ_ONLY" });
+  const exactAdmission = authority.admitOperation({ operationId: "OP-READ", taskId: "TASK-SECURE", generation: 0, profile: "READ_ONLY" });
   assert.equal(exactAdmission.idempotent, true);
   assert.equal(exactAdmission.request_code, "IDEMPOTENT_RECORDED_RESULT");
   assert.throws(
-    () => authority.admitOperation({ operationId: "OP-READ", taskId: "TASK-OTHER", generation: 7, profile: "READ_ONLY" }),
+    () => authority.admitOperation({ operationId: "OP-READ", taskId: "TASK-OTHER", generation: 0, profile: "READ_ONLY" }),
     (error) => error.code === "OPERATION_REQUEST_CONFLICT",
   );
   const exactTerminal = authority.finishOperation("OP-READ", "KNOWN_SUCCESS", null);
@@ -117,8 +117,9 @@ test("a plausible project SQLite forgery is projection only and cannot affect se
   assert.equal(authority.getOperation("OP-FORGED-BY-P0"), null);
   assert.deepEqual(authority.operationsForTask("TASK-FORGE"), []);
 
-  const latch = claimLatchForInternalTest(project, "TASK-FORGE", "INTEGRITY", "human:secure-test");
-  const safePoint = new SafePointCoordinator({ storage: project, taskId: "TASK-FORGE", operationAuthority: authority, gate: { async waitForNoStreams() {} } });
+  authority.ensureLatch("TASK-FORGE");
+  const latch = authority.claimLatch({ taskId: "TASK-FORGE", reason: "INTEGRITY", actor: "human:secure-test" });
+  const safePoint = new SafePointCoordinator({ storage: project, taskId: "TASK-FORGE", operationAuthority: authority, latchAuthority: authority, gate: { async waitForNoStreams() {} } });
   const session = {
     isIdle: true, isStreaming: false, pendingMessageCount: 0, isRetrying: false, isCompacting: false,
     clearQueue() {}, abortRetry() {}, abortCompaction() {}, abortBranchSummary() {}, async abort() {}, async waitForIdle() {},
@@ -134,7 +135,8 @@ test("real SQLite crash before terminal COMMIT recovers the last valid ACTIVE op
   mkdirSync(canonical);
   const path = join(canonical, "operations.sqlite");
   const authority = new ProtectedSqliteOperationAuthority(path, { allowInitialize: true });
-  authority.admitOperation({ operationId: "OP-CRASH", taskId: "TASK-CRASH", generation: 3, profile: "LOCAL_ATOMIC_MUTATION" });
+  authority.ensureLatch("TASK-CRASH");
+  authority.admitOperation({ operationId: "OP-CRASH", taskId: "TASK-CRASH", generation: 0, profile: "LOCAL_ATOMIC_MUTATION" });
   authority.close();
 
   const moduleUrl = new URL("../src/protected-operation-authority.mjs", import.meta.url).href;

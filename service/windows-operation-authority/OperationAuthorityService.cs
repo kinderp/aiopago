@@ -15,7 +15,7 @@ using System.Web.Script.Serialization;
 
 namespace Aiopago.OperationAuthority {
   internal static class Program {
-    internal const string Protocol = "aiopago.operation-authority-protocol/1";
+    internal const string Protocol = "aiopago.operation-authority-protocol/2";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144, RecursionLimit = 32 };
 
     public static int Main(string[] args) {
@@ -98,6 +98,15 @@ namespace Aiopago.OperationAuthority {
     protected override void OnStop() {
       stopped.Set();
       try { if (worker != null && !worker.HasExited) worker.Kill(); } catch { }
+    }
+
+    private string ReadWorkerLine(string timeoutCode) {
+      System.Threading.Tasks.Task<string> pending = worker.StandardOutput.ReadLineAsync();
+      if (!pending.Wait(10000)) {
+        try { worker.Kill(); } catch { }
+        throw new System.TimeoutException(timeoutCode);
+      }
+      return pending.Result;
     }
 
     private void Fatal(string code, Exception error) {
@@ -183,7 +192,7 @@ namespace Aiopago.OperationAuthority {
           { "systemDirectory", Environment.SystemDirectory }, { "canonicalPath", databasePath }, { "allowInitialize", first }, { "testScope", testScope }
         };
         worker.StandardInput.WriteLine(Program.Json.Serialize(hello)); worker.StandardInput.Flush();
-        string readyLine = worker.StandardOutput.ReadLine();
+        string readyLine = ReadWorkerLine("AUTHORITY_READY_TIMEOUT");
         if (readyLine == null) throw new InvalidOperationException("P2_READY_MISSING: " + worker.StandardError.ReadToEnd());
         Dictionary<string, object> ready = Program.Json.Deserialize<Dictionary<string, object>>(readyLine);
         if (Program.Text(ready, "operationType") != "SESSION_READY") throw new InvalidDataException("P2_READY_INVALID");
@@ -195,12 +204,13 @@ namespace Aiopago.OperationAuthority {
           if (request == null) throw new InvalidDataException("SCENARIO_FRAME_INVALID");
           request["version"] = 1; request["protocol"] = Program.Protocol; request["capability"] = capability;
           object operationType;
-          crashRequested = request.TryGetValue("operationType", out operationType) && (string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT";
+          crashRequested = request.TryGetValue("operationType", out operationType)
+            && ((string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LATCH_COMMIT");
           worker.StandardInput.WriteLine(Program.Json.Serialize(request)); worker.StandardInput.Flush();
-          string line = worker.StandardOutput.ReadLine();
+          string line = ReadWorkerLine("AUTHORITY_REQUEST_TIMEOUT");
           if (line == null) {
             worker.WaitForExit(10000);
-            if (crashRequested && worker.ExitCode == 97) Environment.Exit(97);
+            if (crashRequested && (worker.ExitCode == 97 || worker.ExitCode == 98)) Environment.Exit(worker.ExitCode);
             throw new InvalidOperationException("P2_RESULT_MISSING: " + worker.StandardError.ReadToEnd());
           }
           results.Add(Program.Json.DeserializeObject(line));
@@ -208,7 +218,7 @@ namespace Aiopago.OperationAuthority {
         worker.StandardInput.WriteLine(Program.Json.Serialize(new Dictionary<string, object> {
           { "version", 1 }, { "protocol", Program.Protocol }, { "operationType", "SESSION_END" }, { "capability", capability }
         })); worker.StandardInput.Flush();
-        string completeLine = worker.StandardOutput.ReadLine();
+        string completeLine = ReadWorkerLine("AUTHORITY_COMPLETE_TIMEOUT");
         if (completeLine == null) throw new InvalidOperationException("P2_COMPLETE_MISSING: " + worker.StandardError.ReadToEnd());
         worker.WaitForExit(10000);
         if (!worker.HasExited || worker.ExitCode != 0) throw new InvalidOperationException("P2_EXIT_INVALID");
@@ -247,7 +257,10 @@ namespace Aiopago.OperationAuthority {
         string broker = Path.Combine(targetRoot, "bin", "broker-service.exe");
         ArrayList attempts = new ArrayList {
           Attempt("canonical_read", delegate { File.ReadAllBytes(database); }),
+          Attempt("latch_read", delegate { File.ReadAllBytes(database); }),
           Attempt("canonical_write", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.WriteByte(0); } }),
+          Attempt("latch_write", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.WriteByte(0); } }),
+          Attempt("latch_generation_mutation", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.Seek(128, SeekOrigin.Begin); s.WriteByte(0); } }),
           Attempt("key_access", delegate { File.ReadAllBytes(key); }),
           Attempt("canonical_acl_change", delegate {
             System.Security.AccessControl.FileSecurity security = File.GetAccessControl(database);

@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { OPERATION_AUTHORITY_PROTOCOL, requireSecureOperationAuthority } from "./operation-authority.mjs";
+import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
@@ -20,7 +21,6 @@ const iterator = lines[Symbol.asyncIterator]();
 let capability = null;
 let authority = null;
 let requestCount = 0;
-const generations = new Map();
 const trackers = new Map();
 
 function output(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -38,18 +38,14 @@ function identifier(value, code) {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/.test(value)) fail(code);
   return value;
 }
-function tracker(taskId, generation = null) {
-  if (generation !== null) {
-    if (!Number.isSafeInteger(generation) || generation < 0) fail("OPERATION_GENERATION_INVALID");
-    generations.set(taskId, generation);
-  }
+function tracker(taskId) {
   let value = trackers.get(taskId);
   if (!value) {
-    const latch = { ensureLatch(requestedTask) {
-      if (requestedTask !== taskId || !generations.has(taskId)) fail("PRIVATE_LATCH_BINDING_MISSING");
-      return { task_id: taskId, state: "RELEASED", generation: generations.get(taskId), reason: null };
-    } };
-    value = new ToolOperationTracker(latch, taskId, { operationAuthority: requireSecureOperationAuthority(authority) });
+    authority.ensureLatch(taskId);
+    value = new ToolOperationTracker(authority, taskId, {
+      operationAuthority: requireSecureOperationAuthority(authority),
+      latchAuthority: requireSecureLatchAuthority(authority),
+    });
     trackers.set(taskId, value);
   }
   return value;
@@ -77,6 +73,19 @@ function operationResult(operation) {
     terminal_at: operation.terminal_at,
   } : null;
 }
+function latchResult(latch) {
+  return latch ? {
+    task_id: latch.task_id,
+    state: latch.state,
+    generation: latch.generation,
+    reason: latch.reason,
+    engaged_at: latch.engaged_at,
+    engaged_by: latch.engaged_by,
+    released_at: latch.released_at,
+    released_by: latch.released_by,
+    last_event_id: latch.last_event_id,
+  } : null;
+}
 
 async function dispatch(frame, hello) {
   if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail("PRIVATE_FRAME_BINDING_REJECTED");
@@ -91,7 +100,11 @@ async function dispatch(frame, hello) {
       const taskId = identifier(payload.taskId, "OPERATION_TASK_INVALID");
       const operationId = identifier(payload.operationId, "OPERATION_ID_INVALID");
       identifier(payload.toolName, "TOOL_NAME_INVALID");
-      tracker(taskId, payload.generation).admit(operationId, payload.toolName, payload.input ?? {});
+      const expectedGeneration = payload.generation;
+      if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) fail("OPERATION_GENERATION_INVALID");
+      const latch = authority.getLatch(taskId) ?? authority.ensureLatch(taskId);
+      if (latch.generation !== expectedGeneration) fail("LATCH_GENERATION_MISMATCH");
+      tracker(taskId).admit(operationId, payload.toolName, payload.input ?? {});
       result = operationResult(authority.getOperation(operationId));
       break;
     }
@@ -109,6 +122,30 @@ async function dispatch(frame, hello) {
       result = operationResult(authority.getOperation(operationId));
       break;
     }
+    case "LATCH_ENSURE":
+      result = latchResult(authority.ensureLatch(identifier(payload.taskId, "LATCH_TASK_INVALID")));
+      break;
+    case "LATCH_GET":
+      result = latchResult(authority.getLatch(identifier(payload.taskId, "LATCH_TASK_INVALID")));
+      break;
+    case "LATCH_CLAIM_HUMAN_TAKEOVER": {
+      const request = authority.requestLatchClaim(requestId, {
+        taskId: payload.taskId, reason: "HUMAN_TAKEOVER", actor: payload.actor, expected: payload.expected ?? null,
+      });
+      result = { ...request, latch: latchResult(request.latch) };
+      break;
+    }
+    case "LATCH_CLAIM_SAFEPOINT": {
+      if (payload.reason === "HUMAN_TAKEOVER") fail("LATCH_SAFEPOINT_REASON_INVALID");
+      const request = authority.requestLatchClaim(requestId, {
+        taskId: payload.taskId, reason: payload.reason, actor: payload.actor, expected: payload.expected ?? null,
+      });
+      result = { ...request, latch: latchResult(request.latch) };
+      break;
+    }
+    case "LATCH_ASSERT":
+      result = latchResult(authority.assertLatchIdentity(payload.taskId, payload.expected, { allowHumanTakeover: payload.allowHumanTakeover === true }));
+      break;
     case "OPERATION_RETRY_ADMISSION": {
       result = authority.admitOperation({
         operationId: payload.operationId, taskId: payload.taskId,
@@ -133,6 +170,17 @@ async function dispatch(frame, hello) {
       authority.crashBeforeTerminalCommitForPhysicalTest(payload.operationId, payload.outcome, payload.effectReference ?? null);
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_BEFORE_LATCH_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeLatchCommitForPhysicalTest(requestId, {
+        taskId: payload.taskId, reason: payload.reason, actor: payload.actor, expected: payload.expected ?? null,
+      });
+      fail("CRASH_SEAM_RETURNED");
+      break;
+    case "TEST_AUTHORITY_TIMEOUT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      await new Promise(() => {});
+      break;
     default:
       fail("OPERATION_TYPE_INVALID");
   }
@@ -150,6 +198,7 @@ try {
   capability = hello.capability;
   authority = new ProtectedSqliteOperationAuthority(hello.canonicalPath, { allowInitialize: hello.allowInitialize });
   requireSecureOperationAuthority(authority);
+  requireSecureLatchAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

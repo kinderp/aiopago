@@ -5,8 +5,9 @@ export const OPERATION_AUTHORITY_MODES = Object.freeze({
   PORTABLE: "PORTABLE",
 });
 
-export const OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.0.0";
-export const OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/1";
+export const PREVIOUS_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.0.0";
+export const OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1.0";
+export const OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/2";
 
 const PROFILES = new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
 const OUTCOMES = new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);

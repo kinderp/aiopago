@@ -479,7 +479,7 @@ export class GuardianStorage {
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
         ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
-        ('latches','Guardian SQLite canonical runtime','1.0.0'),
+        ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
@@ -491,6 +491,8 @@ export class GuardianStorage {
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
       UPDATE authorities SET authority='Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='operations' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
     `);
   }
 

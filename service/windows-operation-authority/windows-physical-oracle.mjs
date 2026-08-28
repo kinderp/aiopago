@@ -89,6 +89,16 @@ function canonicalQuery(operationId) {
   const row = database.prepare("SELECT operation_id,task_id,latch_generation,profile,state,outcome,effect_reference,admitted_at,terminal_at FROM operations WHERE operation_id=?").get(operationId) ?? null;
   database.close(); return row ? { ...row } : null;
 }
+function canonicalLatch(taskId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT task_id,state,generation,reason,engaged_at,engaged_by,released_at,released_by,last_event_id FROM latches WHERE task_id=?").get(taskId) ?? null;
+  database.close(); return row ? { ...row } : null;
+}
+function canonicalTakeoverCount() {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const count = database.prepare("SELECT COUNT(*) count FROM latches WHERE state='ENGAGED' AND reason='HUMAN_TAKEOVER'").get().count;
+  database.close(); return count;
+}
 function config() { return JSON.parse(readFileSync(join(root, "control", "service-config.json"), "utf8").replace(/^\uFEFF/, "")); }
 function saveConfig(value) { writeFileSync(join(root, "control", "service-config.json"), `${JSON.stringify(value)}\n`); }
 async function expectStartFailure(label) {
@@ -128,17 +138,23 @@ try {
 
   mkdirSync(dirname(projectDatabase), { recursive: true });
   const project = new DatabaseSync(projectDatabase);
-  project.exec(`CREATE TABLE operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,latch_generation INTEGER NOT NULL,profile TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,effect_reference TEXT,admitted_at TEXT NOT NULL,terminal_at TEXT);`);
+  project.exec(`
+    CREATE TABLE operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,latch_generation INTEGER NOT NULL,profile TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,effect_reference TEXT,admitted_at TEXT NOT NULL,terminal_at TEXT);
+    CREATE TABLE latches(task_id TEXT PRIMARY KEY,state TEXT NOT NULL,generation INTEGER NOT NULL,reason TEXT,engaged_at TEXT,engaged_by TEXT,released_at TEXT,released_by TEXT,last_event_id TEXT NOT NULL);
+  `);
   project.close();
 
   const before = await startAndResult([
-    frame("REQ-BEFORE-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 11, toolName: "read", input: { path: "README.md" } }),
+    frame("REQ-BEFORE-LATCH", "LATCH_ENSURE", { taskId: "TASK-PRODUCTION-SECURE" }),
+    frame("REQ-BEFORE-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 0, toolName: "read", input: { path: "README.md" } }),
     frame("REQ-BEFORE-FINISH", "OPERATION_FINISH_TOOL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", isError: false, result: { content: [{ type: "text", text: "real production result" }] }, interrupted: false }),
     frame("REQ-BEFORE-GET", "OPERATION_GET", { operationId: "OP-PRODUCTION-BEFORE-RESTART" }),
   ]);
   const beforeOperation = operationFrom(before, "REQ-BEFORE-GET");
   assert.equal(beforeOperation.state, "TERMINAL"); assert.equal(beforeOperation.outcome, "KNOWN_SUCCESS"); assert.equal(beforeOperation.profile, "READ_ONLY");
-  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, operation: beforeOperation };
+  const beforeLatch = operationFrom(before, "REQ-BEFORE-LATCH");
+  assert.equal(beforeLatch.state, "RELEASED"); assert.equal(beforeLatch.generation, 0);
+  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, latch: beforeLatch, operation: beforeOperation };
   await stop();
 
   const p0 = medium(join(worktree, "test", "reproducers", "r1-m-13-operation-authority-p0.mjs"), [
@@ -146,21 +162,47 @@ try {
   ], join(publicOutput, "p0-attack.json"));
   assert.equal(p0.protectedAllDenied, true, JSON.stringify(p0.attempts.filter((value) => !value.denied), null, 2));
   assert.equal(p0.forged.operation_id, "OP-FORGED-BY-P0");
-  evidence.p0Attack = p0;
+  assert.equal(p0.forgedLatch.reason, "HUMAN_TAKEOVER");
+  assert.deepEqual(canonicalLatch("TASK-PRODUCTION-SECURE"), beforeLatch);
+  evidence.p0Attack = { ...p0, forgedHumanTakeoverCanonicalEffect: "NONE" };
 
   const after = await startAndResult([
     frame("REQ-AFTER-GET-OLD", "OPERATION_GET", { operationId: "OP-PRODUCTION-BEFORE-RESTART" }),
     frame("REQ-AFTER-GET-FORGED", "OPERATION_GET", { operationId: "OP-FORGED-BY-P0" }),
-    frame("REQ-AFTER-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-AFTER-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 12, toolName: "edit", input: { path: "src/exact.txt" } }),
+    frame("REQ-AFTER-LATCH", "LATCH_GET", { taskId: "TASK-PRODUCTION-SECURE" }),
+    frame("REQ-AFTER-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-AFTER-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 0, toolName: "edit", input: { path: "src/exact.txt" } }),
     frame("REQ-AFTER-FINISH", "OPERATION_FINISH_TOOL", { operationId: "OP-PRODUCTION-AFTER-RESTART", taskId: "TASK-PRODUCTION-SECURE", isError: false, result: { content: [{ type: "text", text: "edited" }] }, interrupted: false }),
     frame("REQ-AFTER-GET", "OPERATION_GET", { operationId: "OP-PRODUCTION-AFTER-RESTART" }),
+    frame("REQ-LEGITIMATE-TAKEOVER", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRODUCTION-SECURE", actor: "human:/aio-takeover", expected: { task_id: "TASK-PRODUCTION-SECURE", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-LEGITIMATE-TAKEOVER-GET", "LATCH_GET", { taskId: "TASK-PRODUCTION-SECURE" }),
   ]);
   assert.deepEqual(operationFrom(after, "REQ-AFTER-GET-OLD"), beforeOperation);
   assert.equal(operationFrom(after, "REQ-AFTER-GET-FORGED"), null);
   const afterOperation = operationFrom(after, "REQ-AFTER-GET");
   assert.equal(afterOperation.effect_reference, "file:src/exact.txt");
+  assert.deepEqual(operationFrom(after, "REQ-AFTER-LATCH"), beforeLatch, "forged portable takeover must not affect the secure reader");
+  const legitimateTakeoverRequest = operationFrom(after, "REQ-LEGITIMATE-TAKEOVER");
+  const legitimateTakeover = operationFrom(after, "REQ-LEGITIMATE-TAKEOVER-GET");
+  assert.equal(legitimateTakeoverRequest.request_code, "MUTATION_ACCEPTED");
+  assert.equal(legitimateTakeover.state, "ENGAGED"); assert.equal(legitimateTakeover.reason, "HUMAN_TAKEOVER"); assert.equal(legitimateTakeover.generation, 1);
   assert.notEqual(after.p1Pid, before.p1Pid); assert.notEqual(after.p2Pid, before.p2Pid); assert.equal(after.identityFingerprint, before.identityFingerprint);
-  evidence.phases.afterRestart = { p1Pid: after.p1Pid, p2Pid: after.p2Pid, fingerprint: after.identityFingerprint, oldOperation: operationFrom(after, "REQ-AFTER-GET-OLD"), forged: null, postRestartOperation: afterOperation };
+  evidence.phases.afterRestart = { p1Pid: after.p1Pid, p2Pid: after.p2Pid, fingerprint: after.identityFingerprint, oldOperation: operationFrom(after, "REQ-AFTER-GET-OLD"), forged: null, protectedLatchBeforeTakeover: operationFrom(after, "REQ-AFTER-LATCH"), postRestartOperation: afterOperation };
+  evidence.legitimateTakeover = { taskId: "TASK-PRODUCTION-SECURE", session: { p1Pid: after.p1Pid, p2Pid: after.p2Pid, serviceName }, source: "human:/aio-takeover", initial: beforeLatch, requestId: "REQ-LEGITIMATE-TAKEOVER", reason: "HUMAN_TAKEOVER", final: legitimateTakeover, canonicalEvidence: canonicalLatch("TASK-PRODUCTION-SECURE") };
+  await stop();
+
+  const p0Clear = medium(join(worktree, "test", "reproducers", "r1-m-13-operation-authority-p0.mjs"), [
+    "--root", root, "--service", serviceName, "--project-db", projectDatabase, "--service-config-probe", serviceConfigProbe, "--forge-latch-state", "CLEAR",
+  ], join(publicOutput, "p0-clear-attack.json"));
+  assert.equal(p0Clear.forgedLatch.state, "RELEASED"); assert.equal(p0Clear.forgedLatch.generation, 2147483647);
+  const latchRestart = await startAndResult([
+    frame("REQ-LATCH-RESTART-GET", "LATCH_GET", { taskId: "TASK-PRODUCTION-SECURE" }),
+    frame("REQ-LATCH-RESTART-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-BLOCKED-AFTER-TAKEOVER", taskId: "TASK-PRODUCTION-SECURE", generation: 1, profile: "READ_ONLY" }),
+  ]);
+  const restartedLatch = operationFrom(latchRestart, "REQ-LATCH-RESTART-GET");
+  assert.deepEqual(restartedLatch, legitimateTakeover);
+  const blockedAdmission = latchRestart.results.find((value) => value.requestId === "REQ-LATCH-RESTART-ADMIT");
+  assert.equal(blockedAdmission.ok, false); assert.equal(blockedAdmission.error.code, "HUMAN_TAKEOVER_ACTIVE");
+  evidence.latchRestart = { p1PidBefore: after.p1Pid, p1PidAfter: latchRestart.p1Pid, p2PidBefore: after.p2Pid, p2PidAfter: latchRestart.p2Pid, legacyAttack: p0Clear.forgedLatch, canonicalAfter: restartedLatch, secureAdmission: blockedAdmission, fingerprintStable: latchRestart.identityFingerprint === after.identityFingerprint };
   await stop();
 
   // User-writable projection attacks: valid, delete, forged generation, replay.
@@ -178,14 +220,17 @@ try {
   assert.deepEqual(deletedCanonical, beforeOperation); assert.equal(forgedSequenceCanonical, null); assert.deepEqual(replayCanonical, beforeOperation);
   evidence.projectionAttacks = { validProjectionSha256: projectionSha, deleteCanonicalEffect: "NONE", forgedGenerationCanonical: forgedSequenceCanonical, replayCanonicalEffect: "NONE" };
 
+  const canonicalTakeoversBeforeActivated = canonicalTakeoverCount();
   const activated = medium(join(worktree, "test", "reproducers", "r1-m-13-activated-source.mjs"), [], join(publicOutput, "activated-source.json"), 300_000);
-  assert.equal(activated.piVersion, "0.83.0"); assert.equal(activated.factory, 1); assert.ok(activated.handlers >= 10); assert.equal(activated.forged?.operation_id, "OP-FORGED");
+  assert.equal(activated.piVersion, "0.83.0"); assert.equal(activated.factory, 1); assert.equal(activated.commands, 4); assert.ok(activated.handlers >= 10); assert.equal(activated.forged?.operation_id, "OP-FORGED"); assert.ok(activated.humanTakeover >= 1);
   assert.equal(canonicalQuery("OP-FORGED"), null);
-  evidence.activatedSource = { ...activated, canonicalOperation: null, operationDomainResult: "PASS", unmigratedHumanTakeoverEvents: activated.humanTakeover };
+  assert.equal(canonicalTakeoverCount(), canonicalTakeoversBeforeActivated, "activated-source P0 must not create a protected takeover");
+  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS" };
 
   // Crash the real SQLite transition after UPDATE and before COMMIT.
   writeScenario([
-    frame("REQ-CRASH-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-CRASH", taskId: "TASK-PRODUCTION-SECURE", generation: 13, toolName: "write", input: { path: "src/partial.txt" } }),
+    frame("REQ-CRASH-LATCH", "LATCH_ENSURE", { taskId: "TASK-OPERATION-CRASH" }),
+    frame("REQ-CRASH-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-CRASH", taskId: "TASK-OPERATION-CRASH", generation: 0, toolName: "write", input: { path: "src/partial.txt" } }),
     frame("REQ-CRASH-SEAM", "TEST_CRASH_BEFORE_TERMINAL_COMMIT", { operationId: "OP-PRODUCTION-CRASH", outcome: "KNOWN_SUCCESS", effectReference: "file:src/partial.txt" }),
   ]);
   scRun(["start", serviceName]);
@@ -203,8 +248,8 @@ try {
   await stop();
 
   const idempotency = await startAndResult([
-    frame("REQ-IDEM-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 11, profile: "READ_ONLY" }),
-    frame("REQ-CONFLICT-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-CONFLICT", generation: 11, profile: "READ_ONLY" }),
+    frame("REQ-IDEM-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 0, profile: "READ_ONLY" }),
+    frame("REQ-CONFLICT-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-CONFLICT", generation: 0, profile: "READ_ONLY" }),
     frame("REQ-IDEM-TERMINAL", "OPERATION_RETRY_TERMINAL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", outcome: "KNOWN_SUCCESS", effectReference: null }),
     frame("REQ-CONFLICT-TERMINAL", "OPERATION_RETRY_TERMINAL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", outcome: "KNOWN_FAILURE", effectReference: null }),
     frame("REQ-UNKNOWN-GET", "OPERATION_GET", { operationId: "OP-PRODUCTION-CRASH" }),
@@ -214,6 +259,50 @@ try {
   assert.equal(byId["REQ-IDEM-TERMINAL"].result.idempotent, true); assert.equal(byId["REQ-CONFLICT-TERMINAL"].ok, false);
   assert.equal(byId["REQ-UNKNOWN-GET"].result.outcome, "UNKNOWN");
   evidence.idempotency = byId;
+  await stop();
+
+  const priority = await startAndResult([
+    frame("REQ-PRIORITY-ORDINARY-ENSURE", "LATCH_ENSURE", { taskId: "TASK-PRIORITY-ORDINARY" }),
+    frame("REQ-PRIORITY-ORDINARY", "LATCH_CLAIM_SAFEPOINT", { taskId: "TASK-PRIORITY-ORDINARY", reason: "INTEGRITY", actor: "human:handoff", expected: { task_id: "TASK-PRIORITY-ORDINARY", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-PRIORITY-STALE", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-ORDINARY", actor: "human:/aio-takeover", expected: { task_id: "TASK-PRIORITY-ORDINARY", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-PRIORITY-HUMAN-ENSURE", "LATCH_ENSURE", { taskId: "TASK-PRIORITY-HUMAN" }),
+    frame("REQ-PRIORITY-HUMAN", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-HUMAN", actor: "human:/aio-takeover", expected: { task_id: "TASK-PRIORITY-HUMAN", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-PRIORITY-ESCALATE-ENSURE", "LATCH_ENSURE", { taskId: "TASK-PRIORITY-ESCALATE" }),
+    frame("REQ-PRIORITY-ESCALATE-ORDINARY", "LATCH_CLAIM_SAFEPOINT", { taskId: "TASK-PRIORITY-ESCALATE", reason: "INTEGRITY", actor: "human:handoff", expected: { task_id: "TASK-PRIORITY-ESCALATE", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-PRIORITY-ESCALATE-HUMAN", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-ESCALATE", actor: "human:/aio-takeover", expected: { task_id: "TASK-PRIORITY-ESCALATE", state: "ENGAGED", generation: 1, reason: "INTEGRITY" } }),
+    frame("REQ-PRIORITY-DOWNGRADE", "LATCH_CLAIM_SAFEPOINT", { taskId: "TASK-PRIORITY-ESCALATE", reason: "INTEGRITY", actor: "human:handoff", expected: { task_id: "TASK-PRIORITY-ESCALATE", state: "ENGAGED", generation: 1, reason: "HUMAN_TAKEOVER" } }),
+    frame("REQ-PRIORITY-DUPLICATE", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-ESCALATE", actor: "human:/aio-takeover", expected: { task_id: "TASK-PRIORITY-ESCALATE", state: "ENGAGED", generation: 1, reason: "HUMAN_TAKEOVER" } }),
+    frame("REQ-PRIORITY-CONFLICT", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-CONFLICT", actor: "human:/aio-takeover" }),
+    frame("REQ-PRIORITY-CONFLICT", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-PRIORITY-CONFLICT", actor: "human:conflicting-source" }),
+    frame("REQ-PRIORITY-RELEASE-REFUSED", "LATCH_RELEASE", { taskId: "TASK-PRIORITY-HUMAN" }),
+  ]);
+  const priorityRows = priority.results;
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-ORDINARY").result.latch.reason, "INTEGRITY");
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-STALE").error.code, "LATCH_GENERATION_MISMATCH");
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-HUMAN").result.latch.reason, "HUMAN_TAKEOVER");
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-ESCALATE-HUMAN").result.latch.generation, 1);
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-DOWNGRADE").error.code, "HUMAN_TAKEOVER_ACTIVE");
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-DUPLICATE").result.idempotent, true);
+  assert.equal(priorityRows.filter((row) => row.requestId === "REQ-PRIORITY-CONFLICT")[1].error.code, "LATCH_REQUEST_CONFLICT");
+  assert.equal(priorityRows.find((row) => row.requestId === "REQ-PRIORITY-RELEASE-REFUSED").error.code, "OPERATION_TYPE_INVALID");
+  evidence.priority = priorityRows;
+  await stop();
+
+  const crashLatchSetup = await startAndResult([frame("REQ-LATCH-CRASH-ENSURE", "LATCH_ENSURE", { taskId: "TASK-LATCH-CRASH" })]);
+  const latchBeforeCrash = operationFrom(crashLatchSetup, "REQ-LATCH-CRASH-ENSURE");
+  await stop();
+  writeScenario([frame("REQ-LATCH-CRASH", "TEST_CRASH_BEFORE_LATCH_COMMIT", {
+    taskId: "TASK-LATCH-CRASH", reason: "HUMAN_TAKEOVER", actor: "human:/aio-takeover", expected: { task_id: "TASK-LATCH-CRASH", state: "RELEASED", generation: 0, reason: null },
+  })]);
+  scRun(["start", serviceName]);
+  await waitFor(() => serviceState(serviceName) === "STOPPED", "latch crashed service stops", 30_000);
+  assert.deepEqual(canonicalLatch("TASK-LATCH-CRASH"), latchBeforeCrash);
+  const latchRecovered = await startAndResult([
+    frame("REQ-LATCH-CRASH-GET", "LATCH_GET", { taskId: "TASK-LATCH-CRASH" }),
+    frame("REQ-LATCH-CRASH-RECONCILE", "LATCH_CLAIM_HUMAN_TAKEOVER", { taskId: "TASK-LATCH-CRASH", actor: "human:/aio-takeover", expected: { task_id: "TASK-LATCH-CRASH", state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-LATCH-CRASH-FINAL", "LATCH_GET", { taskId: "TASK-LATCH-CRASH" }),
+  ]);
+  evidence.latchCrash = { seam: "SQLite BEGIN IMMEDIATE + latch/event/request update + P2/P1S exit before COMMIT", preCrash: latchBeforeCrash, restart: operationFrom(latchRecovered, "REQ-LATCH-CRASH-GET"), reconciled: operationFrom(latchRecovered, "REQ-LATCH-CRASH-FINAL"), invalidStateAccepted: false };
   await stop();
 
   // Another unrestricted LocalService token has shared S-1-5-19 but not this service SID.
@@ -239,12 +328,25 @@ try {
   renameSync(databasePath, heldDatabase);
   evidence.failClosed.databaseUnavailable = await expectStartFailure("database unavailable");
   renameSync(heldDatabase, databasePath);
+  const schemaDatabase = new DatabaseSync(databasePath);
+  schemaDatabase.exec("ALTER TABLE latches RENAME TO latches_admin_held");
+  schemaDatabase.close();
+  evidence.failClosed.latchSchemaMissing = await expectStartFailure("latch schema missing");
+  const restoreSchema = new DatabaseSync(databasePath);
+  restoreSchema.exec("ALTER TABLE latches_admin_held RENAME TO latches");
+  restoreSchema.close();
   const validConfig = config();
   saveConfig({ ...validConfig, serviceSid: sentinelSid });
   evidence.failClosed.identityMismatch = await expectStartFailure("identity mismatch");
   saveConfig({ ...validConfig, protocol: "aiopago.operation-authority-protocol/999" });
   evidence.failClosed.versionMismatch = await expectStartFailure("version mismatch");
   saveConfig(validConfig);
+  writeScenario([frame("REQ-AUTHORITY-TIMEOUT", "TEST_AUTHORITY_TIMEOUT", {})]);
+  evidence.failClosed.authorityTimeout = await expectStartFailure("authority timeout");
+  writeScenario([]);
+  evidence.failClosed.channelFailure = "PRIVATE_CHANNEL_EOF_OR_TIMEOUT_STOPS_P1S";
+  evidence.failClosed.staleGeneration = priorityRows.find((row) => row.requestId === "REQ-PRIORITY-STALE").error;
+  evidence.failClosed.requestConflict = priorityRows.filter((row) => row.requestId === "REQ-PRIORITY-CONFLICT")[1].error;
   evidence.failClosed.legacyFallback = false;
 
   const acl = run(powershell, ["-NoProfile", "-NonInteractive", "-Command", `$paths=@('${root.replaceAll("'", "''")}','${join(root, "bin").replaceAll("'", "''")}','${join(root, "canonical").replaceAll("'", "''")}','${join(root, "canonical", "operations.sqlite").replaceAll("'", "''")}');$paths|ForEach-Object{$a=Get-Acl -LiteralPath $_;[ordered]@{path=$_;owner=$a.Owner;sddl=$a.Sddl}}|ConvertTo-Json -Compress`]);

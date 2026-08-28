@@ -1,6 +1,7 @@
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { portableOperationAuthority } from "./operation-authority.mjs";
+import { portableLatchAuthority, requireSecureLatchAuthority } from "./latch-authority.mjs";
 
 const TOOL_PROFILES = Object.freeze({
   read: "READ_ONLY",
@@ -32,8 +33,9 @@ function bashTerminalOutcome(isError, result, interrupted) {
 }
 
 export class AdmissionGate {
-  constructor(storage, taskId) {
+  constructor(storage, taskId, { latchAuthority = null } = {}) {
     this.storage = storage;
+    this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
     this.taskId = taskId;
     this.activeStreams = 0;
     this.waiters = new Set();
@@ -67,7 +69,7 @@ export class AdmissionGate {
   }
 
   admit(openStream, requestModel = null) {
-    if (!this.storage.isAdmissionOpen(this.taskId)) throw new GuardianError("LLM_ADMISSION_BLOCKED", "Guardian latch is engaged or unreadable");
+    if (!this.latchAuthority.isAdmissionOpen(this.taskId)) throw new GuardianError("LLM_ADMISSION_BLOCKED", "Guardian latch is engaged or unreadable");
     if (this.preflightVerifier) this.preflightVerifier(requestModel);
     this.activeStreams += 1;
     let stream;
@@ -94,9 +96,15 @@ export class AdmissionGate {
 }
 
 export class ToolOperationTracker {
-  constructor(storage, taskId, { operationAuthority = null } = {}) {
+  constructor(storage, taskId, { operationAuthority = null, latchAuthority = null } = {}) {
     this.storage = storage;
     this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+    this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
+    if (this.operationAuthority.security?.mode === "SECURE") {
+      requireSecureLatchAuthority(this.latchAuthority);
+      invariant(this.operationAuthority === this.latchAuthority, "SECURE_ADMISSION_TRANSACTION_REQUIRED",
+        "Secure operation admission and latch arbitration must share one protected transaction");
+    }
     this.authoritySecurity = this.operationAuthority.security;
     this.taskId = taskId;
     this.admittedTools = new Map();
@@ -105,7 +113,7 @@ export class ToolOperationTracker {
   admit(toolCallId, toolName, input = {}) {
     const profile = TOOL_PROFILES[toolName];
     invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
-    const latch = this.storage.ensureLatch(this.taskId);
+    const latch = this.latchAuthority.ensureLatch(this.taskId);
     this.operationAuthority.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
     this.admittedTools.set(toolCallId, toolName);
     if (toolName === "bash") {
@@ -132,15 +140,17 @@ export class ToolOperationTracker {
 }
 
 export class SafePointCoordinator {
-  constructor({ storage, taskId, gate, operationAuthority = null }) {
+  constructor({ storage, taskId, gate, operationAuthority = null, latchAuthority = null }) {
     this.storage = storage;
     this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+    this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
+    if (this.operationAuthority.security?.mode === "SECURE") requireSecureLatchAuthority(this.latchAuthority);
     this.taskId = taskId;
     this.gate = gate;
   }
 
   acquiredLatch(latch, reason) {
-    const current = this.storage.getLatch(this.taskId);
+    const current = this.latchAuthority.getLatch(this.taskId);
     if (reason !== "HUMAN_TAKEOVER" && current?.state === "ENGAGED" && current.reason === "HUMAN_TAKEOVER") {
       throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover interrupted safe-point acquisition");
     }
@@ -150,7 +160,7 @@ export class SafePointCoordinator {
   }
 
   async request(session, actor = "human:handoff", reason = "INTEGRITY", options = {}) {
-    const observed = options.expectedLatch ?? this.storage.getLatch(this.taskId) ?? this.storage.ensureLatch(this.taskId);
+    const observed = options.expectedLatch ?? this.latchAuthority.getLatch(this.taskId) ?? this.latchAuthority.ensureLatch(this.taskId);
     const expectedLatch = {
       task_id: this.taskId,
       state: observed.state,

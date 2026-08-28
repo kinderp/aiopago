@@ -1,16 +1,23 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
-import { canonicalJson, sha256, utcNow } from "./canonical.mjs";
+import { canonicalJson, opaqueId, sha256, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import {
   OPERATION_AUTHORITY_SCHEMA,
+  PREVIOUS_OPERATION_AUTHORITY_SCHEMA,
   SECURE_OPERATION_AUTHORITY_LABEL,
   detachedOperation,
   operationIdentifier,
   validateOperationAdmission,
   validateOperationTerminal,
 } from "./operation-authority.mjs";
+import {
+  SECURE_LATCH_AUTHORITY_LABEL,
+  assertLatchIdentityValue,
+  detachedLatch,
+  validateLatchClaim,
+} from "./latch-authority.mjs";
 
 const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
   ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
@@ -18,7 +25,7 @@ const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "stri
 
 function secureUnavailable(error, path) {
   if (error instanceof GuardianError) return error;
-  return new GuardianError("SECURE_OPERATION_AUTHORITY_UNAVAILABLE", "Protected operation authority is unavailable; portable storage was not consulted", {
+  return new GuardianError("SECURE_OPERATION_AUTHORITY_UNAVAILABLE", "Protected operation/latch authority is unavailable; portable storage was not consulted", {
     path,
     cause: error?.code ?? error?.message ?? String(error),
   });
@@ -30,9 +37,10 @@ export class ProtectedSqliteOperationAuthority {
   constructor(path, { allowInitialize = false, expectedSchema = OPERATION_AUTHORITY_SCHEMA } = {}) {
     this.path = resolve(path);
     this.security = SECURE_OPERATION_AUTHORITY_LABEL;
+    this.latchSecurity = SECURE_LATCH_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
-    invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation database is missing; portable storage was not consulted", { path: this.path });
+    invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
     try {
       const { DatabaseSync } = require("node:sqlite");
       this.#connection = new DatabaseSync(this.path);
@@ -42,6 +50,7 @@ export class ProtectedSqliteOperationAuthority {
       invariant(integrity?.integrity_check === "ok", "SECURE_OPERATION_AUTHORITY_INTEGRITY_FAILED");
       const metadata = this.#connection.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(metadata?.schema_version === expectedSchema, "SECURE_OPERATION_AUTHORITY_VERSION_MISMATCH", `${metadata?.schema_version ?? "MISSING"} != ${expectedSchema}`);
+      this.#verifySchema();
       const journal = this.#connection.prepare("PRAGMA journal_mode").get();
       invariant(String(journal?.journal_mode).toLowerCase() === "wal", "SECURE_OPERATION_AUTHORITY_JOURNAL_INVALID");
     } catch (error) {
@@ -59,6 +68,14 @@ export class ProtectedSqliteOperationAuthority {
   #migrate(allowInitialize, existed) {
     const db = this.#database();
     if (!existed) invariant(allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING");
+    if (existed) {
+      const metadataTable = db.prepare("SELECT 1 present FROM sqlite_master WHERE type='table' AND name='authority_metadata'").get();
+      invariant(metadataTable, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
+      const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
+      invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
+      if (existingMetadata.schema_version === this.schema) return;
+      if (!(existingMetadata.schema_version === PREVIOUS_OPERATION_AUTHORITY_SCHEMA && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS authority_metadata(
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -81,6 +98,30 @@ export class ProtectedSqliteOperationAuthority {
           OR (state='TERMINAL' AND outcome IS NOT NULL AND terminal_at IS NOT NULL AND terminal_digest IS NOT NULL)),
         CHECK(outcome='KNOWN_SUCCESS' OR effect_reference IS NULL)
       );
+      CREATE TABLE IF NOT EXISTS latches(
+        task_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('ENGAGED','RELEASED')),
+        generation INTEGER NOT NULL CHECK(generation >= 0),
+        reason TEXT,
+        engaged_at TEXT,
+        engaged_by TEXT,
+        released_at TEXT,
+        released_by TEXT,
+        last_event_id TEXT NOT NULL,
+        CHECK((state='RELEASED' AND reason IS NULL) OR (state='ENGAGED' AND reason IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS latch_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT UNIQUE,
+        task_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('LATCH_BOOTSTRAPPED','LATCH_ENGAGED','LATCH_ESCALATED')),
+        generation INTEGER NOT NULL CHECK(generation >= 0),
+        from_reason TEXT,
+        reason TEXT,
+        actor TEXT NOT NULL,
+        occurred_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authority_requests(
         request_id TEXT PRIMARY KEY,
         operation_type TEXT NOT NULL,
@@ -89,11 +130,30 @@ export class ProtectedSqliteOperationAuthority {
         recorded_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id,state,admitted_at);
+      CREATE INDEX IF NOT EXISTS latch_event_task_sequence ON latch_events(task_id,sequence);
     `);
     const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
+    } else if (metadata.schema_version === PREVIOUS_OPERATION_AUTHORITY_SCHEMA && this.schema === OPERATION_AUTHORITY_SCHEMA) {
+      db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?")
+        .run(OPERATION_AUTHORITY_SCHEMA, PREVIOUS_OPERATION_AUTHORITY_SCHEMA);
+    }
+  }
+
+  #verifySchema() {
+    const db = this.#database();
+    const expected = Object.freeze({
+      authority_metadata: ["singleton", "schema_version", "created_at"],
+      operations: ["operation_id", "task_id", "latch_generation", "profile", "state", "outcome", "effect_reference", "admitted_at", "terminal_at", "admission_digest", "terminal_digest"],
+      latches: ["task_id", "state", "generation", "reason", "engaged_at", "engaged_by", "released_at", "released_by", "last_event_id"],
+      latch_events: ["sequence", "event_id", "request_id", "task_id", "event_type", "generation", "from_reason", "reason", "actor", "occurred_at"],
+      authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"],
+    });
+    for (const [table, columns] of Object.entries(expected)) {
+      const actual = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+      invariant(JSON.stringify(actual) === JSON.stringify(columns), "SECURE_OPERATION_AUTHORITY_SCHEMA_INVALID", `${table} schema is missing or incompatible`);
     }
   }
 
@@ -110,17 +170,118 @@ export class ProtectedSqliteOperationAuthority {
     }
   }
 
-  #recordedRequest(db, requestId, operationType, payloadDigest) {
+  #recordedRequest(db, requestId, operationType, payloadDigest, conflictCode = "OPERATION_REQUEST_CONFLICT") {
     const prior = db.prepare("SELECT operation_type,payload_digest,result_json FROM authority_requests WHERE request_id=?").get(requestId);
     if (!prior) return null;
     invariant(prior.operation_type === operationType && prior.payload_digest === payloadDigest,
-      "OPERATION_REQUEST_CONFLICT", "The protected request identity already binds different operation payload");
+      conflictCode, "The protected request identity already binds different authority payload");
     return Object.freeze({ ...JSON.parse(prior.result_json), idempotent: true, request_code: "IDEMPOTENT_RECORDED_RESULT" });
   }
 
   #saveRequest(db, requestId, operationType, payloadDigest, result) {
     db.prepare("INSERT INTO authority_requests(request_id,operation_type,payload_digest,result_json,recorded_at) VALUES(?,?,?,?,?)")
       .run(requestId, operationType, payloadDigest, JSON.stringify(result), utcNow());
+  }
+
+  #ensureLatchInTransaction(db, taskId) {
+    const prior = db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+    if (prior) return prior;
+    const occurredAt = utcNow();
+    const eventId = opaqueId("LEV");
+    db.prepare("INSERT INTO latch_events(event_id,task_id,event_type,generation,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?)")
+      .run(eventId, taskId, "LATCH_BOOTSTRAPPED", 0, null, "human:bootstrap", occurredAt);
+    db.prepare("INSERT INTO latches(task_id,state,generation,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?)")
+      .run(taskId, "RELEASED", 0, occurredAt, "human:bootstrap", eventId);
+    return db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+  }
+
+  ensureLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.#transaction((db) => this.#ensureLatchInTransaction(db, taskId)));
+  }
+
+  getLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.#database().prepare("SELECT * FROM latches WHERE task_id=?").get(taskId));
+  }
+
+  #claimLatchInTransaction(db, value, requestId, payloadDigest) {
+    const recorded = this.#recordedRequest(db, requestId, "LATCH_CLAIM", payloadDigest, "LATCH_REQUEST_CONFLICT");
+    if (recorded) return recorded;
+    const latch = this.#ensureLatchInTransaction(db, value.taskId);
+    if (value.reason !== "HUMAN_TAKEOVER" && latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover has priority over safe-point acquisition");
+    }
+    if (value.expected && (latch.state !== value.expected.state || latch.generation !== value.expected.generation
+      || (latch.reason ?? null) !== value.expected.reason)) {
+      throw new GuardianError("LATCH_GENERATION_MISMATCH", "Canonical latch no longer matches the expected safe-point precondition", { expected: value.expected, observed: latch });
+    }
+    let changedLatch = latch;
+    let idempotent = true;
+    let requestCode = "IDEMPOTENT_LATCH";
+    if (latch.state === "ENGAGED") {
+      if (value.reason === "HUMAN_TAKEOVER" && latch.reason !== value.reason) {
+        const eventId = opaqueId("LEV");
+        const occurredAt = utcNow();
+        db.prepare("INSERT INTO latch_events(event_id,request_id,task_id,event_type,generation,from_reason,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)")
+          .run(eventId, requestId, value.taskId, "LATCH_ESCALATED", latch.generation, latch.reason, value.reason, value.actor, occurredAt);
+        const changed = db.prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?")
+          .run(value.reason, value.actor, eventId, value.taskId, latch.generation, latch.reason);
+        invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch escalation raced");
+        changedLatch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+        idempotent = false;
+        requestCode = "MUTATION_ACCEPTED";
+      } else {
+        invariant(latch.reason === value.reason, "LATCH_REASON_MISMATCH", `${latch.reason} != ${value.reason}`);
+      }
+    } else {
+      const generation = latch.generation + 1;
+      const eventId = opaqueId("LEV");
+      const occurredAt = utcNow();
+      db.prepare("INSERT INTO latch_events(event_id,request_id,task_id,event_type,generation,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?,?)")
+        .run(eventId, requestId, value.taskId, "LATCH_ENGAGED", generation, value.reason, value.actor, occurredAt);
+      const changed = db.prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND state='RELEASED' AND generation=? AND reason IS NULL")
+        .run(generation, value.reason, occurredAt, value.actor, eventId, value.taskId, latch.generation);
+      invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch acquisition raced");
+      changedLatch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+      idempotent = false;
+      requestCode = "MUTATION_ACCEPTED";
+    }
+    const result = { latch: changedLatch, idempotent, request_code: requestCode };
+    this.#saveRequest(db, requestId, "LATCH_CLAIM", payloadDigest, result);
+    return Object.freeze(result);
+  }
+
+  requestLatchClaim(requestId, request) {
+    operationIdentifier(requestId, "LATCH_REQUEST_ID_INVALID", "requestId");
+    const value = validateLatchClaim(request);
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    const ledgerRequestId = `latch:${requestId}`;
+    return this.#transaction((db) => this.#claimLatchInTransaction(db, value, ledgerRequestId, payloadDigest));
+  }
+
+  claimLatch(request) {
+    const requestId = request?.requestId ?? opaqueId("LREQ");
+    return detachedLatch(this.requestLatchClaim(requestId, request).latch);
+  }
+
+  claimHumanTakeover({ taskId, actor, requestId = undefined, expected = null }) {
+    return this.claimLatch({ taskId, reason: "HUMAN_TAKEOVER", actor, requestId, expected });
+  }
+
+  assertLatchIdentity(taskId, expected, options = {}) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(assertLatchIdentityValue(this.getLatch(taskId), expected, options));
+  }
+
+  isAdmissionOpen(taskId) {
+    try { return this.getLatch(taskId)?.state === "RELEASED"; }
+    catch { return false; }
+  }
+
+  latchEventsForTask(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM latch_events WHERE task_id=? ORDER BY sequence").all(taskId).map((row) => Object.freeze({ ...row })));
   }
 
   admitOperation(request) {
@@ -137,6 +298,13 @@ export class ProtectedSqliteOperationAuthority {
         this.#saveRequest(db, requestId, "OPERATION_ADMIT", payloadDigest, result);
         return Object.freeze(result);
       }
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+      invariant(latch, "SECURE_LATCH_MISSING", "Protected operation admission requires an initialized canonical latch");
+      if (latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover committed before operation admission");
+      }
+      invariant(latch.state === "RELEASED", "TOOL_ADMISSION_BLOCKED", "Canonical latch is engaged");
+      invariant(latch.generation === value.generation, "LATCH_GENERATION_MISMATCH", "Operation admission used a stale canonical latch generation", { expected: value.generation, observed: latch.generation });
       const admittedAt = utcNow();
       db.prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,admitted_at,admission_digest) VALUES(?,?,?,?,?,?,?)")
         .run(value.operationId, value.taskId, value.generation, value.profile, "ACTIVE", admittedAt, payloadDigest);
@@ -184,12 +352,9 @@ export class ProtectedSqliteOperationAuthority {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
   }
 
-  // Test-only physical crash seam. The service worker permits it only for a
-  // scoped test service. The update is made inside the real production SQLite
-  // transaction and the process exits without COMMIT.
   crashBeforeTerminalCommitForPhysicalTest(operationId, outcome, effectReference = null) {
     const value = validateOperationTerminal(operationId, outcome, effectReference);
     const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
@@ -200,6 +365,16 @@ export class ProtectedSqliteOperationAuthority {
     db.prepare("UPDATE operations SET state='TERMINAL',outcome=?,effect_reference=?,terminal_at=?,terminal_digest=? WHERE operation_id=?")
       .run(value.outcome, value.effectReference, utcNow(), payloadDigest, value.operationId);
     process.exit(97);
+  }
+
+  crashBeforeLatchCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "LATCH_REQUEST_ID_INVALID", "requestId");
+    const value = validateLatchClaim(request);
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#claimLatchInTransaction(db, value, `latch:${requestId}`, payloadDigest);
+    process.exit(98);
   }
 
   close() {

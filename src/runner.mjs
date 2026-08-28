@@ -13,6 +13,7 @@ import { claimTrustedHumanTakeoverCurrentPlan } from "./handoff-plan-internal.mj
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
 import { portableOperationAuthority } from "./operation-authority.mjs";
+import { portableLatchAuthority } from "./latch-authority.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
@@ -74,16 +75,16 @@ function ledgerReadFacade(ledger) {
 }
 
 const storageReadFacades = new WeakMap();
-function storageReadFacade(storage) {
-  if (!storage) return null;
-  let facade = storageReadFacades.get(storage);
+function storageReadFacade(storage, latchAuthority = storage) {
+  if (!storage || !latchAuthority) return null;
+  let facade = storageReadFacades.get(latchAuthority);
   if (facade) return facade;
   const read = (method) => (...args) => detached(storage[method](...args));
   facade = Object.freeze(Object.assign(Object.create(null), {
     path: storage.path,
     getCalibrationRuntimeIdentity: read("getCalibrationRuntimeIdentity"),
-    getLatch: read("getLatch"),
-    isAdmissionOpen: (...args) => storage.isAdmissionOpen(...args),
+    getLatch: (...args) => detached(latchAuthority.getLatch(...args)),
+    isAdmissionOpen: (...args) => latchAuthority.isAdmissionOpen(...args),
     getHandoff: read("getHandoff"),
     findHandoffByTarget: read("findHandoffByTarget"),
     findHandoffBySource: read("findHandoffBySource"),
@@ -99,7 +100,7 @@ function storageReadFacade(storage) {
     getArtifact: read("getArtifact"),
     events: read("events"),
   }));
-  storageReadFacades.set(storage, facade);
+  storageReadFacades.set(latchAuthority, facade);
   return facade;
 }
 
@@ -188,7 +189,8 @@ async function createGuardianRunner(options, authority = null) {
   const artifacts = injectedOption(options, "artifacts", authority,
     () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage));
   const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
-  const gate = new AdmissionGate(storage, plan.task_id);
+  const latchAuthority = portableLatchAuthority(storage);
+  const gate = new AdmissionGate(storage, plan.task_id, { latchAuthority });
   gate.install(modelRuntime);
   const modelPolicy = options.modelPolicy ?? plan.model_policy ?? null;
   const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
@@ -217,7 +219,7 @@ async function createGuardianRunner(options, authority = null) {
   const tools = injectedOption(options, "tools", authority, () => DEFAULT_PORTABLE_TOOLS);
   const sessionManager = injectedOption(options, "sessionManager", authority,
     () => pi.coding.SessionManager.create(cwd, options.sessionDir));
-  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
+  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, latchAuthority, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
   const runner = trustedRunnerFacade(publicRunner);
   runner.metrics = injectedOption(options, "metrics", authority, () => new MeasurementInstrumentation({
     storage,
@@ -230,8 +232,8 @@ async function createGuardianRunner(options, authority = null) {
   // is constructed only inside the P1S-launched protected worker; failure to
   // obtain that authority never routes back through this project SQLite path.
   const operationAuthority = portableOperationAuthority(storage);
-  runner.toolTracker = new ToolOperationTracker(storage, plan.task_id, { operationAuthority });
-  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate, operationAuthority });
+  runner.toolTracker = new ToolOperationTracker(storage, plan.task_id, { operationAuthority, latchAuthority });
+  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate, operationAuthority, latchAuthority });
   const callerObserveGit = options.observeGit;
   const observeGit = typeof callerObserveGit === "function"
     ? () => Reflect.apply(callerObserveGit, undefined, [])
@@ -295,7 +297,10 @@ export class GuardianRunner {
   get roots() { return detached(runnerInternals.get(this)?.roots ?? null); }
   get repository() { return detached(runnerInternals.get(this)?.repository ?? null); }
   get ledger() { return ledgerReadFacade(runnerInternals.get(this)?.ledger); }
-  get storage() { return storageReadFacade(runnerInternals.get(this)?.storage); }
+  get storage() {
+    const internal = runnerInternals.get(this);
+    return storageReadFacade(internal?.storage, internal?.latchAuthority);
+  }
   get runtime() { return runnerInternals.get(this)?.runtimeReadFacade ?? null; }
   get runnerInstanceId() { return runnerInternals.get(this)?.runnerInstanceId ?? null; }
   get contextAdvisor() {

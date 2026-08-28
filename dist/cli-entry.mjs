@@ -6818,6 +6818,71 @@ var init_operation_authority = __esm({
   }
 });
 
+// src/latch-authority.mjs
+function detachedLatch(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function portableLatchAuthority(storage) {
+  return new PortableLatchAuthority(storage);
+}
+function requireSecureLatchAuthority(authority) {
+  invariant(
+    authority?.latchSecurity?.mode === LATCH_AUTHORITY_MODES.SECURE && authority.latchSecurity.canonical === true && authority.latchSecurity.r1_m_13_latch_isolation === true,
+    "SECURE_LATCH_AUTHORITY_REQUIRED",
+    "Secure execution cannot use or fall back to portable latch state"
+  );
+  return authority;
+}
+var LATCH_AUTHORITY_MODES, SECURE_LATCH_AUTHORITY_LABEL, PORTABLE_LATCH_AUTHORITY_LABEL, PortableLatchAuthority;
+var init_latch_authority = __esm({
+  "src/latch-authority.mjs"() {
+    init_errors();
+    init_operation_authority();
+    LATCH_AUTHORITY_MODES = Object.freeze({
+      SECURE: "SECURE",
+      PORTABLE: "PORTABLE"
+    });
+    SECURE_LATCH_AUTHORITY_LABEL = Object.freeze({
+      mode: LATCH_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_latch_isolation: true
+    });
+    PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
+      mode: LATCH_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_latch_isolation: false
+    });
+    PortableLatchAuthority = class {
+      constructor(storage) {
+        invariant(
+          storage && typeof storage.ensureLatch === "function" && typeof storage.getLatch === "function" && typeof storage.assertLatchIdentity === "function" && typeof storage.isAdmissionOpen === "function",
+          "PORTABLE_LATCH_AUTHORITY_INVALID"
+        );
+        this.storage = storage;
+        this.security = PORTABLE_LATCH_AUTHORITY_LABEL;
+      }
+      ensureLatch(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.ensureLatch(taskId2));
+      }
+      getLatch(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.getLatch(taskId2));
+      }
+      assertLatchIdentity(taskId2, expected, options = {}) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.assertLatchIdentity(taskId2, expected, options));
+      }
+      isAdmissionOpen(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return this.storage.isAdmissionOpen(taskId2);
+      }
+    };
+  }
+});
+
 // src/safety.mjs
 function shellEffectReference(toolCallId) {
   return `shell:${sha256(Buffer.from(toolCallId, "utf8"))}`;
@@ -6836,6 +6901,7 @@ var init_safety = __esm({
     init_canonical();
     init_errors();
     init_operation_authority();
+    init_latch_authority();
     TOOL_PROFILES = Object.freeze({
       read: "READ_ONLY",
       grep: "READ_ONLY",
@@ -6846,8 +6912,9 @@ var init_safety = __esm({
       bash: "SHELL_ATOMIC_OPERATION"
     });
     AdmissionGate = class {
-      constructor(storage, taskId2) {
+      constructor(storage, taskId2, { latchAuthority = null } = {}) {
         this.storage = storage;
+        this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
         this.taskId = taskId2;
         this.activeStreams = 0;
         this.waiters = /* @__PURE__ */ new Set();
@@ -6881,7 +6948,7 @@ var init_safety = __esm({
         for (const provider of [...modelRuntime.getProviders()]) modelRuntime.registerNativeProvider(this.guardProvider(provider));
       }
       admit(openStream, requestModel = null) {
-        if (!this.storage.isAdmissionOpen(this.taskId)) throw new GuardianError("LLM_ADMISSION_BLOCKED", "Guardian latch is engaged or unreadable");
+        if (!this.latchAuthority.isAdmissionOpen(this.taskId)) throw new GuardianError("LLM_ADMISSION_BLOCKED", "Guardian latch is engaged or unreadable");
         if (this.preflightVerifier) this.preflightVerifier(requestModel);
         this.activeStreams += 1;
         let stream;
@@ -6916,9 +6983,18 @@ var init_safety = __esm({
       }
     };
     ToolOperationTracker = class {
-      constructor(storage, taskId2, { operationAuthority = null } = {}) {
+      constructor(storage, taskId2, { operationAuthority = null, latchAuthority = null } = {}) {
         this.storage = storage;
         this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+        this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
+        if (this.operationAuthority.security?.mode === "SECURE") {
+          requireSecureLatchAuthority(this.latchAuthority);
+          invariant(
+            this.operationAuthority === this.latchAuthority,
+            "SECURE_ADMISSION_TRANSACTION_REQUIRED",
+            "Secure operation admission and latch arbitration must share one protected transaction"
+          );
+        }
         this.authoritySecurity = this.operationAuthority.security;
         this.taskId = taskId2;
         this.admittedTools = /* @__PURE__ */ new Map();
@@ -6927,7 +7003,7 @@ var init_safety = __esm({
       admit(toolCallId, toolName, input = {}) {
         const profile = TOOL_PROFILES[toolName];
         invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
-        const latch = this.storage.ensureLatch(this.taskId);
+        const latch = this.latchAuthority.ensureLatch(this.taskId);
         this.operationAuthority.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
         this.admittedTools.set(toolCallId, toolName);
         if (toolName === "bash") {
@@ -6951,14 +7027,16 @@ var init_safety = __esm({
       }
     };
     SafePointCoordinator = class {
-      constructor({ storage, taskId: taskId2, gate, operationAuthority = null }) {
+      constructor({ storage, taskId: taskId2, gate, operationAuthority = null, latchAuthority = null }) {
         this.storage = storage;
         this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+        this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
+        if (this.operationAuthority.security?.mode === "SECURE") requireSecureLatchAuthority(this.latchAuthority);
         this.taskId = taskId2;
         this.gate = gate;
       }
       acquiredLatch(latch, reason2) {
-        const current = this.storage.getLatch(this.taskId);
+        const current = this.latchAuthority.getLatch(this.taskId);
         if (reason2 !== "HUMAN_TAKEOVER" && current?.state === "ENGAGED" && current.reason === "HUMAN_TAKEOVER") {
           throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover interrupted safe-point acquisition");
         }
@@ -6970,7 +7048,7 @@ var init_safety = __esm({
         return current;
       }
       async request(session, actor = "human:handoff", reason2 = "INTEGRITY", options = {}) {
-        const observed = options.expectedLatch ?? this.storage.getLatch(this.taskId) ?? this.storage.ensureLatch(this.taskId);
+        const observed = options.expectedLatch ?? this.latchAuthority.getLatch(this.taskId) ?? this.latchAuthority.ensureLatch(this.taskId);
         const expectedLatch = {
           task_id: this.taskId,
           state: observed.state,
@@ -7516,7 +7594,7 @@ var init_storage = __esm({
       INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES
         ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
-        ('latches','Guardian SQLite canonical runtime','1.0.0'),
+        ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
         ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
@@ -7528,6 +7606,8 @@ var init_storage = __esm({
         ('ledger_index','TASK_PLAN.md authoritative; no reverse write','0.1.0');
       UPDATE authorities SET authority='Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='operations' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
     `);
       }
       getCalibrationRuntimeIdentity() {
@@ -7999,16 +8079,16 @@ function ledgerReadFacade(ledger) {
   ledgerReadFacades.set(ledger, facade);
   return facade;
 }
-function storageReadFacade(storage) {
-  if (!storage) return null;
-  let facade = storageReadFacades.get(storage);
+function storageReadFacade(storage, latchAuthority = storage) {
+  if (!storage || !latchAuthority) return null;
+  let facade = storageReadFacades.get(latchAuthority);
   if (facade) return facade;
   const read = (method) => (...args) => detached(storage[method](...args));
   facade = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
     path: storage.path,
     getCalibrationRuntimeIdentity: read("getCalibrationRuntimeIdentity"),
-    getLatch: read("getLatch"),
-    isAdmissionOpen: (...args) => storage.isAdmissionOpen(...args),
+    getLatch: (...args) => detached(latchAuthority.getLatch(...args)),
+    isAdmissionOpen: (...args) => latchAuthority.isAdmissionOpen(...args),
     getHandoff: read("getHandoff"),
     findHandoffByTarget: read("findHandoffByTarget"),
     findHandoffBySource: read("findHandoffBySource"),
@@ -8024,7 +8104,7 @@ function storageReadFacade(storage) {
     getArtifact: read("getArtifact"),
     events: read("events")
   }));
-  storageReadFacades.set(storage, facade);
+  storageReadFacades.set(latchAuthority, facade);
   return facade;
 }
 function runtimeReadFacade(internal) {
@@ -8115,7 +8195,8 @@ async function createGuardianRunner(options, authority = null) {
     () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage)
   );
   const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
-  const gate = new AdmissionGate(storage, plan2.task_id);
+  const latchAuthority = portableLatchAuthority(storage);
+  const gate = new AdmissionGate(storage, plan2.task_id, { latchAuthority });
   gate.install(modelRuntime);
   const modelPolicy = options.modelPolicy ?? plan2.model_policy ?? null;
   const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
@@ -8156,7 +8237,7 @@ async function createGuardianRunner(options, authority = null) {
     authority,
     () => pi.coding.SessionManager.create(cwd, options.sessionDir)
   );
-  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
+  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, latchAuthority, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
   const runner = trustedRunnerFacade(publicRunner);
   runner.metrics = injectedOption(options, "metrics", authority, () => new MeasurementInstrumentation({
     storage,
@@ -8166,8 +8247,8 @@ async function createGuardianRunner(options, authority = null) {
     retention: options.metricsRetention
   }));
   const operationAuthority = portableOperationAuthority(storage);
-  runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id, { operationAuthority });
-  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate, operationAuthority });
+  runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id, { operationAuthority, latchAuthority });
+  runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate, operationAuthority, latchAuthority });
   const callerObserveGit = options.observeGit;
   const observeGit = typeof callerObserveGit === "function" ? () => Reflect.apply(callerObserveGit, void 0, []) : () => observeGitState(cwd);
   runner.handoffService = new HandoffService({
@@ -8209,6 +8290,7 @@ var init_runner = __esm({
     init_ledger();
     init_metrics();
     init_operation_authority();
+    init_latch_authority();
     init_runner_ownership();
     init_pi_loader();
     init_safety();
@@ -8290,7 +8372,8 @@ var init_runner = __esm({
         return ledgerReadFacade(runnerInternals.get(this)?.ledger);
       }
       get storage() {
-        return storageReadFacade(runnerInternals.get(this)?.storage);
+        const internal = runnerInternals.get(this);
+        return storageReadFacade(internal?.storage, internal?.latchAuthority);
       }
       get runtime() {
         return runnerInternals.get(this)?.runtimeReadFacade ?? null;

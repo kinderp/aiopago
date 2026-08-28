@@ -10,7 +10,9 @@ const service = option("--service");
 const projectDatabase = option("--project-db");
 const output = option("--output");
 const serviceConfigProbe = option("--service-config-probe");
+const forgedLatchState = option("--forge-latch-state") ?? "HUMAN_TAKEOVER";
 if (!root || !service || !projectDatabase || !output || !serviceConfigProbe) throw new Error("ROOT_SERVICE_PROJECT_DB_OUTPUT_PROBE_REQUIRED");
+if (!["HUMAN_TAKEOVER", "CLEAR"].includes(forgedLatchState)) throw new Error("FORGED_LATCH_STATE_INVALID");
 const system32 = join(process.env.SystemRoot, "System32");
 const canonical = join(root, "canonical", "operations.sqlite");
 const key = join(root, "canonical", "identity.bin");
@@ -44,17 +46,25 @@ native("service_account_change", join(system32, "sc.exe"), ["config", service, "
 native("service_sid_change", join(system32, "sc.exe"), ["sidtype", service, "none"]);
 native("service_delete", join(system32, "sc.exe"), ["delete", service]);
 
-let forged;
+let forged, forgedLatch;
 {
   const database = new DatabaseSync(projectDatabase);
   database.prepare("INSERT OR REPLACE INTO operations(operation_id,task_id,latch_generation,profile,state,outcome,effect_reference,admitted_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?)")
     .run("OP-FORGED-BY-P0", "TASK-PRODUCTION-SECURE", 999999, "READ_ONLY", "TERMINAL", "KNOWN_SUCCESS", null, "2099-01-01T00:00:00.000Z", "2099-01-01T00:00:00.001Z");
   forged = database.prepare("SELECT operation_id,task_id,latch_generation,profile,state,outcome,effect_reference FROM operations WHERE operation_id='OP-FORGED-BY-P0'").get();
+  if (forgedLatchState === "HUMAN_TAKEOVER") {
+    database.prepare("INSERT OR REPLACE INTO latches(task_id,state,generation,reason,engaged_at,engaged_by,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run("TASK-PRODUCTION-SECURE", "ENGAGED", 999999, "HUMAN_TAKEOVER", "2099-01-01T00:00:00.000Z", "human:/aio-takeover", null, null, "EVT-PLAUSIBLE-P0-TAKEOVER");
+  } else {
+    database.prepare("INSERT OR REPLACE INTO latches(task_id,state,generation,reason,engaged_at,engaged_by,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run("TASK-PRODUCTION-SECURE", "RELEASED", 2147483647, null, null, null, "2099-01-01T00:01:00.000Z", "attacker:P0", "EVT-PLAUSIBLE-P0-CLEAR");
+  }
+  forgedLatch = database.prepare("SELECT task_id,state,generation,reason,engaged_at,engaged_by,released_at,released_by,last_event_id FROM latches WHERE task_id='TASK-PRODUCTION-SECURE'").get();
   database.close();
 }
 
 writeFileSync(output, `${JSON.stringify({
-  schema: "aiopago.operation-authority-p0-attack/1", pid: process.pid, ppid: process.ppid,
-  identity, root, service, canonical, key, broker, attempts, forged,
+  schema: "aiopago.operation-latch-authority-p0-attack/2", pid: process.pid, ppid: process.ppid,
+  identity, root, service, canonical, key, broker, attempts, forged, forgedLatch,
   protectedAllDenied: attempts.every((entry) => entry.denied === true),
 }, null, 2)}\n`);
