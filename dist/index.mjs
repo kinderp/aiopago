@@ -289,6 +289,80 @@ function sameGuidedHandoffEligibility(left, right) {
 // src/ledger.mjs
 import { resolve as resolve3 } from "node:path";
 
+// src/operation-authority.mjs
+var OPERATION_AUTHORITY_MODES = Object.freeze({
+  SECURE: "SECURE",
+  PORTABLE: "PORTABLE"
+});
+var SECURE_OPERATION_AUTHORITY_LABEL = Object.freeze({
+  mode: OPERATION_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_operation_isolation: true
+});
+var PORTABLE_LABEL = Object.freeze({
+  mode: OPERATION_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_operation_isolation: false
+});
+
+// src/handoff-reservation-authority.mjs
+var HANDOFF_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_handoff_reservation_isolation: true
+});
+var PORTABLE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_handoff_reservation_isolation: false
+});
+var HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "source_session_id",
+  "source_session_file",
+  "task_id",
+  "task_plan_revision",
+  "task_plan_digest",
+  "requirements_version",
+  "current_item",
+  "next_item",
+  "next_step",
+  "latch_generation",
+  "runner_instance_id",
+  "session_binding_id",
+  "parent_session_id",
+  "parent_session_file",
+  "parent_checkpoint_id",
+  "recovery_of_handoff_id",
+  "checkpoint_id",
+  "resume_manifest_id",
+  "model_policy",
+  "reasoning_policy"
+]);
+
+// src/latch-authority.mjs
+var LATCH_AUTHORITY_MODES = Object.freeze({
+  SECURE: "SECURE",
+  PORTABLE: "PORTABLE"
+});
+var SECURE_LATCH_AUTHORITY_LABEL = Object.freeze({
+  mode: LATCH_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_latch_isolation: true
+});
+var PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
+  mode: LATCH_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_latch_isolation: false
+});
+
 // src/handoff-plan-internal.mjs
 var handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
 function registerTrustedHandoffPlanCapability(ledger, capability) {

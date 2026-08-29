@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { opaqueId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { handoffConsentIdentity } from "./handoff-consent.mjs";
+import { HANDOFF_RESERVATION_IDENTITY_FIELDS } from "./handoff-reservation-authority.mjs";
 import { registerTrustedHandoffStorageCapability } from "./handoff-plan-internal.mjs";
 import { planSemanticDigest, sameCanonicalJson } from "./plan-semantics-internal.mjs";
 import { taskOperationBlocksNewHandoff, taskOperationDisposition } from "./task-operation-internal.mjs";
@@ -55,30 +56,6 @@ export function supersedeRunnerSessionBindingForInternalTest(storage, ...args) {
 export function beginDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).beginDispatch(...args); }
 export function finishDispatchForInternalTest(storage, ...args) { return internalTestCapabilities.get(storage).finishDispatch(...args); }
 // @source-test-support-end
-
-const HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
-  "handoff_id",
-  "source_session_id",
-  "source_session_file",
-  "task_id",
-  "task_plan_revision",
-  "task_plan_digest",
-  "requirements_version",
-  "current_item",
-  "next_item",
-  "next_step",
-  "latch_generation",
-  "runner_instance_id",
-  "session_binding_id",
-  "parent_session_id",
-  "parent_session_file",
-  "parent_checkpoint_id",
-  "recovery_of_handoff_id",
-  "checkpoint_id",
-  "resume_manifest_id",
-  "model_policy",
-  "reasoning_policy",
-]);
 
 function sameHandoffReservationIdentity(existing, projection) {
   if (!existing || !projection) return false;
@@ -299,6 +276,7 @@ export class GuardianStorage {
     this.migrate();
     const trustedCapability = {
       reserve: (projection, precondition) => this.#reserveHandoff(projection, precondition),
+      projectCanonicalReservation: (projection, proof) => this.#projectCanonicalHandoffReservation(projection, proof),
       prepareRecovery: ({ failedHandoffId, preparation, reservation, attestation }) => this.prepareContinuityRecovery(
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
@@ -480,7 +458,7 @@ export class GuardianStorage {
         ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
-        ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
+        ('handoffs','Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode','1.1.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
@@ -493,6 +471,8 @@ export class GuardianStorage {
         WHERE name='operations' AND authority='Guardian SQLite canonical runtime';
       UPDATE authorities SET authority='Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='handoffs' AND authority='Guardian SQLite canonical runtime';
     `);
   }
 
@@ -619,6 +599,40 @@ export class GuardianStorage {
 
   reserveHandoff() {
     throw new GuardianError("HANDOFF_RESERVATION_TRUSTED_PATH_REQUIRED", "Authoritative handoff reservation is package-private and requires plan coordination");
+  }
+
+  #projectCanonicalHandoffReservation(projection, proof) {
+    invariant(proof?.canonical === true && proof?.created === true
+      && proof?.event?.event_type === "HANDOFF_RESERVED"
+      && proof?.event?.handoff_id === projection?.handoff_id
+      && proof?.active_source?.source_session_id === projection?.source_session_id
+      && proof?.active_source?.handoff_id === projection?.handoff_id,
+    "HANDOFF_PROJECTION_PROOF_INVALID", "Portable projection requires the just-committed protected reservation result");
+    return this.transaction(() => {
+      const now = utcNow();
+      database(this).prepare(`INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(handoff_id) DO UPDATE SET source_session_id=excluded.source_session_id,target_session_id=NULL,task_id=excluded.task_id,
+          state=excluded.state,latch_generation=excluded.latch_generation,projection_json=excluded.projection_json,updated_at=excluded.updated_at`)
+        .run(projection.handoff_id, projection.source_session_id, null, projection.task_id, projection.state,
+          projection.latch_generation, JSON.stringify(projection), projection.created_at ?? now, now);
+      database(this).prepare("DELETE FROM active_sources WHERE source_session_id=? OR handoff_id=?")
+        .run(projection.source_session_id, projection.handoff_id);
+      database(this).prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)")
+        .run(projection.source_session_id, projection.handoff_id);
+      const eventKey = `handoff:${projection.handoff_id}`;
+      database(this).prepare("DELETE FROM journal WHERE event_key=? OR event_id=?")
+        .run(eventKey, proof.event.event_id);
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(proof.event.event_id, projection.handoff_id, "HANDOFF_STARTED", eventKey, proof.event.occurred_at, JSON.stringify({
+          source_session_id: projection.source_session_id,
+          latch_generation: projection.latch_generation,
+          recovery_of_handoff_id: null,
+          canonical_reservation_digest: proof.reservation_digest,
+          projection_only: true,
+        }));
+      return this.getHandoff(projection.handoff_id);
+    });
   }
 
   getHandoff(id) {

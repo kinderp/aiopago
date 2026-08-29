@@ -67,7 +67,11 @@ async function startAndResult(requests) {
   writeScenario(requests);
   scRun(["start", serviceName]);
   const path = join(root, "runtime", "latest-result.json");
-  await waitFor(() => existsSync(path), "service result", 60_000);
+  const failurePath = join(root, "runtime", "failure.json");
+  await waitFor(() => {
+    if (existsSync(failurePath)) throw new Error(`service failure: ${readFileSync(failurePath, "utf8")}`);
+    return existsSync(path);
+  }, "service result", 60_000);
   const result = JSON.parse(readFileSync(path, "utf8"));
   assert.equal(result.schema, "aiopago.operation-authority-service-result/1");
   return result;
@@ -98,6 +102,26 @@ function canonicalTakeoverCount() {
   const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
   const count = database.prepare("SELECT COUNT(*) count FROM latches WHERE state='ENGAGED' AND reason='HUMAN_TAKEOVER'").get().count;
   database.close(); return count;
+}
+function canonicalHandoff(handoffId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT handoff_id,source_session_id,task_id,task_plan_revision,task_plan_digest,latch_generation,latch_reason,runner_instance_id,checkpoint_id,resume_manifest_id,reservation_digest,reservation_event_id,projection_json,created_at FROM handoff_reservations WHERE handoff_id=?").get(handoffId) ?? null;
+  database.close(); return row ? { ...row, projection: JSON.parse(row.projection_json) } : null;
+}
+function canonicalHandoffCounts() {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const result = { handoffs: database.prepare("SELECT COUNT(*) count FROM handoff_reservations").get().count, activeSources: database.prepare("SELECT COUNT(*) count FROM active_sources").get().count, events: database.prepare("SELECT COUNT(*) count FROM handoff_reservation_events").get().count };
+  database.close(); return result;
+}
+function canonicalActiveSource(sourceSessionId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id=?").get(sourceSessionId) ?? null;
+  database.close(); return row ? { ...row } : null;
+}
+function physicalHandoffProjection({ handoffId = "HO-PRODUCTION-HANDOFF", source = "SESSION-PRODUCTION-SOURCE", task = "TASK-PRODUCTION-HANDOFF" } = {}) {
+  const digest = `sha256:${"a".repeat(64)}`;
+  const plan = { task_id: task, objective: "Physical protected handoff", current_item: "ITEM-1", next_item: "ITEM-2", next_step: "Continue", plan_revision_id: "PLAN-PRODUCTION-1", content_digest: digest, requirements_version: "REQ-1", completion_criteria: ["physical"], relevant_decisions: [], relevant_tests: [], evidence_references: [], minimal_reads: ["TASK_PLAN.md"], required_local_paths: ["TASK_PLAN.md"], model_policy: "openai-codex/gpt-5.6-sol", reasoning_policy: "high" };
+  return { handoff_id: handoffId, source_session_id: source, source_session_file: `sessions/${source}.jsonl`, target_session_id: null, target_session_file: null, runner_instance_id: "RUNNER-PROTECTED-P2", session_binding_id: `BIND-${handoffId}`, parent_session_id: source, parent_session_file: `sessions/${source}.jsonl`, parent_checkpoint_id: null, recovery_of_handoff_id: null, task_id: task, current_item: "ITEM-1", next_item: "ITEM-2", next_step: "Continue", task_plan_revision: plan.plan_revision_id, task_plan_digest: digest, requirements_version: "REQ-1", latch_generation: 1, checkpoint_id: `CP-${handoffId}`, checkpoint_digest: null, resume_manifest_id: `RM-${handoffId}`, resume_manifest_digest: null, resume_prompt_id: null, resume_prompt_digest: null, resume_prompt: null, authorization_state: "NOT_AUTHORIZED", admission_state: "NOT_COMMITTED", admission_id: null, dispatch_state: "NOT_STARTED", dispatch_attempt_id: null, dispatch_attempt_no: 0, expected_git_state: { repository_id: "physical", workdir: "project", branch: "test", head_sha: "a".repeat(40), base_sha: "a".repeat(40), index_digest: `sha256:${"b".repeat(64)}`, worktree_digest: `sha256:${"c".repeat(64)}`, status_entries: [] }, model_policy: plan.model_policy, reasoning_policy: plan.reasoning_policy, reserved_plan_snapshot: plan, state: "SAFE_TO_HANDOFF", created_at: "2026-08-29T12:00:00.000Z", updated_at: "2026-08-29T12:00:00.000Z" };
 }
 function config() { return JSON.parse(readFileSync(join(root, "control", "service-config.json"), "utf8").replace(/^\uFEFF/, "")); }
 function saveConfig(value) { writeFileSync(join(root, "control", "service-config.json"), `${JSON.stringify(value)}\n`); }
@@ -141,34 +165,71 @@ try {
   project.exec(`
     CREATE TABLE operations(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,latch_generation INTEGER NOT NULL,profile TEXT NOT NULL,state TEXT NOT NULL,outcome TEXT,effect_reference TEXT,admitted_at TEXT NOT NULL,terminal_at TEXT);
     CREATE TABLE latches(task_id TEXT PRIMARY KEY,state TEXT NOT NULL,generation INTEGER NOT NULL,reason TEXT,engaged_at TEXT,engaged_by TEXT,released_at TEXT,released_by TEXT,last_event_id TEXT NOT NULL);
+    CREATE TABLE handoffs(handoff_id TEXT PRIMARY KEY,source_session_id TEXT NOT NULL,target_session_id TEXT,task_id TEXT NOT NULL,state TEXT NOT NULL,latch_generation INTEGER NOT NULL,projection_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+    CREATE TABLE active_sources(source_session_id TEXT PRIMARY KEY,handoff_id TEXT NOT NULL UNIQUE REFERENCES handoffs(handoff_id));
+    CREATE TABLE journal(seq INTEGER PRIMARY KEY AUTOINCREMENT,event_id TEXT NOT NULL UNIQUE,handoff_id TEXT,event_type TEXT NOT NULL,event_key TEXT UNIQUE,occurred_at TEXT NOT NULL,data_json TEXT NOT NULL);
   `);
   project.close();
 
+  const legitimateHandoffProjection = physicalHandoffProjection();
   const before = await startAndResult([
     frame("REQ-BEFORE-LATCH", "LATCH_ENSURE", { taskId: "TASK-PRODUCTION-SECURE" }),
     frame("REQ-BEFORE-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 0, toolName: "read", input: { path: "README.md" } }),
     frame("REQ-BEFORE-FINISH", "OPERATION_FINISH_TOOL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-PRODUCTION-SECURE", isError: false, result: { content: [{ type: "text", text: "real production result" }] }, interrupted: false }),
     frame("REQ-BEFORE-GET", "OPERATION_GET", { operationId: "OP-PRODUCTION-BEFORE-RESTART" }),
+    frame("REQ-HANDOFF-LATCH-ENSURE", "LATCH_ENSURE", { taskId: legitimateHandoffProjection.task_id }),
+    frame("REQ-HANDOFF-LATCH-CLAIM", "LATCH_CLAIM_SAFEPOINT", { taskId: legitimateHandoffProjection.task_id, reason: "INTEGRITY", actor: "human:/aio-handoff", expected: { task_id: legitimateHandoffProjection.task_id, state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-HANDOFF-RESERVE", "HANDOFF_RESERVE", { projection: legitimateHandoffProjection, expectedLatch: { task_id: legitimateHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
+    frame("REQ-HANDOFF-GET", "HANDOFF_GET", { handoffId: legitimateHandoffProjection.handoff_id }),
+    frame("REQ-ACTIVE-SOURCE-GET", "ACTIVE_SOURCE_GET", { sourceSessionId: legitimateHandoffProjection.source_session_id }),
   ]);
   const beforeOperation = operationFrom(before, "REQ-BEFORE-GET");
   assert.equal(beforeOperation.state, "TERMINAL"); assert.equal(beforeOperation.outcome, "KNOWN_SUCCESS"); assert.equal(beforeOperation.profile, "READ_ONLY");
   const beforeLatch = operationFrom(before, "REQ-BEFORE-LATCH");
   assert.equal(beforeLatch.state, "RELEASED"); assert.equal(beforeLatch.generation, 0);
-  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, latch: beforeLatch, operation: beforeOperation };
+  const legitimateHandoff = operationFrom(before, "REQ-HANDOFF-GET");
+  const legitimateActiveSource = operationFrom(before, "REQ-ACTIVE-SOURCE-GET");
+  assert.equal(legitimateHandoff.handoff_id, legitimateHandoffProjection.handoff_id);
+  assert.equal(legitimateHandoff.state, "SAFE_TO_HANDOFF");
+  assert.equal(legitimateHandoff.authorization_state, "NOT_AUTHORIZED");
+  assert.equal(legitimateActiveSource.handoff_id, legitimateHandoffProjection.handoff_id);
+  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, latch: beforeLatch, operation: beforeOperation, handoff: legitimateHandoff, activeSource: legitimateActiveSource };
   await stop();
+
+  const compatibility = new DatabaseSync(projectDatabase);
+  compatibility.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run(legitimateHandoffProjection.handoff_id, legitimateHandoffProjection.source_session_id, null, legitimateHandoffProjection.task_id, legitimateHandoffProjection.state, legitimateHandoffProjection.latch_generation, JSON.stringify(legitimateHandoffProjection), legitimateHandoffProjection.created_at, legitimateHandoffProjection.updated_at);
+  compatibility.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(legitimateHandoffProjection.source_session_id, legitimateHandoffProjection.handoff_id);
+  compatibility.prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+    .run("EVT-PROJECT-REAL-HANDOFF", legitimateHandoffProjection.handoff_id, "HANDOFF_STARTED", `handoff:${legitimateHandoffProjection.handoff_id}`, legitimateHandoffProjection.created_at, JSON.stringify({ projected: true }));
+  compatibility.close();
 
   const p0 = medium(join(worktree, "test", "reproducers", "r1-m-13-operation-authority-p0.mjs"), [
     "--root", root, "--service", serviceName, "--project-db", projectDatabase, "--service-config-probe", serviceConfigProbe,
+    "--attack-real-handoff-id", legitimateHandoffProjection.handoff_id,
   ], join(publicOutput, "p0-attack.json"));
   assert.equal(p0.protectedAllDenied, true, JSON.stringify(p0.attempts.filter((value) => !value.denied), null, 2));
   assert.equal(p0.forged.operation_id, "OP-FORGED-BY-P0");
   assert.equal(p0.forgedLatch.reason, "HUMAN_TAKEOVER");
+  assert.equal(p0.forgedHandoff.handoff_id, "HO-FORGED-BY-P0");
   assert.deepEqual(canonicalLatch("TASK-PRODUCTION-SECURE"), beforeLatch);
-  evidence.p0Attack = { ...p0, forgedHumanTakeoverCanonicalEffect: "NONE" };
+  assert.equal(canonicalHandoff("HO-FORGED-BY-P0"), null);
+  assert.equal(canonicalActiveSource("SESSION-FORGED-BY-P0"), null);
+  assert.equal(p0.falseNegativeAttack.deleted_handoff_id, legitimateHandoffProjection.handoff_id);
+  assert.equal(canonicalHandoff(legitimateHandoffProjection.handoff_id).handoff_id, legitimateHandoffProjection.handoff_id);
+  assert.equal(canonicalActiveSource(legitimateHandoffProjection.source_session_id).handoff_id, legitimateHandoffProjection.handoff_id);
+  evidence.p0Attack = { ...p0, forgedHumanTakeoverCanonicalEffect: "NONE", forgedHandoffCanonical: null, forgedActiveSourceCanonical: null, falseNegativeCanonicalHandoff: canonicalHandoff(legitimateHandoffProjection.handoff_id), falseNegativeCanonicalActiveSource: canonicalActiveSource(legitimateHandoffProjection.source_session_id) };
 
+  const conflictingHandoffProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-CONFLICT", source: legitimateHandoffProjection.source_session_id, task: "TASK-PRODUCTION-CONFLICT" });
   const after = await startAndResult([
     frame("REQ-AFTER-GET-OLD", "OPERATION_GET", { operationId: "OP-PRODUCTION-BEFORE-RESTART" }),
     frame("REQ-AFTER-GET-FORGED", "OPERATION_GET", { operationId: "OP-FORGED-BY-P0" }),
+    frame("REQ-AFTER-HANDOFF", "HANDOFF_GET", { handoffId: legitimateHandoffProjection.handoff_id }),
+    frame("REQ-AFTER-FORGED-HANDOFF", "HANDOFF_GET", { handoffId: "HO-FORGED-BY-P0" }),
+    frame("REQ-AFTER-ACTIVE-SOURCE", "ACTIVE_SOURCE_GET", { sourceSessionId: legitimateHandoffProjection.source_session_id }),
+    frame("REQ-CONFLICT-LATCH-ENSURE", "LATCH_ENSURE", { taskId: conflictingHandoffProjection.task_id }),
+    frame("REQ-CONFLICT-LATCH-CLAIM", "LATCH_CLAIM_SAFEPOINT", { taskId: conflictingHandoffProjection.task_id, reason: "INTEGRITY", actor: "human:/aio-handoff", expected: { task_id: conflictingHandoffProjection.task_id, state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-CONFLICT-HANDOFF", "HANDOFF_RESERVE", { projection: conflictingHandoffProjection, expectedLatch: { task_id: conflictingHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
     frame("REQ-AFTER-LATCH", "LATCH_GET", { taskId: "TASK-PRODUCTION-SECURE" }),
     frame("REQ-AFTER-ADMIT", "OPERATION_ADMIT_TOOL", { operationId: "OP-PRODUCTION-AFTER-RESTART", taskId: "TASK-PRODUCTION-SECURE", generation: 0, toolName: "edit", input: { path: "src/exact.txt" } }),
     frame("REQ-AFTER-FINISH", "OPERATION_FINISH_TOOL", { operationId: "OP-PRODUCTION-AFTER-RESTART", taskId: "TASK-PRODUCTION-SECURE", isError: false, result: { content: [{ type: "text", text: "edited" }] }, interrupted: false }),
@@ -178,6 +239,11 @@ try {
   ]);
   assert.deepEqual(operationFrom(after, "REQ-AFTER-GET-OLD"), beforeOperation);
   assert.equal(operationFrom(after, "REQ-AFTER-GET-FORGED"), null);
+  assert.equal(operationFrom(after, "REQ-AFTER-HANDOFF").handoff_id, legitimateHandoffProjection.handoff_id);
+  assert.equal(operationFrom(after, "REQ-AFTER-FORGED-HANDOFF"), null);
+  assert.equal(operationFrom(after, "REQ-AFTER-ACTIVE-SOURCE").handoff_id, legitimateHandoffProjection.handoff_id);
+  const conflictResult = after.results.find((value) => value.requestId === "REQ-CONFLICT-HANDOFF");
+  assert.equal(conflictResult.ok, false); assert.equal(conflictResult.error.code, "HANDOFF_ACTIVE_SOURCE_CONFLICT");
   const afterOperation = operationFrom(after, "REQ-AFTER-GET");
   assert.equal(afterOperation.effect_reference, "file:src/exact.txt");
   assert.deepEqual(operationFrom(after, "REQ-AFTER-LATCH"), beforeLatch, "forged portable takeover must not affect the secure reader");
@@ -186,7 +252,7 @@ try {
   assert.equal(legitimateTakeoverRequest.request_code, "MUTATION_ACCEPTED");
   assert.equal(legitimateTakeover.state, "ENGAGED"); assert.equal(legitimateTakeover.reason, "HUMAN_TAKEOVER"); assert.equal(legitimateTakeover.generation, 1);
   assert.notEqual(after.p1Pid, before.p1Pid); assert.notEqual(after.p2Pid, before.p2Pid); assert.equal(after.identityFingerprint, before.identityFingerprint);
-  evidence.phases.afterRestart = { p1Pid: after.p1Pid, p2Pid: after.p2Pid, fingerprint: after.identityFingerprint, oldOperation: operationFrom(after, "REQ-AFTER-GET-OLD"), forged: null, protectedLatchBeforeTakeover: operationFrom(after, "REQ-AFTER-LATCH"), postRestartOperation: afterOperation };
+  evidence.phases.afterRestart = { p1Pid: after.p1Pid, p2Pid: after.p2Pid, fingerprint: after.identityFingerprint, oldOperation: operationFrom(after, "REQ-AFTER-GET-OLD"), forged: null, protectedLatchBeforeTakeover: operationFrom(after, "REQ-AFTER-LATCH"), postRestartOperation: afterOperation, protectedHandoff: operationFrom(after, "REQ-AFTER-HANDOFF"), protectedActiveSource: operationFrom(after, "REQ-AFTER-ACTIVE-SOURCE"), conflictingSecureReservation: conflictResult };
   evidence.legitimateTakeover = { taskId: "TASK-PRODUCTION-SECURE", session: { p1Pid: after.p1Pid, p2Pid: after.p2Pid, serviceName }, source: "human:/aio-takeover", initial: beforeLatch, requestId: "REQ-LEGITIMATE-TAKEOVER", reason: "HUMAN_TAKEOVER", final: legitimateTakeover, canonicalEvidence: canonicalLatch("TASK-PRODUCTION-SECURE") };
   await stop();
 
@@ -221,11 +287,14 @@ try {
   evidence.projectionAttacks = { validProjectionSha256: projectionSha, deleteCanonicalEffect: "NONE", forgedGenerationCanonical: forgedSequenceCanonical, replayCanonicalEffect: "NONE" };
 
   const canonicalTakeoversBeforeActivated = canonicalTakeoverCount();
+  const canonicalHandoffsBeforeActivated = canonicalHandoffCounts();
   const activated = medium(join(worktree, "test", "reproducers", "r1-m-13-activated-source.mjs"), [], join(publicOutput, "activated-source.json"), 300_000);
   assert.equal(activated.piVersion, "0.83.0"); assert.equal(activated.factory, 1); assert.equal(activated.commands, 4); assert.ok(activated.handlers >= 10); assert.equal(activated.forged?.operation_id, "OP-FORGED"); assert.ok(activated.humanTakeover >= 1);
   assert.equal(canonicalQuery("OP-FORGED"), null);
+  assert.equal(canonicalHandoff("HO-FORGED-BY-P0"), null);
+  assert.deepEqual(canonicalHandoffCounts(), canonicalHandoffsBeforeActivated, "activated-source P0 must not create protected reservation authority");
   assert.equal(canonicalTakeoverCount(), canonicalTakeoversBeforeActivated, "activated-source P0 must not create a protected takeover");
-  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS" };
+  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalHandoffAddedByAttack: false, canonicalActiveSourceAddedByAttack: false, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS", handoffDomainResult: "PASS" };
 
   // Crash the real SQLite transition after UPDATE and before COMMIT.
   writeScenario([
@@ -252,13 +321,17 @@ try {
     frame("REQ-CONFLICT-ADMIT", "OPERATION_RETRY_ADMISSION", { operationId: "OP-PRODUCTION-BEFORE-RESTART", taskId: "TASK-CONFLICT", generation: 0, profile: "READ_ONLY" }),
     frame("REQ-IDEM-TERMINAL", "OPERATION_RETRY_TERMINAL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", outcome: "KNOWN_SUCCESS", effectReference: null }),
     frame("REQ-CONFLICT-TERMINAL", "OPERATION_RETRY_TERMINAL", { operationId: "OP-PRODUCTION-BEFORE-RESTART", outcome: "KNOWN_FAILURE", effectReference: null }),
+    frame("REQ-HANDOFF-RESERVE", "HANDOFF_RESERVE", { projection: legitimateHandoffProjection, expectedLatch: { task_id: legitimateHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
+    frame("REQ-HANDOFF-RESERVE", "HANDOFF_RESERVE", { projection: { ...legitimateHandoffProjection, task_plan_digest: `sha256:${"d".repeat(64)}`, reserved_plan_snapshot: { ...legitimateHandoffProjection.reserved_plan_snapshot, content_digest: `sha256:${"d".repeat(64)}` } }, expectedLatch: { task_id: legitimateHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
     frame("REQ-UNKNOWN-GET", "OPERATION_GET", { operationId: "OP-PRODUCTION-CRASH" }),
   ]);
   const byId = Object.fromEntries(idempotency.results.map((value) => [value.requestId, value]));
   assert.equal(byId["REQ-IDEM-ADMIT"].result.idempotent, true); assert.equal(byId["REQ-CONFLICT-ADMIT"].ok, false);
   assert.equal(byId["REQ-IDEM-TERMINAL"].result.idempotent, true); assert.equal(byId["REQ-CONFLICT-TERMINAL"].ok, false);
   assert.equal(byId["REQ-UNKNOWN-GET"].result.outcome, "UNKNOWN");
-  evidence.idempotency = byId;
+  const handoffRetries = idempotency.results.filter((value) => value.requestId === "REQ-HANDOFF-RESERVE");
+  assert.equal(handoffRetries[0].result.idempotent, true); assert.equal(handoffRetries[1].ok, false); assert.equal(handoffRetries[1].error.code, "HANDOFF_REQUEST_CONFLICT");
+  evidence.idempotency = { ...byId, handoffRetries };
   await stop();
 
   const priority = await startAndResult([
@@ -305,6 +378,26 @@ try {
   evidence.latchCrash = { seam: "SQLite BEGIN IMMEDIATE + latch/event/request update + P2/P1S exit before COMMIT", preCrash: latchBeforeCrash, restart: operationFrom(latchRecovered, "REQ-LATCH-CRASH-GET"), reconciled: operationFrom(latchRecovered, "REQ-LATCH-CRASH-FINAL"), invalidStateAccepted: false };
   await stop();
 
+  const crashHandoffProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-CRASH", source: "SESSION-PRODUCTION-CRASH", task: "TASK-HANDOFF-CRASH" });
+  await startAndResult([
+    frame("REQ-HANDOFF-CRASH-ENSURE", "LATCH_ENSURE", { taskId: crashHandoffProjection.task_id }),
+    frame("REQ-HANDOFF-CRASH-CLAIM", "LATCH_CLAIM_SAFEPOINT", { taskId: crashHandoffProjection.task_id, reason: "INTEGRITY", actor: "human:/aio-handoff", expected: { task_id: crashHandoffProjection.task_id, state: "RELEASED", generation: 0, reason: null } }),
+  ]);
+  await stop();
+  writeScenario([frame("REQ-HANDOFF-CRASH", "TEST_CRASH_BEFORE_HANDOFF_COMMIT", { projection: crashHandoffProjection, expectedLatch: { task_id: crashHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null })]);
+  scRun(["start", serviceName]);
+  await waitFor(() => serviceState(serviceName) === "STOPPED", "handoff crashed service stops", 30_000);
+  assert.equal(canonicalHandoff(crashHandoffProjection.handoff_id), null);
+  assert.equal(canonicalActiveSource(crashHandoffProjection.source_session_id), null);
+  const handoffRecovered = await startAndResult([
+    frame("REQ-HANDOFF-CRASH-GET", "HANDOFF_GET", { handoffId: crashHandoffProjection.handoff_id }),
+    frame("REQ-HANDOFF-CRASH-ACTIVE", "ACTIVE_SOURCE_GET", { sourceSessionId: crashHandoffProjection.source_session_id }),
+  ]);
+  assert.equal(operationFrom(handoffRecovered, "REQ-HANDOFF-CRASH-GET"), null);
+  assert.equal(operationFrom(handoffRecovered, "REQ-HANDOFF-CRASH-ACTIVE"), null);
+  evidence.handoffCrash = { seam: "SQLite BEGIN IMMEDIATE + handoff insert + active-source insert + P2/P1S exit before event/COMMIT", canonicalHandoff: null, canonicalActiveSource: null, restartHandoff: null, restartActiveSource: null, invalidStateAccepted: false };
+  await stop();
+
   // Another unrestricted LocalService token has shared S-1-5-19 but not this service SID.
   const sentinelSidText = scRun(["showsid", sentinelName]).stdout;
   const sentinelSid = sentinelSidText.match(/S-1-5-80-(?:\d+-){4}\d+/)?.[0]; assert.ok(sentinelSid);
@@ -335,11 +428,20 @@ try {
   const restoreSchema = new DatabaseSync(databasePath);
   restoreSchema.exec("ALTER TABLE latches_admin_held RENAME TO latches");
   restoreSchema.close();
+  const handoffSchema = new DatabaseSync(databasePath);
+  handoffSchema.exec("ALTER TABLE handoff_reservations RENAME TO handoff_reservations_admin_held");
+  handoffSchema.close();
+  evidence.failClosed.handoffSchemaMissing = await expectStartFailure("handoff schema missing");
+  const restoreHandoffSchema = new DatabaseSync(databasePath);
+  restoreHandoffSchema.exec("ALTER TABLE handoff_reservations_admin_held RENAME TO handoff_reservations");
+  restoreHandoffSchema.close();
   const validConfig = config();
   saveConfig({ ...validConfig, serviceSid: sentinelSid });
   evidence.failClosed.identityMismatch = await expectStartFailure("identity mismatch");
   saveConfig({ ...validConfig, protocol: "aiopago.operation-authority-protocol/999" });
   evidence.failClosed.versionMismatch = await expectStartFailure("version mismatch");
+  saveConfig({ ...validConfig, workerSha256: "0".repeat(64) });
+  evidence.failClosed.workerHashMismatch = await expectStartFailure("worker hash mismatch");
   saveConfig(validConfig);
   writeScenario([frame("REQ-AUTHORITY-TIMEOUT", "TEST_AUTHORITY_TIMEOUT", {})]);
   evidence.failClosed.authorityTimeout = await expectStartFailure("authority timeout");
@@ -353,7 +455,7 @@ try {
   evidence.acls = JSON.parse(acl);
   evidence.store = { path: databasePath, journalMode: (() => { const db = new DatabaseSync(databasePath, { readOnly: true }); const mode = db.prepare("PRAGMA journal_mode").get().journal_mode; db.close(); return mode; })(), files: [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].filter(existsSync), owner: evidence.acls.find((value) => value.path === databasePath)?.owner, p0Access: "DENIED", otherLocalServiceAccess: "DENIED", p1sP2Access: "READ_WRITE" };
   evidence.binaryIdentity = { broker: sha(join(root, "bin", "broker-service.exe")), node: sha(join(root, "bin", "node.exe")), worker: sha(join(root, "bin", "operation-authority-worker.mjs")), config: validConfig };
-  evidence.result = "PRODUCTION OPERATION AUTHORITY: PASS";
+  evidence.result = "HANDOFF RESERVATION + LATCH + OPERATION AUTHORITY: PASS";
   writeFileSync(join(publicOutput, "windows-physical-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
 } finally {

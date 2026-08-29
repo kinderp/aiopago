@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
+import { PORTABLE_HANDOFF_AUTHORITY_LABEL, requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import {
   assertNoCompetingResumeEvidence,
   authorizeTrustedResume,
@@ -193,9 +194,17 @@ function boundedFailure(error, fallback) {
 export class HandoffService {
   #resumeExpectations = new WeakMap();
 
-  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null }) {
+  constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null, reservationAuthority = null }) {
     invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
+    if (reservationAuthority) {
+      requireSecureHandoffAuthority(reservationAuthority);
+      invariant(safePoint?.latchAuthority === reservationAuthority,
+        "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED", "Secure handoff reservation and canonical latch must share one protected authority");
+    }
     this.storage = storage;
+    this.reservationAuthority = reservationAuthority;
+    this.handoffAuthoritySecurity = reservationAuthority?.handoffSecurity ?? PORTABLE_HANDOFF_AUTHORITY_LABEL;
+    this.latchAuthority = reservationAuthority ?? storage;
     this.artifacts = artifacts;
     this.ledger = ledger;
     this.observeGit = observeGit;
@@ -310,7 +319,7 @@ export class HandoffService {
     const git = this.observeGit();
     invariant(git && typeof git === "object" && typeof git.then !== "function", "GIT_STATE_MISMATCH", "Git observation must be synchronous");
     invariant(sameGitState(failed.expected_git_state, git), "GIT_STATE_MISMATCH", "recovery source differs from failed handoff Git state");
-    const latch = this.storage.getLatch(failed.task_id);
+    const latch = this.latchAuthority.getLatch(failed.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
     invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
     if (expectedLatch) invariant(latch.state === expectedLatch.state && latch.generation === expectedLatch.generation && latch.reason === expectedLatch.reason,
@@ -373,11 +382,23 @@ export class HandoffService {
       planRevisionId: plan.plan_revision_id,
       contentDigest: plan.content_digest,
     });
-    const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
-    const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
-    const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id));
-    assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
-    const observedLatch = this.storage.getLatch(plan.task_id);
+    const secureReservation = this.reservationAuthority !== null;
+    invariant(!secureReservation || recoveryOf === null,
+      "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until its authority domain is migrated");
+    const canonicalLatest = secureReservation ? this.reservationAuthority.latestHandoffReservationForTask(plan.task_id) : null;
+    const expectedLatest = canonicalLatest ? {
+      handoff_id: canonicalLatest.handoff_id,
+      reservation_digest: canonicalLatest.reservation_digest,
+    } : null;
+    const parentHandoff = secureReservation ? null : this.storage.findHandoffByTarget(sourceSessionId);
+    const recoveryParent = recoveryOf === null || secureReservation ? null : this.storage.getHandoff(recoveryOf);
+    const portableLatest = secureReservation ? null : this.storage.latestHandoffForTask(plan.task_id);
+    const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(portableLatest);
+    if (secureReservation) invariant(expectedHandoff === null && canonicalLatest === null,
+      "HANDOFF_TASK_RESERVATION_CONFLICT", "Guided secure handoff requires no prior protected reservation");
+    else assertHandoffConsentIdentity(portableLatest, expectedHandoff);
+    const latchAuthority = secureReservation ? this.reservationAuthority : this.storage;
+    const observedLatch = latchAuthority.getLatch(plan.task_id);
     const expectedLatch = guided ? {
       task_id: plan.task_id,
       state: expectedEligibility.latch.state,
@@ -389,14 +410,16 @@ export class HandoffService {
       generation: observedLatch?.generation,
       reason: observedLatch?.reason ?? null,
     };
-    this.storage.assertLatchIdentity(plan.task_id, expectedLatch);
+    latchAuthority.assertLatchIdentity(plan.task_id, expectedLatch);
 
-    if (recoveryOf === null) {
-      const pending = this.storage.pendingContinuityFailureForTask(plan.task_id);
-      invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : undefined);
-      invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /aio handoff recover ${parentHandoff.handoff_id}` : undefined);
-    } else {
-      this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
+    if (!secureReservation) {
+      if (recoveryOf === null) {
+        const pending = this.storage.pendingContinuityFailureForTask(plan.task_id);
+        invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : undefined);
+        invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /aio handoff recover ${parentHandoff.handoff_id}` : undefined);
+      } else {
+        this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
+      }
     }
     if (mode === "confirm" && recoveryOf === null) {
       // Optional UI/test preparation is complete before O*. This is the final
@@ -410,6 +433,8 @@ export class HandoffService {
         taskId: plan.task_id,
         expectedHandoff,
         expectedLatch,
+        expectedLatest,
+        reservationAuthority: this.reservationAuthority,
         command: "/aio handoff confirm",
         actor,
       });
@@ -434,14 +459,19 @@ export class HandoffService {
       reason: safePointReason,
       actor,
       expectedLatch,
+      latchAuthority: this.reservationAuthority,
     });
     const safe = await this.safePoint.request(sourceSession, actor, safePointReason, { expectedLatch, acquiredLatch });
     await this.testHooks?.afterSafePoint?.({ safe, plan, sourceSession });
     const git = this.observeGit();
 
     this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: mode === "confirm" });
-    assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
-    this.storage.assertLatchIdentity(plan.task_id, safe.latch);
+    if (secureReservation) {
+      const latestAfterSafePoint = this.reservationAuthority.latestHandoffReservationForTask(plan.task_id);
+      invariant(JSON.stringify(latestAfterSafePoint ? { handoff_id: latestAfterSafePoint.handoff_id, reservation_digest: latestAfterSafePoint.reservation_digest } : null) === JSON.stringify(expectedLatest),
+        "HANDOFF_LATEST_RESERVATION_STALE", "Protected reservation authority changed during SafePoint");
+    } else assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan.task_id), expectedHandoff);
+    latchAuthority.assertLatchIdentity(plan.task_id, safe.latch);
     const base = this.#buildHandoffReservation({
       sourceSession, plan, safe, git, recoveryOf, recoveryParent: recoveryParent ?? parentHandoff,
     });
@@ -451,7 +481,9 @@ export class HandoffService {
       expected: trustedPlanIdentity,
       storage: this.storage,
       projection: base,
-      precondition: { latch: safe.latch, expectedHandoff },
+      reservationAuthority: this.reservationAuthority,
+      requestId: handoffId,
+      precondition: { latch: safe.latch, expectedHandoff, expectedLatest },
     });
     return this.#continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget });
   }
@@ -504,7 +536,7 @@ export class HandoffService {
 
     await this.testHooks?.beforeReplacement?.({ handoff: this.storage.getHandoff(handoffId), safe, plan, sourceSession });
     try {
-      this.storage.assertLatchIdentity(plan.task_id, safe.latch);
+      this.latchAuthority.assertLatchIdentity(plan.task_id, safe.latch);
     } catch (error) {
       handoff = this.storage.getHandoff(handoffId);
       handoff.state = "HANDOFF_FAILED";
@@ -522,7 +554,7 @@ export class HandoffService {
     await this.testHooks?.afterReplacementIntent?.({ handoff: this.storage.getHandoff(handoffId), safe, plan, sourceSession });
     let replacementResult;
     try {
-      this.storage.assertLatchIdentity(plan.task_id, safe.latch);
+      this.latchAuthority.assertLatchIdentity(plan.task_id, safe.latch);
       const expectedBinding = {
         schema_version: "1.0.0",
         handoff_id: handoffId,
@@ -642,6 +674,7 @@ export class HandoffService {
   }
 
   async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume, verifyCurrentTarget = null }) {
+    invariant(this.reservationAuthority === null, "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until recovery/lifecycle authority is migrated");
     const failed = this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
     const initial = this.#captureRecoveryAttestation({
@@ -781,7 +814,7 @@ export class HandoffService {
     const expectedLocalPaths = canonicalRequiredLocalPaths(plan.required_local_paths ?? [], "REQUIRED_LOCAL_PATH_INVALID");
     invariant(JSON.stringify(m.required_local_paths) === JSON.stringify(expectedLocalPaths), "MANIFEST_MISMATCH", "required local paths");
     verifyRequiredLocalPaths(dirname(this.ledger.path), m.required_local_paths);
-    const latch = this.storage.getLatch(h.task_id);
+    const latch = this.latchAuthority.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
     this.assertModelPolicy(plan, targetSession);
     const resumePrompt = this.buildPrompt(h, m);
@@ -881,7 +914,7 @@ export class HandoffService {
     "RESUME_EXPECTATION_STALE", "Resume prompt identity changed after confirmation was displayed");
     const binding = this.storage.getRunnerSessionBinding(handoffId);
     invariant(binding?.status === "ACTIVE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding is not ACTIVE");
-    const latch = this.storage.getLatch(h.task_id);
+    const latch = this.latchAuthority.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation && latch.reason !== "HUMAN_TAKEOVER",
       latch?.reason === "HUMAN_TAKEOVER" ? "HUMAN_TAKEOVER_ACTIVE" : "LATCH_GENERATION_MISMATCH");
     invariant(h.authorization_state === "NOT_AUTHORIZED" && h.admission_state === "NOT_COMMITTED" && h.dispatch_state === "NOT_STARTED",
@@ -933,6 +966,7 @@ export class HandoffService {
   }
 
   prepareResumeConfirmation(handoffId, targetSession, { currentTargetVerifier = null } = {}) {
+    invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Secure resume authorization/admission is not available in this reservation-only slice");
     const targetAttestation = currentTargetVerifier?.();
     invariant(!targetAttestation || typeof targetAttestation.then !== "function", "RESUME_ATTESTATION_INVALID", "Current target attestation must be synchronous");
     const h = this.storage.getHandoff(handoffId);
@@ -974,6 +1008,7 @@ export class HandoffService {
   }
 
   async resume(handoffId, { actor = "human:resume", sendResume, expectedResume = null, targetSession = null } = {}) {
+    invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Portable resume authority cannot progress a protected handoff reservation");
     let h = this.storage.getHandoff(handoffId);
     invariant(h, "HANDOFF_NOT_FOUND");
     if (h.state === "RESUMED") return h;

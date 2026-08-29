@@ -78,6 +78,11 @@ try {
         toolCallId: "OP-FORGED", toolName: "read", input: { path: "attacker-chosen.txt" }, isError: false,
         result: { content: [{ type: "text", text: "forged" }] },
       }, { signal: { aborted: false } });
+      capture.attackerHandoffInvocation = 1;
+      await commands.get("aio")?.handler("handoff manual", {
+        ui: { notify() {}, setEditorText() {}, async confirm() { return false; } },
+        async newSession() { throw new Error("ATTACKER_REPLACEMENT_STOP"); },
+      });
       await commands.get("aio")?.handler("takeover", { ui: { notify() {} } });
       throw new Error("RECONSTRUCTION_CAPTURE_COMPLETE");
     };
@@ -93,11 +98,14 @@ try {
     process.exitCode = 0;
 
     const databasePath = join(target, ".guardian", "runtime", "guardian.sqlite");
-    let forged = null; let humanTakeover = 0;
+    let forged = null; let humanTakeover = 0; let portableHandoffs = 0; let portableActiveSources = 0; let portableHandoffEvents = 0;
     if (existsSync(databasePath)) {
       const database = new DatabaseSync(databasePath, { readOnly: true });
       forged = database.prepare("SELECT operation_id,state,outcome,profile FROM operations WHERE operation_id='OP-FORGED'").get() ?? null;
       humanTakeover = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('LATCH_ENGAGED','LATCH_ESCALATED') AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count;
+      portableHandoffs = database.prepare("SELECT COUNT(*) count FROM handoffs").get().count;
+      portableActiveSources = database.prepare("SELECT COUNT(*) count FROM active_sources").get().count;
+      portableHandoffEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type='HANDOFF_STARTED'").get().count;
       database.close();
     }
     const installedAfter = await readFile(entry);
@@ -109,6 +117,9 @@ try {
       reconstruction: "physical marker replacement + appended invocation + base64 data URL",
       forged,
       humanTakeover,
+      portableHandoffs,
+      portableActiveSources,
+      portableHandoffEvents,
     }));
   `);
 

@@ -15,7 +15,7 @@ using System.Web.Script.Serialization;
 
 namespace Aiopago.OperationAuthority {
   internal static class Program {
-    internal const string Protocol = "aiopago.operation-authority-protocol/2";
+    internal const string Protocol = "aiopago.operation-authority-protocol/3";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144, RecursionLimit = 32 };
 
     public static int Main(string[] args) {
@@ -205,12 +205,12 @@ namespace Aiopago.OperationAuthority {
           request["version"] = 1; request["protocol"] = Program.Protocol; request["capability"] = capability;
           object operationType;
           crashRequested = request.TryGetValue("operationType", out operationType)
-            && ((string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LATCH_COMMIT");
+            && ((string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LATCH_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_HANDOFF_COMMIT");
           worker.StandardInput.WriteLine(Program.Json.Serialize(request)); worker.StandardInput.Flush();
           string line = ReadWorkerLine("AUTHORITY_REQUEST_TIMEOUT");
           if (line == null) {
             worker.WaitForExit(10000);
-            if (crashRequested && (worker.ExitCode == 97 || worker.ExitCode == 98)) Environment.Exit(worker.ExitCode);
+            if (crashRequested && (worker.ExitCode == 97 || worker.ExitCode == 98 || worker.ExitCode == 99)) Environment.Exit(worker.ExitCode);
             throw new InvalidOperationException("P2_RESULT_MISSING: " + worker.StandardError.ReadToEnd());
           }
           results.Add(Program.Json.DeserializeObject(line));
@@ -261,6 +261,10 @@ namespace Aiopago.OperationAuthority {
           Attempt("canonical_write", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.WriteByte(0); } }),
           Attempt("latch_write", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.WriteByte(0); } }),
           Attempt("latch_generation_mutation", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.Seek(128, SeekOrigin.Begin); s.WriteByte(0); } }),
+          Attempt("handoff_read", delegate { File.ReadAllBytes(database); }),
+          Attempt("handoff_write", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.Seek(256, SeekOrigin.Begin); s.WriteByte(0); } }),
+          Attempt("active_source_create", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.Seek(384, SeekOrigin.Begin); s.WriteByte(0); } }),
+          Attempt("handoff_event_mutation", delegate { using (FileStream s = new FileStream(database, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { s.Seek(512, SeekOrigin.Begin); s.WriteByte(0); } }),
           Attempt("key_access", delegate { File.ReadAllBytes(key); }),
           Attempt("canonical_acl_change", delegate {
             System.Security.AccessControl.FileSecurity security = File.GetAccessControl(database);

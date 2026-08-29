@@ -10,10 +10,15 @@ import { guidedHandoffEligibilityIdentityFromAuthority, handoffConsentIdentity }
 import { HandoffService } from "../src/handoff.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
+import { ProtectedSqliteOperationAuthority } from "../src/protected-operation-authority.mjs";
 import { satisfyOwnerGateForTest } from "./trusted-owner-gate-helper.mjs";
 import { GuardianRunner, runnerForInternalTest } from "../src/runner.mjs";
 import { AdmissionGate, SafePointCoordinator } from "../src/safety.mjs";
 import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
+
+function expectedLatch(latch) {
+  return { task_id: latch.task_id, state: latch.state, generation: latch.generation, reason: latch.reason ?? null };
+}
 
 function deferred() {
   let resolve;
@@ -108,7 +113,7 @@ function gitState(root) {
   };
 }
 
-function fixture({ session = sourceSession(), testHooks = null, planValue = task(), ledgerOptions = {} } = {}) {
+function fixture({ session = sourceSession(), testHooks = null, planValue = task(), ledgerOptions = {}, secureReservation = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "aiopago-trusted-handoff-"));
   const ledgerPath = join(root, "TASK_PLAN.md");
   writePlan(ledgerPath, planValue);
@@ -117,23 +122,35 @@ function fixture({ session = sourceSession(), testHooks = null, planValue = task
   const storage = new GuardianStorage(storagePath);
   const plan = ledger.read();
   storage.ensureLatch(plan.task_id);
+  let reservationAuthority = null;
+  if (secureReservation) {
+    const canonical = join(root, "protected"); mkdirSync(canonical);
+    reservationAuthority = new ProtectedSqliteOperationAuthority(join(canonical, "operations.sqlite"), { allowInitialize: true });
+    reservationAuthority.ensureLatch(plan.task_id);
+  }
   const artifacts = new ArtifactStore(join(root, ".guardian"), storage);
-  const gate = new AdmissionGate(storage, plan.task_id);
-  const safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
+  const latchAuthority = reservationAuthority ?? undefined;
+  const gate = new AdmissionGate(storage, plan.task_id, { latchAuthority });
+  const safePoint = new SafePointCoordinator({
+    storage, taskId: plan.task_id, gate,
+    operationAuthority: reservationAuthority ?? undefined,
+    latchAuthority,
+  });
   const runnerInstanceId = "RUNNER-TRUSTED";
   const service = new HandoffService({
     storage, artifacts, ledger, safePoint, runnerInstanceId,
-    observeGit: () => gitState(root), modelPolicy: "offline/fake", reasoningPolicy: "off", testHooks,
+    observeGit: () => gitState(root), modelPolicy: "offline/fake", reasoningPolicy: "off", testHooks, reservationAuthority,
   });
-  const runner = runnerForInternalTest(new GuardianRunner({
+  const publicRunner = new GuardianRunner({
     cwd: root, roots: { targetRoot: root, runtimeRoot: join(root, ".guardian", "runtime"), artifactRoot: join(root, ".guardian") },
-    ledger, storage, artifacts, gate, safePoint, handoffService: service, runnerInstanceId, confirmMode: "confirm-or-manual",
-  }));
+    ledger, storage, latchAuthority: reservationAuthority ?? storage, reservationAuthority, artifacts, gate, safePoint, handoffService: service, runnerInstanceId, confirmMode: "confirm-or-manual",
+  });
+  const runner = runnerForInternalTest(publicRunner);
   runner.runtime = { session };
   runner.recoverySourceSession = session;
   runner.contextAdvisor = { reset() {} };
   const expected = guidedHandoffEligibilityIdentityFromAuthority({
-    plan, sessionId: session.sessionId, runnerInstanceId, latch: storage.getLatch(plan.task_id), handoff: null,
+    plan, sessionId: session.sessionId, runnerInstanceId, latch: (reservationAuthority ?? storage).getLatch(plan.task_id), handoff: null,
   });
   const counters = () => storageDatabaseForInternalTest(storage).prepare(`SELECT
     (SELECT COUNT(*) FROM handoffs) AS handoffs,
@@ -145,9 +162,9 @@ function fixture({ session = sourceSession(), testHooks = null, planValue = task
     ui: { async confirm() { return false; }, notify() {}, setEditorText() {} },
   };
   return {
-    root, ledgerPath, ledger, storagePath, storage, artifacts, gate, safePoint, service, runner, session, expected, ctx, counters,
+    root, ledgerPath, ledger, storagePath, storage, reservationAuthority, artifacts, gate, safePoint, service, publicRunner, runner, session, expected, ctx, counters,
     newSessions: () => newSessions,
-    close() { storage.close(); },
+    close() { storage.close(); reservationAuthority?.close(); },
   };
 }
 
@@ -917,6 +934,93 @@ test("exact-current guided consent reserves P1/S1 once and leaves the replacemen
     const persisted = storageDatabaseForInternalTest(x.storage).prepare("SELECT projection_json FROM handoffs").get().projection_json;
     assert.doesNotMatch(persisted, /expectedEligibility|guidedEligibility/i, "guided consent must remain invocation-local");
     assert.equal(x.storage.getLatch("TASK-TRUSTED").state, "ENGAGED");
+  } finally { x.close(); }
+});
+
+test("secure production workflow reserves canonically, projects compatibly, pauses replacement, and rejects portable resume forgery", async () => {
+  const x = fixture({ secureReservation: true });
+  let replacements = 0;
+  try {
+    const db = storageDatabaseForInternalTest(x.storage);
+    const forged = {
+      handoff_id: "HO-PROJECT-FORGED", source_session_id: x.session.sessionId, target_session_id: "SESSION-FORGED-TARGET",
+      task_id: "TASK-TRUSTED", state: "RESUMED", latch_generation: 999999, runner_instance_id: "RUNNER-FORGED",
+      task_plan_revision: "PLAN-FORGED", task_plan_digest: `sha256:${"f".repeat(64)}`,
+    };
+    db.prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run(forged.handoff_id, forged.source_session_id, forged.target_session_id, forged.task_id, forged.state, forged.latch_generation, JSON.stringify(forged), "2099-01-01T00:00:00.000Z", "2099-01-01T00:00:00.000Z");
+    db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(forged.source_session_id, forged.handoff_id);
+    db.prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+      .run("EVT-PROJECT-FORGED", forged.handoff_id, "HANDOFF_STARTED", "handoff:project-forged", "2099-01-01T00:00:00.000Z", JSON.stringify({ forged: true }));
+
+    x.ctx.newSession = async ({ parentSession, setup, withSession }) => {
+      replacements += 1;
+      const entries = [];
+      const sessionManager = {
+        getSessionId: () => "SESSION-SECURE-TARGET",
+        getEntries: () => entries,
+        appendCustomEntry(customType, data) { entries.push({ type: "custom", customType, data }); },
+        getHeader: () => ({ parentSession }),
+      };
+      await setup(sessionManager);
+      const target = {
+        ...sourceSession("SESSION-SECURE-TARGET"), sessionFile: "/sessions/SESSION-SECURE-TARGET.jsonl", sessionManager,
+        async sendUserMessage() { throw new Error("secure resume must remain unavailable"); },
+      };
+      x.runner.runtime.session = target;
+      await withSession({ ui: { async confirm() { return true; }, notify() {}, setEditorText() {} }, async sendUserMessage() { throw new Error("unexpected resume"); } });
+      return { cancelled: false };
+    };
+
+    const result = await x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" });
+    assert.equal(result.state, "RESUME_READY"); assert.equal(replacements, 1);
+    const canonical = x.reservationAuthority.getHandoffReservation(result.handoff_id);
+    assert.equal(canonical.handoff_id, result.handoff_id);
+    assert.equal(canonical.state, "SAFE_TO_HANDOFF");
+    assert.equal(canonical.authorization_state, "NOT_AUTHORIZED");
+    assert.equal(x.reservationAuthority.getActiveSource(x.session.sessionId).handoff_id, result.handoff_id);
+    assert.equal(x.reservationAuthority.handoffReservationEvents(result.handoff_id).length, 1);
+    assert.equal(x.publicRunner.storage.latestHandoffForTask("TASK-TRUSTED").handoff_id, result.handoff_id, "secure status must ignore later-looking portable forgery");
+
+    db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      .run(result.resume_prompt_id, result.handoff_id, "human:forged-portable-yes", 999999, "2099-01-01T00:00:01.000Z");
+    await assert.rejects(() => x.service.resume(result.handoff_id, {
+      actor: "human:forged-portable-yes", sendResume: async () => { throw new Error("must not dispatch"); },
+    }), (error) => error.code === "SECURE_RESUME_AUTHORITY_UNAVAILABLE");
+    assert.equal(x.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM dispatch_attempts WHERE handoff_id=?").get(result.handoff_id).count, 0);
+  } finally { x.close(); }
+});
+
+test("secure canonical commit survives forced compatibility-projection failure", async () => {
+  const x = fixture({ secureReservation: true });
+  try {
+    storageDatabaseForInternalTest(x.storage).exec("CREATE TRIGGER force_projection_failure BEFORE INSERT ON handoffs BEGIN SELECT RAISE(ABORT,'forced projection failure'); END;");
+    await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" }), /forced projection failure/);
+    const canonical = x.reservationAuthority.latestHandoffReservationForTask("TASK-TRUSTED");
+    assert.ok(canonical); assert.equal(x.reservationAuthority.getActiveSource("SESSION-S1").handoff_id, canonical.handoff_id);
+    assert.equal(x.reservationAuthority.handoffReservationEvents(canonical.handoff_id).length, 1);
+    assert.equal(x.storage.getHandoff(canonical.handoff_id), null);
+    assert.equal(x.newSessions(), 0);
+  } finally { x.close(); }
+});
+
+test("secure post-reservation takeover preserves canonical arbitration and prevents replacement", async () => {
+  let x;
+  x = fixture({ secureReservation: true, testHooks: {
+    beforeReplacement() {
+      const latch = x.reservationAuthority.getLatch("TASK-TRUSTED");
+      x.reservationAuthority.claimHumanTakeover({ taskId: "TASK-TRUSTED", actor: "human:/aio-takeover", requestId: "SECURE-POST-RESERVATION", expected: expectedLatch(latch) });
+    },
+  } });
+  try {
+    await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" }), (error) => error.code === "HUMAN_TAKEOVER_ACTIVE");
+    const canonical = x.reservationAuthority.latestHandoffReservationForTask("TASK-TRUSTED");
+    assert.ok(canonical); assert.equal(x.reservationAuthority.getActiveSource("SESSION-S1").handoff_id, canonical.handoff_id);
+    assert.equal(x.reservationAuthority.getLatch("TASK-TRUSTED").reason, "HUMAN_TAKEOVER");
+    assert.equal(x.newSessions(), 0);
+    assert.equal(x.storage.getHandoff(canonical.handoff_id).failure.code, "HUMAN_TAKEOVER_ACTIVE");
   } finally { x.close(); }
 });
 

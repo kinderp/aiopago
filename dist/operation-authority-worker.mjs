@@ -27,8 +27,9 @@ var OPERATION_AUTHORITY_MODES = Object.freeze({
   PORTABLE: "PORTABLE"
 });
 var PREVIOUS_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.0.0";
-var OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1.0";
-var OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/2";
+var LATCH_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1.0";
+var OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.2.0";
+var OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/3";
 var PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
 var OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
 var IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
@@ -191,11 +192,6 @@ function assertLatchIdentityValue(current, expected, { allowHumanTakeover = fals
   return current;
 }
 
-// src/protected-operation-authority.mjs
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { resolve } from "node:path";
-
 // src/canonical.mjs
 import { createHash, randomUUID } from "node:crypto";
 function canonicalJson(value) {
@@ -216,7 +212,148 @@ function utcNow() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
 
+// src/handoff-reservation-authority.mjs
+var HANDOFF_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_handoff_reservation_isolation: true
+});
+var PORTABLE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_handoff_reservation_isolation: false
+});
+var HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "source_session_id",
+  "source_session_file",
+  "task_id",
+  "task_plan_revision",
+  "task_plan_digest",
+  "requirements_version",
+  "current_item",
+  "next_item",
+  "next_step",
+  "latch_generation",
+  "runner_instance_id",
+  "session_binding_id",
+  "parent_session_id",
+  "parent_session_file",
+  "parent_checkpoint_id",
+  "recovery_of_handoff_id",
+  "checkpoint_id",
+  "resume_manifest_id",
+  "model_policy",
+  "reasoning_policy"
+]);
+var DIGEST = /^sha256:[a-f0-9]{64}$/;
+var BOUNDED_PATH = /^[^\r\n]{1,4096}$/;
+var BOUNDED_TEXT2 = /^[^\r\n]{1,8192}$/;
+var MAX_PROJECTION_BYTES = 196608;
+function optionalIdentifier(value, code, field) {
+  if (value === null || value === void 0) return null;
+  return operationIdentifier(value, code, field);
+}
+function boundedNullable(value, code, field, expression = BOUNDED_TEXT2) {
+  invariant(value === null || value === void 0 || typeof value === "string" && expression.test(value), code, `${field} is invalid`);
+  return value ?? null;
+}
+function sameHandoffReservationIdentity(left, right) {
+  return HANDOFF_RESERVATION_IDENTITY_FIELDS.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+function validateHandoffProjection(projection) {
+  invariant(projection && typeof projection === "object" && !Array.isArray(projection), "HANDOFF_RESERVATION_INVALID");
+  operationIdentifier(projection.handoff_id, "HANDOFF_ID_INVALID", "handoff_id");
+  operationIdentifier(projection.source_session_id, "HANDOFF_SOURCE_INVALID", "source_session_id");
+  invariant(typeof projection.source_session_file === "string" && BOUNDED_PATH.test(projection.source_session_file), "HANDOFF_SOURCE_INVALID", "source_session_file is invalid");
+  operationIdentifier(projection.task_id, "HANDOFF_TASK_INVALID", "task_id");
+  operationIdentifier(projection.task_plan_revision, "HANDOFF_PLAN_INVALID", "task_plan_revision");
+  invariant(DIGEST.test(projection.task_plan_digest ?? ""), "HANDOFF_PLAN_INVALID", "task_plan_digest is invalid");
+  operationIdentifier(projection.requirements_version, "HANDOFF_PLAN_INVALID", "requirements_version");
+  operationIdentifier(projection.runner_instance_id, "HANDOFF_RUNNER_INVALID", "runner_instance_id");
+  operationIdentifier(projection.session_binding_id, "HANDOFF_BINDING_INVALID", "session_binding_id");
+  operationIdentifier(projection.parent_session_id, "HANDOFF_PARENT_INVALID", "parent_session_id");
+  invariant(typeof projection.parent_session_file === "string" && BOUNDED_PATH.test(projection.parent_session_file), "HANDOFF_PARENT_INVALID", "parent_session_file is invalid");
+  operationIdentifier(projection.checkpoint_id, "HANDOFF_CHECKPOINT_INVALID", "checkpoint_id");
+  operationIdentifier(projection.resume_manifest_id, "HANDOFF_MANIFEST_INVALID", "resume_manifest_id");
+  optionalIdentifier(projection.current_item, "HANDOFF_PLAN_INVALID", "current_item");
+  optionalIdentifier(projection.next_item, "HANDOFF_PLAN_INVALID", "next_item");
+  boundedNullable(projection.next_step, "HANDOFF_PLAN_INVALID", "next_step");
+  optionalIdentifier(projection.parent_checkpoint_id, "HANDOFF_PARENT_INVALID", "parent_checkpoint_id");
+  optionalIdentifier(projection.recovery_of_handoff_id, "HANDOFF_RECOVERY_INVALID", "recovery_of_handoff_id");
+  boundedNullable(projection.model_policy, "HANDOFF_POLICY_INVALID", "model_policy");
+  boundedNullable(projection.reasoning_policy, "HANDOFF_POLICY_INVALID", "reasoning_policy");
+  invariant(Number.isSafeInteger(projection.latch_generation) && projection.latch_generation >= 0, "HANDOFF_LATCH_INVALID");
+  invariant(
+    projection.state === "SAFE_TO_HANDOFF" && projection.target_session_id === null && projection.authorization_state === "NOT_AUTHORIZED" && projection.admission_state === "NOT_COMMITTED" && projection.dispatch_state === "NOT_STARTED",
+    "HANDOFF_RESERVATION_STATE_INVALID",
+    "A canonical reservation begins paused with empty resume authority"
+  );
+  invariant(
+    projection.reserved_plan_snapshot?.task_id === projection.task_id && projection.reserved_plan_snapshot?.plan_revision_id === projection.task_plan_revision && projection.reserved_plan_snapshot?.content_digest === projection.task_plan_digest,
+    "HANDOFF_PLAN_PROVENANCE_MISMATCH",
+    "Reserved plan snapshot does not match handoff plan identity"
+  );
+  const bytes = Buffer.from(canonicalJson(projection), "utf8");
+  invariant(bytes.length <= MAX_PROJECTION_BYTES, "HANDOFF_RESERVATION_TOO_LARGE");
+  return Object.freeze({ projection: structuredClone(projection), projectionDigest: sha256(bytes) });
+}
+function validateHandoffReservationRequest(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "HANDOFF_RESERVATION_INVALID");
+  const validated = validateHandoffProjection(request.projection);
+  const taskId = validated.projection.task_id;
+  const expectedLatch = request.expectedLatch;
+  invariant(
+    expectedLatch?.task_id === taskId && expectedLatch.state === "ENGAGED" && Number.isSafeInteger(expectedLatch.generation) && expectedLatch.generation >= 0 && typeof expectedLatch.reason === "string" && expectedLatch.reason.length > 0 && expectedLatch.reason !== "HUMAN_TAKEOVER" && validated.projection.latch_generation === expectedLatch.generation,
+    "HANDOFF_LATCH_INVALID",
+    "Reservation requires the exact acquired non-takeover latch"
+  );
+  let expectedLatest = null;
+  if (request.expectedLatest !== null && request.expectedLatest !== void 0) {
+    invariant(request.expectedLatest && typeof request.expectedLatest === "object" && !Array.isArray(request.expectedLatest), "HANDOFF_LATEST_INVALID");
+    expectedLatest = Object.freeze({
+      handoff_id: operationIdentifier(request.expectedLatest.handoff_id, "HANDOFF_LATEST_INVALID", "handoff_id"),
+      reservation_digest: operationIdentifier(request.expectedLatest.reservation_digest, "HANDOFF_LATEST_INVALID", "reservation_digest")
+    });
+  }
+  invariant(
+    validated.projection.recovery_of_handoff_id === null,
+    "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE",
+    "Continuity recovery remains unavailable until its authority domain is migrated"
+  );
+  return Object.freeze({
+    projection: validated.projection,
+    projectionDigest: validated.projectionDigest,
+    expectedLatch: Object.freeze({ task_id: taskId, state: "ENGAGED", generation: expectedLatch.generation, reason: expectedLatch.reason }),
+    expectedLatest
+  });
+}
+function detachedReservation(row) {
+  if (!row) return null;
+  const projection = typeof row.projection_json === "string" ? JSON.parse(row.projection_json) : row.projection ?? row;
+  return Object.freeze({
+    ...structuredClone(projection),
+    reservation_digest: row.reservation_digest ?? projection.reservation_digest ?? null,
+    latch_reason: row.latch_reason ?? projection.latch_reason ?? null,
+    reservation_event_id: row.reservation_event_id ?? projection.reservation_event_id ?? null
+  });
+}
+function requireSecureHandoffAuthority(authority) {
+  invariant(
+    authority?.handoffSecurity?.mode === HANDOFF_AUTHORITY_MODES.SECURE && authority.handoffSecurity.canonical === true && authority.handoffSecurity.r1_m_13_handoff_reservation_isolation === true,
+    "SECURE_HANDOFF_AUTHORITY_REQUIRED",
+    "Secure handoff cannot use or fall back to portable reservation state"
+  );
+  return authority;
+}
+
 // src/protected-operation-authority.mjs
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { resolve } from "node:path";
 var require2 = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url);
 function secureUnavailable(error, path) {
   if (error instanceof GuardianError) return error;
@@ -231,6 +368,7 @@ var ProtectedSqliteOperationAuthority = class {
     this.path = resolve(path);
     this.security = SECURE_OPERATION_AUTHORITY_LABEL;
     this.latchSecurity = SECURE_LATCH_AUTHORITY_LABEL;
+    this.handoffSecurity = SECURE_HANDOFF_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
     invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
@@ -268,7 +406,7 @@ var ProtectedSqliteOperationAuthority = class {
       const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       if (existingMetadata.schema_version === this.schema) return;
-      if (!(existingMetadata.schema_version === PREVIOUS_OPERATION_AUTHORITY_SCHEMA && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
     }
     db.exec(`
       CREATE TABLE IF NOT EXISTS authority_metadata(
@@ -316,6 +454,39 @@ var ProtectedSqliteOperationAuthority = class {
         actor TEXT NOT NULL,
         occurred_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS handoff_reservations(
+        handoff_id TEXT PRIMARY KEY,
+        source_session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        task_plan_revision TEXT NOT NULL,
+        task_plan_digest TEXT NOT NULL,
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        runner_instance_id TEXT NOT NULL,
+        recovery_of_handoff_id TEXT,
+        checkpoint_id TEXT NOT NULL,
+        resume_manifest_id TEXT NOT NULL,
+        reservation_digest TEXT NOT NULL,
+        reservation_event_id TEXT NOT NULL UNIQUE,
+        projection_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS active_sources(
+        source_session_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES handoff_reservations(handoff_id)
+      );
+      CREATE TABLE IF NOT EXISTS handoff_reservation_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES handoff_reservations(handoff_id),
+        task_id TEXT NOT NULL,
+        source_session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type='HANDOFF_RESERVED'),
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        occurred_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authority_requests(
         request_id TEXT PRIMARY KEY,
         operation_type TEXT NOT NULL,
@@ -325,13 +496,14 @@ var ProtectedSqliteOperationAuthority = class {
       );
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id,state,admitted_at);
       CREATE INDEX IF NOT EXISTS latch_event_task_sequence ON latch_events(task_id,sequence);
+      CREATE INDEX IF NOT EXISTS handoff_reservation_task_created ON handoff_reservations(task_id,created_at,handoff_id);
     `);
     const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
-    } else if (metadata.schema_version === PREVIOUS_OPERATION_AUTHORITY_SCHEMA && this.schema === OPERATION_AUTHORITY_SCHEMA) {
-      db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?").run(OPERATION_AUTHORITY_SCHEMA, PREVIOUS_OPERATION_AUTHORITY_SCHEMA);
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA) {
+      db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?").run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
     }
   }
   #verifySchema() {
@@ -341,6 +513,9 @@ var ProtectedSqliteOperationAuthority = class {
       operations: ["operation_id", "task_id", "latch_generation", "profile", "state", "outcome", "effect_reference", "admitted_at", "terminal_at", "admission_digest", "terminal_digest"],
       latches: ["task_id", "state", "generation", "reason", "engaged_at", "engaged_by", "released_at", "released_by", "last_event_id"],
       latch_events: ["sequence", "event_id", "request_id", "task_id", "event_type", "generation", "from_reason", "reason", "actor", "occurred_at"],
+      handoff_reservations: ["handoff_id", "source_session_id", "task_id", "task_plan_revision", "task_plan_digest", "latch_generation", "latch_reason", "runner_instance_id", "recovery_of_handoff_id", "checkpoint_id", "resume_manifest_id", "reservation_digest", "reservation_event_id", "projection_json", "created_at"],
+      active_sources: ["source_session_id", "handoff_id"],
+      handoff_reservation_events: ["sequence", "event_id", "request_id", "handoff_id", "task_id", "source_session_id", "event_type", "latch_generation", "latch_reason", "occurred_at"],
       authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"]
     });
     for (const [table, columns] of Object.entries(expected)) {
@@ -463,6 +638,153 @@ var ProtectedSqliteOperationAuthority = class {
     operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
     return Object.freeze(this.#database().prepare("SELECT * FROM latch_events WHERE task_id=? ORDER BY sequence").all(taskId).map((row) => Object.freeze({ ...row })));
   }
+  #reservationRow(db, handoffId) {
+    return db.prepare("SELECT * FROM handoff_reservations WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+  #reservationResult(db, handoffId, created, requestCode) {
+    const reservation = this.#reservationRow(db, handoffId);
+    const activeSource = db.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE handoff_id=?").get(handoffId) ?? null;
+    const event = db.prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=?").get(handoffId) ?? null;
+    return Object.freeze({ reservation, active_source: activeSource, event, created, idempotent: !created, request_code: requestCode });
+  }
+  #reserveHandoffInTransaction(db, value, ledgerRequestId, payloadDigest, { crashBeforeEvent = false } = {}) {
+    const recorded = this.#recordedRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, "HANDOFF_REQUEST_CONFLICT");
+    if (recorded) return Object.freeze({ ...recorded, created: false, idempotent: true });
+    const projection = value.projection;
+    const exact = this.#reservationRow(db, projection.handoff_id);
+    if (exact) {
+      const existingProjection = JSON.parse(exact.projection_json);
+      invariant(
+        exact.reservation_digest === payloadDigest && exact.latch_reason === value.expectedLatch.reason && sameHandoffReservationIdentity(existingProjection, projection) && canonicalJson(existingProjection) === canonicalJson(projection),
+        "HANDOFF_RESERVATION_CONFLICT",
+        "The handoff identity already binds different canonical reservation provenance"
+      );
+      const result2 = this.#reservationResult(db, projection.handoff_id, false, "IDEMPOTENT_HANDOFF_RESERVATION");
+      this.#saveRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, result2);
+      return result2;
+    }
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(projection.task_id);
+    if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover committed before protected handoff reservation");
+    }
+    invariant(
+      latch?.state === value.expectedLatch.state && latch.generation === value.expectedLatch.generation && latch.reason === value.expectedLatch.reason,
+      "LATCH_GENERATION_MISMATCH",
+      "Protected handoff reservation used stale canonical latch identity"
+    );
+    const active = db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
+    if (active) {
+      const existing = this.#reservationRow(db, active.handoff_id);
+      throw new GuardianError("HANDOFF_ACTIVE_SOURCE_CONFLICT", "The canonical source session is already reserved by a different handoff operation", {
+        source_session_id: projection.source_session_id,
+        existing_handoff_id: existing?.handoff_id ?? active.handoff_id,
+        requested_handoff_id: projection.handoff_id
+      });
+    }
+    const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(projection.task_id) ?? null;
+    const expectedLatest = value.expectedLatest;
+    invariant(
+      latest === null && expectedLatest === null || latest !== null && expectedLatest !== null && latest.handoff_id === expectedLatest.handoff_id && latest.reservation_digest === expectedLatest.reservation_digest,
+      "HANDOFF_LATEST_RESERVATION_STALE",
+      "Canonical latest handoff reservation changed"
+    );
+    if (latest) {
+      throw new GuardianError("HANDOFF_TASK_RESERVATION_CONFLICT", "A protected reservation already owns this task; secure lifecycle/recovery authority is not yet available to transfer it", {
+        task_id: projection.task_id,
+        existing_handoff_id: latest.handoff_id
+      });
+    }
+    const eventId = opaqueId("HEV");
+    const occurredAt = utcNow();
+    db.prepare(`INSERT INTO handoff_reservations(
+      handoff_id,source_session_id,task_id,task_plan_revision,task_plan_digest,latch_generation,latch_reason,
+      runner_instance_id,recovery_of_handoff_id,checkpoint_id,resume_manifest_id,reservation_digest,reservation_event_id,projection_json,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      projection.handoff_id,
+      projection.source_session_id,
+      projection.task_id,
+      projection.task_plan_revision,
+      projection.task_plan_digest,
+      projection.latch_generation,
+      value.expectedLatch.reason,
+      projection.runner_instance_id,
+      projection.recovery_of_handoff_id ?? null,
+      projection.checkpoint_id,
+      projection.resume_manifest_id,
+      payloadDigest,
+      eventId,
+      JSON.stringify(projection),
+      occurredAt
+    );
+    db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
+    if (crashBeforeEvent) process.exit(99);
+    db.prepare(`INSERT INTO handoff_reservation_events(
+      event_id,request_id,handoff_id,task_id,source_session_id,event_type,latch_generation,latch_reason,occurred_at
+    ) VALUES(?,?,?,?,?,'HANDOFF_RESERVED',?,?,?)`).run(
+      eventId,
+      ledgerRequestId,
+      projection.handoff_id,
+      projection.task_id,
+      projection.source_session_id,
+      projection.latch_generation,
+      value.expectedLatch.reason,
+      occurredAt
+    );
+    const result = this.#reservationResult(db, projection.handoff_id, true, "MUTATION_ACCEPTED");
+    this.#saveRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, result);
+    return result;
+  }
+  assertHandoffOwnerAuthority({ taskId, expectedLatch, expectedLatest = null }) {
+    operationIdentifier(taskId, "HANDOFF_TASK_INVALID", "taskId");
+    return this.#transaction((db) => {
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+      if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover won protected owner-gate arbitration");
+      }
+      invariant(
+        latch?.state === expectedLatch?.state && latch.generation === expectedLatch?.generation && (latch.reason ?? null) === (expectedLatch?.reason ?? null),
+        "LATCH_GENERATION_MISMATCH",
+        "Protected latch changed before owner-gate mutation"
+      );
+      const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(taskId) ?? null;
+      invariant(
+        latest === null && expectedLatest === null || latest !== null && expectedLatest?.handoff_id === latest.handoff_id && expectedLatest?.reservation_digest === latest.reservation_digest,
+        "HANDOFF_LATEST_RESERVATION_STALE",
+        "Protected handoff lifecycle changed before owner-gate mutation"
+      );
+      invariant(latest === null, "HANDOFF_TASK_RESERVATION_CONFLICT", "Secure lifecycle authority is unavailable to transfer an existing reservation");
+      return Object.freeze({ task_id: taskId, eligible: true });
+    });
+  }
+  requestHandoffReservation(requestId, request) {
+    operationIdentifier(requestId, "HANDOFF_REQUEST_ID_INVALID", "requestId");
+    const value = validateHandoffReservationRequest(request);
+    const payload = { projection: value.projection, expectedLatch: value.expectedLatch, expectedLatest: value.expectedLatest };
+    const payloadDigest = sha256(Buffer.from(canonicalJson(payload), "utf8"));
+    return this.#transaction((db) => this.#reserveHandoffInTransaction(db, value, `handoff:${requestId}`, payloadDigest));
+  }
+  reserveHandoff(request) {
+    const requestId = request?.requestId ?? request?.projection?.handoff_id;
+    return this.requestHandoffReservation(requestId, request);
+  }
+  getHandoffReservation(handoffId) {
+    operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
+    return detachedReservation(this.#reservationRow(this.#database(), handoffId));
+  }
+  latestHandoffReservationForTask(taskId) {
+    operationIdentifier(taskId, "HANDOFF_TASK_INVALID", "taskId");
+    const row = this.#database().prepare("SELECT * FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(taskId);
+    return detachedReservation(row);
+  }
+  getActiveSource(sourceSessionId) {
+    operationIdentifier(sourceSessionId, "HANDOFF_SOURCE_INVALID", "sourceSessionId");
+    const row = this.#database().prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id=?").get(sourceSessionId);
+    return row ? Object.freeze({ ...row }) : null;
+  }
+  handoffReservationEvents(handoffId) {
+    operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
+  }
   admitOperation(request) {
     const value = validateOperationAdmission(request);
     const requestId = `admit:${value.operationId}`;
@@ -525,7 +847,7 @@ var ProtectedSqliteOperationAuthority = class {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, latch_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
   }
   crashBeforeTerminalCommitForPhysicalTest(operationId, outcome, effectReference = null) {
     const value = validateOperationTerminal(operationId, outcome, effectReference);
@@ -545,6 +867,16 @@ var ProtectedSqliteOperationAuthority = class {
     db.exec("BEGIN IMMEDIATE");
     this.#claimLatchInTransaction(db, value, `latch:${requestId}`, payloadDigest);
     process.exit(98);
+  }
+  crashBeforeHandoffCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "HANDOFF_REQUEST_ID_INVALID", "requestId");
+    const value = validateHandoffReservationRequest(request);
+    const payload = { projection: value.projection, expectedLatch: value.expectedLatch, expectedLatest: value.expectedLatest };
+    const payloadDigest = sha256(Buffer.from(canonicalJson(payload), "utf8"));
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#reserveHandoffInTransaction(db, value, `handoff:${requestId}`, payloadDigest, { crashBeforeEvent: true });
+    process.exit(99);
   }
   close() {
     const db = this.#database();
@@ -621,7 +953,7 @@ var ToolOperationTracker = class {
 
 // src/operation-authority-worker.mjs
 async function operationAuthorityWorkerEntrypoint() {
-  const MAX_FRAME_BYTES = 65536;
+  const MAX_FRAME_BYTES = 262144;
   const MAX_REQUESTS = 128;
   const SERVICE_NAME = /^AiopagoOperationAuthority(?:Test-[A-Za-z0-9-]{1,64})?$/;
   const SERVICE_SID = /^S-1-5-80-(?:\d+-){4}\d+$/;
@@ -709,6 +1041,13 @@ async function operationAuthorityWorkerEntrypoint() {
       last_event_id: latch.last_event_id
     } : null;
   }
+  function handoffResult(reservation) {
+    return reservation ? {
+      ...reservation,
+      reserved_plan_snapshot: reservation.reserved_plan_snapshot ?? null,
+      expected_git_state: reservation.expected_git_state ?? null
+    } : null;
+  }
   async function dispatch(frame, hello) {
     if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail2("PRIVATE_FRAME_BINDING_REJECTED");
     const requestId = identifier(frame.requestId, "REQUEST_ID_INVALID");
@@ -774,6 +1113,27 @@ async function operationAuthorityWorkerEntrypoint() {
       case "LATCH_ASSERT":
         result = latchResult(authority.assertLatchIdentity(payload.taskId, payload.expected, { allowHumanTakeover: payload.allowHumanTakeover === true }));
         break;
+      case "HANDOFF_RESERVE": {
+        const reserved = authority.requestHandoffReservation(requestId, {
+          projection: payload.projection,
+          expectedLatch: payload.expectedLatch,
+          expectedLatest: payload.expectedLatest ?? null
+        });
+        result = {
+          ...reserved,
+          reservation: handoffResult(authority.getHandoffReservation(payload.projection?.handoff_id))
+        };
+        break;
+      }
+      case "HANDOFF_GET":
+        result = handoffResult(authority.getHandoffReservation(payload.handoffId));
+        break;
+      case "HANDOFF_LATEST_TASK":
+        result = handoffResult(authority.latestHandoffReservationForTask(payload.taskId));
+        break;
+      case "ACTIVE_SOURCE_GET":
+        result = authority.getActiveSource(payload.sourceSessionId);
+        break;
       case "OPERATION_RETRY_ADMISSION": {
         result = authority.admitOperation({
           operationId: payload.operationId,
@@ -810,6 +1170,15 @@ async function operationAuthorityWorkerEntrypoint() {
         });
         fail2("CRASH_SEAM_RETURNED");
         break;
+      case "TEST_CRASH_BEFORE_HANDOFF_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeHandoffCommitForPhysicalTest(requestId, {
+          projection: payload.projection,
+          expectedLatch: payload.expectedLatch,
+          expectedLatest: payload.expectedLatest ?? null
+        });
+        fail2("CRASH_SEAM_RETURNED");
+        break;
       case "TEST_AUTHORITY_TIMEOUT":
         if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
         await new Promise(() => {
@@ -828,6 +1197,7 @@ async function operationAuthorityWorkerEntrypoint() {
     authority = new ProtectedSqliteOperationAuthority(hello.canonicalPath, { allowInitialize: hello.allowInitialize });
     requireSecureOperationAuthority(authority);
     requireSecureLatchAuthority(authority);
+    requireSecureHandoffAuthority(authority);
     output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
     while (true) {
       const frame = await readFrame();

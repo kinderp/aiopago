@@ -117,6 +117,205 @@ var init_canonical = __esm({
   }
 });
 
+// src/operation-authority.mjs
+function operationIdentifier(value, code, field) {
+  invariant(typeof value === "string" && IDENTIFIER.test(value), code, `${field} is invalid`);
+  return value;
+}
+function validateOperationAdmission(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "OPERATION_ADMISSION_INVALID");
+  const operationId = operationIdentifier(request.operationId, "OPERATION_ID_INVALID", "operationId");
+  const taskId2 = operationIdentifier(request.taskId, "OPERATION_TASK_INVALID", "taskId");
+  invariant(Number.isSafeInteger(request.generation) && request.generation >= 0, "OPERATION_GENERATION_INVALID");
+  invariant(PROFILES.has(request.profile), "OPERATION_PROFILE_INVALID");
+  return Object.freeze({ operationId, taskId: taskId2, generation: request.generation, profile: request.profile });
+}
+function validateOperationTerminal(operationId, outcome, effectReference) {
+  operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+  invariant(OUTCOMES.has(outcome), "OPERATION_OUTCOME_INVALID");
+  invariant(effectReference === null || typeof effectReference === "string" && EFFECT_REFERENCE.test(effectReference), "OPERATION_EFFECT_REFERENCE_INVALID");
+  if (outcome !== "KNOWN_SUCCESS") invariant(effectReference === null, "OPERATION_EFFECT_REFERENCE_INVALID", "Only known success may carry effect evidence");
+  return Object.freeze({ operationId, outcome, effectReference });
+}
+function detachedOperation(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function portableOperationAuthority(storage) {
+  return new PortableOperationAuthority(storage);
+}
+var OPERATION_AUTHORITY_MODES, PROFILES, OUTCOMES, IDENTIFIER, EFFECT_REFERENCE, SECURE_OPERATION_AUTHORITY_LABEL, PORTABLE_LABEL, PortableOperationAuthority;
+var init_operation_authority = __esm({
+  "src/operation-authority.mjs"() {
+    init_errors();
+    OPERATION_AUTHORITY_MODES = Object.freeze({
+      SECURE: "SECURE",
+      PORTABLE: "PORTABLE"
+    });
+    PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
+    OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
+    IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
+    EFFECT_REFERENCE = /^(?:file|shell):[^\r\n]{1,2048}$/;
+    SECURE_OPERATION_AUTHORITY_LABEL = Object.freeze({
+      mode: OPERATION_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_operation_isolation: true
+    });
+    PORTABLE_LABEL = Object.freeze({
+      mode: OPERATION_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_operation_isolation: false
+    });
+    PortableOperationAuthority = class {
+      constructor(storage) {
+        invariant(storage && typeof storage.admitOperation === "function" && typeof storage.finishOperation === "function" && typeof storage.operationsForTask === "function", "PORTABLE_OPERATION_AUTHORITY_INVALID");
+        this.storage = storage;
+        this.security = PORTABLE_LABEL;
+      }
+      admitOperation(request) {
+        const value = validateOperationAdmission(request);
+        this.storage.admitOperation(value);
+        return detachedOperation(this.storage.operationsForTask(value.taskId).find((row) => row.operation_id === value.operationId));
+      }
+      finishOperation(operationId, outcome, effectReference = null) {
+        const value = validateOperationTerminal(operationId, outcome, effectReference);
+        this.storage.finishOperation(value.operationId, value.outcome, value.effectReference);
+        return null;
+      }
+      operationsForTask(taskId2) {
+        operationIdentifier(taskId2, "OPERATION_TASK_INVALID", "taskId");
+        return Object.freeze(this.storage.operationsForTask(taskId2).map(detachedOperation));
+      }
+      getOperation(operationId) {
+        operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+        return null;
+      }
+      close() {
+      }
+    };
+  }
+});
+
+// src/handoff-reservation-authority.mjs
+function requireSecureHandoffAuthority(authority) {
+  invariant(
+    authority?.handoffSecurity?.mode === HANDOFF_AUTHORITY_MODES.SECURE && authority.handoffSecurity.canonical === true && authority.handoffSecurity.r1_m_13_handoff_reservation_isolation === true,
+    "SECURE_HANDOFF_AUTHORITY_REQUIRED",
+    "Secure handoff cannot use or fall back to portable reservation state"
+  );
+  return authority;
+}
+var HANDOFF_AUTHORITY_MODES, SECURE_HANDOFF_AUTHORITY_LABEL, PORTABLE_HANDOFF_AUTHORITY_LABEL, HANDOFF_RESERVATION_IDENTITY_FIELDS;
+var init_handoff_reservation_authority = __esm({
+  "src/handoff-reservation-authority.mjs"() {
+    init_canonical();
+    init_errors();
+    init_operation_authority();
+    HANDOFF_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+    SECURE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+      mode: HANDOFF_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_handoff_reservation_isolation: true
+    });
+    PORTABLE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+      mode: HANDOFF_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_handoff_reservation_isolation: false
+    });
+    HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
+      "handoff_id",
+      "source_session_id",
+      "source_session_file",
+      "task_id",
+      "task_plan_revision",
+      "task_plan_digest",
+      "requirements_version",
+      "current_item",
+      "next_item",
+      "next_step",
+      "latch_generation",
+      "runner_instance_id",
+      "session_binding_id",
+      "parent_session_id",
+      "parent_session_file",
+      "parent_checkpoint_id",
+      "recovery_of_handoff_id",
+      "checkpoint_id",
+      "resume_manifest_id",
+      "model_policy",
+      "reasoning_policy"
+    ]);
+  }
+});
+
+// src/latch-authority.mjs
+function detachedLatch(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function portableLatchAuthority(storage) {
+  return new PortableLatchAuthority(storage);
+}
+function requireSecureLatchAuthority(authority) {
+  invariant(
+    authority?.latchSecurity?.mode === LATCH_AUTHORITY_MODES.SECURE && authority.latchSecurity.canonical === true && authority.latchSecurity.r1_m_13_latch_isolation === true,
+    "SECURE_LATCH_AUTHORITY_REQUIRED",
+    "Secure execution cannot use or fall back to portable latch state"
+  );
+  return authority;
+}
+var LATCH_AUTHORITY_MODES, SECURE_LATCH_AUTHORITY_LABEL, PORTABLE_LATCH_AUTHORITY_LABEL, PortableLatchAuthority;
+var init_latch_authority = __esm({
+  "src/latch-authority.mjs"() {
+    init_errors();
+    init_operation_authority();
+    LATCH_AUTHORITY_MODES = Object.freeze({
+      SECURE: "SECURE",
+      PORTABLE: "PORTABLE"
+    });
+    SECURE_LATCH_AUTHORITY_LABEL = Object.freeze({
+      mode: LATCH_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_latch_isolation: true
+    });
+    PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
+      mode: LATCH_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_latch_isolation: false
+    });
+    PortableLatchAuthority = class {
+      constructor(storage) {
+        invariant(
+          storage && typeof storage.ensureLatch === "function" && typeof storage.getLatch === "function" && typeof storage.assertLatchIdentity === "function" && typeof storage.isAdmissionOpen === "function",
+          "PORTABLE_LATCH_AUTHORITY_INVALID"
+        );
+        this.storage = storage;
+        this.security = PORTABLE_LATCH_AUTHORITY_LABEL;
+      }
+      ensureLatch(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.ensureLatch(taskId2));
+      }
+      getLatch(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.getLatch(taskId2));
+      }
+      assertLatchIdentity(taskId2, expected, options = {}) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return detachedLatch(this.storage.assertLatchIdentity(taskId2, expected, options));
+      }
+      isAdmissionOpen(taskId2) {
+        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
+        return this.storage.isAdmissionOpen(taskId2);
+      }
+    };
+  }
+});
+
 // src/handoff-plan-internal.mjs
 function registerTrustedHandoffPlanCapability(ledger, capability) {
   invariant(ledger && typeof capability?.attest === "function" && typeof capability?.attestRecovery === "function" && typeof capability?.attestResume === "function" && typeof capability?.attestCurrentTakeover === "function" && typeof capability?.satisfyOwnerGate === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
@@ -130,10 +329,11 @@ function registerTrustedHandoffPlanCapability(ledger, capability) {
   }));
 }
 function registerTrustedHandoffStorageCapability(storage, capability) {
-  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
+    projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
     resumeEvidence: capability.resumeEvidence,
@@ -152,13 +352,13 @@ function satisfyTrustedHandoffOwnerGate(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed GuardianStorage");
-  const { expected, taskId: taskId2, expectedHandoff, expectedLatch, command, actor } = request;
+  const { expected, taskId: taskId2, expectedHandoff, expectedLatch, expectedLatest = null, reservationAuthority = null, command, actor } = request;
   invariant(
     taskId2 === expected?.taskId && expectedLatch?.task_id === taskId2,
     "HANDOFF_OWNER_GATE_AUTHORITY_INVALID"
   );
   return planCapability.satisfyOwnerGate({ expected, command, actor }, () => {
-    const authority = storageCapability.assertOwnerGateAuthority({ taskId: taskId2, expectedHandoff, expectedLatch });
+    const authority = reservationAuthority ? requireSecureHandoffAuthority(reservationAuthority).assertHandoffOwnerAuthority({ taskId: taskId2, expectedLatch, expectedLatest }) : storageCapability.assertOwnerGateAuthority({ taskId: taskId2, expectedHandoff, expectedLatch });
     invariant(!authority || typeof authority.then !== "function", "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Owner authority attestation must be synchronous");
     return authority;
   });
@@ -187,13 +387,13 @@ function claimTrustedHandoffLatch(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed GuardianStorage");
-  const { expected, taskId: taskId2, reason: reason2, actor, expectedLatch } = request;
+  const { expected, taskId: taskId2, reason: reason2, actor, expectedLatch, latchAuthority = null } = request;
   invariant(
     taskId2 === expected?.taskId && expectedLatch?.task_id === taskId2 && typeof reason2 === "string" && reason2 !== "HUMAN_TAKEOVER" && typeof actor === "string",
     "HANDOFF_LATCH_AUTHORITY_INVALID"
   );
   return planCapability.attest(expected, () => {
-    const claimed = storageCapability.claimHandoffLatch({ taskId: taskId2, reason: reason2, actor, expectedLatch });
+    const claimed = latchAuthority ? requireSecureLatchAuthority(latchAuthority).claimLatch({ taskId: taskId2, reason: reason2, actor, expected: expectedLatch }) : storageCapability.claimHandoffLatch({ taskId: taskId2, reason: reason2, actor, expectedLatch });
     invariant(claimed && typeof claimed.then !== "function", "HANDOFF_LATCH_AUTHORITY_INVALID", "SafePoint latch claim must be synchronous");
     return claimed;
   });
@@ -237,13 +437,42 @@ function reserveTrustedHandoffPlan(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted handoff requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted handoff requires an internally constructed GuardianStorage");
-  const { expected, projection, precondition } = request;
+  const { expected, projection, precondition, reservationAuthority = null, requestId = projection?.handoff_id } = request;
   invariant(
     projection?.task_id === expected?.taskId && projection.task_plan_revision === expected.planRevisionId && projection.task_plan_digest === expected.contentDigest,
     "HANDOFF_PLAN_PROVENANCE_MISMATCH",
     "Reservation projection does not match the attested plan identity"
   );
-  return planCapability.attest(expected, () => storageCapability.reserve(projection, precondition));
+  const reserved = planCapability.attest(expected, () => reservationAuthority ? reservationAuthority.requestHandoffReservation(requestId, {
+    projection,
+    expectedLatch: precondition.latch,
+    expectedLatest: precondition.expectedLatest ?? null
+  }) : storageCapability.reserve(projection, precondition));
+  if (!reservationAuthority) return reserved;
+  const canonical = reservationAuthority.getHandoffReservation(projection.handoff_id);
+  invariant(
+    canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest,
+    "HANDOFF_CANONICAL_RESULT_INVALID",
+    "Protected reservation result could not be re-observed exactly"
+  );
+  let handoff = projection;
+  if (reserved.created) {
+    handoff = storageCapability.projectCanonicalReservation(projection, {
+      canonical: true,
+      created: true,
+      reservation_digest: canonical.reservation_digest,
+      active_source: reserved.active_source,
+      event: reserved.event
+    });
+  }
+  return Object.freeze({
+    created: reserved.created,
+    canonical: true,
+    reservation: canonical,
+    active_source: reserved.active_source,
+    event: reserved.event,
+    handoff: handoff ?? projection
+  });
 }
 function prepareTrustedContinuityRecovery(ledger, request) {
   const planCapability = handoffPlanCapabilities.get(ledger);
@@ -273,6 +502,8 @@ var handoffPlanCapabilities, handoffStorageCapabilities;
 var init_handoff_plan_internal = __esm({
   "src/handoff-plan-internal.mjs"() {
     init_errors();
+    init_handoff_reservation_authority();
+    init_latch_authority();
     handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
     handoffStorageCapabilities = /* @__PURE__ */ new WeakMap();
   }
@@ -5674,6 +5905,7 @@ var init_handoff = __esm({
     init_canonical();
     init_errors();
     init_git_state();
+    init_handoff_reservation_authority();
     init_handoff_plan_internal();
     init_handoff_consent();
     init_ledger();
@@ -5720,9 +5952,20 @@ var init_handoff = __esm({
     });
     HandoffService = class {
       #resumeExpectations = /* @__PURE__ */ new WeakMap();
-      constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null }) {
+      constructor({ storage, artifacts, ledger, observeGit, safePoint, runnerInstanceId, modelPolicy = null, reasoningPolicy = null, telemetry = null, testHooks = null, reservationAuthority = null }) {
         invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
+        if (reservationAuthority) {
+          requireSecureHandoffAuthority(reservationAuthority);
+          invariant(
+            safePoint?.latchAuthority === reservationAuthority,
+            "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED",
+            "Secure handoff reservation and canonical latch must share one protected authority"
+          );
+        }
         this.storage = storage;
+        this.reservationAuthority = reservationAuthority;
+        this.handoffAuthoritySecurity = reservationAuthority?.handoffSecurity ?? PORTABLE_HANDOFF_AUTHORITY_LABEL;
+        this.latchAuthority = reservationAuthority ?? storage;
         this.artifacts = artifacts;
         this.ledger = ledger;
         this.observeGit = observeGit;
@@ -5850,7 +6093,7 @@ var init_handoff = __esm({
         const git3 = this.observeGit();
         invariant(git3 && typeof git3 === "object" && typeof git3.then !== "function", "GIT_STATE_MISMATCH", "Git observation must be synchronous");
         invariant(sameGitState(failed.expected_git_state, git3), "GIT_STATE_MISMATCH", "recovery source differs from failed handoff Git state");
-        const latch = this.storage.getLatch(failed.task_id);
+        const latch = this.latchAuthority.getLatch(failed.task_id);
         invariant(latch?.state === "ENGAGED" && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
         invariant(latch.reason !== "HUMAN_TAKEOVER", "HUMAN_TAKEOVER_ACTIVE");
         if (expectedLatch) invariant(
@@ -5917,11 +6160,29 @@ var init_handoff = __esm({
           planRevisionId: plan2.plan_revision_id,
           contentDigest: plan2.content_digest
         });
-        const parentHandoff = this.storage.findHandoffByTarget(sourceSessionId);
-        const recoveryParent = recoveryOf === null ? null : this.storage.getHandoff(recoveryOf);
-        const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(this.storage.latestHandoffForTask(plan2.task_id));
-        assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan2.task_id), expectedHandoff);
-        const observedLatch = this.storage.getLatch(plan2.task_id);
+        const secureReservation = this.reservationAuthority !== null;
+        invariant(
+          !secureReservation || recoveryOf === null,
+          "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE",
+          "Secure recovery remains fail-closed until its authority domain is migrated"
+        );
+        const canonicalLatest = secureReservation ? this.reservationAuthority.latestHandoffReservationForTask(plan2.task_id) : null;
+        const expectedLatest = canonicalLatest ? {
+          handoff_id: canonicalLatest.handoff_id,
+          reservation_digest: canonicalLatest.reservation_digest
+        } : null;
+        const parentHandoff = secureReservation ? null : this.storage.findHandoffByTarget(sourceSessionId);
+        const recoveryParent = recoveryOf === null || secureReservation ? null : this.storage.getHandoff(recoveryOf);
+        const portableLatest = secureReservation ? null : this.storage.latestHandoffForTask(plan2.task_id);
+        const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(portableLatest);
+        if (secureReservation) invariant(
+          expectedHandoff === null && canonicalLatest === null,
+          "HANDOFF_TASK_RESERVATION_CONFLICT",
+          "Guided secure handoff requires no prior protected reservation"
+        );
+        else assertHandoffConsentIdentity(portableLatest, expectedHandoff);
+        const latchAuthority = secureReservation ? this.reservationAuthority : this.storage;
+        const observedLatch = latchAuthority.getLatch(plan2.task_id);
         const expectedLatch = guided ? {
           task_id: plan2.task_id,
           state: expectedEligibility.latch.state,
@@ -5933,13 +6194,15 @@ var init_handoff = __esm({
           generation: observedLatch?.generation,
           reason: observedLatch?.reason ?? null
         };
-        this.storage.assertLatchIdentity(plan2.task_id, expectedLatch);
-        if (recoveryOf === null) {
-          const pending = this.storage.pendingContinuityFailureForTask(plan2.task_id);
-          invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : void 0);
-          invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /aio handoff recover ${parentHandoff.handoff_id}` : void 0);
-        } else {
-          this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
+        latchAuthority.assertLatchIdentity(plan2.task_id, expectedLatch);
+        if (!secureReservation) {
+          if (recoveryOf === null) {
+            const pending = this.storage.pendingContinuityFailureForTask(plan2.task_id);
+            invariant(!pending, "CONTINUITY_RECOVERY_REQUIRED", pending ? `Use /aio handoff recover ${pending.handoff_id}` : void 0);
+            invariant(parentHandoff?.state !== "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_REQUIRED", parentHandoff ? `Use /aio handoff recover ${parentHandoff.handoff_id}` : void 0);
+          } else {
+            this.storage.assertContinuityRecoveryPrepared(recoveryOf, { sourceSessionId, runnerInstanceId: this.runnerInstanceId });
+          }
         }
         if (mode === "confirm" && recoveryOf === null) {
           await this.testHooks?.beforeOwnerGate?.({ plan: plan2, sourceSession, expected: ownerGateExpected });
@@ -5950,6 +6213,8 @@ var init_handoff = __esm({
             taskId: plan2.task_id,
             expectedHandoff,
             expectedLatch,
+            expectedLatest,
+            reservationAuthority: this.reservationAuthority,
             command: "/aio handoff confirm",
             actor
           });
@@ -5973,14 +6238,22 @@ var init_handoff = __esm({
           taskId: plan2.task_id,
           reason: safePointReason,
           actor,
-          expectedLatch
+          expectedLatch,
+          latchAuthority: this.reservationAuthority
         });
         const safe = await this.safePoint.request(sourceSession, actor, safePointReason, { expectedLatch, acquiredLatch });
         await this.testHooks?.afterSafePoint?.({ safe, plan: plan2, sourceSession });
         const git3 = this.observeGit();
         this.verifyCurrentSource(sourceSession, currentSourceVerifier, { required: mode === "confirm" });
-        assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan2.task_id), expectedHandoff);
-        this.storage.assertLatchIdentity(plan2.task_id, safe.latch);
+        if (secureReservation) {
+          const latestAfterSafePoint = this.reservationAuthority.latestHandoffReservationForTask(plan2.task_id);
+          invariant(
+            JSON.stringify(latestAfterSafePoint ? { handoff_id: latestAfterSafePoint.handoff_id, reservation_digest: latestAfterSafePoint.reservation_digest } : null) === JSON.stringify(expectedLatest),
+            "HANDOFF_LATEST_RESERVATION_STALE",
+            "Protected reservation authority changed during SafePoint"
+          );
+        } else assertHandoffConsentIdentity(this.storage.latestHandoffForTask(plan2.task_id), expectedHandoff);
+        latchAuthority.assertLatchIdentity(plan2.task_id, safe.latch);
         const base = this.#buildHandoffReservation({
           sourceSession,
           plan: plan2,
@@ -5995,7 +6268,9 @@ var init_handoff = __esm({
           expected: trustedPlanIdentity,
           storage: this.storage,
           projection: base,
-          precondition: { latch: safe.latch, expectedHandoff }
+          reservationAuthority: this.reservationAuthority,
+          requestId: handoffId,
+          precondition: { latch: safe.latch, expectedHandoff, expectedLatest }
         });
         return this.#continueReservedHandoff({ reserved, sourceSession, plan: plan2, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget });
       }
@@ -6045,7 +6320,7 @@ var init_handoff = __esm({
         }
         await this.testHooks?.beforeReplacement?.({ handoff: this.storage.getHandoff(handoffId), safe, plan: plan2, sourceSession });
         try {
-          this.storage.assertLatchIdentity(plan2.task_id, safe.latch);
+          this.latchAuthority.assertLatchIdentity(plan2.task_id, safe.latch);
         } catch (error) {
           handoff = this.storage.getHandoff(handoffId);
           handoff.state = "HANDOFF_FAILED";
@@ -6062,7 +6337,7 @@ var init_handoff = __esm({
         await this.testHooks?.afterReplacementIntent?.({ handoff: this.storage.getHandoff(handoffId), safe, plan: plan2, sourceSession });
         let replacementResult;
         try {
-          this.storage.assertLatchIdentity(plan2.task_id, safe.latch);
+          this.latchAuthority.assertLatchIdentity(plan2.task_id, safe.latch);
           const expectedBinding = {
             schema_version: "1.0.0",
             handoff_id: handoffId,
@@ -6178,6 +6453,7 @@ var init_handoff = __esm({
         return h;
       }
       async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume, verifyCurrentTarget = null }) {
+        invariant(this.reservationAuthority === null, "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until recovery/lifecycle authority is migrated");
         const failed = this.storage.getHandoff(failedHandoffId);
         invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
         const initial = this.#captureRecoveryAttestation({
@@ -6311,7 +6587,7 @@ var init_handoff = __esm({
         const expectedLocalPaths = canonicalRequiredLocalPaths(plan2.required_local_paths ?? [], "REQUIRED_LOCAL_PATH_INVALID");
         invariant(JSON.stringify(m.required_local_paths) === JSON.stringify(expectedLocalPaths), "MANIFEST_MISMATCH", "required local paths");
         verifyRequiredLocalPaths(dirname7(this.ledger.path), m.required_local_paths);
-        const latch = this.storage.getLatch(h.task_id);
+        const latch = this.latchAuthority.getLatch(h.task_id);
         invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
         this.assertModelPolicy(plan2, targetSession);
         const resumePrompt = this.buildPrompt(h, m);
@@ -6416,7 +6692,7 @@ var init_handoff = __esm({
         );
         const binding = this.storage.getRunnerSessionBinding(handoffId);
         invariant(binding?.status === "ACTIVE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding is not ACTIVE");
-        const latch = this.storage.getLatch(h.task_id);
+        const latch = this.latchAuthority.getLatch(h.task_id);
         invariant(
           latch?.state === "ENGAGED" && latch.generation === h.latch_generation && latch.reason !== "HUMAN_TAKEOVER",
           latch?.reason === "HUMAN_TAKEOVER" ? "HUMAN_TAKEOVER_ACTIVE" : "LATCH_GENERATION_MISMATCH"
@@ -6475,6 +6751,7 @@ var init_handoff = __esm({
         return authority;
       }
       prepareResumeConfirmation(handoffId, targetSession, { currentTargetVerifier = null } = {}) {
+        invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Secure resume authorization/admission is not available in this reservation-only slice");
         const targetAttestation = currentTargetVerifier?.();
         invariant(!targetAttestation || typeof targetAttestation.then !== "function", "RESUME_ATTESTATION_INVALID", "Current target attestation must be synchronous");
         const h = this.storage.getHandoff(handoffId);
@@ -6514,6 +6791,7 @@ var init_handoff = __esm({
         return this.#resumeExpectations.delete(expectation);
       }
       async resume(handoffId, { actor = "human:resume", sendResume, expectedResume = null, targetSession = null } = {}) {
+        invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Portable resume authority cannot progress a protected handoff reservation");
         let h = this.storage.getHandoff(handoffId);
         invariant(h, "HANDOFF_NOT_FOUND");
         if (h.state === "RESUMED") return h;
@@ -6733,151 +7011,6 @@ var init_handoff = __esm({
         if (expectedModel) invariant(actualModel === expectedModel, "MODEL_POLICY_MISMATCH", `${actualModel} != ${expectedModel}`);
         const expectedReasoning = this.reasoningPolicy ?? plan2.reasoning_policy;
         if (expectedReasoning) invariant(session.thinkingLevel === expectedReasoning, "REASONING_POLICY_MISMATCH", `${session.thinkingLevel} != ${expectedReasoning}`);
-      }
-    };
-  }
-});
-
-// src/operation-authority.mjs
-function operationIdentifier(value, code, field) {
-  invariant(typeof value === "string" && IDENTIFIER.test(value), code, `${field} is invalid`);
-  return value;
-}
-function validateOperationAdmission(request) {
-  invariant(request && typeof request === "object" && !Array.isArray(request), "OPERATION_ADMISSION_INVALID");
-  const operationId = operationIdentifier(request.operationId, "OPERATION_ID_INVALID", "operationId");
-  const taskId2 = operationIdentifier(request.taskId, "OPERATION_TASK_INVALID", "taskId");
-  invariant(Number.isSafeInteger(request.generation) && request.generation >= 0, "OPERATION_GENERATION_INVALID");
-  invariant(PROFILES.has(request.profile), "OPERATION_PROFILE_INVALID");
-  return Object.freeze({ operationId, taskId: taskId2, generation: request.generation, profile: request.profile });
-}
-function validateOperationTerminal(operationId, outcome, effectReference) {
-  operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
-  invariant(OUTCOMES.has(outcome), "OPERATION_OUTCOME_INVALID");
-  invariant(effectReference === null || typeof effectReference === "string" && EFFECT_REFERENCE.test(effectReference), "OPERATION_EFFECT_REFERENCE_INVALID");
-  if (outcome !== "KNOWN_SUCCESS") invariant(effectReference === null, "OPERATION_EFFECT_REFERENCE_INVALID", "Only known success may carry effect evidence");
-  return Object.freeze({ operationId, outcome, effectReference });
-}
-function detachedOperation(row) {
-  return row ? Object.freeze({ ...row }) : null;
-}
-function portableOperationAuthority(storage) {
-  return new PortableOperationAuthority(storage);
-}
-var OPERATION_AUTHORITY_MODES, PROFILES, OUTCOMES, IDENTIFIER, EFFECT_REFERENCE, SECURE_OPERATION_AUTHORITY_LABEL, PORTABLE_LABEL, PortableOperationAuthority;
-var init_operation_authority = __esm({
-  "src/operation-authority.mjs"() {
-    init_errors();
-    OPERATION_AUTHORITY_MODES = Object.freeze({
-      SECURE: "SECURE",
-      PORTABLE: "PORTABLE"
-    });
-    PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
-    OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
-    IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
-    EFFECT_REFERENCE = /^(?:file|shell):[^\r\n]{1,2048}$/;
-    SECURE_OPERATION_AUTHORITY_LABEL = Object.freeze({
-      mode: OPERATION_AUTHORITY_MODES.SECURE,
-      canonical: true,
-      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
-      r1_m_13_operation_isolation: true
-    });
-    PORTABLE_LABEL = Object.freeze({
-      mode: OPERATION_AUTHORITY_MODES.PORTABLE,
-      canonical: false,
-      isolation: "ORDINARY_USER_OWNED",
-      r1_m_13_operation_isolation: false
-    });
-    PortableOperationAuthority = class {
-      constructor(storage) {
-        invariant(storage && typeof storage.admitOperation === "function" && typeof storage.finishOperation === "function" && typeof storage.operationsForTask === "function", "PORTABLE_OPERATION_AUTHORITY_INVALID");
-        this.storage = storage;
-        this.security = PORTABLE_LABEL;
-      }
-      admitOperation(request) {
-        const value = validateOperationAdmission(request);
-        this.storage.admitOperation(value);
-        return detachedOperation(this.storage.operationsForTask(value.taskId).find((row) => row.operation_id === value.operationId));
-      }
-      finishOperation(operationId, outcome, effectReference = null) {
-        const value = validateOperationTerminal(operationId, outcome, effectReference);
-        this.storage.finishOperation(value.operationId, value.outcome, value.effectReference);
-        return null;
-      }
-      operationsForTask(taskId2) {
-        operationIdentifier(taskId2, "OPERATION_TASK_INVALID", "taskId");
-        return Object.freeze(this.storage.operationsForTask(taskId2).map(detachedOperation));
-      }
-      getOperation(operationId) {
-        operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
-        return null;
-      }
-      close() {
-      }
-    };
-  }
-});
-
-// src/latch-authority.mjs
-function detachedLatch(row) {
-  return row ? Object.freeze({ ...row }) : null;
-}
-function portableLatchAuthority(storage) {
-  return new PortableLatchAuthority(storage);
-}
-function requireSecureLatchAuthority(authority) {
-  invariant(
-    authority?.latchSecurity?.mode === LATCH_AUTHORITY_MODES.SECURE && authority.latchSecurity.canonical === true && authority.latchSecurity.r1_m_13_latch_isolation === true,
-    "SECURE_LATCH_AUTHORITY_REQUIRED",
-    "Secure execution cannot use or fall back to portable latch state"
-  );
-  return authority;
-}
-var LATCH_AUTHORITY_MODES, SECURE_LATCH_AUTHORITY_LABEL, PORTABLE_LATCH_AUTHORITY_LABEL, PortableLatchAuthority;
-var init_latch_authority = __esm({
-  "src/latch-authority.mjs"() {
-    init_errors();
-    init_operation_authority();
-    LATCH_AUTHORITY_MODES = Object.freeze({
-      SECURE: "SECURE",
-      PORTABLE: "PORTABLE"
-    });
-    SECURE_LATCH_AUTHORITY_LABEL = Object.freeze({
-      mode: LATCH_AUTHORITY_MODES.SECURE,
-      canonical: true,
-      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
-      r1_m_13_latch_isolation: true
-    });
-    PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
-      mode: LATCH_AUTHORITY_MODES.PORTABLE,
-      canonical: false,
-      isolation: "ORDINARY_USER_OWNED",
-      r1_m_13_latch_isolation: false
-    });
-    PortableLatchAuthority = class {
-      constructor(storage) {
-        invariant(
-          storage && typeof storage.ensureLatch === "function" && typeof storage.getLatch === "function" && typeof storage.assertLatchIdentity === "function" && typeof storage.isAdmissionOpen === "function",
-          "PORTABLE_LATCH_AUTHORITY_INVALID"
-        );
-        this.storage = storage;
-        this.security = PORTABLE_LATCH_AUTHORITY_LABEL;
-      }
-      ensureLatch(taskId2) {
-        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
-        return detachedLatch(this.storage.ensureLatch(taskId2));
-      }
-      getLatch(taskId2) {
-        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
-        return detachedLatch(this.storage.getLatch(taskId2));
-      }
-      assertLatchIdentity(taskId2, expected, options = {}) {
-        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
-        return detachedLatch(this.storage.assertLatchIdentity(taskId2, expected, options));
-      }
-      isAdmissionOpen(taskId2) {
-        operationIdentifier(taskId2, "LATCH_TASK_INVALID", "taskId");
-        return this.storage.isAdmissionOpen(taskId2);
       }
     };
   }
@@ -7353,41 +7486,19 @@ function prepareContinuityRecoveryInTransaction(storage, handoffId, request) {
   }, { handoffId, eventKey: `continuity-recovery:${handoffId}` });
   return { handoff: storage.getHandoff(handoffId), binding: storage.getRunnerSessionBinding(handoffId), latch };
 }
-var require2, TRUSTED_RECOVERY_RESERVATION, storageDatabases, HANDOFF_RESERVATION_IDENTITY_FIELDS, RECOVERY_FAILED_IDENTITY_FIELDS, GuardianStorage;
+var require2, TRUSTED_RECOVERY_RESERVATION, storageDatabases, RECOVERY_FAILED_IDENTITY_FIELDS, GuardianStorage;
 var init_storage = __esm({
   "src/storage.mjs"() {
     init_canonical();
     init_errors();
     init_handoff_consent();
+    init_handoff_reservation_authority();
     init_handoff_plan_internal();
     init_plan_semantics_internal();
     init_task_operation_internal();
     require2 = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url);
     TRUSTED_RECOVERY_RESERVATION = Symbol("trusted-recovery-reservation");
     storageDatabases = /* @__PURE__ */ new WeakMap();
-    HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
-      "handoff_id",
-      "source_session_id",
-      "source_session_file",
-      "task_id",
-      "task_plan_revision",
-      "task_plan_digest",
-      "requirements_version",
-      "current_item",
-      "next_item",
-      "next_step",
-      "latch_generation",
-      "runner_instance_id",
-      "session_binding_id",
-      "parent_session_id",
-      "parent_session_file",
-      "parent_checkpoint_id",
-      "recovery_of_handoff_id",
-      "checkpoint_id",
-      "resume_manifest_id",
-      "model_policy",
-      "reasoning_policy"
-    ]);
     RECOVERY_FAILED_IDENTITY_FIELDS = Object.freeze([
       "handoff_id",
       "state",
@@ -7425,6 +7536,7 @@ var init_storage = __esm({
         this.migrate();
         const trustedCapability = {
           reserve: (projection, precondition) => this.#reserveHandoff(projection, precondition),
+          projectCanonicalReservation: (projection, proof) => this.#projectCanonicalHandoffReservation(projection, proof),
           prepareRecovery: ({ failedHandoffId, preparation, reservation, attestation }) => this.prepareContinuityRecovery(
             failedHandoffId,
             preparation,
@@ -7595,7 +7707,7 @@ var init_storage = __esm({
         ('calibration_runtime_identity','run-specific calibration bootstrap identity','1.0.0'),
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
-        ('handoffs','Guardian SQLite canonical runtime','1.0.0'),
+        ('handoffs','Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode','1.1.0'),
         ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
@@ -7608,6 +7720,8 @@ var init_storage = __esm({
         WHERE name='operations' AND authority='Guardian SQLite canonical runtime';
       UPDATE authorities SET authority='Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='handoffs' AND authority='Guardian SQLite canonical runtime';
     `);
       }
       getCalibrationRuntimeIdentity() {
@@ -7724,6 +7838,42 @@ var init_storage = __esm({
       }
       reserveHandoff() {
         throw new GuardianError("HANDOFF_RESERVATION_TRUSTED_PATH_REQUIRED", "Authoritative handoff reservation is package-private and requires plan coordination");
+      }
+      #projectCanonicalHandoffReservation(projection, proof) {
+        invariant(
+          proof?.canonical === true && proof?.created === true && proof?.event?.event_type === "HANDOFF_RESERVED" && proof?.event?.handoff_id === projection?.handoff_id && proof?.active_source?.source_session_id === projection?.source_session_id && proof?.active_source?.handoff_id === projection?.handoff_id,
+          "HANDOFF_PROJECTION_PROOF_INVALID",
+          "Portable projection requires the just-committed protected reservation result"
+        );
+        return this.transaction(() => {
+          const now = utcNow();
+          database(this).prepare(`INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(handoff_id) DO UPDATE SET source_session_id=excluded.source_session_id,target_session_id=NULL,task_id=excluded.task_id,
+          state=excluded.state,latch_generation=excluded.latch_generation,projection_json=excluded.projection_json,updated_at=excluded.updated_at`).run(
+            projection.handoff_id,
+            projection.source_session_id,
+            null,
+            projection.task_id,
+            projection.state,
+            projection.latch_generation,
+            JSON.stringify(projection),
+            projection.created_at ?? now,
+            now
+          );
+          database(this).prepare("DELETE FROM active_sources WHERE source_session_id=? OR handoff_id=?").run(projection.source_session_id, projection.handoff_id);
+          database(this).prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
+          const eventKey = `handoff:${projection.handoff_id}`;
+          database(this).prepare("DELETE FROM journal WHERE event_key=? OR event_id=?").run(eventKey, proof.event.event_id);
+          database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(proof.event.event_id, projection.handoff_id, "HANDOFF_STARTED", eventKey, proof.event.occurred_at, JSON.stringify({
+            source_session_id: projection.source_session_id,
+            latch_generation: projection.latch_generation,
+            recovery_of_handoff_id: null,
+            canonical_reservation_digest: proof.reservation_digest,
+            projection_only: true
+          }));
+          return this.getHandoff(projection.handoff_id);
+        });
       }
       getHandoff(id) {
         const row = database(this).prepare("SELECT * FROM handoffs WHERE handoff_id=?").get(id);
@@ -8079,9 +8229,10 @@ function ledgerReadFacade(ledger) {
   ledgerReadFacades.set(ledger, facade);
   return facade;
 }
-function storageReadFacade(storage, latchAuthority = storage) {
+function storageReadFacade(storage, latchAuthority = storage, handoffAuthority = null) {
   if (!storage || !latchAuthority) return null;
-  let facade = storageReadFacades.get(latchAuthority);
+  const authorityKey = handoffAuthority ?? latchAuthority;
+  let facade = storageReadFacades.get(authorityKey);
   if (facade) return facade;
   const read = (method) => (...args) => detached(storage[method](...args));
   facade = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
@@ -8089,12 +8240,15 @@ function storageReadFacade(storage, latchAuthority = storage) {
     getCalibrationRuntimeIdentity: read("getCalibrationRuntimeIdentity"),
     getLatch: (...args) => detached(latchAuthority.getLatch(...args)),
     isAdmissionOpen: (...args) => latchAuthority.isAdmissionOpen(...args),
-    getHandoff: read("getHandoff"),
-    findHandoffByTarget: read("findHandoffByTarget"),
-    findHandoffBySource: read("findHandoffBySource"),
-    pendingContinuityFailureForTask: read("pendingContinuityFailureForTask"),
+    getHandoff: (...args) => detached(handoffAuthority ? handoffAuthority.getHandoffReservation(...args) : storage.getHandoff(...args)),
+    findHandoffByTarget: (...args) => detached(handoffAuthority ? null : storage.findHandoffByTarget(...args)),
+    findHandoffBySource: (...args) => detached(handoffAuthority ? (() => {
+      const active = handoffAuthority.getActiveSource(...args);
+      return active ? handoffAuthority.getHandoffReservation(active.handoff_id) : null;
+    })() : storage.findHandoffBySource(...args)),
+    pendingContinuityFailureForTask: (...args) => detached(handoffAuthority ? null : storage.pendingContinuityFailureForTask(...args)),
     getRunnerSessionBinding: read("getRunnerSessionBinding"),
-    latestHandoffForTask: read("latestHandoffForTask"),
+    latestHandoffForTask: (...args) => detached(handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args)),
     operationsForTask: read("operationsForTask"),
     getMetricSession: read("getMetricSession"),
     metricSessions: read("metricSessions"),
@@ -8102,9 +8256,9 @@ function storageReadFacade(storage, latchAuthority = storage) {
     handoffMetricEvents: read("handoffMetricEvents"),
     metricDiagnostics: read("metricDiagnostics"),
     getArtifact: read("getArtifact"),
-    events: read("events")
+    events: (...args) => detached(handoffAuthority ? handoffAuthority.handoffReservationEvents(...args) : storage.events(...args))
   }));
-  storageReadFacades.set(latchAuthority, facade);
+  storageReadFacades.set(authorityKey, facade);
   return facade;
 }
 function runtimeReadFacade(internal) {
@@ -8188,6 +8342,8 @@ async function createGuardianRunner(options, authority = null) {
   );
   if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
   storage.ensureLatch(plan2.task_id);
+  const reservationAuthority = injectedOption(options, "reservationAuthority", authority, () => null);
+  reservationAuthority?.ensureLatch(plan2.task_id);
   const artifacts = injectedOption(
     options,
     "artifacts",
@@ -8195,7 +8351,7 @@ async function createGuardianRunner(options, authority = null) {
     () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage)
   );
   const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
-  const latchAuthority = portableLatchAuthority(storage);
+  const latchAuthority = reservationAuthority ?? portableLatchAuthority(storage);
   const gate = new AdmissionGate(storage, plan2.task_id, { latchAuthority });
   gate.install(modelRuntime);
   const modelPolicy = options.modelPolicy ?? plan2.model_policy ?? null;
@@ -8237,7 +8393,7 @@ async function createGuardianRunner(options, authority = null) {
     authority,
     () => pi.coding.SessionManager.create(cwd, options.sessionDir)
   );
-  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, latchAuthority, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
+  const publicRunner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, latchAuthority, reservationAuthority, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, sessionManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools });
   const runner = trustedRunnerFacade(publicRunner);
   runner.metrics = injectedOption(options, "metrics", authority, () => new MeasurementInstrumentation({
     storage,
@@ -8246,7 +8402,7 @@ async function createGuardianRunner(options, authority = null) {
     thresholdPercent: contextAdvisor.thresholdPercent,
     retention: options.metricsRetention
   }));
-  const operationAuthority = portableOperationAuthority(storage);
+  const operationAuthority = reservationAuthority ?? portableOperationAuthority(storage);
   runner.toolTracker = new ToolOperationTracker(storage, plan2.task_id, { operationAuthority, latchAuthority });
   runner.safePoint = new SafePointCoordinator({ storage, taskId: plan2.task_id, gate, operationAuthority, latchAuthority });
   const callerObserveGit = options.observeGit;
@@ -8260,7 +8416,8 @@ async function createGuardianRunner(options, authority = null) {
     runnerInstanceId,
     modelPolicy,
     reasoningPolicy,
-    telemetry: runner.metrics
+    telemetry: runner.metrics,
+    reservationAuthority
   });
   await runner.createRuntime(options, authority);
   if (!modelPolicy) {
@@ -8329,6 +8486,8 @@ var init_runner = __esm({
       "metrics",
       "model",
       "modelRuntime",
+      "operationAuthority",
+      "reservationAuthority",
       "sessionManager",
       "settingsManager",
       "storage",
@@ -8373,7 +8532,7 @@ var init_runner = __esm({
       }
       get storage() {
         const internal = runnerInternals.get(this);
-        return storageReadFacade(internal?.storage, internal?.latchAuthority);
+        return storageReadFacade(internal?.storage, internal?.latchAuthority, internal?.reservationAuthority ?? null);
       }
       get runtime() {
         return runnerInternals.get(this)?.runtimeReadFacade ?? null;
@@ -8800,6 +8959,7 @@ var init_runner = __esm({
         if (internal.runtime) await internal.runtime.dispose();
         await internal.settingsManager?.flush?.();
         internal.storage?.close?.();
+        if (internal.reservationAuthority && internal.reservationAuthority !== internal.storage) internal.reservationAuthority.close?.();
       }
     };
   }

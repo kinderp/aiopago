@@ -230,7 +230,7 @@ test("schema upgrade is bounded and missing current latch schema fails closed", 
   legacy.exec("DROP TABLE latch_events; DROP TABLE latches; UPDATE authority_metadata SET schema_version='aiopago.operation-authority/1.0.0' WHERE singleton=1;");
   legacy.close();
   const upgraded = new ProtectedSqliteOperationAuthority(x.path);
-  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.1.0");
+  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.2.0");
   assert.equal(upgraded.ensureLatch("TASK-UPGRADED").state, "RELEASED");
   upgraded.close();
   const damaged = new DatabaseSync(x.path);

@@ -1,4 +1,6 @@
 import { invariant } from "./errors.mjs";
+import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
+import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 
 // Package-private capability registries. Public TaskLedger and GuardianStorage
 // objects expose their accepted APIs only; trusted handoff receives one bounded
@@ -26,6 +28,7 @@ export function registerTrustedHandoffPlanCapability(ledger, capability) {
 export function registerTrustedHandoffStorageCapability(storage, capability) {
   invariant(storage
     && typeof capability?.reserve === "function"
+    && typeof capability?.projectCanonicalReservation === "function"
     && typeof capability?.prepareRecovery === "function"
     && typeof capability?.authorizeResume === "function"
     && typeof capability?.resumeEvidence === "function"
@@ -40,6 +43,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
+    projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
     resumeEvidence: capability.resumeEvidence,
@@ -64,11 +68,13 @@ export function satisfyTrustedHandoffOwnerGate(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted owner-gate mutation requires an internally constructed GuardianStorage");
-  const { expected, taskId, expectedHandoff, expectedLatch, command, actor } = request;
+  const { expected, taskId, expectedHandoff, expectedLatch, expectedLatest = null, reservationAuthority = null, command, actor } = request;
   invariant(taskId === expected?.taskId && expectedLatch?.task_id === taskId,
     "HANDOFF_OWNER_GATE_AUTHORITY_INVALID");
   return planCapability.satisfyOwnerGate({ expected, command, actor }, () => {
-    const authority = storageCapability.assertOwnerGateAuthority({ taskId, expectedHandoff, expectedLatch });
+    const authority = reservationAuthority
+      ? requireSecureHandoffAuthority(reservationAuthority).assertHandoffOwnerAuthority({ taskId, expectedLatch, expectedLatest })
+      : storageCapability.assertOwnerGateAuthority({ taskId, expectedHandoff, expectedLatch });
     invariant(!authority || typeof authority.then !== "function", "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Owner authority attestation must be synchronous");
     return authority;
   });
@@ -104,12 +110,14 @@ export function claimTrustedHandoffLatch(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted SafePoint requires an internally constructed GuardianStorage");
-  const { expected, taskId, reason, actor, expectedLatch } = request;
+  const { expected, taskId, reason, actor, expectedLatch, latchAuthority = null } = request;
   invariant(taskId === expected?.taskId && expectedLatch?.task_id === taskId
     && typeof reason === "string" && reason !== "HUMAN_TAKEOVER" && typeof actor === "string",
   "HANDOFF_LATCH_AUTHORITY_INVALID");
   return planCapability.attest(expected, () => {
-    const claimed = storageCapability.claimHandoffLatch({ taskId, reason, actor, expectedLatch });
+    const claimed = latchAuthority
+      ? requireSecureLatchAuthority(latchAuthority).claimLatch({ taskId, reason, actor, expected: expectedLatch })
+      : storageCapability.claimHandoffLatch({ taskId, reason, actor, expectedLatch });
     invariant(claimed && typeof claimed.then !== "function", "HANDOFF_LATCH_AUTHORITY_INVALID", "SafePoint latch claim must be synchronous");
     return claimed;
   });
@@ -158,12 +166,40 @@ export function reserveTrustedHandoffPlan(ledger, request) {
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
   invariant(planCapability, "HANDOFF_PLAN_CAPABILITY_REQUIRED", "Trusted handoff requires an internally constructed TaskLedger");
   invariant(storageCapability, "HANDOFF_STORAGE_CAPABILITY_REQUIRED", "Trusted handoff requires an internally constructed GuardianStorage");
-  const { expected, projection, precondition } = request;
+  const { expected, projection, precondition, reservationAuthority = null, requestId = projection?.handoff_id } = request;
   invariant(projection?.task_id === expected?.taskId
     && projection.task_plan_revision === expected.planRevisionId
     && projection.task_plan_digest === expected.contentDigest,
   "HANDOFF_PLAN_PROVENANCE_MISMATCH", "Reservation projection does not match the attested plan identity");
-  return planCapability.attest(expected, () => storageCapability.reserve(projection, precondition));
+  const reserved = planCapability.attest(expected, () => reservationAuthority
+    ? reservationAuthority.requestHandoffReservation(requestId, {
+      projection,
+      expectedLatch: precondition.latch,
+      expectedLatest: precondition.expectedLatest ?? null,
+    })
+    : storageCapability.reserve(projection, precondition));
+  if (!reservationAuthority) return reserved;
+  const canonical = reservationAuthority.getHandoffReservation(projection.handoff_id);
+  invariant(canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest,
+    "HANDOFF_CANONICAL_RESULT_INVALID", "Protected reservation result could not be re-observed exactly");
+  let handoff = projection;
+  if (reserved.created) {
+    handoff = storageCapability.projectCanonicalReservation(projection, {
+      canonical: true,
+      created: true,
+      reservation_digest: canonical.reservation_digest,
+      active_source: reserved.active_source,
+      event: reserved.event,
+    });
+  }
+  return Object.freeze({
+    created: reserved.created,
+    canonical: true,
+    reservation: canonical,
+    active_source: reserved.active_source,
+    event: reserved.event,
+    handoff: handoff ?? projection,
+  });
 }
 
 // Recovery uses the same package-private PlanRevisionWriter coordination as

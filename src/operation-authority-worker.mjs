@@ -6,11 +6,12 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { OPERATION_AUTHORITY_PROTOCOL, requireSecureOperationAuthority } from "./operation-authority.mjs";
 import { requireSecureLatchAuthority } from "./latch-authority.mjs";
+import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
 async function operationAuthorityWorkerEntrypoint() {
-const MAX_FRAME_BYTES = 65_536;
+const MAX_FRAME_BYTES = 262_144;
 const MAX_REQUESTS = 128;
 const SERVICE_NAME = /^AiopagoOperationAuthority(?:Test-[A-Za-z0-9-]{1,64})?$/;
 const SERVICE_SID = /^S-1-5-80-(?:\d+-){4}\d+$/;
@@ -86,6 +87,13 @@ function latchResult(latch) {
     last_event_id: latch.last_event_id,
   } : null;
 }
+function handoffResult(reservation) {
+  return reservation ? {
+    ...reservation,
+    reserved_plan_snapshot: reservation.reserved_plan_snapshot ?? null,
+    expected_git_state: reservation.expected_git_state ?? null,
+  } : null;
+}
 
 async function dispatch(frame, hello) {
   if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail("PRIVATE_FRAME_BINDING_REJECTED");
@@ -146,6 +154,27 @@ async function dispatch(frame, hello) {
     case "LATCH_ASSERT":
       result = latchResult(authority.assertLatchIdentity(payload.taskId, payload.expected, { allowHumanTakeover: payload.allowHumanTakeover === true }));
       break;
+    case "HANDOFF_RESERVE": {
+      const reserved = authority.requestHandoffReservation(requestId, {
+        projection: payload.projection,
+        expectedLatch: payload.expectedLatch,
+        expectedLatest: payload.expectedLatest ?? null,
+      });
+      result = {
+        ...reserved,
+        reservation: handoffResult(authority.getHandoffReservation(payload.projection?.handoff_id)),
+      };
+      break;
+    }
+    case "HANDOFF_GET":
+      result = handoffResult(authority.getHandoffReservation(payload.handoffId));
+      break;
+    case "HANDOFF_LATEST_TASK":
+      result = handoffResult(authority.latestHandoffReservationForTask(payload.taskId));
+      break;
+    case "ACTIVE_SOURCE_GET":
+      result = authority.getActiveSource(payload.sourceSessionId);
+      break;
     case "OPERATION_RETRY_ADMISSION": {
       result = authority.admitOperation({
         operationId: payload.operationId, taskId: payload.taskId,
@@ -177,6 +206,13 @@ async function dispatch(frame, hello) {
       });
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_BEFORE_HANDOFF_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeHandoffCommitForPhysicalTest(requestId, {
+        projection: payload.projection, expectedLatch: payload.expectedLatch, expectedLatest: payload.expectedLatest ?? null,
+      });
+      fail("CRASH_SEAM_RETURNED");
+      break;
     case "TEST_AUTHORITY_TIMEOUT":
       if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
       await new Promise(() => {});
@@ -199,6 +235,7 @@ try {
   authority = new ProtectedSqliteOperationAuthority(hello.canonicalPath, { allowInitialize: hello.allowInitialize });
   requireSecureOperationAuthority(authority);
   requireSecureLatchAuthority(authority);
+  requireSecureHandoffAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

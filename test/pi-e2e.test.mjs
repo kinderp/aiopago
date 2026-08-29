@@ -12,6 +12,7 @@ import { HandoffService } from "../src/handoff.mjs";
 import { observeRunnerHumanWorkflow, projectHumanWorkflow } from "../src/human-workflow.mjs";
 import { createPlanAdapter, PLAN_INTENT_SCHEMA } from "../src/intent-adapter.mjs";
 import { loadPi } from "../src/pi-loader.mjs";
+import { ProtectedSqliteOperationAuthority } from "../src/protected-operation-authority.mjs";
 import { createRunnerForInternalTest, runnerForInternalTest } from "../src/runner.mjs";
 import { readRuntimeRunnerBinding, RUNNER_BINDING_CUSTOM_TYPE } from "../src/runner-ownership.mjs";
 import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
@@ -85,7 +86,7 @@ function writeOwnerGateLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null, modelReasoning = false, reasoningPolicy = "off" } = {}) {
+async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null, modelReasoning = false, reasoningPolicy = "off", secureReservation = false } = {}) {
   const root = existingRoot ?? mkdtempSync(join(tmpdir(), "aiopago-pi-e2e-"));
   if (!existingRoot) {
     fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake", requiredLocalPaths);
@@ -115,7 +116,12 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   await modelRuntime.setRuntimeApiKey(model.provider, "offline-placeholder");
   const settings = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const sessions = mkdtempSync(join(tmpdir(), "aiopago-pi-sessions-"));
-  const runner = runnerForInternalTest(await createRunnerForInternalTest({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all" }));
+  let reservationAuthority = null;
+  if (secureReservation) {
+    const protectedRoot = mkdtempSync(join(tmpdir(), "aiopago-pi-protected-"));
+    reservationAuthority = new ProtectedSqliteOperationAuthority(join(protectedRoot, "operations.sqlite"), { allowInitialize: true });
+  }
+  const runner = runnerForInternalTest(await createRunnerForInternalTest({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all", ...(reservationAuthority ? { reservationAuthority } : {}) }));
   await runner.runtime.session.bindExtensions({
     mode: "print",
     commandContextActions: {
@@ -127,7 +133,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
       reload: async () => {},
     },
   });
-  return { root, runner, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
+  return { root, runner, reservationAuthority, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
 }
 
 async function makeContinuityRecoveryFixture(options = {}) {
@@ -319,6 +325,39 @@ test("Pi E2E: a Pi-selected model becomes effective handoff policy when the Ledg
     assert.equal(result.model_policy, "offline-fake/offline-fake");
     const manifest = x.runner.artifacts.verify("manifest", result.resume_manifest_id, result.resume_manifest_digest);
     assert.equal(manifest.payload.model_policy, "offline-fake/offline-fake");
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RESUME_READY with zero resume authority", async (t) => {
+  const x = await makeRunner({ secureReservation: true });
+  try {
+    assert.equal(x.runner.pi.version, "0.83.0");
+    const result = await x.runner.handoffDirect({ mode: "manual", confirm: true });
+    assert.equal(result.state, "RESUME_READY");
+    const canonical = x.reservationAuthority.getHandoffReservation(result.handoff_id);
+    assert.equal(canonical.handoff_id, result.handoff_id);
+    assert.equal(canonical.source_session_id, result.source_session_id);
+    assert.equal(canonical.runner_instance_id, result.runner_instance_id);
+    assert.equal(canonical.task_plan_revision, result.task_plan_revision);
+    assert.equal(canonical.task_plan_digest, result.task_plan_digest);
+    assert.equal(canonical.latch_generation, result.latch_generation);
+    assert.equal(canonical.latch_reason, "INTEGRITY");
+    assert.equal(canonical.authorization_state, "NOT_AUTHORIZED");
+    assert.equal(x.reservationAuthority.getActiveSource(result.source_session_id).handoff_id, result.handoff_id);
+    assert.equal(x.reservationAuthority.handoffReservationEvents(result.handoff_id).length, 1);
+    const db = storageDatabaseForInternalTest(x.runner.storage);
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) count FROM dispatch_attempts WHERE handoff_id=?").get(result.handoff_id).count, 0);
+    const legitimateResumeAuthorizations = 0;
+    db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      .run(result.resume_prompt_id, result.handoff_id, "human:portable-forged", 999999, "2099-01-01T00:00:00.000Z");
+    await assert.rejects(() => x.runner.handoffService.resume(result.handoff_id, {
+      actor: "human:portable-forged", sendResume: async () => { throw new Error("must remain paused"); },
+    }), (error) => error.code === "SECURE_RESUME_AUTHORITY_UNAVAILABLE");
+    assert.equal(x.runner.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
+    assert.equal(x.calls, 0); assert.equal(x.networkAttempts, 0);
+    t.diagnostic(`secure Pi handoff ${JSON.stringify({ task_id: result.task_id, source_session_id: result.source_session_id, target_session_id: result.target_session_id, runner_instance_id: result.runner_instance_id, plan_revision: result.task_plan_revision, plan_digest: result.task_plan_digest, latch_generation: result.latch_generation, latch_reason: canonical.latch_reason, reservation_id: result.handoff_id, active_source: x.reservationAuthority.getActiveSource(result.source_session_id), checkpoint_id: result.checkpoint_id, manifest_id: result.resume_manifest_id, handoff_state: result.state, resume_authorizations: legitimateResumeAuthorizations, forged_portable_authorizations_after_boundary_attack: db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, admissions: 0, dispatches: 0 })}`);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 
