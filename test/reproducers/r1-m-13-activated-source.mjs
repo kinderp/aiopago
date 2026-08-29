@@ -98,7 +98,7 @@ try {
     process.exitCode = 0;
 
     const databasePath = join(target, ".guardian", "runtime", "guardian.sqlite");
-    let forged = null; let humanTakeover = 0; let portableHandoffs = 0; let portableActiveSources = 0; let portableHandoffEvents = 0;
+    let forged = null; let humanTakeover = 0; let portableHandoffs = 0; let portableActiveSources = 0; let portableHandoffEvents = 0; let portableLifecycleBindings = 0; let portableLifecycleEvents = 0;
     if (existsSync(databasePath)) {
       const database = new DatabaseSync(databasePath, { readOnly: true });
       forged = database.prepare("SELECT operation_id,state,outcome,profile FROM operations WHERE operation_id='OP-FORGED'").get() ?? null;
@@ -106,6 +106,8 @@ try {
       portableHandoffs = database.prepare("SELECT COUNT(*) count FROM handoffs").get().count;
       portableActiveSources = database.prepare("SELECT COUNT(*) count FROM active_sources").get().count;
       portableHandoffEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type='HANDOFF_STARTED'").get().count;
+      portableLifecycleBindings = database.prepare("SELECT COUNT(*) count FROM runner_session_bindings").get().count;
+      portableLifecycleEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('RUNNER_SESSION_BOUND','RUNNER_SESSION_BINDING_SUPERSEDED')").get().count;
       database.close();
     }
     const installedAfter = await readFile(entry);
@@ -120,6 +122,8 @@ try {
       portableHandoffs,
       portableActiveSources,
       portableHandoffEvents,
+      portableLifecycleBindings,
+      portableLifecycleEvents,
     }));
   `);
 

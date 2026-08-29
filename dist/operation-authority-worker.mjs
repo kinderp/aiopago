@@ -28,8 +28,9 @@ var OPERATION_AUTHORITY_MODES = Object.freeze({
 });
 var PREVIOUS_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.0.0";
 var LATCH_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1.0";
-var OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.2.0";
-var OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/3";
+var HANDOFF_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.2.0";
+var OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.3.0";
+var OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/4";
 var PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
 var OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
 var IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
@@ -350,6 +351,74 @@ function requireSecureHandoffAuthority(authority) {
   return authority;
 }
 
+// src/lifecycle-binding-authority.mjs
+var LIFECYCLE_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+  mode: LIFECYCLE_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_lifecycle_binding_isolation: true
+});
+var PORTABLE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+  mode: LIFECYCLE_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_lifecycle_binding_isolation: false
+});
+var LIFECYCLE_BINDING_STATES = Object.freeze(["ACTIVE", "SUPERSEDED"]);
+var LIFECYCLE_BINDING_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "replacement_session_id",
+  "runner_instance_id",
+  "session_binding_id",
+  "lifecycle_incarnation"
+]);
+var BOUNDED_REASON = /^[^\r\n]{1,2048}$/;
+function lifecycleIncarnation(value) {
+  invariant(Number.isSafeInteger(value) && value > 0, "LIFECYCLE_INCARNATION_INVALID");
+  return value;
+}
+function sameLifecycleBindingIdentity(left, right) {
+  return LIFECYCLE_BINDING_IDENTITY_FIELDS.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+function validateLifecycleBindingCreate(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "LIFECYCLE_BINDING_INVALID");
+  const binding = request.binding;
+  invariant(binding && typeof binding === "object" && !Array.isArray(binding), "LIFECYCLE_BINDING_INVALID");
+  const value = Object.freeze({
+    handoff_id: operationIdentifier(binding.handoff_id, "LIFECYCLE_HANDOFF_INVALID", "handoff_id"),
+    replacement_session_id: operationIdentifier(binding.replacement_session_id, "LIFECYCLE_SESSION_INVALID", "replacement_session_id"),
+    runner_instance_id: operationIdentifier(binding.runner_instance_id, "LIFECYCLE_RUNNER_INVALID", "runner_instance_id"),
+    session_binding_id: operationIdentifier(binding.session_binding_id, "LIFECYCLE_BINDING_ID_INVALID", "session_binding_id"),
+    lifecycle_incarnation: lifecycleIncarnation(binding.lifecycle_incarnation)
+  });
+  return Object.freeze({ binding: value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function validateLifecycleBindingTransition(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "LIFECYCLE_TRANSITION_INVALID");
+  const expected = validateLifecycleBindingCreate({ binding: request.expected }).binding;
+  invariant(request.expected.status === "ACTIVE" && request.nextStatus === "SUPERSEDED", "LIFECYCLE_TRANSITION_INVALID", "Only ACTIVE to SUPERSEDED is supported");
+  invariant(typeof request.reason === "string" && BOUNDED_REASON.test(request.reason), "LIFECYCLE_REASON_INVALID");
+  const value = Object.freeze({ expected: Object.freeze({ ...expected, status: "ACTIVE" }), nextStatus: "SUPERSEDED", reason: request.reason });
+  return Object.freeze({ ...value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function detachedLifecycleBinding(row, event = null) {
+  if (!row) return null;
+  return Object.freeze({
+    schema_version: "1.0.0",
+    ...structuredClone(row),
+    event_data: event?.data_json ? JSON.parse(event.data_json) : event?.event_data ? structuredClone(event.event_data) : void 0
+  });
+}
+function requireSecureLifecycleAuthority(authority) {
+  invariant(
+    authority?.lifecycleSecurity?.mode === LIFECYCLE_AUTHORITY_MODES.SECURE && authority.lifecycleSecurity.canonical === true && authority.lifecycleSecurity.r1_m_13_lifecycle_binding_isolation === true,
+    "SECURE_LIFECYCLE_AUTHORITY_REQUIRED",
+    "Secure lifecycle cannot use or fall back to portable Runner/session bindings"
+  );
+  return authority;
+}
+
 // src/protected-operation-authority.mjs
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -369,6 +438,7 @@ var ProtectedSqliteOperationAuthority = class {
     this.security = SECURE_OPERATION_AUTHORITY_LABEL;
     this.latchSecurity = SECURE_LATCH_AUTHORITY_LABEL;
     this.handoffSecurity = SECURE_HANDOFF_AUTHORITY_LABEL;
+    this.lifecycleSecurity = SECURE_LIFECYCLE_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
     invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
@@ -406,7 +476,7 @@ var ProtectedSqliteOperationAuthority = class {
       const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       if (existingMetadata.schema_version === this.schema) return;
-      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
     }
     db.exec(`
       CREATE TABLE IF NOT EXISTS authority_metadata(
@@ -487,6 +557,36 @@ var ProtectedSqliteOperationAuthority = class {
         latch_reason TEXT NOT NULL,
         occurred_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS lifecycle_bindings(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        replacement_session_id TEXT NOT NULL UNIQUE,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL UNIQUE,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+        bound_at TEXT NOT NULL,
+        bind_event_id TEXT NOT NULL UNIQUE,
+        superseded_at TEXT,
+        superseded_reason TEXT,
+        supersede_event_id TEXT UNIQUE,
+        CHECK((status='ACTIVE' AND superseded_at IS NULL AND superseded_reason IS NULL AND supersede_event_id IS NULL)
+          OR (status='SUPERSEDED' AND superseded_at IS NOT NULL AND superseded_reason IS NOT NULL AND supersede_event_id IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS lifecycle_binding_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        handoff_id TEXT NOT NULL REFERENCES lifecycle_bindings(handoff_id),
+        replacement_session_id TEXT NOT NULL,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        event_type TEXT NOT NULL CHECK(event_type IN ('RUNNER_SESSION_BOUND','RUNNER_SESSION_BINDING_SUPERSEDED')),
+        from_status TEXT,
+        status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+        reason TEXT,
+        occurred_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authority_requests(
         request_id TEXT PRIMARY KEY,
         operation_type TEXT NOT NULL,
@@ -497,12 +597,14 @@ var ProtectedSqliteOperationAuthority = class {
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id,state,admitted_at);
       CREATE INDEX IF NOT EXISTS latch_event_task_sequence ON latch_events(task_id,sequence);
       CREATE INDEX IF NOT EXISTS handoff_reservation_task_created ON handoff_reservations(task_id,created_at,handoff_id);
+      CREATE INDEX IF NOT EXISTS lifecycle_binding_session_status ON lifecycle_bindings(replacement_session_id,status);
+      CREATE INDEX IF NOT EXISTS lifecycle_binding_event_handoff_sequence ON lifecycle_binding_events(handoff_id,sequence);
     `);
     const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
-    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA) {
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA) {
       db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?").run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
     }
   }
@@ -516,6 +618,8 @@ var ProtectedSqliteOperationAuthority = class {
       handoff_reservations: ["handoff_id", "source_session_id", "task_id", "task_plan_revision", "task_plan_digest", "latch_generation", "latch_reason", "runner_instance_id", "recovery_of_handoff_id", "checkpoint_id", "resume_manifest_id", "reservation_digest", "reservation_event_id", "projection_json", "created_at"],
       active_sources: ["source_session_id", "handoff_id"],
       handoff_reservation_events: ["sequence", "event_id", "request_id", "handoff_id", "task_id", "source_session_id", "event_type", "latch_generation", "latch_reason", "occurred_at"],
+      lifecycle_bindings: ["handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "status", "bound_at", "bind_event_id", "superseded_at", "superseded_reason", "supersede_event_id"],
+      lifecycle_binding_events: ["sequence", "event_id", "request_id", "handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "event_type", "from_status", "status", "reason", "occurred_at"],
       authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"]
     });
     for (const [table, columns] of Object.entries(expected)) {
@@ -689,10 +793,16 @@ var ProtectedSqliteOperationAuthority = class {
       "Canonical latest handoff reservation changed"
     );
     if (latest) {
-      throw new GuardianError("HANDOFF_TASK_RESERVATION_CONFLICT", "A protected reservation already owns this task; secure lifecycle/recovery authority is not yet available to transfer it", {
-        task_id: projection.task_id,
-        existing_handoff_id: latest.handoff_id
-      });
+      const priorBinding = this.#lifecycleBindingRow(db, latest.handoff_id);
+      invariant(
+        priorBinding?.status === "ACTIVE" && priorBinding.replacement_session_id === projection.source_session_id && priorBinding.runner_instance_id === projection.runner_instance_id,
+        "HANDOFF_TASK_RESERVATION_CONFLICT",
+        "The latest protected lifecycle does not authorize this exact active target as the next source",
+        {
+          task_id: projection.task_id,
+          existing_handoff_id: latest.handoff_id
+        }
+      );
     }
     const eventId = opaqueId("HEV");
     const occurredAt = utcNow();
@@ -752,7 +862,10 @@ var ProtectedSqliteOperationAuthority = class {
         "HANDOFF_LATEST_RESERVATION_STALE",
         "Protected handoff lifecycle changed before owner-gate mutation"
       );
-      invariant(latest === null, "HANDOFF_TASK_RESERVATION_CONFLICT", "Secure lifecycle authority is unavailable to transfer an existing reservation");
+      if (latest) {
+        const binding = this.#lifecycleBindingRow(db, latest.handoff_id);
+        invariant(binding?.status === "ACTIVE", "HANDOFF_TASK_RESERVATION_CONFLICT", "Latest protected reservation has no ACTIVE lifecycle successor");
+      }
       return Object.freeze({ task_id: taskId, eligible: true });
     });
   }
@@ -784,6 +897,134 @@ var ProtectedSqliteOperationAuthority = class {
   handoffReservationEvents(handoffId) {
     operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
     return Object.freeze(this.#database().prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
+  }
+  #lifecycleBindingRow(db, handoffId) {
+    return db.prepare("SELECT * FROM lifecycle_bindings WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+  #detachedLifecycleBinding(db, row) {
+    if (!row) return null;
+    const event = db.prepare("SELECT event_type,reason AS event_reason,occurred_at FROM lifecycle_binding_events WHERE event_id=? AND handoff_id=?").get(row.bind_event_id, row.handoff_id);
+    invariant(event?.event_type === "RUNNER_SESSION_BOUND", "LIFECYCLE_BINDING_EVENT_MISMATCH");
+    return detachedLifecycleBinding(row, { event_data: {
+      handoff_id: row.handoff_id,
+      replacement_session_id: row.replacement_session_id,
+      runner_instance_id: row.runner_instance_id,
+      session_binding_id: row.session_binding_id,
+      lifecycle_incarnation: row.lifecycle_incarnation
+    } });
+  }
+  requestLifecycleBindingCreate(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingCreate(request);
+    const ledgerRequestId = `lifecycle-bind:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, "LIFECYCLE_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, binding: this.getLifecycleBinding(value.binding.handoff_id) });
+      const reservation = this.#reservationRow(db, value.binding.handoff_id);
+      invariant(reservation, "LIFECYCLE_RESERVATION_NOT_FOUND", "A protected binding requires an existing canonical reservation");
+      const projection = JSON.parse(reservation.projection_json);
+      invariant(
+        reservation.runner_instance_id === value.binding.runner_instance_id && projection.session_binding_id === value.binding.session_binding_id,
+        "LIFECYCLE_RESERVATION_MISMATCH",
+        "Binding identity does not match its protected reservation"
+      );
+      const prior = this.#lifecycleBindingRow(db, value.binding.handoff_id);
+      if (prior) {
+        invariant(
+          prior.status === "ACTIVE" && sameLifecycleBindingIdentity(prior, value.binding),
+          "LIFECYCLE_BINDING_CONFLICT",
+          "The protected handoff already binds a different lifecycle identity"
+        );
+        const result2 = { binding: this.#detachedLifecycleBinding(db, prior), created: false, idempotent: true, request_code: "IDEMPOTENT_LIFECYCLE_BINDING" };
+        this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const sessionConflict = db.prepare("SELECT handoff_id FROM lifecycle_bindings WHERE replacement_session_id=? OR session_binding_id=? LIMIT 1").get(value.binding.replacement_session_id, value.binding.session_binding_id);
+      invariant(!sessionConflict, "LIFECYCLE_BINDING_CONFLICT", "Session or binding identity is already canonical for another handoff");
+      const eventId = opaqueId("BEV");
+      const occurredAt = utcNow();
+      db.prepare(`INSERT INTO lifecycle_bindings(
+        handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,status,bound_at,bind_event_id
+      ) VALUES(?,?,?,?,?,'ACTIVE',?,?)`).run(
+        value.binding.handoff_id,
+        value.binding.replacement_session_id,
+        value.binding.runner_instance_id,
+        value.binding.session_binding_id,
+        value.binding.lifecycle_incarnation,
+        occurredAt,
+        eventId
+      );
+      db.prepare(`INSERT INTO lifecycle_binding_events(
+        event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+      ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BOUND',NULL,'ACTIVE',NULL,?)`).run(
+        eventId,
+        ledgerRequestId,
+        value.binding.handoff_id,
+        value.binding.replacement_session_id,
+        value.binding.runner_instance_id,
+        value.binding.session_binding_id,
+        value.binding.lifecycle_incarnation,
+        occurredAt
+      );
+      const result = { binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, value.binding.handoff_id)), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  requestLifecycleBindingTransition(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingTransition(request);
+    const ledgerRequestId = `lifecycle-transition:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, "LIFECYCLE_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, binding: this.getLifecycleBinding(value.expected.handoff_id) });
+      const prior = this.#lifecycleBindingRow(db, value.expected.handoff_id);
+      invariant(
+        prior && sameLifecycleBindingIdentity(prior, value.expected),
+        "LIFECYCLE_BINDING_STALE",
+        "Expected protected lifecycle identity is stale or absent"
+      );
+      if (prior.status === "SUPERSEDED") {
+        invariant(prior.superseded_reason === value.reason, "LIFECYCLE_TRANSITION_CONFLICT", "Protected lifecycle already has different terminal provenance");
+        const result2 = { binding: this.#detachedLifecycleBinding(db, prior), transitioned: false, idempotent: true, request_code: "IDEMPOTENT_LIFECYCLE_TRANSITION" };
+        this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      invariant(prior.status === "ACTIVE", "LIFECYCLE_TRANSITION_INVALID");
+      const eventId = opaqueId("BEV");
+      const occurredAt = utcNow();
+      const changed = db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE' AND lifecycle_incarnation=?").run(occurredAt, value.reason, eventId, prior.handoff_id, prior.lifecycle_incarnation);
+      invariant(changed.changes === 1, "LIFECYCLE_BINDING_STALE", "Protected lifecycle transition raced");
+      db.prepare(`INSERT INTO lifecycle_binding_events(
+        event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+      ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+        eventId,
+        ledgerRequestId,
+        prior.handoff_id,
+        prior.replacement_session_id,
+        prior.runner_instance_id,
+        prior.session_binding_id,
+        prior.lifecycle_incarnation,
+        value.reason,
+        occurredAt
+      );
+      const result = { binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, prior.handoff_id)), transitioned: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  getLifecycleBinding(handoffId) {
+    operationIdentifier(handoffId, "LIFECYCLE_HANDOFF_INVALID", "handoffId");
+    return this.#detachedLifecycleBinding(this.#database(), this.#lifecycleBindingRow(this.#database(), handoffId));
+  }
+  getLifecycleBindingBySession(sessionId) {
+    operationIdentifier(sessionId, "LIFECYCLE_SESSION_INVALID", "sessionId");
+    const db = this.#database();
+    return this.#detachedLifecycleBinding(db, db.prepare("SELECT * FROM lifecycle_bindings WHERE replacement_session_id=? ORDER BY bound_at DESC LIMIT 1").get(sessionId) ?? null);
+  }
+  lifecycleBindingEvents(handoffId) {
+    operationIdentifier(handoffId, "LIFECYCLE_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM lifecycle_binding_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
   }
   admitOperation(request) {
     const value = validateOperationAdmission(request);
@@ -847,7 +1088,7 @@ var ProtectedSqliteOperationAuthority = class {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
   }
   crashBeforeTerminalCommitForPhysicalTest(operationId, outcome, effectReference = null) {
     const value = validateOperationTerminal(operationId, outcome, effectReference);
@@ -877,6 +1118,31 @@ var ProtectedSqliteOperationAuthority = class {
     db.exec("BEGIN IMMEDIATE");
     this.#reserveHandoffInTransaction(db, value, `handoff:${requestId}`, payloadDigest, { crashBeforeEvent: true });
     process.exit(99);
+  }
+  crashBeforeLifecycleTransitionCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingTransition(request);
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const prior = this.#lifecycleBindingRow(db, value.expected.handoff_id);
+    invariant(prior?.status === "ACTIVE" && sameLifecycleBindingIdentity(prior, value.expected), "LIFECYCLE_BINDING_STALE");
+    const eventId = opaqueId("BEV");
+    const occurredAt = utcNow();
+    db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE'").run(occurredAt, value.reason, eventId, prior.handoff_id);
+    db.prepare(`INSERT INTO lifecycle_binding_events(
+      event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+    ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+      eventId,
+      `lifecycle-transition:${requestId}`,
+      prior.handoff_id,
+      prior.replacement_session_id,
+      prior.runner_instance_id,
+      prior.session_binding_id,
+      prior.lifecycle_incarnation,
+      value.reason,
+      occurredAt
+    );
+    process.exit(100);
   }
   close() {
     const db = this.#database();
@@ -1048,6 +1314,23 @@ async function operationAuthorityWorkerEntrypoint() {
       expected_git_state: reservation.expected_git_state ?? null
     } : null;
   }
+  function lifecycleBindingResult(binding) {
+    return binding ? {
+      handoff_id: binding.handoff_id,
+      replacement_session_id: binding.replacement_session_id,
+      runner_instance_id: binding.runner_instance_id,
+      session_binding_id: binding.session_binding_id,
+      lifecycle_incarnation: binding.lifecycle_incarnation,
+      status: binding.status,
+      bound_at: binding.bound_at,
+      bind_event_id: binding.bind_event_id,
+      superseded_at: binding.superseded_at,
+      superseded_reason: binding.superseded_reason,
+      supersede_event_id: binding.supersede_event_id,
+      event_data: binding.event_data,
+      schema_version: binding.schema_version
+    } : null;
+  }
   async function dispatch(frame, hello) {
     if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail2("PRIVATE_FRAME_BINDING_REJECTED");
     const requestId = identifier(frame.requestId, "REQUEST_ID_INVALID");
@@ -1134,6 +1417,29 @@ async function operationAuthorityWorkerEntrypoint() {
       case "ACTIVE_SOURCE_GET":
         result = authority.getActiveSource(payload.sourceSessionId);
         break;
+      case "LIFECYCLE_BIND_CREATE": {
+        const created = authority.requestLifecycleBindingCreate(requestId, { binding: payload.binding });
+        result = { ...created, binding: lifecycleBindingResult(created.binding) };
+        break;
+      }
+      case "LIFECYCLE_BIND_GET":
+        result = lifecycleBindingResult(authority.getLifecycleBinding(payload.handoffId));
+        break;
+      case "LIFECYCLE_BIND_GET_SESSION":
+        result = lifecycleBindingResult(authority.getLifecycleBindingBySession(payload.sessionId));
+        break;
+      case "LIFECYCLE_BIND_TRANSITION": {
+        const transitioned = authority.requestLifecycleBindingTransition(requestId, {
+          expected: payload.expected,
+          nextStatus: payload.nextStatus,
+          reason: payload.reason
+        });
+        result = { ...transitioned, binding: lifecycleBindingResult(transitioned.binding) };
+        break;
+      }
+      case "LIFECYCLE_BIND_EVENTS":
+        result = authority.lifecycleBindingEvents(payload.handoffId);
+        break;
       case "OPERATION_RETRY_ADMISSION": {
         result = authority.admitOperation({
           operationId: payload.operationId,
@@ -1179,6 +1485,15 @@ async function operationAuthorityWorkerEntrypoint() {
         });
         fail2("CRASH_SEAM_RETURNED");
         break;
+      case "TEST_CRASH_BEFORE_LIFECYCLE_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeLifecycleTransitionCommitForPhysicalTest(requestId, {
+          expected: payload.expected,
+          nextStatus: payload.nextStatus,
+          reason: payload.reason
+        });
+        fail2("CRASH_SEAM_RETURNED");
+        break;
       case "TEST_AUTHORITY_TIMEOUT":
         if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
         await new Promise(() => {
@@ -1198,6 +1513,7 @@ async function operationAuthorityWorkerEntrypoint() {
     requireSecureOperationAuthority(authority);
     requireSecureLatchAuthority(authority);
     requireSecureHandoffAuthority(authority);
+    requireSecureLifecycleAuthority(authority);
     output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
     while (true) {
       const frame = await readFrame();

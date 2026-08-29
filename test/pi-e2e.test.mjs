@@ -345,6 +345,13 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
     assert.equal(canonical.authorization_state, "NOT_AUTHORIZED");
     assert.equal(x.reservationAuthority.getActiveSource(result.source_session_id).handoff_id, result.handoff_id);
     assert.equal(x.reservationAuthority.handoffReservationEvents(result.handoff_id).length, 1);
+    const canonicalBinding = x.reservationAuthority.getLifecycleBinding(result.handoff_id);
+    assert.equal(canonicalBinding.status, "ACTIVE");
+    assert.equal(canonicalBinding.replacement_session_id, result.target_session_id);
+    assert.equal(canonicalBinding.runner_instance_id, result.runner_instance_id);
+    assert.equal(canonicalBinding.session_binding_id, result.session_binding_id);
+    assert.equal(canonicalBinding.lifecycle_incarnation, x.runner.sessionLifecycle.epoch);
+    assert.equal(x.reservationAuthority.lifecycleBindingEvents(result.handoff_id).length, 1);
     const db = storageDatabaseForInternalTest(x.runner.storage);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, 0);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
@@ -356,8 +363,24 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
       actor: "human:portable-forged", sendResume: async () => { throw new Error("must remain paused"); },
     }), (error) => error.code === "SECURE_RESUME_AUTHORITY_UNAVAILABLE");
     assert.equal(x.runner.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
+    const second = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(second.state, "RESUME_READY");
+    assert.equal(second.source_session_id, result.target_session_id);
+    assert.equal(x.reservationAuthority.latestHandoffReservationForTask(result.task_id).handoff_id, second.handoff_id);
+    assert.equal(x.reservationAuthority.getLifecycleBinding(result.handoff_id).status, "SUPERSEDED", "source shutdown transfers lifecycle away from the first target");
+    const secondBinding = x.reservationAuthority.getLifecycleBinding(second.handoff_id);
+    assert.equal(secondBinding.status, "ACTIVE");
+    const e1 = x.runner.sessionLifecycle.epoch;
+    await x.runner.runtime.session.extensionRunner.emit({ type: "session_shutdown", reason: "secure lifecycle oracle" });
+    const shutdownBinding = x.reservationAuthority.getLifecycleBinding(second.handoff_id);
+    assert.equal(shutdownBinding.status, "SUPERSEDED");
+    assert.equal(shutdownBinding.superseded_reason, "session_shutdown");
+    await x.runner.runtime.session.extensionRunner.emit({ type: "session_start", reason: "same-ID lifecycle ABA" });
+    assert.ok(x.runner.sessionLifecycle.epoch > e1);
+    assert.equal(x.runner.runtime.session.sessionId, second.target_session_id);
+    assert.equal(x.reservationAuthority.getLifecycleBinding(second.handoff_id).status, "SUPERSEDED", "same textual session ID E2 must not revive E1");
     assert.equal(x.calls, 0); assert.equal(x.networkAttempts, 0);
-    t.diagnostic(`secure Pi handoff ${JSON.stringify({ task_id: result.task_id, source_session_id: result.source_session_id, target_session_id: result.target_session_id, runner_instance_id: result.runner_instance_id, plan_revision: result.task_plan_revision, plan_digest: result.task_plan_digest, latch_generation: result.latch_generation, latch_reason: canonical.latch_reason, reservation_id: result.handoff_id, active_source: x.reservationAuthority.getActiveSource(result.source_session_id), checkpoint_id: result.checkpoint_id, manifest_id: result.resume_manifest_id, handoff_state: result.state, resume_authorizations: legitimateResumeAuthorizations, forged_portable_authorizations_after_boundary_attack: db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, admissions: 0, dispatches: 0 })}`);
+    t.diagnostic(`secure Pi handoff ${JSON.stringify({ task_id: result.task_id, source_session_id: result.source_session_id, target_session_id: result.target_session_id, runner_instance_id: result.runner_instance_id, plan_revision: result.task_plan_revision, plan_digest: result.task_plan_digest, latch_generation: result.latch_generation, latch_reason: canonical.latch_reason, reservation_id: result.handoff_id, active_source: x.reservationAuthority.getActiveSource(result.source_session_id), binding_id: canonicalBinding.session_binding_id, binding_status: canonicalBinding.status, lifecycle_incarnation: canonicalBinding.lifecycle_incarnation, checkpoint_id: result.checkpoint_id, manifest_id: result.resume_manifest_id, handoff_state: result.state, resume_authorizations: legitimateResumeAuthorizations, forged_portable_authorizations_after_boundary_attack: db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, admissions: 0, dispatches: 0 })}`);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 

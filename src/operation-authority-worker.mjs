@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { OPERATION_AUTHORITY_PROTOCOL, requireSecureOperationAuthority } from "./operation-authority.mjs";
 import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
+import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
@@ -94,6 +95,23 @@ function handoffResult(reservation) {
     expected_git_state: reservation.expected_git_state ?? null,
   } : null;
 }
+function lifecycleBindingResult(binding) {
+  return binding ? {
+    handoff_id: binding.handoff_id,
+    replacement_session_id: binding.replacement_session_id,
+    runner_instance_id: binding.runner_instance_id,
+    session_binding_id: binding.session_binding_id,
+    lifecycle_incarnation: binding.lifecycle_incarnation,
+    status: binding.status,
+    bound_at: binding.bound_at,
+    bind_event_id: binding.bind_event_id,
+    superseded_at: binding.superseded_at,
+    superseded_reason: binding.superseded_reason,
+    supersede_event_id: binding.supersede_event_id,
+    event_data: binding.event_data,
+    schema_version: binding.schema_version,
+  } : null;
+}
 
 async function dispatch(frame, hello) {
   if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail("PRIVATE_FRAME_BINDING_REJECTED");
@@ -175,6 +193,27 @@ async function dispatch(frame, hello) {
     case "ACTIVE_SOURCE_GET":
       result = authority.getActiveSource(payload.sourceSessionId);
       break;
+    case "LIFECYCLE_BIND_CREATE": {
+      const created = authority.requestLifecycleBindingCreate(requestId, { binding: payload.binding });
+      result = { ...created, binding: lifecycleBindingResult(created.binding) };
+      break;
+    }
+    case "LIFECYCLE_BIND_GET":
+      result = lifecycleBindingResult(authority.getLifecycleBinding(payload.handoffId));
+      break;
+    case "LIFECYCLE_BIND_GET_SESSION":
+      result = lifecycleBindingResult(authority.getLifecycleBindingBySession(payload.sessionId));
+      break;
+    case "LIFECYCLE_BIND_TRANSITION": {
+      const transitioned = authority.requestLifecycleBindingTransition(requestId, {
+        expected: payload.expected, nextStatus: payload.nextStatus, reason: payload.reason,
+      });
+      result = { ...transitioned, binding: lifecycleBindingResult(transitioned.binding) };
+      break;
+    }
+    case "LIFECYCLE_BIND_EVENTS":
+      result = authority.lifecycleBindingEvents(payload.handoffId);
+      break;
     case "OPERATION_RETRY_ADMISSION": {
       result = authority.admitOperation({
         operationId: payload.operationId, taskId: payload.taskId,
@@ -213,6 +252,13 @@ async function dispatch(frame, hello) {
       });
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_BEFORE_LIFECYCLE_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeLifecycleTransitionCommitForPhysicalTest(requestId, {
+        expected: payload.expected, nextStatus: payload.nextStatus, reason: payload.reason,
+      });
+      fail("CRASH_SEAM_RETURNED");
+      break;
     case "TEST_AUTHORITY_TIMEOUT":
       if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
       await new Promise(() => {});
@@ -236,6 +282,7 @@ try {
   requireSecureOperationAuthority(authority);
   requireSecureLatchAuthority(authority);
   requireSecureHandoffAuthority(authority);
+  requireSecureLifecycleAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

@@ -47,7 +47,7 @@ native("service_account_change", join(system32, "sc.exe"), ["config", service, "
 native("service_sid_change", join(system32, "sc.exe"), ["sidtype", service, "none"]);
 native("service_delete", join(system32, "sc.exe"), ["delete", service]);
 
-let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, falseNegativeAttack = null;
+let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, falseNegativeAttack = null;
 {
   const database = new DatabaseSync(projectDatabase);
   database.prepare("INSERT OR REPLACE INTO operations(operation_id,task_id,latch_generation,profile,state,outcome,effect_reference,admitted_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?)")
@@ -77,20 +77,26 @@ let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, 
   forgedHandoff = database.prepare("SELECT handoff_id,source_session_id,target_session_id,task_id,state,latch_generation FROM handoffs WHERE handoff_id='HO-FORGED-BY-P0'").get();
   forgedActiveSource = database.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id='SESSION-FORGED-BY-P0'").get();
   forgedHandoffEvent = database.prepare("SELECT event_id,handoff_id,event_type,event_key FROM journal WHERE event_id='EVT-FORGED-HANDOFF'").get();
+  database.prepare("INSERT OR REPLACE INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)")
+    .run(handoffProjection.handoff_id, handoffProjection.target_session_id, "RUNNER-FORGED", "BIND-FORGED-BY-P0", "ACTIVE", "2099-01-01T00:00:00.000Z", "EVT-FORGED-HANDOFF", null, null);
+  forgedLifecycleBinding = database.prepare("SELECT handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,superseded_at,superseded_reason FROM runner_session_bindings WHERE handoff_id='HO-FORGED-BY-P0'").get();
   if (attackRealHandoffId) {
     database.prepare("DELETE FROM active_sources WHERE handoff_id=? OR source_session_id=?").run(attackRealHandoffId, "SESSION-PRODUCTION-SOURCE");
+    database.prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(attackRealHandoffId);
     database.prepare("DELETE FROM journal WHERE handoff_id=?").run(attackRealHandoffId);
     database.prepare("DELETE FROM handoffs WHERE handoff_id=?").run(attackRealHandoffId);
     database.prepare("INSERT OR REPLACE INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
       .run("HO-FALSE-NEGATIVE-FAKE", "SESSION-PRODUCTION-SOURCE", "SESSION-FAKE-REPLACEMENT", "TASK-FAKE", "RESUMED", 2147483647, JSON.stringify({ handoff_id: "HO-FALSE-NEGATIVE-FAKE", source_session_id: "SESSION-PRODUCTION-SOURCE", state: "RESUMED" }), "2099-01-01T00:02:00.000Z", "2099-01-01T00:02:00.001Z");
     database.prepare("INSERT OR REPLACE INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run("SESSION-PRODUCTION-SOURCE", "HO-FALSE-NEGATIVE-FAKE");
-    falseNegativeAttack = { deleted_handoff_id: attackRealHandoffId, fake_active_source: database.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id='SESSION-PRODUCTION-SOURCE'").get() };
+    database.prepare("INSERT OR REPLACE INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)")
+      .run("HO-FALSE-NEGATIVE-FAKE", "SESSION-FAKE-REPLACEMENT", "RUNNER-P0-NEWER", "BIND-P0-NEWER", "SUPERSEDED", "2099-01-01T00:02:00.000Z", "EVT-FORGED-HANDOFF", "2099-01-01T00:03:00.000Z", "forged newer lifecycle");
+    falseNegativeAttack = { deleted_handoff_id: attackRealHandoffId, fake_active_source: database.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id='SESSION-PRODUCTION-SOURCE'").get(), fake_binding: database.prepare("SELECT handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,superseded_at,superseded_reason FROM runner_session_bindings WHERE handoff_id='HO-FALSE-NEGATIVE-FAKE'").get() };
   }
   database.close();
 }
 
 writeFileSync(output, `${JSON.stringify({
   schema: "aiopago.operation-latch-authority-p0-attack/2", pid: process.pid, ppid: process.ppid,
-  identity, root, service, canonical, key, broker, attempts, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, falseNegativeAttack,
+  identity, root, service, canonical, key, broker, attempts, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, falseNegativeAttack,
   protectedAllDenied: attempts.every((entry) => entry.denied === true),
 }, null, 2)}\n`);

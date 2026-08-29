@@ -37,6 +37,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     && typeof capability?.claimHandoffLatch === "function"
     && typeof capability?.saveHandoff === "function"
     && typeof capability?.bindRunnerSession === "function"
+    && typeof capability?.projectCanonicalRunnerSessionBinding === "function"
     && typeof capability?.supersedeRunnerSessionBinding === "function"
     && typeof capability?.beginDispatch === "function"
     && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
@@ -52,6 +53,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     claimHandoffLatch: capability.claimHandoffLatch,
     saveHandoff: capability.saveHandoff,
     bindRunnerSession: capability.bindRunnerSession,
+    projectCanonicalRunnerSessionBinding: capability.projectCanonicalRunnerSessionBinding,
     supersedeRunnerSessionBinding: capability.supersedeRunnerSessionBinding,
     beginDispatch: capability.beginDispatch,
     finishDispatch: capability.finishDispatch,
@@ -147,6 +149,10 @@ export function saveTrustedHandoff(storage, ...args) {
 
 export function bindTrustedRunnerSession(storage, ...args) {
   return trustedStorageCapability(storage).bindRunnerSession(...args);
+}
+
+export function projectTrustedCanonicalRunnerSessionBinding(storage, ...args) {
+  return trustedStorageCapability(storage).projectCanonicalRunnerSessionBinding(...args);
 }
 
 export function supersedeTrustedRunnerSessionBinding(storage, ...args) {

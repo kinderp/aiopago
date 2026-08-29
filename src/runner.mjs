@@ -92,7 +92,9 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
       ? (() => { const active = handoffAuthority.getActiveSource(...args); return active ? handoffAuthority.getHandoffReservation(active.handoff_id) : null; })()
       : storage.findHandoffBySource(...args)),
     pendingContinuityFailureForTask: (...args) => detached(handoffAuthority ? null : storage.pendingContinuityFailureForTask(...args)),
-    getRunnerSessionBinding: read("getRunnerSessionBinding"),
+    getRunnerSessionBinding: (...args) => detached(handoffAuthority?.getLifecycleBinding
+      ? handoffAuthority.getLifecycleBinding(...args)
+      : storage.getRunnerSessionBinding(...args)),
     latestHandoffForTask: (...args) => detached(handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args)),
     operationsForTask: read("operationsForTask"),
     getMetricSession: read("getMetricSession"),
@@ -393,8 +395,22 @@ export class GuardianRunner {
     requireRunnerAuthority(authority);
     const sessionId = this.lifecycleSessionId(ctx);
     if (!sessionId || (this.sessionLifecycle && this.sessionLifecycle.sessionId !== sessionId)) return false;
+    const activeLifecycle = this.sessionLifecycle;
     this.sessionLifecycleEpoch += 1;
     this.sessionLifecycle = Object.freeze({ sessionId, epoch: this.sessionLifecycleEpoch, active: false });
+    if (this.reservationAuthority?.getLifecycleBindingBySession && activeLifecycle?.active === true) {
+      const binding = this.reservationAuthority.getLifecycleBindingBySession(sessionId);
+      if (binding?.status === "ACTIVE") {
+        invariant(binding.runner_instance_id === this.runnerInstanceId
+          && binding.lifecycle_incarnation === activeLifecycle.epoch,
+        "LIFECYCLE_BINDING_STALE", "Shutdown lifecycle does not match the protected ACTIVE binding");
+        this.reservationAuthority.requestLifecycleBindingTransition(`shutdown:${binding.session_binding_id}:${activeLifecycle.epoch}`, {
+          expected: binding,
+          nextStatus: "SUPERSEDED",
+          reason: "session_shutdown",
+        });
+      }
+    }
     return true;
   }
 

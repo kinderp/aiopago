@@ -329,7 +329,7 @@ function registerTrustedHandoffPlanCapability(ledger, capability) {
   }));
 }
 function registerTrustedHandoffStorageCapability(storage, capability) {
-  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.projectCanonicalRunnerSessionBinding === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
@@ -342,6 +342,7 @@ function registerTrustedHandoffStorageCapability(storage, capability) {
     claimHandoffLatch: capability.claimHandoffLatch,
     saveHandoff: capability.saveHandoff,
     bindRunnerSession: capability.bindRunnerSession,
+    projectCanonicalRunnerSessionBinding: capability.projectCanonicalRunnerSessionBinding,
     supersedeRunnerSessionBinding: capability.supersedeRunnerSessionBinding,
     beginDispatch: capability.beginDispatch,
     finishDispatch: capability.finishDispatch
@@ -422,6 +423,9 @@ function saveTrustedHandoff(storage, ...args) {
 }
 function bindTrustedRunnerSession(storage, ...args) {
   return trustedStorageCapability(storage).bindRunnerSession(...args);
+}
+function projectTrustedCanonicalRunnerSessionBinding(storage, ...args) {
+  return trustedStorageCapability(storage).projectCanonicalRunnerSessionBinding(...args);
 }
 function supersedeTrustedRunnerSessionBinding(storage, ...args) {
   return trustedStorageCapability(storage).supersedeRunnerSessionBinding(...args);
@@ -5268,6 +5272,45 @@ var init_git_state = __esm({
   }
 });
 
+// src/lifecycle-binding-authority.mjs
+function requireSecureLifecycleAuthority(authority) {
+  invariant(
+    authority?.lifecycleSecurity?.mode === LIFECYCLE_AUTHORITY_MODES.SECURE && authority.lifecycleSecurity.canonical === true && authority.lifecycleSecurity.r1_m_13_lifecycle_binding_isolation === true,
+    "SECURE_LIFECYCLE_AUTHORITY_REQUIRED",
+    "Secure lifecycle cannot use or fall back to portable Runner/session bindings"
+  );
+  return authority;
+}
+var LIFECYCLE_AUTHORITY_MODES, SECURE_LIFECYCLE_AUTHORITY_LABEL, PORTABLE_LIFECYCLE_AUTHORITY_LABEL, LIFECYCLE_BINDING_STATES, LIFECYCLE_BINDING_IDENTITY_FIELDS;
+var init_lifecycle_binding_authority = __esm({
+  "src/lifecycle-binding-authority.mjs"() {
+    init_canonical();
+    init_errors();
+    init_operation_authority();
+    LIFECYCLE_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+    SECURE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+      mode: LIFECYCLE_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_lifecycle_binding_isolation: true
+    });
+    PORTABLE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+      mode: LIFECYCLE_AUTHORITY_MODES.PORTABLE,
+      canonical: false,
+      isolation: "ORDINARY_USER_OWNED",
+      r1_m_13_lifecycle_binding_isolation: false
+    });
+    LIFECYCLE_BINDING_STATES = Object.freeze(["ACTIVE", "SUPERSEDED"]);
+    LIFECYCLE_BINDING_IDENTITY_FIELDS = Object.freeze([
+      "handoff_id",
+      "replacement_session_id",
+      "runner_instance_id",
+      "session_binding_id",
+      "lifecycle_incarnation"
+    ]);
+  }
+});
+
 // src/metrics.mjs
 import { statSync as statSync3 } from "node:fs";
 import { performance as performance2 } from "node:perf_hooks";
@@ -5906,6 +5949,7 @@ var init_handoff = __esm({
     init_errors();
     init_git_state();
     init_handoff_reservation_authority();
+    init_lifecycle_binding_authority();
     init_handoff_plan_internal();
     init_handoff_consent();
     init_ledger();
@@ -5956,6 +6000,7 @@ var init_handoff = __esm({
         invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
         if (reservationAuthority) {
           requireSecureHandoffAuthority(reservationAuthority);
+          requireSecureLifecycleAuthority(reservationAuthority);
           invariant(
             safePoint?.latchAuthority === reservationAuthority,
             "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED",
@@ -5964,6 +6009,7 @@ var init_handoff = __esm({
         }
         this.storage = storage;
         this.reservationAuthority = reservationAuthority;
+        this.bindingAuthority = reservationAuthority ?? storage;
         this.handoffAuthoritySecurity = reservationAuthority?.handoffSecurity ?? PORTABLE_HANDOFF_AUTHORITY_LABEL;
         this.latchAuthority = reservationAuthority ?? storage;
         this.artifacts = artifacts;
@@ -6106,7 +6152,7 @@ var init_handoff = __esm({
           "LATCH_GENERATION_MISMATCH",
           "SafePoint result no longer matches the canonical recovery latch"
         );
-        const binding = this.storage.getRunnerSessionBinding(failedHandoffId);
+        const binding = this.bindingAuthority.getLifecycleBinding ? this.bindingAuthority.getLifecycleBinding(failedHandoffId) : this.storage.getRunnerSessionBinding(failedHandoffId);
         invariant(
           binding?.status === "ACTIVE" && binding.replacement_session_id === failed.target_session_id && binding.runner_instance_id === failed.runner_instance_id && binding.session_binding_id === failed.session_binding_id,
           "CONTINUITY_RECOVERY_SOURCE_INVALID",
@@ -6175,12 +6221,14 @@ var init_handoff = __esm({
         const recoveryParent = recoveryOf === null || secureReservation ? null : this.storage.getHandoff(recoveryOf);
         const portableLatest = secureReservation ? null : this.storage.latestHandoffForTask(plan2.task_id);
         const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(portableLatest);
-        if (secureReservation) invariant(
-          expectedHandoff === null && canonicalLatest === null,
-          "HANDOFF_TASK_RESERVATION_CONFLICT",
-          "Guided secure handoff requires no prior protected reservation"
-        );
-        else assertHandoffConsentIdentity(portableLatest, expectedHandoff);
+        if (secureReservation && canonicalLatest) {
+          const sourceBinding = this.bindingAuthority.getLifecycleBinding(canonicalLatest.handoff_id);
+          invariant(
+            sourceBinding?.status === "ACTIVE" && sourceBinding.replacement_session_id === sourceSessionId && sourceBinding.runner_instance_id === this.runnerInstanceId,
+            "HANDOFF_TASK_RESERVATION_CONFLICT",
+            "The current source is not the exact ACTIVE protected lifecycle successor"
+          );
+        } else if (!secureReservation) assertHandoffConsentIdentity(portableLatest, expectedHandoff);
         const latchAuthority = secureReservation ? this.reservationAuthority : this.storage;
         const observedLatch = latchAuthority.getLatch(plan2.task_id);
         const expectedLatch = guided ? {
@@ -6390,7 +6438,22 @@ var init_handoff = __esm({
         try {
           const runtimeBinding = readRuntimeRunnerBinding(session);
           invariant(runtimeBinding.handoff_id === h.handoff_id && runtimeBinding.runner_instance_id === h.runner_instance_id && runtimeBinding.session_binding_id === h.session_binding_id, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "replacement setup binding");
-          bindTrustedRunnerSession(this.storage, handoffId, runtimeBinding);
+          if (this.reservationAuthority) {
+            const lifecycle = options.verifyCurrentTarget?.(session);
+            invariant(
+              lifecycle?.sessionId === session.sessionId && lifecycle.runnerInstanceId === h.runner_instance_id && Number.isSafeInteger(lifecycle.lifecycleEpoch) && lifecycle.lifecycleEpoch > 0,
+              "LIFECYCLE_ATTESTATION_INVALID",
+              "Protected binding requires the exact active Runner lifecycle incarnation"
+            );
+            const canonical = this.bindingAuthority.requestLifecycleBindingCreate(handoffId, {
+              binding: { ...runtimeBinding, lifecycle_incarnation: lifecycle.lifecycleEpoch }
+            });
+            invariant(canonical?.binding?.status === "ACTIVE", "LIFECYCLE_BINDING_COMMIT_FAILED");
+            projectTrustedCanonicalRunnerSessionBinding(this.storage, handoffId, runtimeBinding, {
+              canonical: true,
+              binding: canonical.binding
+            });
+          } else bindTrustedRunnerSession(this.storage, handoffId, runtimeBinding);
         } catch (error) {
           h = this.storage.getHandoff(handoffId);
           h.state = "RUNNER_OWNERSHIP_ATTESTATION_FAILED";
@@ -6632,7 +6695,7 @@ var init_handoff = __esm({
         };
         return verifyRunnerOwnership({
           runtimeBinding: readRuntimeRunnerBinding(targetSession),
-          journalBinding: this.storage.getRunnerSessionBinding(h.handoff_id),
+          journalBinding: this.bindingAuthority.getLifecycleBinding ? this.bindingAuthority.getLifecycleBinding(h.handoff_id) : this.storage.getRunnerSessionBinding(h.handoff_id),
           manifestBinding: {
             schema_version: "1.0.0",
             handoff_id: manifest.handoff_id,
@@ -6690,7 +6753,7 @@ var init_handoff = __esm({
           "RESUME_EXPECTATION_STALE",
           "Resume prompt identity changed after confirmation was displayed"
         );
-        const binding = this.storage.getRunnerSessionBinding(handoffId);
+        const binding = this.bindingAuthority.getLifecycleBinding ? this.bindingAuthority.getLifecycleBinding(handoffId) : this.storage.getRunnerSessionBinding(handoffId);
         invariant(binding?.status === "ACTIVE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding is not ACTIVE");
         const latch = this.latchAuthority.getLatch(h.task_id);
         invariant(
@@ -7553,6 +7616,7 @@ var init_storage = __esm({
           claimHandoffLatch: ({ taskId: taskId2, reason: reason2, actor, expectedLatch }) => this.#claimLatch(taskId2, reason2, actor, expectedLatch),
           saveHandoff: (...args) => this.#saveHandoff(...args),
           bindRunnerSession: (...args) => this.#bindRunnerSession(...args),
+          projectCanonicalRunnerSessionBinding: (...args) => this.#projectCanonicalRunnerSessionBinding(...args),
           supersedeRunnerSessionBinding: (...args) => this.#supersedeRunnerSessionBinding(...args),
           beginDispatch: (...args) => this.#beginDispatch(...args),
           finishDispatch: (...args) => this.#finishDispatch(...args)
@@ -7708,7 +7772,7 @@ var init_storage = __esm({
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
         ('handoffs','Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode','1.1.0'),
-        ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
+        ('runner_session_bindings','Portable/dev Runner session binding projection; never canonical in SECURE authority mode','1.1.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
         ('metric_sessions','Guardian SQLite bounded measurement summary','1.0.0'),
@@ -7722,6 +7786,8 @@ var init_storage = __esm({
         WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
       UPDATE authorities SET authority='Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='handoffs' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev Runner session binding projection; never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='runner_session_bindings';
     `);
       }
       getCalibrationRuntimeIdentity() {
@@ -7916,6 +7982,32 @@ var init_storage = __esm({
           };
           const event = this.appendEvent("RUNNER_SESSION_BOUND", data, { handoffId, eventKey: `runner-binding:${handoffId}` });
           database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)").run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", event.occurred_at, event.event_id);
+          return this.getRunnerSessionBinding(handoffId);
+        });
+      }
+      #projectCanonicalRunnerSessionBinding(handoffId, binding, proof) {
+        invariant(
+          proof?.canonical === true && proof?.binding?.handoff_id === handoffId && proof.binding.status === "ACTIVE" && proof.binding.replacement_session_id === binding?.replacement_session_id && proof.binding.runner_instance_id === binding?.runner_instance_id && proof.binding.session_binding_id === binding?.session_binding_id,
+          "LIFECYCLE_PROJECTION_PROOF_INVALID"
+        );
+        return this.transaction(() => {
+          const handoff = this.getHandoff(handoffId);
+          invariant(
+            handoff?.state === "REPLACEMENT_SESSION_CREATED_PAUSED" && handoff.target_session_id === binding.replacement_session_id,
+            "RUNNER_BINDING_STATE_INVALID"
+          );
+          const conflicts = database(this).prepare("SELECT handoff_id,bind_event_id FROM runner_session_bindings WHERE handoff_id=? OR replacement_session_id=? OR session_binding_id=?").all(handoffId, binding.replacement_session_id, binding.session_binding_id);
+          for (const conflict of conflicts) database(this).prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(conflict.handoff_id);
+          for (const conflict of conflicts) database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(conflict.bind_event_id, `runner-binding:${conflict.handoff_id}`);
+          const data = {
+            handoff_id: handoffId,
+            replacement_session_id: binding.replacement_session_id,
+            runner_instance_id: binding.runner_instance_id,
+            session_binding_id: binding.session_binding_id
+          };
+          database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(proof.binding.bind_event_id, `runner-binding:${handoffId}`);
+          database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(proof.binding.bind_event_id, handoffId, "RUNNER_SESSION_BOUND", `runner-binding:${handoffId}`, proof.binding.bound_at, JSON.stringify(data));
+          database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)").run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", proof.binding.bound_at, proof.binding.bind_event_id);
           return this.getRunnerSessionBinding(handoffId);
         });
       }
@@ -8247,7 +8339,7 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
       return active ? handoffAuthority.getHandoffReservation(active.handoff_id) : null;
     })() : storage.findHandoffBySource(...args)),
     pendingContinuityFailureForTask: (...args) => detached(handoffAuthority ? null : storage.pendingContinuityFailureForTask(...args)),
-    getRunnerSessionBinding: read("getRunnerSessionBinding"),
+    getRunnerSessionBinding: (...args) => detached(handoffAuthority?.getLifecycleBinding ? handoffAuthority.getLifecycleBinding(...args) : storage.getRunnerSessionBinding(...args)),
     latestHandoffForTask: (...args) => detached(handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args)),
     operationsForTask: read("operationsForTask"),
     getMetricSession: read("getMetricSession"),
@@ -8623,8 +8715,24 @@ var init_runner = __esm({
         requireRunnerAuthority(authority);
         const sessionId = this.lifecycleSessionId(ctx);
         if (!sessionId || this.sessionLifecycle && this.sessionLifecycle.sessionId !== sessionId) return false;
+        const activeLifecycle = this.sessionLifecycle;
         this.sessionLifecycleEpoch += 1;
         this.sessionLifecycle = Object.freeze({ sessionId, epoch: this.sessionLifecycleEpoch, active: false });
+        if (this.reservationAuthority?.getLifecycleBindingBySession && activeLifecycle?.active === true) {
+          const binding = this.reservationAuthority.getLifecycleBindingBySession(sessionId);
+          if (binding?.status === "ACTIVE") {
+            invariant(
+              binding.runner_instance_id === this.runnerInstanceId && binding.lifecycle_incarnation === activeLifecycle.epoch,
+              "LIFECYCLE_BINDING_STALE",
+              "Shutdown lifecycle does not match the protected ACTIVE binding"
+            );
+            this.reservationAuthority.requestLifecycleBindingTransition(`shutdown:${binding.session_binding_id}:${activeLifecycle.epoch}`, {
+              expected: binding,
+              nextStatus: "SUPERSEDED",
+              reason: "session_shutdown"
+            });
+          }
+        }
         return true;
       }
       noteCurrentReplacementActive(session, authority = null) {

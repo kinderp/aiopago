@@ -291,6 +291,7 @@ export class GuardianStorage {
       claimHandoffLatch: ({ taskId, reason, actor, expectedLatch }) => this.#claimLatch(taskId, reason, actor, expectedLatch),
       saveHandoff: (...args) => this.#saveHandoff(...args),
       bindRunnerSession: (...args) => this.#bindRunnerSession(...args),
+      projectCanonicalRunnerSessionBinding: (...args) => this.#projectCanonicalRunnerSessionBinding(...args),
       supersedeRunnerSessionBinding: (...args) => this.#supersedeRunnerSessionBinding(...args),
       beginDispatch: (...args) => this.#beginDispatch(...args),
       finishDispatch: (...args) => this.#finishDispatch(...args),
@@ -303,6 +304,7 @@ export class GuardianStorage {
       claimLatch: ({ taskId, reason, actor, expected }) => this.#claimLatch(taskId, reason, actor, expected),
       saveHandoff: trustedCapability.saveHandoff,
       bindRunnerSession: trustedCapability.bindRunnerSession,
+      projectCanonicalRunnerSessionBinding: trustedCapability.projectCanonicalRunnerSessionBinding,
       supersedeRunnerSessionBinding: trustedCapability.supersedeRunnerSessionBinding,
       beginDispatch: trustedCapability.beginDispatch,
       finishDispatch: trustedCapability.finishDispatch,
@@ -459,7 +461,7 @@ export class GuardianStorage {
         ('journal','Guardian SQLite append-only operational lifecycle','1.0.0'),
         ('latches','Portable/dev Guardian SQLite latch state; never canonical in SECURE authority mode','1.1.0'),
         ('handoffs','Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode','1.1.0'),
-        ('runner_session_bindings','Guardian SQLite + append-only binding event','1.0.0'),
+        ('runner_session_bindings','Portable/dev Runner session binding projection; never canonical in SECURE authority mode','1.1.0'),
         ('operations','Portable/dev Guardian SQLite operation state; never canonical in SECURE authority mode','1.1.0'),
         ('artifacts','sealed JSON authoritative; SQLite index derived','1.0.0'),
         ('metric_sessions','Guardian SQLite bounded measurement summary','1.0.0'),
@@ -473,6 +475,8 @@ export class GuardianStorage {
         WHERE name='latches' AND authority='Guardian SQLite canonical runtime';
       UPDATE authorities SET authority='Portable/dev handoff lifecycle projection; reservation is never canonical in SECURE authority mode',schema_version='1.1.0'
         WHERE name='handoffs' AND authority='Guardian SQLite canonical runtime';
+      UPDATE authorities SET authority='Portable/dev Runner session binding projection; never canonical in SECURE authority mode',schema_version='1.1.0'
+        WHERE name='runner_session_bindings';
     `);
   }
 
@@ -682,6 +686,37 @@ export class GuardianStorage {
       const event = this.appendEvent("RUNNER_SESSION_BOUND", data, { handoffId, eventKey: `runner-binding:${handoffId}` });
       database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)")
         .run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", event.occurred_at, event.event_id);
+      return this.getRunnerSessionBinding(handoffId);
+    });
+  }
+
+  #projectCanonicalRunnerSessionBinding(handoffId, binding, proof) {
+    invariant(proof?.canonical === true && proof?.binding?.handoff_id === handoffId
+      && proof.binding.status === "ACTIVE"
+      && proof.binding.replacement_session_id === binding?.replacement_session_id
+      && proof.binding.runner_instance_id === binding?.runner_instance_id
+      && proof.binding.session_binding_id === binding?.session_binding_id,
+    "LIFECYCLE_PROJECTION_PROOF_INVALID");
+    return this.transaction(() => {
+      const handoff = this.getHandoff(handoffId);
+      invariant(handoff?.state === "REPLACEMENT_SESSION_CREATED_PAUSED"
+        && handoff.target_session_id === binding.replacement_session_id,
+      "RUNNER_BINDING_STATE_INVALID");
+      const conflicts = database(this).prepare("SELECT handoff_id,bind_event_id FROM runner_session_bindings WHERE handoff_id=? OR replacement_session_id=? OR session_binding_id=?")
+        .all(handoffId, binding.replacement_session_id, binding.session_binding_id);
+      for (const conflict of conflicts) database(this).prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(conflict.handoff_id);
+      for (const conflict of conflicts) database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(conflict.bind_event_id, `runner-binding:${conflict.handoff_id}`);
+      const data = {
+        handoff_id: handoffId,
+        replacement_session_id: binding.replacement_session_id,
+        runner_instance_id: binding.runner_instance_id,
+        session_binding_id: binding.session_binding_id,
+      };
+      database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(proof.binding.bind_event_id, `runner-binding:${handoffId}`);
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(proof.binding.bind_event_id, handoffId, "RUNNER_SESSION_BOUND", `runner-binding:${handoffId}`, proof.binding.bound_at, JSON.stringify(data));
+      database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id) VALUES(?,?,?,?,?,?,?)")
+        .run(handoffId, data.replacement_session_id, data.runner_instance_id, data.session_binding_id, "ACTIVE", proof.binding.bound_at, proof.binding.bind_event_id);
       return this.getRunnerSessionBinding(handoffId);
     });
   }

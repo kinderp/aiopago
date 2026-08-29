@@ -5,6 +5,7 @@ import { opaqueId, sha256, stableId, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { sameGitState } from "./git-state.mjs";
 import { PORTABLE_HANDOFF_AUTHORITY_LABEL, requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
+import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
 import {
   assertNoCompetingResumeEvidence,
   authorizeTrustedResume,
@@ -13,6 +14,7 @@ import {
   claimTrustedHandoffLatch,
   finishTrustedResumeDispatch,
   prepareTrustedContinuityRecovery,
+  projectTrustedCanonicalRunnerSessionBinding,
   reserveTrustedHandoffPlan,
   satisfyTrustedHandoffOwnerGate,
   saveTrustedHandoff,
@@ -198,11 +200,13 @@ export class HandoffService {
     invariant(typeof runnerInstanceId === "string" && runnerInstanceId.length > 0, "RUNNER_INSTANCE_REQUIRED");
     if (reservationAuthority) {
       requireSecureHandoffAuthority(reservationAuthority);
+      requireSecureLifecycleAuthority(reservationAuthority);
       invariant(safePoint?.latchAuthority === reservationAuthority,
         "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED", "Secure handoff reservation and canonical latch must share one protected authority");
     }
     this.storage = storage;
     this.reservationAuthority = reservationAuthority;
+    this.bindingAuthority = reservationAuthority ?? storage;
     this.handoffAuthoritySecurity = reservationAuthority?.handoffSecurity ?? PORTABLE_HANDOFF_AUTHORITY_LABEL;
     this.latchAuthority = reservationAuthority ?? storage;
     this.artifacts = artifacts;
@@ -326,7 +330,9 @@ export class HandoffService {
       "LATCH_GENERATION_MISMATCH", "Recovery latch changed after initial validation");
     if (safe) invariant(safe.latch.state === latch.state && safe.latch.generation === latch.generation && safe.latch.reason === latch.reason,
       "LATCH_GENERATION_MISMATCH", "SafePoint result no longer matches the canonical recovery latch");
-    const binding = this.storage.getRunnerSessionBinding(failedHandoffId);
+    const binding = this.bindingAuthority.getLifecycleBinding
+      ? this.bindingAuthority.getLifecycleBinding(failedHandoffId)
+      : this.storage.getRunnerSessionBinding(failedHandoffId);
     invariant(binding?.status === "ACTIVE"
       && binding.replacement_session_id === failed.target_session_id
       && binding.runner_instance_id === failed.runner_instance_id
@@ -394,9 +400,13 @@ export class HandoffService {
     const recoveryParent = recoveryOf === null || secureReservation ? null : this.storage.getHandoff(recoveryOf);
     const portableLatest = secureReservation ? null : this.storage.latestHandoffForTask(plan.task_id);
     const expectedHandoff = guided ? expectedEligibility.handoff : handoffConsentIdentity(portableLatest);
-    if (secureReservation) invariant(expectedHandoff === null && canonicalLatest === null,
-      "HANDOFF_TASK_RESERVATION_CONFLICT", "Guided secure handoff requires no prior protected reservation");
-    else assertHandoffConsentIdentity(portableLatest, expectedHandoff);
+    if (secureReservation && canonicalLatest) {
+      const sourceBinding = this.bindingAuthority.getLifecycleBinding(canonicalLatest.handoff_id);
+      invariant(sourceBinding?.status === "ACTIVE"
+        && sourceBinding.replacement_session_id === sourceSessionId
+        && sourceBinding.runner_instance_id === this.runnerInstanceId,
+      "HANDOFF_TASK_RESERVATION_CONFLICT", "The current source is not the exact ACTIVE protected lifecycle successor");
+    } else if (!secureReservation) assertHandoffConsentIdentity(portableLatest, expectedHandoff);
     const latchAuthority = secureReservation ? this.reservationAuthority : this.storage;
     const observedLatch = latchAuthority.getLatch(plan.task_id);
     const expectedLatch = guided ? {
@@ -609,7 +619,21 @@ export class HandoffService {
     try {
       const runtimeBinding = readRuntimeRunnerBinding(session);
       invariant(runtimeBinding.handoff_id === h.handoff_id && runtimeBinding.runner_instance_id === h.runner_instance_id && runtimeBinding.session_binding_id === h.session_binding_id, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "replacement setup binding");
-      bindTrustedRunnerSession(this.storage, handoffId, runtimeBinding);
+      if (this.reservationAuthority) {
+        const lifecycle = options.verifyCurrentTarget?.(session);
+        invariant(lifecycle?.sessionId === session.sessionId
+          && lifecycle.runnerInstanceId === h.runner_instance_id
+          && Number.isSafeInteger(lifecycle.lifecycleEpoch) && lifecycle.lifecycleEpoch > 0,
+        "LIFECYCLE_ATTESTATION_INVALID", "Protected binding requires the exact active Runner lifecycle incarnation");
+        const canonical = this.bindingAuthority.requestLifecycleBindingCreate(handoffId, {
+          binding: { ...runtimeBinding, lifecycle_incarnation: lifecycle.lifecycleEpoch },
+        });
+        invariant(canonical?.binding?.status === "ACTIVE", "LIFECYCLE_BINDING_COMMIT_FAILED");
+        projectTrustedCanonicalRunnerSessionBinding(this.storage, handoffId, runtimeBinding, {
+          canonical: true,
+          binding: canonical.binding,
+        });
+      } else bindTrustedRunnerSession(this.storage, handoffId, runtimeBinding);
     } catch (error) {
       h = this.storage.getHandoff(handoffId);
       h.state = "RUNNER_OWNERSHIP_ATTESTATION_FAILED";
@@ -857,7 +881,9 @@ export class HandoffService {
     };
     return verifyRunnerOwnership({
       runtimeBinding: readRuntimeRunnerBinding(targetSession),
-      journalBinding: this.storage.getRunnerSessionBinding(h.handoff_id),
+      journalBinding: this.bindingAuthority.getLifecycleBinding
+        ? this.bindingAuthority.getLifecycleBinding(h.handoff_id)
+        : this.storage.getRunnerSessionBinding(h.handoff_id),
       manifestBinding: {
         schema_version: "1.0.0",
         handoff_id: manifest.handoff_id,
@@ -912,7 +938,9 @@ export class HandoffService {
       && sha256(Buffer.from(h.resume_prompt, "utf8")) === h.resume_prompt_digest
       && h.resume_prompt === this.buildPrompt(h, manifest.payload),
     "RESUME_EXPECTATION_STALE", "Resume prompt identity changed after confirmation was displayed");
-    const binding = this.storage.getRunnerSessionBinding(handoffId);
+    const binding = this.bindingAuthority.getLifecycleBinding
+      ? this.bindingAuthority.getLifecycleBinding(handoffId)
+      : this.storage.getRunnerSessionBinding(handoffId);
     invariant(binding?.status === "ACTIVE", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "Durable Runner binding is not ACTIVE");
     const latch = this.latchAuthority.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation && latch.reason !== "HUMAN_TAKEOVER",

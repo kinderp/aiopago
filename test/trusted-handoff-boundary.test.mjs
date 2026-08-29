@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { ArtifactStore } from "../src/artifact-store.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
@@ -967,6 +968,11 @@ test("secure production workflow reserves canonically, projects compatibly, paus
         ...sourceSession("SESSION-SECURE-TARGET"), sessionFile: "/sessions/SESSION-SECURE-TARGET.jsonl", sessionManager,
         async sendUserMessage() { throw new Error("secure resume must remain unavailable"); },
       };
+      const projected = x.storage.latestHandoffForTask("TASK-TRUSTED");
+      db.prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run("EVT-PROJECT-FORGED-BINDING", projected.handoff_id, "RUNNER_SESSION_BOUND", `runner-binding:${projected.handoff_id}`, "2099-01-01T00:00:02.000Z", JSON.stringify({ handoff_id: projected.handoff_id, replacement_session_id: target.sessionId, runner_instance_id: "RUNNER-FORGED", session_binding_id: "BIND-FORGED" }));
+      db.prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)")
+        .run(projected.handoff_id, target.sessionId, "RUNNER-FORGED", "BIND-FORGED", "SUPERSEDED", "2099-01-01T00:00:02.000Z", "EVT-PROJECT-FORGED-BINDING", "2099-01-01T00:00:03.000Z", "forged");
       x.runner.runtime.session = target;
       await withSession({ ui: { async confirm() { return true; }, notify() {}, setEditorText() {} }, async sendUserMessage() { throw new Error("unexpected resume"); } });
       return { cancelled: false };
@@ -980,6 +986,9 @@ test("secure production workflow reserves canonically, projects compatibly, paus
     assert.equal(canonical.authorization_state, "NOT_AUTHORIZED");
     assert.equal(x.reservationAuthority.getActiveSource(x.session.sessionId).handoff_id, result.handoff_id);
     assert.equal(x.reservationAuthority.handoffReservationEvents(result.handoff_id).length, 1);
+    const protectedBinding = x.reservationAuthority.getLifecycleBinding(result.handoff_id);
+    assert.equal(protectedBinding.status, "ACTIVE"); assert.equal(protectedBinding.runner_instance_id, result.runner_instance_id);
+    assert.equal(x.publicRunner.storage.getRunnerSessionBinding(result.handoff_id).session_binding_id, result.session_binding_id);
     assert.equal(x.publicRunner.storage.latestHandoffForTask("TASK-TRUSTED").handoff_id, result.handoff_id, "secure status must ignore later-looking portable forgery");
 
     db.prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
@@ -990,6 +999,61 @@ test("secure production workflow reserves canonically, projects compatibly, paus
     assert.equal(x.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
     assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM dispatch_attempts WHERE handoff_id=?").get(result.handoff_id).count, 0);
+  } finally { x.close(); }
+});
+
+test("shutdown linearized before final binding attestation rejects a dead target with no canonical binding", async () => {
+  const x = fixture({ secureReservation: true });
+  let replacements = 0; let shutdownInjected = false; let bindingInstalled = false;
+  x.ctx.newSession = async ({ parentSession, setup, withSession }) => {
+    replacements += 1;
+    const entries = [];
+    const sessionManager = {
+      getSessionId: () => "SESSION-SHUTDOWN-BEFORE-BIND",
+      getEntries() {
+        if (bindingInstalled && !shutdownInjected) {
+          shutdownInjected = true;
+          x.runner.noteSessionShutdown({ type: "session_shutdown", reason: "binding race" }, { sessionManager: { getSessionId: () => "SESSION-SHUTDOWN-BEFORE-BIND" } });
+        }
+        return entries;
+      },
+      appendCustomEntry(customType, data) { entries.push({ type: "custom", customType, data }); bindingInstalled = true; },
+      getHeader: () => ({ parentSession }),
+    };
+    await setup(sessionManager);
+    const target = { ...sourceSession("SESSION-SHUTDOWN-BEFORE-BIND"), sessionFile: "/sessions/SESSION-SHUTDOWN-BEFORE-BIND.jsonl", sessionManager };
+    x.runner.runtime.session = target;
+    await withSession({ ui: { async confirm() { return false; }, notify() {}, setEditorText() {} }, async sendUserMessage() {} });
+    return { cancelled: false };
+  };
+  try {
+    await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" }), (error) => error.code === "RESUME_EXPECTATION_STALE");
+    const reservation = x.reservationAuthority.latestHandoffReservationForTask("TASK-TRUSTED");
+    assert.ok(reservation); assert.equal(replacements, 1); assert.equal(shutdownInjected, true);
+    assert.equal(x.reservationAuthority.getLifecycleBinding(reservation.handoff_id), null);
+    assert.equal(x.storage.getHandoff(reservation.handoff_id).state, "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+  } finally { x.close(); }
+});
+
+test("external paused replacement plus protected binding commit failure remains paused with exact canonical evidence", async () => {
+  let x;
+  x = fixture({ secureReservation: true, testHooks: {
+    beforeReplacement() {
+      const breaker = new DatabaseSync(x.reservationAuthority.path);
+      breaker.exec("CREATE TRIGGER force_lifecycle_binding_failure BEFORE INSERT ON lifecycle_bindings BEGIN SELECT RAISE(ABORT,'forced lifecycle binding failure'); END;");
+      breaker.close();
+    },
+  } });
+  const replacements = installPausedReplacement(x, { targetId: "SESSION-BINDING-COMMIT-FAIL" });
+  try {
+    await assert.rejects(() => x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" }), /forced lifecycle binding failure/);
+    const reservation = x.reservationAuthority.latestHandoffReservationForTask("TASK-TRUSTED");
+    assert.ok(reservation); assert.equal(replacements(), 1);
+    assert.equal(x.reservationAuthority.getLifecycleBinding(reservation.handoff_id), null);
+    const projected = x.storage.getHandoff(reservation.handoff_id);
+    assert.equal(projected.target_session_id, "SESSION-BINDING-COMMIT-FAIL");
+    assert.equal(projected.state, "RUNNER_OWNERSHIP_ATTESTATION_FAILED");
+    assert.equal(projected.failure.code, "ERR_SQLITE_ERROR");
   } finally { x.close(); }
 });
 

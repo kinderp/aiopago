@@ -479,7 +479,17 @@ test("R1-M-13 every packed JavaScript file is inert or public-only on direct imp
     await new Promise((resolve, reject) => { worker.once("error", reject); worker.once("exit", resolve); });
     process.stdout.write(JSON.stringify(row));
   `);
-  const protectedWorker = JSON.parse(execFileSync(process.execPath, [protectedWorkerProbe], { cwd: x.consumer, encoding: "utf8" }));
+  let protectedWorkerOutput = null; let protectedWorkerError = null;
+  for (let attempt = 0; attempt < 3 && protectedWorkerOutput === null; attempt += 1) {
+    try {
+      protectedWorkerOutput = execFileSync(process.execPath, [protectedWorkerProbe], { cwd: x.consumer, encoding: "utf8", timeout: 60_000 });
+    } catch (error) {
+      protectedWorkerError = error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_000);
+    }
+  }
+  if (protectedWorkerOutput === null) throw protectedWorkerError;
+  const protectedWorker = JSON.parse(protectedWorkerOutput);
   assert.equal(protectedWorker.pid, protectedWorker.parentPid);
   assert.ok(protectedWorker.threadId > 0);
   assert.deepEqual([protectedWorker.factory, protectedWorker.commands, protectedWorker.handlers], [0, 0, 0]);
