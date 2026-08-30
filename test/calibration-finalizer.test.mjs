@@ -7,7 +7,7 @@ import { finalizeCalibrationRun } from "../src/calibration-finalizer.mjs";
 import { CALIBRATION_ATTESTATION_SCHEMA } from "../src/calibration-preflight.mjs";
 import { LEGACY_CALIBRATION_QUALITY_SCHEMA, emptyCalibrationQualityEvidence, writeCalibrationQualityEvidence } from "../src/calibration-quality.mjs";
 import { sha256 } from "../src/canonical.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, storageDatabaseForInternalTest } from "../src/storage.mjs";
 
 const COMMANDS = [
   "npm run check",
@@ -453,7 +453,7 @@ test("controlled-environment mismatch between protocol and attestation is INVALI
   writeFileSync(attestationPath, `${JSON.stringify(attestation)}\n`);
   const storage = new GuardianStorage(join(x.runRoot, "runtime", "guardian.sqlite"));
   try {
-    storage.db.prepare("UPDATE calibration_runtime_identity SET attestation_sha256=? WHERE singleton=1")
+    storageDatabaseForInternalTest(storage).prepare("UPDATE calibration_runtime_identity SET attestation_sha256=? WHERE singleton=1")
       .run(sha256(readFileSync(attestationPath)).slice("sha256:".length));
   } finally { storage.close(); }
   const { record } = finalizeCalibrationRun({ runRoot: x.runRoot });

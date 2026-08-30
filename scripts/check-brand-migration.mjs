@@ -39,10 +39,10 @@ const fullAllowlist = new Map(Object.entries({
 }));
 
 const shortAllowlist = new Map(Object.entries({
-  "CHECKPOINT.md": [27, "rename closure compatibility summary, 0.2-D alias evidence, and immutable session history"],
+  "CHECKPOINT.md": [29, "rename closure compatibility summary, 0.2-D alias evidence, immutable history, and current package-artifact matrix"],
   "README.md": [1, "deprecated CLI notice"],
   "TASK_PLAN.md": [11, "closed Ledger command provenance"],
-  [["bin", `${legacyShort}.mjs`].join("/")]: [1, "deprecated thin CLI wrapper"],
+  [["bin", `${legacyShort}.mjs`].join("/")]: [0, "deprecated thin CLI wrapper path only"],
   "docs/0.2-b-plan-proposal-foundation.md": [2, "explicit legacy owner-command compatibility policy"],
   "docs/0.2-d-start-objective.md": [1, "deprecated CLI compatibility documentation"],
   "docs/m1-h2-calibration-pilot.json": [2, "frozen digest-bound protocol"],
@@ -51,6 +51,7 @@ const shortAllowlist = new Map(Object.entries({
   "docs/portable-alpha.md": [3, "deprecated CLI/TUI and environment compatibility"],
   "docs/rename-aiopago-migration.md": [16, "rename inventory and compatibility documentation"],
   "package.json": [4, "deprecated executable and npm script"],
+  "package-lock.json": [2, "lockfile records the deprecated executable metadata"],
   "src/bootstrap.mjs": [1, "legacy managed-ignore marker"],
   "src/cli-entry.mjs": [1, "deprecated CLI warning"],
   "src/context-advisor.mjs": [1, "legacy environment fallback"],
@@ -59,6 +60,7 @@ const shortAllowlist = new Map(Object.entries({
   "test/core.test.mjs": [5, "legacy environment, Ledger and TUI tests"],
   "test/fixtures/historical-owner-gate-b317f79.md": [2, "exact historical owner-gate command and actor fixture"],
   "test/plan-proposal.test.mjs": [6, "legacy owner-command alias compatibility tests"],
+  "test/package-artifact-security.test.mjs": [2, "real tarball inventory and direct-import security matrix include the deprecated compatibility executable"],
   "test/portable-alpha.test.mjs": [5, "deprecated CLI and package tests"],
   "test/start-objective.test.mjs": [3, "deprecated CLI start compatibility test"],
 }));
@@ -69,7 +71,8 @@ const legacyPathAllowlist = new Map([
 
 function trackedFiles() {
   const output = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
-  return output.toString("utf8").split("\0").filter(Boolean).map((path) => path.replaceAll("\\", "/"));
+  return output.toString("utf8").split("\0").filter(Boolean).map((path) => path.replaceAll("\\", "/"))
+    .filter((path) => !path.startsWith("dist/"));
 }
 
 function count(text, pattern) {

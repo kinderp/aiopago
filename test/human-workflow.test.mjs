@@ -8,9 +8,10 @@ import { initializeRepository } from "../src/bootstrap.mjs";
 import { runCli } from "../src/cli.mjs";
 import { sha256 } from "../src/canonical.mjs";
 import { observeHumanWorkflow, observeTaskPlan, projectHumanWorkflow } from "../src/human-workflow.mjs";
+import { handoffConsentIdentity } from "../src/handoff-consent.mjs";
 import { TaskLedger } from "../src/ledger.mjs";
 import { readRuntimeProjection } from "../src/runtime-reader.mjs";
-import { GuardianStorage } from "../src/storage.mjs";
+import { GuardianStorage, beginDispatchForInternalTest, bindRunnerSessionForInternalTest, claimLatchForInternalTest, claimTakeoverForInternalTest, finishDispatchForInternalTest, reserveHandoffForInternalTest, saveHandoffForInternalTest, storageDatabaseForInternalTest, supersedeRunnerSessionBindingForInternalTest } from "../src/storage.mjs";
 
 const fakePi = async () => ({ root: "/fake/pi", version: "0.83.0", name: "@earendil-works/pi-coding-agent" });
 function git(cwd, args) { return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
@@ -92,9 +93,10 @@ function planAuthority(root) { return new TaskLedger(join(root, "TASK_PLAN.md"))
 
 function seedResumeReady(storage, plan, suffix = "one") {
   storage.ensureLatch(plan.task_id);
-  const latch = storage.engageLatch(plan.task_id, "INTEGRITY", "human:test");
+  const latch = claimLatchForInternalTest(storage, plan.task_id, "INTEGRITY", "human:test");
   const handoffId = `HO-${suffix}`;
-  storage.reserveHandoff({
+  const expectedHandoff = handoffConsentIdentity(storage.latestHandoffForTask(plan.task_id));
+  reserveHandoffForInternalTest(storage, {
     handoff_id: handoffId,
     source_session_id: `SES-source-${suffix}`,
     source_session_file: `/private/source-${suffix}.jsonl`,
@@ -119,13 +121,13 @@ function seedResumeReady(storage, plan, suffix = "one") {
     dispatch_state: "NOT_STARTED",
     dispatch_attempt_id: null,
     dispatch_attempt_no: 0,
-  });
+  }, { latch, expectedHandoff });
   const created = storage.getHandoff(handoffId);
   created.target_session_id = `SES-target-${suffix}`;
   created.target_session_file = `/private/target-${suffix}.jsonl`;
   created.state = "REPLACEMENT_SESSION_CREATED_PAUSED";
-  storage.saveHandoff(created, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: created.target_session_id });
-  storage.bindRunnerSession(handoffId, {
+  saveHandoffForInternalTest(storage, created, "REPLACEMENT_SESSION_CREATED_PAUSED", { target_session_id: created.target_session_id });
+  bindRunnerSessionForInternalTest(storage, handoffId, {
     replacement_session_id: created.target_session_id,
     runner_instance_id: created.runner_instance_id,
     session_binding_id: created.session_binding_id,
@@ -133,8 +135,33 @@ function seedResumeReady(storage, plan, suffix = "one") {
   const ready = storage.getHandoff(handoffId);
   ready.resume_prompt_id = `RP-${suffix}`;
   ready.state = "RESUME_READY";
-  storage.saveHandoff(ready, "CONTINUITY_VALIDATED", {});
+  saveHandoffForInternalTest(storage, ready, "CONTINUITY_VALIDATED", {});
   return storage.getHandoff(handoffId);
+}
+
+function seedCommittedAdmission(storage, handoff, suffix = handoff.handoff_id) {
+  return storage.transaction(() => {
+    const h = storage.getHandoff(handoff.handoff_id);
+    const latch = storage.getLatch(h.task_id);
+    const generation = latch.generation + 1;
+    const actor = "human:test";
+    const released = storage.appendEvent("LATCH_RELEASED", { task_id: h.task_id, generation, actor }, { handoffId: h.handoff_id, eventKey: `latch-release:${h.task_id}:${generation}` });
+    storageDatabaseForInternalTest(storage).prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?")
+      .run(generation, released.occurred_at, actor, released.event_id, h.task_id);
+    const admissionId = `ADM-${suffix}`;
+    storageDatabaseForInternalTest(storage).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+      .run(h.resume_prompt_id, h.handoff_id, actor, generation, released.occurred_at);
+    storageDatabaseForInternalTest(storage).prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+      .run(admissionId, h.resume_prompt_id, `resume:${h.resume_prompt_id}`, h.handoff_id, released.occurred_at);
+    h.authorization_state = "AUTHORIZED";
+    h.admission_state = "COMMITTED";
+    h.admission_id = admissionId;
+    h.state = "RESUME_ADMISSION_COMMITTED";
+    storageDatabaseForInternalTest(storage).prepare("UPDATE handoffs SET state=?,projection_json=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), h.handoff_id);
+    storage.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor }, { handoffId: h.handoff_id, eventKey: `authorization:${h.resume_prompt_id}` });
+    storage.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admissionId, idempotency_key: `resume:${h.resume_prompt_id}` }, { handoffId: h.handoff_id, eventKey: `admission:${h.resume_prompt_id}` });
+    return storage.getHandoff(h.handoff_id);
+  });
 }
 
 function assertUnchanged(before, after) {
@@ -201,7 +228,7 @@ test("a live WAL runtime fails closed without changing database or sidecar bytes
   const storage = new GuardianStorage(join(root, ".guardian", "runtime", "guardian.sqlite"));
   try {
     storage.ensureLatch("TASK-HUMAN");
-    storage.engageLatch("TASK-HUMAN", "HUMAN_TAKEOVER", "human:test");
+    claimTakeoverForInternalTest(storage, "TASK-HUMAN", "human:test");
     const before = capture(root);
     assert.equal(before.runtimeEntries.includes("guardian.sqlite-wal"), true);
     assert.equal(before.runtimeEntries.includes("guardian.sqlite-shm"), true);
@@ -323,34 +350,34 @@ test("plan --raw never invokes TaskLedger.read or the validator", async () => {
 test("review regressions fail closed at the architectural boundary without presenter hard-coding", async (t) => {
   const cases = [
     ["future operation state", (storage) => {
-      storage.db.prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,outcome,admitted_at) VALUES(?,?,?,?,?,?,?)")
+      storageDatabaseForInternalTest(storage).prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,outcome,admitted_at) VALUES(?,?,?,?,?,?,?)")
         .run("OP-FUTURE", "TASK-HUMAN", 0, "READ_ONLY", "FUTURE_STATE", null, "2026-08-16T10:00:00.000Z");
     }],
     ["latch row disagrees with HUMAN_TAKEOVER journal", (storage, plan) => {
       seedResumeReady(storage, plan, "takeover-mismatch");
-      storage.engageLatch(plan.task_id, "HUMAN_TAKEOVER", "human:test");
-      storage.db.prepare("UPDATE latches SET reason='INTEGRITY' WHERE task_id=?").run(plan.task_id);
+      claimTakeoverForInternalTest(storage, plan.task_id, "human:test");
+      storageDatabaseForInternalTest(storage).prepare("UPDATE latches SET reason='INTEGRITY' WHERE task_id=?").run(plan.task_id);
     }],
     ["authorization actor is not human", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "actor");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-actor");
-      storage.beginDispatch(handoff.handoff_id, "DSP-actor", 1);
-      storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
-      storage.db.prepare("UPDATE authorizations SET actor='future:machine' WHERE handoff_id=?").run(handoff.handoff_id);
+      seedCommittedAdmission(storage, handoff, "actor");
+      beginDispatchForInternalTest(storage, handoff.handoff_id, "DSP-actor", 1);
+      finishDispatchForInternalTest(storage, handoff.handoff_id, "ACKNOWLEDGED");
+      storageDatabaseForInternalTest(storage).prepare("UPDATE authorizations SET actor='future:machine' WHERE handoff_id=?").run(handoff.handoff_id);
     }],
     ["RESUME_ADMISSION_COMMITTED event is missing", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "missing-admission-event");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-missing-event");
-      storage.beginDispatch(handoff.handoff_id, "DSP-missing-event", 1);
-      storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
-      storage.db.prepare("DELETE FROM journal WHERE handoff_id=? AND event_type='RESUME_ADMISSION_COMMITTED'").run(handoff.handoff_id);
+      seedCommittedAdmission(storage, handoff, "missing-event");
+      beginDispatchForInternalTest(storage, handoff.handoff_id, "DSP-missing-event", 1);
+      finishDispatchForInternalTest(storage, handoff.handoff_id, "ACKNOWLEDGED");
+      storageDatabaseForInternalTest(storage).prepare("DELETE FROM journal WHERE handoff_id=? AND event_type='RESUME_ADMISSION_COMMITTED'").run(handoff.handoff_id);
     }],
     ["authorization/admission/dispatch journal sequence is incomplete", (storage, plan) => {
       const handoff = seedResumeReady(storage, plan, "incomplete-sequence");
-      storage.authorizeAndAdmit(handoff.handoff_id, "human:test", `resume:${handoff.resume_prompt_id}`, "ADM-incomplete");
-      storage.beginDispatch(handoff.handoff_id, "DSP-incomplete", 1);
-      storage.finishDispatch(handoff.handoff_id, "ACKNOWLEDGED");
-      storage.db.prepare("DELETE FROM journal WHERE handoff_id=? AND event_type IN ('RESUME_AUTHORIZED','RESUME_DISPATCH_INTENT')").run(handoff.handoff_id);
+      seedCommittedAdmission(storage, handoff, "incomplete");
+      beginDispatchForInternalTest(storage, handoff.handoff_id, "DSP-incomplete", 1);
+      finishDispatchForInternalTest(storage, handoff.handoff_id, "ACKNOWLEDGED");
+      storageDatabaseForInternalTest(storage).prepare("DELETE FROM journal WHERE handoff_id=? AND event_type IN ('RESUME_AUTHORIZED','RESUME_DISPATCH_INTENT')").run(handoff.handoff_id);
     }],
   ];
 
@@ -375,30 +402,30 @@ test("review regressions fail closed at the architectural boundary without prese
 test("all persisted authorization/admission/dispatch states remain unverified without the Core Observation Port", async (t) => {
   const cases = [
     ["RESUME_READY", (storage, h) => h],
-    ["RESUME_ADMISSION_COMMITTED", (storage, h) => storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`).handoff],
+    ["RESUME_ADMISSION_COMMITTED", (storage, h) => seedCommittedAdmission(storage, h)],
     ["RESUME_DISPATCHING", (storage, h) => {
-      const admitted = storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`).handoff;
-      return storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1).handoff;
+      const admitted = seedCommittedAdmission(storage, h);
+      return beginDispatchForInternalTest(storage, h.handoff_id, `DSP-${h.handoff_id}`, 1).handoff;
     }],
     ["RESUME_DISPATCHED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
-      storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
-      return storage.finishDispatch(h.handoff_id, "DISPATCHED");
+      seedCommittedAdmission(storage, h);
+      beginDispatchForInternalTest(storage, h.handoff_id, `DSP-${h.handoff_id}`, 1);
+      return finishDispatchForInternalTest(storage, h.handoff_id, "DISPATCHED");
     }],
     ["RESUME_DISPATCH_FAILED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
-      storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
-      return storage.finishDispatch(h.handoff_id, "FAILED", "known failure");
+      seedCommittedAdmission(storage, h);
+      beginDispatchForInternalTest(storage, h.handoff_id, `DSP-${h.handoff_id}`, 1);
+      return finishDispatchForInternalTest(storage, h.handoff_id, "FAILED", "known failure");
     }],
     ["RESUME_DISPATCH_UNKNOWN", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
-      storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
-      return storage.finishDispatch(h.handoff_id, "UNKNOWN", "ambiguous");
+      seedCommittedAdmission(storage, h);
+      beginDispatchForInternalTest(storage, h.handoff_id, `DSP-${h.handoff_id}`, 1);
+      return finishDispatchForInternalTest(storage, h.handoff_id, "UNKNOWN", "ambiguous");
     }],
     ["RESUMED", (storage, h) => {
-      storage.authorizeAndAdmit(h.handoff_id, "human:test", `resume:${h.resume_prompt_id}`, `ADM-${h.handoff_id}`);
-      storage.beginDispatch(h.handoff_id, `DSP-${h.handoff_id}`, 1);
-      return storage.finishDispatch(h.handoff_id, "ACKNOWLEDGED");
+      seedCommittedAdmission(storage, h);
+      beginDispatchForInternalTest(storage, h.handoff_id, `DSP-${h.handoff_id}`, 1);
+      return finishDispatchForInternalTest(storage, h.handoff_id, "ACKNOWLEDGED");
     }],
   ];
 
@@ -424,7 +451,7 @@ test("unknown handoff state fails closed", async () => {
   const handoff = seedResumeReady(storage, plan, "unknown");
   const projection = storage.getHandoff(handoff.handoff_id);
   projection.state = "FUTURE_RUNTIME_STATE";
-  storage.db.prepare("UPDATE handoffs SET state=?,projection_json=? WHERE handoff_id=?").run(projection.state, JSON.stringify(projection), handoff.handoff_id);
+  storageDatabaseForInternalTest(storage).prepare("UPDATE handoffs SET state=?,projection_json=? WHERE handoff_id=?").run(projection.state, JSON.stringify(projection), handoff.handoff_id);
   storage.close();
   const observed = readRuntimeProjection(join(root, ".guardian", "runtime", "guardian.sqlite"), plan);
   assert.equal(observed.workflow, "NEEDS_ATTENTION");
@@ -435,7 +462,7 @@ test("takeover authority from the prior task survives a direct plan task_id chan
   const root = await fixture();
   const storage = new GuardianStorage(join(root, ".guardian", "runtime", "guardian.sqlite"));
   storage.ensureLatch("TASK-HUMAN");
-  storage.engageLatch("TASK-HUMAN", "HUMAN_TAKEOVER", "human:test");
+  claimTakeoverForInternalTest(storage, "TASK-HUMAN", "human:test");
   storage.close();
   const changed = task({ task_id: "TASK-NEW", plan_revision_id: "PLAN-NEW" });
   changed.task_items = changed.task_items.map((item) => ({ ...item, task_id: "TASK-NEW" }));
@@ -445,18 +472,16 @@ test("takeover authority from the prior task survives a direct plan task_id chan
   assert.doesNotMatch(status.output, /pronto a continuare/);
 });
 
-test("a prior dispatch ambiguity is not hidden by a later acknowledged handoff", async () => {
+test("a prior dispatch ambiguity transactionally blocks a later handoff lifecycle", async () => {
   const root = await fixture();
   const storage = new GuardianStorage(join(root, ".guardian", "runtime", "guardian.sqlite"));
   const plan = planAuthority(root);
   const first = seedResumeReady(storage, plan, "ambiguous-first");
-  storage.authorizeAndAdmit(first.handoff_id, "human:test", `resume:${first.resume_prompt_id}`, "ADM-first");
-  storage.beginDispatch(first.handoff_id, "DSP-first", 1);
-  storage.finishDispatch(first.handoff_id, "UNKNOWN", "transport ambiguous");
-  const second = seedResumeReady(storage, plan, "successful-second");
-  storage.authorizeAndAdmit(second.handoff_id, "human:test", `resume:${second.resume_prompt_id}`, "ADM-second");
-  storage.beginDispatch(second.handoff_id, "DSP-second", 1);
-  storage.finishDispatch(second.handoff_id, "ACKNOWLEDGED");
+  seedCommittedAdmission(storage, first, "first");
+  beginDispatchForInternalTest(storage, first.handoff_id, "DSP-first", 1);
+  finishDispatchForInternalTest(storage, first.handoff_id, "UNKNOWN", "transport ambiguous");
+  assert.throws(() => seedResumeReady(storage, plan, "forbidden-second"), (error) => error.code === "TASK_OPERATION_CONFLICT");
+  assert.equal(storageDatabaseForInternalTest(storage).prepare("SELECT COUNT(*) AS count FROM handoffs").get().count, 1);
   storage.close();
   const observed = readRuntimeProjection(join(root, ".guardian", "runtime", "guardian.sqlite"), plan);
   assert.equal(observed.workflow, "NEEDS_ATTENTION");
@@ -465,14 +490,14 @@ test("a prior dispatch ambiguity is not hidden by a later acknowledged handoff",
 
 test("generation, row/projection, admission projection, and Runner binding mismatches fail closed", async (t) => {
   const corruptions = [
-    ["generation", (storage) => storage.db.prepare("UPDATE latches SET generation=generation+2 WHERE task_id='TASK-HUMAN'").run()],
-    ["row/projection", (storage, h) => storage.db.prepare("UPDATE handoffs SET state='RESUME_DISPATCHING' WHERE handoff_id=?").run(h.handoff_id)],
+    ["generation", (storage) => storageDatabaseForInternalTest(storage).prepare("UPDATE latches SET generation=generation+2 WHERE task_id='TASK-HUMAN'").run()],
+    ["row/projection", (storage, h) => storageDatabaseForInternalTest(storage).prepare("UPDATE handoffs SET state='RESUME_DISPATCHING' WHERE handoff_id=?").run(h.handoff_id)],
     ["admission projection", (storage, h) => {
       const projection = storage.getHandoff(h.handoff_id);
       projection.dispatch_state = "DISPATCHING";
-      storage.db.prepare("UPDATE handoffs SET projection_json=? WHERE handoff_id=?").run(JSON.stringify(projection), h.handoff_id);
+      storageDatabaseForInternalTest(storage).prepare("UPDATE handoffs SET projection_json=? WHERE handoff_id=?").run(JSON.stringify(projection), h.handoff_id);
     }],
-    ["binding", (storage, h) => storage.db.prepare("UPDATE runner_session_bindings SET runner_instance_id='RUNNER-incompatible' WHERE handoff_id=?").run(h.handoff_id)],
+    ["binding", (storage, h) => storageDatabaseForInternalTest(storage).prepare("UPDATE runner_session_bindings SET runner_instance_id='RUNNER-incompatible' WHERE handoff_id=?").run(h.handoff_id)],
   ];
   for (const [name, corrupt] of corruptions) {
     await t.test(name, async () => {

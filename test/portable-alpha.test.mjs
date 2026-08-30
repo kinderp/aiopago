@@ -317,6 +317,7 @@ test("environment checks reject incompatible Node, missing Git, and unavailable 
   assert.equal(isSupportedNodeVersion("23.0.0"), true);
   assert.equal(isSupportedNodeVersion("22.18.9"), false);
   assert.equal(isSupportedPiVersion("0.83.0"), true);
+  assert.equal(isSupportedPiVersion("0.83.1"), false);
   assert.equal(isSupportedPiVersion("0.83.0-beta.1"), false);
   assert.equal(isSupportedPiVersion("0.84.0"), false);
   let piCalls = 0;
@@ -331,10 +332,10 @@ test("environment checks reject incompatible Node, missing Git, and unavailable 
     () => checkPortableEnvironment({ piInspector: async () => { throw new GuardianError("PI_UNAVAILABLE", "install Pi"); } }),
     (error) => error.code === "PI_UNAVAILABLE",
   );
-  await assert.rejects(
-    () => resolvePiRoot({ root: join(temp("aiopago missing pi root "), "missing") }),
-    (error) => error.code === "PI_UNAVAILABLE",
-  );
+  const configured = join(temp("aiopago ignored pi root "), "missing");
+  process.env.PI_CODING_AGENT_ROOT = configured;
+  try { assert.notEqual((await resolvePiRoot()).toLowerCase(), configured.toLowerCase()); }
+  finally { delete process.env.PI_CODING_AGENT_ROOT; }
   const unrelated = temp("aiopago unrelated project pi ");
   const unrelatedPi = join(unrelated, "node_modules", "@earendil-works", "pi-coding-agent");
   mkdirSync(join(unrelatedPi, "dist"), { recursive: true });
@@ -421,13 +422,16 @@ test("package bin is invocable with an unrelated cwd and does not create target 
   assert.deepEqual(readdirSync(outside), []);
 });
 
-test("package declares a real CLI bin, ESM export, engine, and supported Pi peer", () => {
+test("package declares a real CLI bin, ESM export, engine, and exact owned Pi dependency", () => {
   const manifest = JSON.parse(readFileSync(join(INSTALLATION_ROOT, "package.json"), "utf8"));
   assert.equal(manifest.name, "aiopago");
   assert.equal(manifest.bin.aio, "bin/aio.mjs");
   assert.equal(manifest.bin.eio, "bin/eio.mjs");
   assert.equal(manifest.repository.url, "git+https://github.com/kinderp/aiopago.git");
-  assert.equal(manifest.exports["."], "./src/index.mjs");
+  assert.equal(manifest.exports["."], "./dist/index.mjs");
+  assert.deepEqual(manifest.files.slice(0, 2), ["bin/", "dist/"]);
+  assert.equal(manifest.files.includes("src/"), false);
   assert.equal(manifest.engines.node, ">=22.19.0");
-  assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.83.0 <0.84.0");
+  assert.equal(manifest.peerDependencies, undefined);
+  assert.equal(manifest.dependencies["@earendil-works/pi-coding-agent"], "0.83.0");
 });

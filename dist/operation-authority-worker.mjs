@@ -1,0 +1,3218 @@
+const __AIOPAGO_OPERATIONAL_ENTRY_URL__ = import.meta.url;
+
+// src/operation-authority-worker.mjs
+import { execFileSync } from "node:child_process";
+import { createInterface } from "node:readline";
+import { join } from "node:path";
+
+// src/errors.mjs
+var GuardianError = class extends Error {
+  constructor(code, message = code, details = void 0) {
+    super(message);
+    this.name = "GuardianError";
+    this.code = code;
+    this.details = details;
+  }
+};
+function fail(code, message = code, details) {
+  throw new GuardianError(code, message, details);
+}
+function invariant(condition, code, message = code, details) {
+  if (!condition) fail(code, message, details);
+}
+
+// src/operation-authority.mjs
+var OPERATION_AUTHORITY_MODES = Object.freeze({
+  SECURE: "SECURE",
+  PORTABLE: "PORTABLE"
+});
+var PREVIOUS_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.0.0";
+var LATCH_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1.0";
+var HANDOFF_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.2.0";
+var LIFECYCLE_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.3.0";
+var RESUME_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.4.0";
+var RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.5.0";
+var OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.6.0";
+var OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/7";
+var PROFILES = /* @__PURE__ */ new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
+var OUTCOMES = /* @__PURE__ */ new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);
+var IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/;
+var EFFECT_REFERENCE = /^(?:file|shell):[^\r\n]{1,2048}$/;
+var SECURE_OPERATION_AUTHORITY_LABEL = Object.freeze({
+  mode: OPERATION_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_operation_isolation: true
+});
+var PORTABLE_LABEL = Object.freeze({
+  mode: OPERATION_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_operation_isolation: false
+});
+function operationIdentifier(value, code, field) {
+  invariant(typeof value === "string" && IDENTIFIER.test(value), code, `${field} is invalid`);
+  return value;
+}
+function validateOperationAdmission(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "OPERATION_ADMISSION_INVALID");
+  const operationId = operationIdentifier(request.operationId, "OPERATION_ID_INVALID", "operationId");
+  const taskId = operationIdentifier(request.taskId, "OPERATION_TASK_INVALID", "taskId");
+  invariant(Number.isSafeInteger(request.generation) && request.generation >= 0, "OPERATION_GENERATION_INVALID");
+  invariant(PROFILES.has(request.profile), "OPERATION_PROFILE_INVALID");
+  return Object.freeze({ operationId, taskId, generation: request.generation, profile: request.profile });
+}
+function validateOperationTerminal(operationId, outcome, effectReference) {
+  operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+  invariant(OUTCOMES.has(outcome), "OPERATION_OUTCOME_INVALID");
+  invariant(effectReference === null || typeof effectReference === "string" && EFFECT_REFERENCE.test(effectReference), "OPERATION_EFFECT_REFERENCE_INVALID");
+  if (outcome !== "KNOWN_SUCCESS") invariant(effectReference === null, "OPERATION_EFFECT_REFERENCE_INVALID", "Only known success may carry effect evidence");
+  return Object.freeze({ operationId, outcome, effectReference });
+}
+function detachedOperation(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+var PortableOperationAuthority = class {
+  constructor(storage) {
+    invariant(storage && typeof storage.admitOperation === "function" && typeof storage.finishOperation === "function" && typeof storage.operationsForTask === "function", "PORTABLE_OPERATION_AUTHORITY_INVALID");
+    this.storage = storage;
+    this.security = PORTABLE_LABEL;
+  }
+  admitOperation(request) {
+    const value = validateOperationAdmission(request);
+    this.storage.admitOperation(value);
+    return detachedOperation(this.storage.operationsForTask(value.taskId).find((row) => row.operation_id === value.operationId));
+  }
+  finishOperation(operationId, outcome, effectReference = null) {
+    const value = validateOperationTerminal(operationId, outcome, effectReference);
+    this.storage.finishOperation(value.operationId, value.outcome, value.effectReference);
+    return null;
+  }
+  operationsForTask(taskId) {
+    operationIdentifier(taskId, "OPERATION_TASK_INVALID", "taskId");
+    return Object.freeze(this.storage.operationsForTask(taskId).map(detachedOperation));
+  }
+  getOperation(operationId) {
+    operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+    return null;
+  }
+  close() {
+  }
+};
+function portableOperationAuthority(storage) {
+  return new PortableOperationAuthority(storage);
+}
+function requireSecureOperationAuthority(authority) {
+  invariant(
+    authority?.security?.mode === OPERATION_AUTHORITY_MODES.SECURE && authority.security.canonical === true && authority.security.r1_m_13_operation_isolation === true,
+    "SECURE_OPERATION_AUTHORITY_REQUIRED",
+    "Secure execution cannot use or fall back to portable operation state"
+  );
+  return authority;
+}
+
+// src/latch-authority.mjs
+var LATCH_AUTHORITY_MODES = Object.freeze({
+  SECURE: "SECURE",
+  PORTABLE: "PORTABLE"
+});
+var SECURE_LATCH_AUTHORITY_LABEL = Object.freeze({
+  mode: LATCH_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_latch_isolation: true
+});
+var PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
+  mode: LATCH_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_latch_isolation: false
+});
+var LATCH_STATES = /* @__PURE__ */ new Set(["ENGAGED", "RELEASED"]);
+var BOUNDED_TEXT = /^[^\r\n]{1,256}$/;
+function detachedLatch(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function validateLatchExpected(taskId, expected) {
+  if (expected === null || expected === void 0) return null;
+  invariant(expected && typeof expected === "object" && !Array.isArray(expected), "LATCH_CLAIM_INVALID");
+  invariant(
+    expected.task_id === taskId && LATCH_STATES.has(expected.state) && Number.isSafeInteger(expected.generation) && expected.generation >= 0 && (expected.reason === null || typeof expected.reason === "string" && BOUNDED_TEXT.test(expected.reason)),
+    "LATCH_CLAIM_INVALID"
+  );
+  invariant(expected.state === "RELEASED" && expected.reason === null || expected.state === "ENGAGED" && typeof expected.reason === "string", "LATCH_CLAIM_INVALID");
+  return Object.freeze({ task_id: taskId, state: expected.state, generation: expected.generation, reason: expected.reason });
+}
+function validateLatchClaim(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "LATCH_CLAIM_INVALID");
+  const taskId = operationIdentifier(request.taskId, "LATCH_TASK_INVALID", "taskId");
+  invariant(typeof request.reason === "string" && BOUNDED_TEXT.test(request.reason), "LATCH_REASON_INVALID");
+  invariant(typeof request.actor === "string" && BOUNDED_TEXT.test(request.actor), "LATCH_ACTOR_INVALID");
+  const expected = validateLatchExpected(taskId, request.expected ?? null);
+  return Object.freeze({ taskId, reason: request.reason, actor: request.actor, expected });
+}
+var PortableLatchAuthority = class {
+  constructor(storage) {
+    invariant(
+      storage && typeof storage.ensureLatch === "function" && typeof storage.getLatch === "function" && typeof storage.assertLatchIdentity === "function" && typeof storage.isAdmissionOpen === "function",
+      "PORTABLE_LATCH_AUTHORITY_INVALID"
+    );
+    this.storage = storage;
+    this.security = PORTABLE_LATCH_AUTHORITY_LABEL;
+  }
+  ensureLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.storage.ensureLatch(taskId));
+  }
+  getLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.storage.getLatch(taskId));
+  }
+  assertLatchIdentity(taskId, expected, options = {}) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.storage.assertLatchIdentity(taskId, expected, options));
+  }
+  isAdmissionOpen(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return this.storage.isAdmissionOpen(taskId);
+  }
+};
+function portableLatchAuthority(storage) {
+  return new PortableLatchAuthority(storage);
+}
+function requireSecureLatchAuthority(authority) {
+  invariant(
+    authority?.latchSecurity?.mode === LATCH_AUTHORITY_MODES.SECURE && authority.latchSecurity.canonical === true && authority.latchSecurity.r1_m_13_latch_isolation === true,
+    "SECURE_LATCH_AUTHORITY_REQUIRED",
+    "Secure execution cannot use or fall back to portable latch state"
+  );
+  return authority;
+}
+function assertLatchIdentityValue(current, expected, { allowHumanTakeover = false } = {}) {
+  if (!allowHumanTakeover && current?.state === "ENGAGED" && current.reason === "HUMAN_TAKEOVER") {
+    throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover has priority");
+  }
+  invariant(current?.state === expected?.state && current.generation === expected?.generation && (current.reason ?? null) === (expected?.reason ?? null), "LATCH_GENERATION_MISMATCH", "Canonical latch identity changed");
+  return current;
+}
+
+// src/canonical.mjs
+import { createHash, randomUUID } from "node:crypto";
+var MAX_JSON_DEPTH = 128;
+var MAX_JSON_NODES = 1e5;
+function strictJsonClone(value, { code = "STRICT_JSON_DOMAIN_INVALID", field = "value", clone = true } = {}) {
+  const ancestors = /* @__PURE__ */ new Set();
+  let nodes = 0;
+  const fail2 = (message) => {
+    const error = new TypeError(`${field} is outside the strict JSON domain: ${message}`);
+    error.code = code;
+    throw error;
+  };
+  const visit = (current, path, depth) => {
+    nodes += 1;
+    if (nodes > MAX_JSON_NODES) fail2(`more than ${MAX_JSON_NODES} values`);
+    if (depth > MAX_JSON_DEPTH) fail2(`nesting exceeds ${MAX_JSON_DEPTH} at ${path}`);
+    if (current === null || typeof current === "boolean" || typeof current === "string") return current;
+    if (typeof current === "number") {
+      if (!Number.isFinite(current)) fail2(`non-finite number at ${path}`);
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (typeof current !== "object") fail2(`${typeof current} at ${path}`);
+    if (ancestors.has(current)) fail2(`cycle at ${path}`);
+    const prototype = Object.getPrototypeOf(current);
+    if (Array.isArray(current)) {
+      if (prototype !== Array.prototype) fail2(`array with a custom prototype at ${path}`);
+      if (current.length > MAX_JSON_NODES) fail2(`array is too large at ${path}`);
+      const keys2 = Reflect.ownKeys(current);
+      if (keys2.some((key) => typeof key === "symbol")) fail2(`symbol-keyed array property at ${path}`);
+      const expected = /* @__PURE__ */ new Set(["length", ...Array.from({ length: current.length }, (_, index) => String(index))]);
+      if (keys2.some((key) => !expected.has(key)) || keys2.length !== expected.size) fail2(`sparse array or extra array property at ${path}`);
+      ancestors.add(current);
+      const result2 = clone ? [] : current;
+      for (let index = 0; index < current.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, String(index));
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) fail2(`accessor or hidden array element at ${path}[${index}]`);
+        const child = visit(descriptor.value, `${path}[${index}]`, depth + 1);
+        if (clone) result2.push(child);
+      }
+      ancestors.delete(current);
+      return result2;
+    }
+    if (prototype !== Object.prototype && prototype !== null) fail2(`non-plain object at ${path}`);
+    const keys = Reflect.ownKeys(current);
+    if (keys.some((key) => typeof key === "symbol")) fail2(`symbol-keyed property at ${path}`);
+    ancestors.add(current);
+    const result = clone ? {} : current;
+    for (const key of keys.sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) fail2(`accessor or hidden property at ${path}.${key}`);
+      const child = visit(descriptor.value, `${path}.${key}`, depth + 1);
+      if (clone) Object.defineProperty(result, key, { value: child, enumerable: true, writable: true, configurable: true });
+    }
+    ancestors.delete(current);
+    return result;
+  };
+  return visit(value, "$", 0);
+}
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  if (value === void 0) throw new TypeError("undefined is not canonical JSON");
+  return JSON.stringify(value);
+}
+function sha256(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+function digestObject(value) {
+  return sha256(Buffer.from(canonicalJson(value), "utf8"));
+}
+function opaqueId(prefix) {
+  return `${prefix}-${randomUUID()}`;
+}
+function utcNow() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+
+// src/handoff-reservation-authority.mjs
+var HANDOFF_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_handoff_reservation_isolation: true
+});
+var PORTABLE_HANDOFF_AUTHORITY_LABEL = Object.freeze({
+  mode: HANDOFF_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_handoff_reservation_isolation: false
+});
+var HANDOFF_RESERVATION_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "source_session_id",
+  "source_session_file",
+  "task_id",
+  "task_plan_revision",
+  "task_plan_digest",
+  "requirements_version",
+  "current_item",
+  "next_item",
+  "next_step",
+  "latch_generation",
+  "runner_instance_id",
+  "session_binding_id",
+  "parent_session_id",
+  "parent_session_file",
+  "parent_checkpoint_id",
+  "recovery_of_handoff_id",
+  "checkpoint_id",
+  "resume_manifest_id",
+  "model_policy",
+  "reasoning_policy"
+]);
+var DIGEST = /^sha256:[a-f0-9]{64}$/;
+var BOUNDED_PATH = /^[^\r\n]{1,4096}$/;
+var BOUNDED_TEXT2 = /^[^\r\n]{1,8192}$/;
+var MAX_PROJECTION_BYTES = 196608;
+function optionalIdentifier(value, code, field) {
+  if (value === null || value === void 0) return null;
+  return operationIdentifier(value, code, field);
+}
+function boundedNullable(value, code, field, expression = BOUNDED_TEXT2) {
+  invariant(value === null || value === void 0 || typeof value === "string" && expression.test(value), code, `${field} is invalid`);
+  return value ?? null;
+}
+function sameHandoffReservationIdentity(left, right) {
+  return HANDOFF_RESERVATION_IDENTITY_FIELDS.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+function validateHandoffProjection(projection) {
+  invariant(projection && typeof projection === "object" && !Array.isArray(projection), "HANDOFF_RESERVATION_INVALID");
+  operationIdentifier(projection.handoff_id, "HANDOFF_ID_INVALID", "handoff_id");
+  operationIdentifier(projection.source_session_id, "HANDOFF_SOURCE_INVALID", "source_session_id");
+  invariant(typeof projection.source_session_file === "string" && BOUNDED_PATH.test(projection.source_session_file), "HANDOFF_SOURCE_INVALID", "source_session_file is invalid");
+  operationIdentifier(projection.task_id, "HANDOFF_TASK_INVALID", "task_id");
+  operationIdentifier(projection.task_plan_revision, "HANDOFF_PLAN_INVALID", "task_plan_revision");
+  invariant(DIGEST.test(projection.task_plan_digest ?? ""), "HANDOFF_PLAN_INVALID", "task_plan_digest is invalid");
+  operationIdentifier(projection.requirements_version, "HANDOFF_PLAN_INVALID", "requirements_version");
+  operationIdentifier(projection.runner_instance_id, "HANDOFF_RUNNER_INVALID", "runner_instance_id");
+  operationIdentifier(projection.session_binding_id, "HANDOFF_BINDING_INVALID", "session_binding_id");
+  operationIdentifier(projection.parent_session_id, "HANDOFF_PARENT_INVALID", "parent_session_id");
+  invariant(typeof projection.parent_session_file === "string" && BOUNDED_PATH.test(projection.parent_session_file), "HANDOFF_PARENT_INVALID", "parent_session_file is invalid");
+  operationIdentifier(projection.checkpoint_id, "HANDOFF_CHECKPOINT_INVALID", "checkpoint_id");
+  operationIdentifier(projection.resume_manifest_id, "HANDOFF_MANIFEST_INVALID", "resume_manifest_id");
+  optionalIdentifier(projection.current_item, "HANDOFF_PLAN_INVALID", "current_item");
+  optionalIdentifier(projection.next_item, "HANDOFF_PLAN_INVALID", "next_item");
+  boundedNullable(projection.next_step, "HANDOFF_PLAN_INVALID", "next_step");
+  optionalIdentifier(projection.parent_checkpoint_id, "HANDOFF_PARENT_INVALID", "parent_checkpoint_id");
+  optionalIdentifier(projection.recovery_of_handoff_id, "HANDOFF_RECOVERY_INVALID", "recovery_of_handoff_id");
+  boundedNullable(projection.model_policy, "HANDOFF_POLICY_INVALID", "model_policy");
+  boundedNullable(projection.reasoning_policy, "HANDOFF_POLICY_INVALID", "reasoning_policy");
+  invariant(Number.isSafeInteger(projection.latch_generation) && projection.latch_generation >= 0, "HANDOFF_LATCH_INVALID");
+  invariant(
+    projection.state === "SAFE_TO_HANDOFF" && projection.target_session_id === null && projection.authorization_state === "NOT_AUTHORIZED" && projection.admission_state === "NOT_COMMITTED" && projection.dispatch_state === "NOT_STARTED",
+    "HANDOFF_RESERVATION_STATE_INVALID",
+    "A canonical reservation begins paused with empty resume authority"
+  );
+  invariant(
+    projection.reserved_plan_snapshot?.task_id === projection.task_id && projection.reserved_plan_snapshot?.plan_revision_id === projection.task_plan_revision && projection.reserved_plan_snapshot?.content_digest === projection.task_plan_digest,
+    "HANDOFF_PLAN_PROVENANCE_MISMATCH",
+    "Reserved plan snapshot does not match handoff plan identity"
+  );
+  const bytes = Buffer.from(canonicalJson(projection), "utf8");
+  invariant(bytes.length <= MAX_PROJECTION_BYTES, "HANDOFF_RESERVATION_TOO_LARGE");
+  return Object.freeze({ projection: structuredClone(projection), projectionDigest: sha256(bytes) });
+}
+function validateHandoffReservationRequest(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "HANDOFF_RESERVATION_INVALID");
+  const validated = validateHandoffProjection(request.projection);
+  const taskId = validated.projection.task_id;
+  const expectedLatch = request.expectedLatch;
+  invariant(
+    expectedLatch?.task_id === taskId && expectedLatch.state === "ENGAGED" && Number.isSafeInteger(expectedLatch.generation) && expectedLatch.generation >= 0 && typeof expectedLatch.reason === "string" && expectedLatch.reason.length > 0 && expectedLatch.reason !== "HUMAN_TAKEOVER" && validated.projection.latch_generation === expectedLatch.generation,
+    "HANDOFF_LATCH_INVALID",
+    "Reservation requires the exact acquired non-takeover latch"
+  );
+  let expectedLatest = null;
+  if (request.expectedLatest !== null && request.expectedLatest !== void 0) {
+    invariant(request.expectedLatest && typeof request.expectedLatest === "object" && !Array.isArray(request.expectedLatest), "HANDOFF_LATEST_INVALID");
+    expectedLatest = Object.freeze({
+      handoff_id: operationIdentifier(request.expectedLatest.handoff_id, "HANDOFF_LATEST_INVALID", "handoff_id"),
+      reservation_digest: operationIdentifier(request.expectedLatest.reservation_digest, "HANDOFF_LATEST_INVALID", "reservation_digest")
+    });
+  }
+  invariant(
+    validated.projection.recovery_of_handoff_id === null,
+    "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED",
+    "Recovery children require the bounded protected recovery transaction, not generic reservation"
+  );
+  return Object.freeze({
+    projection: validated.projection,
+    projectionDigest: validated.projectionDigest,
+    expectedLatch: Object.freeze({ task_id: taskId, state: "ENGAGED", generation: expectedLatch.generation, reason: expectedLatch.reason }),
+    expectedLatest
+  });
+}
+function detachedReservation(row) {
+  if (!row) return null;
+  const projection = typeof row.projection_json === "string" ? JSON.parse(row.projection_json) : row.projection ?? row;
+  return Object.freeze({
+    ...structuredClone(projection),
+    reservation_digest: row.reservation_digest ?? projection.reservation_digest ?? null,
+    latch_reason: row.latch_reason ?? projection.latch_reason ?? null,
+    reservation_event_id: row.reservation_event_id ?? projection.reservation_event_id ?? null
+  });
+}
+function requireSecureHandoffAuthority(authority) {
+  invariant(
+    authority?.handoffSecurity?.mode === HANDOFF_AUTHORITY_MODES.SECURE && authority.handoffSecurity.canonical === true && authority.handoffSecurity.r1_m_13_handoff_reservation_isolation === true,
+    "SECURE_HANDOFF_AUTHORITY_REQUIRED",
+    "Secure handoff cannot use or fall back to portable reservation state"
+  );
+  return authority;
+}
+
+// src/lifecycle-binding-authority.mjs
+var LIFECYCLE_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+  mode: LIFECYCLE_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_lifecycle_binding_isolation: true
+});
+var PORTABLE_LIFECYCLE_AUTHORITY_LABEL = Object.freeze({
+  mode: LIFECYCLE_AUTHORITY_MODES.PORTABLE,
+  canonical: false,
+  isolation: "ORDINARY_USER_OWNED",
+  r1_m_13_lifecycle_binding_isolation: false
+});
+var LIFECYCLE_BINDING_STATES = Object.freeze(["ACTIVE", "SUPERSEDED"]);
+var LIFECYCLE_BINDING_IDENTITY_FIELDS = Object.freeze([
+  "handoff_id",
+  "replacement_session_id",
+  "runner_instance_id",
+  "session_binding_id",
+  "lifecycle_incarnation"
+]);
+var BOUNDED_REASON = /^[^\r\n]{1,2048}$/;
+function lifecycleIncarnation(value) {
+  invariant(Number.isSafeInteger(value) && value > 0, "LIFECYCLE_INCARNATION_INVALID");
+  return value;
+}
+function sameLifecycleBindingIdentity(left, right) {
+  return LIFECYCLE_BINDING_IDENTITY_FIELDS.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
+function validateLifecycleBindingCreate(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "LIFECYCLE_BINDING_INVALID");
+  const binding = request.binding;
+  invariant(binding && typeof binding === "object" && !Array.isArray(binding), "LIFECYCLE_BINDING_INVALID");
+  const value = Object.freeze({
+    handoff_id: operationIdentifier(binding.handoff_id, "LIFECYCLE_HANDOFF_INVALID", "handoff_id"),
+    replacement_session_id: operationIdentifier(binding.replacement_session_id, "LIFECYCLE_SESSION_INVALID", "replacement_session_id"),
+    runner_instance_id: operationIdentifier(binding.runner_instance_id, "LIFECYCLE_RUNNER_INVALID", "runner_instance_id"),
+    session_binding_id: operationIdentifier(binding.session_binding_id, "LIFECYCLE_BINDING_ID_INVALID", "session_binding_id"),
+    lifecycle_incarnation: lifecycleIncarnation(binding.lifecycle_incarnation)
+  });
+  return Object.freeze({ binding: value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function validateLifecycleBindingTransition(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "LIFECYCLE_TRANSITION_INVALID");
+  const expected = validateLifecycleBindingCreate({ binding: request.expected }).binding;
+  invariant(request.expected.status === "ACTIVE" && request.nextStatus === "SUPERSEDED", "LIFECYCLE_TRANSITION_INVALID", "Only ACTIVE to SUPERSEDED is supported");
+  invariant(typeof request.reason === "string" && BOUNDED_REASON.test(request.reason), "LIFECYCLE_REASON_INVALID");
+  const value = Object.freeze({ expected: Object.freeze({ ...expected, status: "ACTIVE" }), nextStatus: "SUPERSEDED", reason: request.reason });
+  return Object.freeze({ ...value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function detachedLifecycleBinding(row, event = null) {
+  if (!row) return null;
+  return Object.freeze({
+    schema_version: "1.0.0",
+    ...structuredClone(row),
+    event_data: event?.data_json ? JSON.parse(event.data_json) : event?.event_data ? structuredClone(event.event_data) : void 0
+  });
+}
+function requireSecureLifecycleAuthority(authority) {
+  invariant(
+    authority?.lifecycleSecurity?.mode === LIFECYCLE_AUTHORITY_MODES.SECURE && authority.lifecycleSecurity.canonical === true && authority.lifecycleSecurity.r1_m_13_lifecycle_binding_isolation === true,
+    "SECURE_LIFECYCLE_AUTHORITY_REQUIRED",
+    "Secure lifecycle cannot use or fall back to portable Runner/session bindings"
+  );
+  return authority;
+}
+
+// src/resume-authority.mjs
+var RESUME_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_RESUME_AUTHORITY_LABEL = Object.freeze({
+  mode: RESUME_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_resume_admission_dispatch_isolation: true
+});
+var DIGEST2 = /^sha256:[a-f0-9]{64}$/;
+var ACTOR = /^human:[^\r\n]{1,1024}$/;
+var IDEMPOTENCY_KEY = /^[^\r\n]{1,1024}$/;
+var MAX_PROMPT_BYTES = 131072;
+var OUTCOMES2 = /* @__PURE__ */ new Set(["ACKNOWLEDGED", "DISPATCHED", "FAILED", "UNKNOWN"]);
+function digest(value, code, field) {
+  invariant(typeof value === "string" && DIGEST2.test(value), code, `${field} is invalid`);
+  return value;
+}
+function exactLatch(value) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "RESUME_LATCH_INVALID");
+  invariant(
+    value.state === "ENGAGED" && Number.isSafeInteger(value.generation) && value.generation >= 0 && typeof value.reason === "string" && value.reason.length > 0 && value.reason !== "HUMAN_TAKEOVER",
+    "RESUME_LATCH_INVALID"
+  );
+  return Object.freeze({
+    task_id: operationIdentifier(value.task_id, "RESUME_TASK_INVALID", "task_id"),
+    state: "ENGAGED",
+    generation: value.generation,
+    reason: value.reason
+  });
+}
+function exactBinding(value) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "RESUME_BINDING_INVALID");
+  invariant(
+    value.status === "ACTIVE" && Number.isSafeInteger(value.lifecycle_incarnation) && value.lifecycle_incarnation > 0,
+    "RESUME_BINDING_INVALID"
+  );
+  return Object.freeze({
+    handoff_id: operationIdentifier(value.handoff_id, "RESUME_HANDOFF_INVALID", "handoff_id"),
+    replacement_session_id: operationIdentifier(value.replacement_session_id, "RESUME_SESSION_INVALID", "replacement_session_id"),
+    runner_instance_id: operationIdentifier(value.runner_instance_id, "RESUME_RUNNER_INVALID", "runner_instance_id"),
+    session_binding_id: operationIdentifier(value.session_binding_id, "RESUME_BINDING_INVALID", "session_binding_id"),
+    lifecycle_incarnation: value.lifecycle_incarnation,
+    status: "ACTIVE"
+  });
+}
+function validateResumeReadiness(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "RESUME_READINESS_INVALID");
+  const prompt = request.resume_prompt;
+  invariant(
+    typeof prompt === "string" && prompt.length > 0 && Buffer.byteLength(prompt, "utf8") <= MAX_PROMPT_BYTES,
+    "RESUME_PROMPT_INVALID"
+  );
+  const value = Object.freeze({
+    handoff_id: operationIdentifier(request.handoff_id, "RESUME_HANDOFF_INVALID", "handoff_id"),
+    reservation_digest: operationIdentifier(request.reservation_digest, "RESUME_RESERVATION_INVALID", "reservation_digest"),
+    binding: exactBinding(request.binding),
+    latch: exactLatch(request.latch),
+    checkpoint_digest: digest(request.checkpoint_digest, "RESUME_CHECKPOINT_INVALID", "checkpoint_digest"),
+    resume_manifest_digest: digest(request.resume_manifest_digest, "RESUME_MANIFEST_INVALID", "resume_manifest_digest"),
+    resume_prompt_id: operationIdentifier(request.resume_prompt_id, "RESUME_PROMPT_INVALID", "resume_prompt_id"),
+    resume_prompt_digest: digest(request.resume_prompt_digest, "RESUME_PROMPT_INVALID", "resume_prompt_digest"),
+    resume_prompt: prompt,
+    plan_semantic_digest: digest(request.plan_semantic_digest, "RESUME_PLAN_INVALID", "plan_semantic_digest")
+  });
+  invariant(
+    value.binding.handoff_id === value.handoff_id && value.latch.task_id.length > 0,
+    "RESUME_READINESS_INVALID"
+  );
+  invariant(
+    sha256(Buffer.from(prompt, "utf8")) === value.resume_prompt_digest,
+    "RESUME_PROMPT_INVALID",
+    "resume prompt bytes do not match their digest"
+  );
+  return Object.freeze({ value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function validateResumeDecision(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "RESUME_DECISION_INVALID");
+  invariant(request.answer === "YES" || request.answer === "NO", "RESUME_DECISION_INVALID");
+  invariant(typeof request.actor === "string" && ACTOR.test(request.actor), "HUMAN_AUTHORIZATION_REQUIRED");
+  const value = {
+    answer: request.answer,
+    actor: request.actor,
+    handoff_id: operationIdentifier(request.handoff_id, "RESUME_HANDOFF_INVALID", "handoff_id"),
+    readiness_digest: digest(request.readiness_digest, "RESUME_READINESS_INVALID", "readiness_digest"),
+    resume_prompt_id: operationIdentifier(request.resume_prompt_id, "RESUME_PROMPT_INVALID", "resume_prompt_id")
+  };
+  if (request.answer === "YES") {
+    value.authorization_id = operationIdentifier(request.authorization_id, "RESUME_AUTHORIZATION_INVALID", "authorization_id");
+    value.admission_id = operationIdentifier(request.admission_id, "RESUME_ADMISSION_INVALID", "admission_id");
+    invariant(typeof request.idempotency_key === "string" && IDEMPOTENCY_KEY.test(request.idempotency_key), "RESUME_IDEMPOTENCY_KEY_INVALID");
+    value.idempotency_key = request.idempotency_key;
+    value.dispatch_attempt_id = operationIdentifier(request.dispatch_attempt_id, "RESUME_DISPATCH_INVALID", "dispatch_attempt_id");
+    invariant(request.attempt_no === 1, "RESUME_DISPATCH_INVALID", "Resume dispatch supports exactly one non-replayable attempt");
+    value.attempt_no = 1;
+    value.binding = exactBinding(request.binding);
+    value.latch = exactLatch(request.latch);
+  }
+  const frozen = Object.freeze(value);
+  return Object.freeze({ value: frozen, payload_digest: sha256(Buffer.from(canonicalJson(frozen), "utf8")) });
+}
+function validateResumeDispatchOutcome(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "RESUME_DISPATCH_OUTCOME_INVALID");
+  const outcome = request.outcome;
+  invariant(OUTCOMES2.has(outcome), "RESUME_DISPATCH_OUTCOME_INVALID");
+  invariant(
+    request.error === null || request.error === void 0 || typeof request.error === "string" && !/[\r\n]/.test(request.error) && request.error.length <= 2048,
+    "RESUME_DISPATCH_OUTCOME_INVALID"
+  );
+  const value = Object.freeze({
+    dispatch_attempt_id: operationIdentifier(request.dispatch_attempt_id, "RESUME_DISPATCH_INVALID", "dispatch_attempt_id"),
+    outcome,
+    error: request.error ?? null
+  });
+  return Object.freeze({ value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function detachedResumeReadiness(row) {
+  return row ? Object.freeze({ ...structuredClone(row) }) : null;
+}
+function detachedResumeState(value) {
+  if (!value) return null;
+  return Object.freeze({
+    readiness: detachedResumeReadiness(value.readiness),
+    authorization: value.authorization ? Object.freeze({ ...value.authorization }) : null,
+    admission: value.admission ? Object.freeze({ ...value.admission }) : null,
+    dispatch: value.dispatch ? Object.freeze({ ...value.dispatch }) : null
+  });
+}
+function requireSecureResumeAuthority(authority) {
+  invariant(
+    authority?.resumeSecurity?.mode === RESUME_AUTHORITY_MODES.SECURE && authority.resumeSecurity.canonical === true && authority.resumeSecurity.r1_m_13_resume_admission_dispatch_isolation === true,
+    "SECURE_RESUME_AUTHORITY_REQUIRED",
+    "Secure resume cannot use or fall back to portable authorization/admission/dispatch state"
+  );
+  return authority;
+}
+
+// src/recovery-authority.mjs
+var RECOVERY_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_RECOVERY_AUTHORITY_LABEL = Object.freeze({
+  mode: RECOVERY_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_recovery_reconciliation_isolation: true
+});
+var DIGEST3 = /^sha256:[a-f0-9]{64}$/;
+var ACTOR2 = /^human:[^\r\n]{1,1024}$/;
+var BOUNDED_TEXT3 = /^[^\r\n]{1,2048}$/;
+function digest2(value, code, field) {
+  invariant(typeof value === "string" && DIGEST3.test(value), code, `${field} is invalid`);
+  return value;
+}
+function exactLatch2(value) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "RECOVERY_LATCH_INVALID");
+  invariant(
+    value.state === "ENGAGED" && Number.isSafeInteger(value.generation) && value.generation >= 0 && typeof value.reason === "string" && value.reason.length > 0 && value.reason !== "HUMAN_TAKEOVER",
+    "RECOVERY_LATCH_INVALID"
+  );
+  return Object.freeze({
+    task_id: operationIdentifier(value.task_id, "RECOVERY_TASK_INVALID", "task_id"),
+    state: "ENGAGED",
+    generation: value.generation,
+    reason: value.reason
+  });
+}
+function exactBinding2(value) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "RECOVERY_BINDING_INVALID");
+  invariant(
+    value.status === "ACTIVE" && Number.isSafeInteger(value.lifecycle_incarnation) && value.lifecycle_incarnation > 0,
+    "RECOVERY_BINDING_INVALID"
+  );
+  return Object.freeze({
+    handoff_id: operationIdentifier(value.handoff_id, "RECOVERY_HANDOFF_INVALID", "handoff_id"),
+    replacement_session_id: operationIdentifier(value.replacement_session_id, "RECOVERY_SESSION_INVALID", "replacement_session_id"),
+    runner_instance_id: operationIdentifier(value.runner_instance_id, "RECOVERY_RUNNER_INVALID", "runner_instance_id"),
+    session_binding_id: operationIdentifier(value.session_binding_id, "RECOVERY_BINDING_INVALID", "session_binding_id"),
+    lifecycle_incarnation: value.lifecycle_incarnation,
+    status: "ACTIVE"
+  });
+}
+function exactArtifact(value, kind) {
+  invariant(value && typeof value === "object" && !Array.isArray(value), "RECOVERY_ARTIFACT_INVALID");
+  return Object.freeze({
+    id: operationIdentifier(value.id, "RECOVERY_ARTIFACT_INVALID", `${kind}.id`),
+    digest: digest2(value.digest, "RECOVERY_ARTIFACT_INVALID", `${kind}.digest`),
+    content_digest: digest2(value.content_digest, "RECOVERY_ARTIFACT_INVALID", `${kind}.content_digest`)
+  });
+}
+function validateContinuityFailure(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "CONTINUITY_FAILURE_INVALID");
+  const failed = request.failed_handoff;
+  invariant(
+    failed && typeof failed === "object" && !Array.isArray(failed) && failed.state === "CONTINUITY_FAILED",
+    "CONTINUITY_FAILURE_INVALID"
+  );
+  invariant(
+    failed.failure && typeof failed.failure === "object" && typeof failed.failure.code === "string" && BOUNDED_TEXT3.test(failed.failure.code) && typeof failed.failure.message === "string" && BOUNDED_TEXT3.test(failed.failure.message),
+    "CONTINUITY_FAILURE_INVALID"
+  );
+  const value = Object.freeze({
+    failed_handoff: structuredClone(failed),
+    reservation_digest: digest2(request.reservation_digest, "CONTINUITY_FAILURE_INVALID", "reservation_digest"),
+    binding: exactBinding2(request.binding),
+    latch: exactLatch2(request.latch),
+    plan_semantic_digest: digest2(request.plan_semantic_digest, "CONTINUITY_FAILURE_INVALID", "plan_semantic_digest"),
+    checkpoint: exactArtifact(request.checkpoint, "checkpoint"),
+    manifest: exactArtifact(request.manifest, "manifest")
+  });
+  invariant(
+    value.binding.handoff_id === failed.handoff_id && value.latch.task_id === failed.task_id,
+    "CONTINUITY_FAILURE_INVALID"
+  );
+  return Object.freeze({ value, payload_digest: sha256(Buffer.from(canonicalJson(value), "utf8")) });
+}
+function validateContinuityRecovery(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "CONTINUITY_RECOVERY_INVALID");
+  invariant(typeof request.actor === "string" && ACTOR2.test(request.actor), "CONTINUITY_RECOVERY_AUTHORITY_INVALID");
+  const child = validateHandoffProjection(request.child_projection).projection;
+  invariant(child.recovery_of_handoff_id !== null, "CONTINUITY_RECOVERY_INVALID", "Recovery child must identify one failed handoff");
+  const source = request.source;
+  invariant(
+    source && typeof source === "object" && !Array.isArray(source) && Number.isSafeInteger(source.lifecycle_incarnation) && source.lifecycle_incarnation > 0 && source.active === true && source.history_length === 0 && source.idle === true,
+    "CONTINUITY_RECOVERY_SOURCE_INVALID"
+  );
+  const value = Object.freeze({
+    decision_id: operationIdentifier(request.decision_id, "RECOVERY_DECISION_ID_INVALID", "decision_id"),
+    failed_handoff_id: operationIdentifier(request.failed_handoff_id, "RECOVERY_HANDOFF_INVALID", "failed_handoff_id"),
+    failure_digest: digest2(request.failure_digest, "CONTINUITY_RECOVERY_INVALID", "failure_digest"),
+    actor: request.actor,
+    source: Object.freeze({
+      session_id: operationIdentifier(source.session_id, "RECOVERY_SESSION_INVALID", "source.session_id"),
+      runner_instance_id: operationIdentifier(source.runner_instance_id, "RECOVERY_RUNNER_INVALID", "source.runner_instance_id"),
+      lifecycle_incarnation: source.lifecycle_incarnation,
+      active: true,
+      history_length: 0,
+      idle: true
+    }),
+    binding: exactBinding2(request.binding),
+    latch: exactLatch2(request.latch),
+    plan_semantic_digest: digest2(request.plan_semantic_digest, "CONTINUITY_RECOVERY_INVALID", "plan_semantic_digest"),
+    model_policy: request.model_policy ?? null,
+    reasoning_policy: request.reasoning_policy ?? null,
+    git: structuredClone(request.git),
+    checkpoint: exactArtifact(request.checkpoint, "checkpoint"),
+    manifest: exactArtifact(request.manifest, "manifest"),
+    child_projection: child,
+    expected_latest: Object.freeze({
+      handoff_id: operationIdentifier(request.expected_latest?.handoff_id, "RECOVERY_LATEST_INVALID", "expected_latest.handoff_id"),
+      reservation_digest: digest2(request.expected_latest?.reservation_digest, "RECOVERY_LATEST_INVALID", "expected_latest.reservation_digest")
+    })
+  });
+  invariant(
+    value.failed_handoff_id === value.binding.handoff_id && value.failed_handoff_id === value.child_projection.recovery_of_handoff_id && value.source.session_id === value.child_projection.source_session_id && value.source.runner_instance_id === value.child_projection.runner_instance_id && value.latch.task_id === value.child_projection.task_id && value.latch.generation === value.child_projection.latch_generation && value.expected_latest.handoff_id === value.failed_handoff_id,
+    "CONTINUITY_RECOVERY_INVALID"
+  );
+  invariant(value.model_policy === null || typeof value.model_policy === "string" && BOUNDED_TEXT3.test(value.model_policy), "CONTINUITY_RECOVERY_INVALID");
+  invariant(value.reasoning_policy === null || typeof value.reasoning_policy === "string" && BOUNDED_TEXT3.test(value.reasoning_policy), "CONTINUITY_RECOVERY_INVALID");
+  const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+  const childReservationPayload = Object.freeze({
+    projection: child,
+    expectedLatch: value.latch,
+    expectedLatest: value.expected_latest
+  });
+  return Object.freeze({
+    value,
+    payload_digest: payloadDigest,
+    child_reservation_digest: sha256(Buffer.from(canonicalJson(childReservationPayload), "utf8")),
+    attestation_digest: sha256(Buffer.from(canonicalJson({
+      failure_digest: value.failure_digest,
+      source: value.source,
+      binding: value.binding,
+      latch: value.latch,
+      plan_semantic_digest: value.plan_semantic_digest,
+      model_policy: value.model_policy,
+      reasoning_policy: value.reasoning_policy,
+      git: value.git,
+      checkpoint: value.checkpoint,
+      manifest: value.manifest
+    }), "utf8"))
+  });
+}
+function detachedContinuityFailure(row) {
+  if (!row) return null;
+  return Object.freeze({ ...row, failed_handoff: Object.freeze(JSON.parse(row.failed_projection_json)) });
+}
+function detachedContinuityRecovery(value) {
+  if (!value) return null;
+  return Object.freeze({
+    failure: detachedContinuityFailure(value.failure),
+    decision: value.decision ? Object.freeze({ ...value.decision }) : null,
+    event: value.event ? Object.freeze({ ...value.event, data: value.event.data_json ? JSON.parse(value.event.data_json) : void 0 }) : null,
+    child: value.child ?? null,
+    binding: value.binding ?? null
+  });
+}
+function requireSecureRecoveryAuthority(authority) {
+  invariant(
+    authority?.recoverySecurity?.mode === RECOVERY_AUTHORITY_MODES.SECURE && authority.recoverySecurity.canonical === true && authority.recoverySecurity.r1_m_13_recovery_reconciliation_isolation === true,
+    "SECURE_RECOVERY_AUTHORITY_REQUIRED",
+    "Secure recovery/reconciliation cannot use or fall back to project recovery state"
+  );
+  return authority;
+}
+
+// src/plan-store.mjs
+import {
+  closeSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync
+} from "node:fs";
+var MAX_PLAN_BYTES = 32 * 1024 * 1024;
+var MAX_PLAN_STATE_BYTES = 128 * 1024 * 1024;
+var LOCK_METADATA_KEYS = Object.freeze([
+  "schema",
+  "ownership_nonce",
+  "pid",
+  "process_identity",
+  "created_at",
+  "plan_path",
+  "guardian_root"
+]);
+var DEFAULT_IO = Object.freeze({
+  closeSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync
+});
+var PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
+var PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
+
+// src/plan-markdown.mjs
+var METADATA_HEADERS = Object.freeze([
+  { field: "plan_revision_id", pattern: /^\*\*Current revision:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/ },
+  { field: "requirements_version", pattern: /^\*\*Requirements version:\*\*[ \t]*`([^`\r\n]+)`[ \t]*$/ },
+  { field: "updated_at", pattern: /^\*\*Updated:\*\*[ \t]*(\S(?:.*?\S)?)[ \t]*$/ }
+]);
+
+// src/ledger.mjs
+var TASK_STATUS_VALUES = ["PLANNED", "IN_PROGRESS", "BLOCKED", "DONE", "DROPPED", "SUPERSEDED"];
+var TASK_STATES = new Set(TASK_STATUS_VALUES);
+var TASK_STATUS_MESSAGE = `status must be one of ${TASK_STATUS_VALUES.join(", ")}`;
+var MAX_RESUME_LIST_ENTRIES = 64;
+var MAX_RESUME_ENTRY_LENGTH = 2048;
+function validateBoundedStringList(value, field, code = "LEDGER_RESUME_CONTEXT_INVALID") {
+  invariant(Array.isArray(value) && value.length <= MAX_RESUME_LIST_ENTRIES, code, `${field} must be an array with at most ${MAX_RESUME_LIST_ENTRIES} entries`);
+  for (const entry of value) invariant(typeof entry === "string" && entry.length > 0 && entry.length <= MAX_RESUME_ENTRY_LENGTH, code, `${field} entries must be non-empty bounded strings`);
+  return value;
+}
+function validateRequiredLocalPaths(value, code = "LEDGER_REQUIRED_LOCAL_PATH_INVALID") {
+  validateBoundedStringList(value, "required_local_paths", code);
+  for (const path of value) {
+    const components = path.split("/");
+    invariant(!path.includes("\\") && !path.includes("\0") && !path.startsWith("/") && !/^[A-Za-z]:/.test(path) && components.every((component) => component.length > 0 && component !== "." && component !== ".."), code, `required_local_paths entries must be normalized repo-relative paths: ${path}`);
+  }
+  return value;
+}
+function canonicalRequiredLocalPaths(value = [], code = "LEDGER_REQUIRED_LOCAL_PATH_INVALID") {
+  validateRequiredLocalPaths(value, code);
+  const canonical = [.../* @__PURE__ */ new Set(["TASK_PLAN.md", ...value])];
+  invariant(canonical.length <= MAX_RESUME_LIST_ENTRIES, code, `required_local_paths including TASK_PLAN.md must have at most ${MAX_RESUME_LIST_ENTRIES} entries`);
+  return canonical;
+}
+
+// src/plan-semantics-internal.mjs
+var PLAN_SEMANTIC_FIELDS = Object.freeze([
+  "task_id",
+  "objective",
+  "current_item",
+  "next_item",
+  "next_step",
+  "plan_revision_id",
+  "content_digest",
+  "requirements_version",
+  "completion_criteria",
+  "relevant_decisions",
+  "relevant_tests",
+  "evidence_references",
+  "minimal_reads",
+  "required_local_paths",
+  "model_policy",
+  "reasoning_policy"
+]);
+function semanticList(plan, field, { required, code }) {
+  if (!Object.hasOwn(plan, field)) {
+    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
+    return [];
+  }
+  invariant(Array.isArray(plan[field]), code, `Canonical plan semantic field ${field} must be an array`);
+  return strictJsonClone(plan[field], { code, field: `plan.${field}` });
+}
+function semanticScalar(plan, field, { nullable = false, required = true, code }) {
+  if (!Object.hasOwn(plan, field)) {
+    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
+    return null;
+  }
+  const value = plan[field];
+  invariant(nullable && value === null || typeof value === "string", code, `Canonical plan semantic field ${field} is invalid`);
+  return value;
+}
+function canonicalPlanSemantics(plan, {
+  requireAll = false,
+  modelPolicy = void 0,
+  reasoningPolicy = void 0,
+  code = "HANDOFF_PLAN_PROVENANCE_MISMATCH"
+} = {}) {
+  invariant(plan && typeof plan === "object" && !Array.isArray(plan), code, "Canonical plan semantics require a plan object");
+  if (requireAll) {
+    for (const field of PLAN_SEMANTIC_FIELDS) invariant(Object.hasOwn(plan, field), code, `Canonical plan semantics are missing ${field}`);
+  }
+  const required = requireAll;
+  const projection = {
+    task_id: semanticScalar(plan, "task_id", { code }),
+    objective: semanticScalar(plan, "objective", { code }),
+    current_item: semanticScalar(plan, "current_item", { nullable: true, code }),
+    next_item: semanticScalar(plan, "next_item", { nullable: true, code }),
+    next_step: semanticScalar(plan, "next_step", { code }),
+    plan_revision_id: semanticScalar(plan, "plan_revision_id", { code }),
+    content_digest: semanticScalar(plan, "content_digest", { code }),
+    requirements_version: semanticScalar(plan, "requirements_version", { code }),
+    completion_criteria: semanticList(plan, "completion_criteria", { required, code }),
+    relevant_decisions: semanticList(plan, "relevant_decisions", { required, code }),
+    relevant_tests: semanticList(plan, "relevant_tests", { required, code }),
+    evidence_references: semanticList(plan, "evidence_references", { required, code }),
+    minimal_reads: semanticList(plan, "minimal_reads", { required, code }),
+    required_local_paths: canonicalRequiredLocalPaths(
+      Object.hasOwn(plan, "required_local_paths") ? plan.required_local_paths : [],
+      code
+    ),
+    model_policy: modelPolicy === void 0 ? semanticScalar(plan, "model_policy", { nullable: true, required, code }) : modelPolicy,
+    reasoning_policy: reasoningPolicy === void 0 ? semanticScalar(plan, "reasoning_policy", { nullable: true, required, code }) : reasoningPolicy
+  };
+  invariant(projection.model_policy === null || typeof projection.model_policy === "string", code, "Canonical model policy is invalid");
+  invariant(projection.reasoning_policy === null || typeof projection.reasoning_policy === "string", code, "Canonical reasoning policy is invalid");
+  return strictJsonClone(projection, { code, field: "canonical plan semantics" });
+}
+function planSemanticDigest(plan, options = {}) {
+  return digestObject(canonicalPlanSemantics(plan, options));
+}
+
+// src/recovery-input-authority.mjs
+var RECOVERY_INPUT_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_RECOVERY_INPUT_AUTHORITY_LABEL = Object.freeze({
+  mode: RECOVERY_INPUT_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_recovery_input_isolation: true
+});
+var DIGEST4 = /^sha256:[a-f0-9]{64}$/;
+var KINDS = /* @__PURE__ */ new Set(["checkpoint", "manifest"]);
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+function digest3(value, code, field) {
+  invariant(typeof value === "string" && DIGEST4.test(value), code, `${field} is invalid`);
+  return value;
+}
+function protectedPlanSnapshot(projection) {
+  invariant(projection && typeof projection === "object" && !Array.isArray(projection), "PLAN_AUTHORITY_INVALID");
+  const snapshot = canonicalPlanSemantics(projection.reserved_plan_snapshot, {
+    requireAll: true,
+    code: "PLAN_AUTHORITY_INVALID"
+  });
+  invariant(
+    snapshot.task_id === projection.task_id && snapshot.plan_revision_id === projection.task_plan_revision && snapshot.content_digest === projection.task_plan_digest && snapshot.current_item === (projection.current_item ?? null) && snapshot.next_item === (projection.next_item ?? null) && snapshot.next_step === projection.next_step && snapshot.requirements_version === projection.requirements_version && snapshot.model_policy === (projection.model_policy ?? null) && snapshot.reasoning_policy === (projection.reasoning_policy ?? null),
+    "PLAN_AUTHORITY_INVALID",
+    "Protected plan snapshot conflicts with reservation provenance"
+  );
+  const semanticDigest = planSemanticDigest(snapshot, { requireAll: true });
+  return Object.freeze({ snapshot, semantic_digest: semanticDigest, snapshot_id: semanticDigest });
+}
+function validateArtifactRegistration(request) {
+  invariant(request && typeof request === "object" && !Array.isArray(request), "ARTIFACT_AUTHORITY_INVALID");
+  invariant(KINDS.has(request.kind), "ARTIFACT_AUTHORITY_KIND_INVALID");
+  const value = {
+    kind: request.kind,
+    artifact_id: operationIdentifier(request.artifact_id, "ARTIFACT_AUTHORITY_ID_INVALID", "artifact_id"),
+    handoff_id: operationIdentifier(request.handoff_id, "ARTIFACT_AUTHORITY_HANDOFF_INVALID", "handoff_id"),
+    artifact_digest: digest3(request.artifact_digest, "ARTIFACT_AUTHORITY_DIGEST_INVALID", "artifact_digest"),
+    content_digest: digest3(request.content_digest, "ARTIFACT_AUTHORITY_DIGEST_INVALID", "content_digest"),
+    plan_semantic_digest: digest3(request.plan_semantic_digest, "ARTIFACT_AUTHORITY_PLAN_INVALID", "plan_semantic_digest"),
+    checkpoint_id: null,
+    checkpoint_digest: null
+  };
+  if (request.kind === "manifest") {
+    value.checkpoint_id = operationIdentifier(request.checkpoint_id, "ARTIFACT_AUTHORITY_CHECKPOINT_INVALID", "checkpoint_id");
+    value.checkpoint_digest = digest3(request.checkpoint_digest, "ARTIFACT_AUTHORITY_CHECKPOINT_INVALID", "checkpoint_digest");
+  } else {
+    invariant(
+      request.checkpoint_id === null || request.checkpoint_id === void 0,
+      "ARTIFACT_AUTHORITY_CHECKPOINT_INVALID",
+      "A checkpoint cannot claim a checkpoint parent"
+    );
+    invariant(
+      request.checkpoint_digest === null || request.checkpoint_digest === void 0,
+      "ARTIFACT_AUTHORITY_CHECKPOINT_INVALID",
+      "A checkpoint cannot claim a checkpoint digest parent"
+    );
+  }
+  const frozen = Object.freeze(value);
+  return Object.freeze({ value: frozen, payload_digest: sha256(Buffer.from(canonicalJson(frozen), "utf8")) });
+}
+function validateArtifactActual(actual) {
+  invariant(actual && typeof actual === "object" && !Array.isArray(actual), "ARTIFACT_AUTHENTICITY_INVALID");
+  return Object.freeze({
+    kind: actual.kind,
+    artifact_id: operationIdentifier(actual.artifact_id, "ARTIFACT_AUTHORITY_ID_INVALID", "artifact_id"),
+    handoff_id: operationIdentifier(actual.handoff_id, "ARTIFACT_AUTHORITY_HANDOFF_INVALID", "handoff_id"),
+    artifact_digest: digest3(actual.artifact_digest, "ARTIFACT_AUTHORITY_DIGEST_INVALID", "artifact_digest"),
+    content_digest: digest3(actual.content_digest, "ARTIFACT_AUTHORITY_DIGEST_INVALID", "content_digest")
+  });
+}
+function detachedPlanAuthority(row) {
+  if (!row) return null;
+  return Object.freeze({
+    snapshot_id: row.snapshot_id,
+    task_id: row.task_id,
+    plan_revision_id: row.plan_revision_id,
+    content_digest: row.plan_content_digest,
+    semantic_digest: row.plan_semantic_digest,
+    current_item: row.current_item ?? null,
+    next_item: row.next_item ?? null,
+    next_step: row.next_step,
+    snapshot: deepFreeze(JSON.parse(row.snapshot_json)),
+    reservation_digest: row.reservation_digest ?? null,
+    handoff_id: row.handoff_id ?? null,
+    created_at: row.created_at
+  });
+}
+function detachedArtifactAuthority(row) {
+  return row ? Object.freeze({ ...row }) : null;
+}
+function requireSecureRecoveryInputAuthority(authority) {
+  invariant(
+    authority?.recoveryInputSecurity?.mode === RECOVERY_INPUT_AUTHORITY_MODES.SECURE && authority.recoveryInputSecurity.canonical === true && authority.recoveryInputSecurity.r1_m_13_recovery_input_isolation === true,
+    "SECURE_RECOVERY_INPUT_AUTHORITY_REQUIRED",
+    "Secure recovery-input reads cannot use or fall back to project plan/artifact state"
+  );
+  return authority;
+}
+
+// src/protected-operation-authority.mjs
+import { existsSync as existsSync2 } from "node:fs";
+import { createRequire } from "node:module";
+import { resolve } from "node:path";
+var require2 = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string" ? __AIOPAGO_OPERATIONAL_ENTRY_URL__ : import.meta.url);
+function sameProtectedGit(left, right) {
+  const fields = ["repository_id", "workdir", "branch", "head_sha", "base_sha", "index_digest", "worktree_digest"];
+  return fields.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null)) && canonicalJson(left?.status_entries ?? []) === canonicalJson(right?.status_entries ?? []);
+}
+function secureUnavailable(error, path) {
+  if (error instanceof GuardianError) return error;
+  return new GuardianError("SECURE_OPERATION_AUTHORITY_UNAVAILABLE", "Protected operation/latch authority is unavailable; portable storage was not consulted", {
+    path,
+    cause: error?.code ?? error?.message ?? String(error)
+  });
+}
+var ProtectedSqliteOperationAuthority = class {
+  #connection;
+  constructor(path, { allowInitialize = false, expectedSchema = OPERATION_AUTHORITY_SCHEMA } = {}) {
+    this.path = resolve(path);
+    this.security = SECURE_OPERATION_AUTHORITY_LABEL;
+    this.latchSecurity = SECURE_LATCH_AUTHORITY_LABEL;
+    this.handoffSecurity = SECURE_HANDOFF_AUTHORITY_LABEL;
+    this.lifecycleSecurity = SECURE_LIFECYCLE_AUTHORITY_LABEL;
+    this.resumeSecurity = SECURE_RESUME_AUTHORITY_LABEL;
+    this.recoveryInputSecurity = SECURE_RECOVERY_INPUT_AUTHORITY_LABEL;
+    this.recoverySecurity = SECURE_RECOVERY_AUTHORITY_LABEL;
+    this.schema = expectedSchema;
+    const existed = existsSync2(this.path);
+    invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
+    try {
+      const { DatabaseSync } = require2("node:sqlite");
+      this.#connection = new DatabaseSync(this.path);
+      this.#connection.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=1000;");
+      this.#migrate(allowInitialize, existed);
+      const integrity = this.#connection.prepare("PRAGMA integrity_check").get();
+      invariant(integrity?.integrity_check === "ok", "SECURE_OPERATION_AUTHORITY_INTEGRITY_FAILED");
+      const metadata = this.#connection.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
+      invariant(metadata?.schema_version === expectedSchema, "SECURE_OPERATION_AUTHORITY_VERSION_MISMATCH", `${metadata?.schema_version ?? "MISSING"} != ${expectedSchema}`);
+      this.#verifySchema();
+      const journal = this.#connection.prepare("PRAGMA journal_mode").get();
+      invariant(String(journal?.journal_mode).toLowerCase() === "wal", "SECURE_OPERATION_AUTHORITY_JOURNAL_INVALID");
+    } catch (error) {
+      try {
+        this.#connection?.close();
+      } catch {
+      }
+      this.#connection = null;
+      throw secureUnavailable(error, this.path);
+    }
+  }
+  #database() {
+    invariant(this.#connection, "SECURE_OPERATION_AUTHORITY_CLOSED");
+    return this.#connection;
+  }
+  #migrate(allowInitialize, existed) {
+    const db = this.#database();
+    if (!existed) invariant(allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING");
+    if (existed) {
+      const metadataTable = db.prepare("SELECT 1 present FROM sqlite_master WHERE type='table' AND name='authority_metadata'").get();
+      invariant(metadataTable, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
+      const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
+      invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
+      if (existingMetadata.schema_version === this.schema) return;
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA, RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS authority_metadata(
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        schema_version TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS operations(
+        operation_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        profile TEXT NOT NULL CHECK(profile IN ('READ_ONLY','LOCAL_ATOMIC_MUTATION','SHELL_ATOMIC_OPERATION')),
+        state TEXT NOT NULL CHECK(state IN ('ACTIVE','TERMINAL')),
+        outcome TEXT CHECK(outcome IS NULL OR outcome IN ('KNOWN_SUCCESS','KNOWN_FAILURE','UNKNOWN')),
+        effect_reference TEXT,
+        admitted_at TEXT NOT NULL,
+        terminal_at TEXT,
+        admission_digest TEXT NOT NULL,
+        terminal_digest TEXT,
+        CHECK((state='ACTIVE' AND outcome IS NULL AND terminal_at IS NULL AND terminal_digest IS NULL)
+          OR (state='TERMINAL' AND outcome IS NOT NULL AND terminal_at IS NOT NULL AND terminal_digest IS NOT NULL)),
+        CHECK(outcome='KNOWN_SUCCESS' OR effect_reference IS NULL)
+      );
+      CREATE TABLE IF NOT EXISTS latches(
+        task_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('ENGAGED','RELEASED')),
+        generation INTEGER NOT NULL CHECK(generation >= 0),
+        reason TEXT,
+        engaged_at TEXT,
+        engaged_by TEXT,
+        released_at TEXT,
+        released_by TEXT,
+        last_event_id TEXT NOT NULL,
+        CHECK((state='RELEASED' AND reason IS NULL) OR (state='ENGAGED' AND reason IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS latch_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT UNIQUE,
+        task_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('LATCH_BOOTSTRAPPED','LATCH_ENGAGED','LATCH_ESCALATED')),
+        generation INTEGER NOT NULL CHECK(generation >= 0),
+        from_reason TEXT,
+        reason TEXT,
+        actor TEXT NOT NULL,
+        occurred_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS handoff_reservations(
+        handoff_id TEXT PRIMARY KEY,
+        source_session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        task_plan_revision TEXT NOT NULL,
+        task_plan_digest TEXT NOT NULL,
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        runner_instance_id TEXT NOT NULL,
+        recovery_of_handoff_id TEXT,
+        checkpoint_id TEXT NOT NULL,
+        resume_manifest_id TEXT NOT NULL,
+        reservation_digest TEXT NOT NULL,
+        reservation_event_id TEXT NOT NULL UNIQUE,
+        projection_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS active_sources(
+        source_session_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES handoff_reservations(handoff_id)
+      );
+      CREATE TABLE IF NOT EXISTS handoff_reservation_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES handoff_reservations(handoff_id),
+        task_id TEXT NOT NULL,
+        source_session_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type='HANDOFF_RESERVED'),
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        occurred_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS plan_authority_snapshots(
+        snapshot_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        plan_revision_id TEXT NOT NULL,
+        plan_content_digest TEXT NOT NULL,
+        plan_semantic_digest TEXT NOT NULL UNIQUE,
+        current_item TEXT,
+        next_item TEXT,
+        next_step TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id,plan_revision_id)
+      );
+      CREATE TABLE IF NOT EXISTS handoff_plan_authority(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        snapshot_id TEXT NOT NULL REFERENCES plan_authority_snapshots(snapshot_id),
+        reservation_digest TEXT NOT NULL,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS artifact_authority(
+        artifact_kind TEXT NOT NULL CHECK(artifact_kind IN ('checkpoint','manifest')),
+        artifact_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL REFERENCES handoff_reservations(handoff_id),
+        snapshot_id TEXT NOT NULL REFERENCES plan_authority_snapshots(snapshot_id),
+        artifact_digest TEXT NOT NULL,
+        content_digest TEXT NOT NULL,
+        checkpoint_id TEXT,
+        checkpoint_digest TEXT,
+        relationship_digest TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        PRIMARY KEY(artifact_kind,artifact_id),
+        CHECK((artifact_kind='checkpoint' AND checkpoint_id IS NULL AND checkpoint_digest IS NULL)
+          OR (artifact_kind='manifest' AND checkpoint_id IS NOT NULL AND checkpoint_digest IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS lifecycle_bindings(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        replacement_session_id TEXT NOT NULL UNIQUE,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL UNIQUE,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+        bound_at TEXT NOT NULL,
+        bind_event_id TEXT NOT NULL UNIQUE,
+        superseded_at TEXT,
+        superseded_reason TEXT,
+        supersede_event_id TEXT UNIQUE,
+        CHECK((status='ACTIVE' AND superseded_at IS NULL AND superseded_reason IS NULL AND supersede_event_id IS NULL)
+          OR (status='SUPERSEDED' AND superseded_at IS NOT NULL AND superseded_reason IS NOT NULL AND supersede_event_id IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS lifecycle_binding_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        handoff_id TEXT NOT NULL REFERENCES lifecycle_bindings(handoff_id),
+        replacement_session_id TEXT NOT NULL,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        event_type TEXT NOT NULL CHECK(event_type IN ('RUNNER_SESSION_BOUND','RUNNER_SESSION_BINDING_SUPERSEDED')),
+        from_status TEXT,
+        status TEXT NOT NULL CHECK(status IN ('ACTIVE','SUPERSEDED')),
+        reason TEXT,
+        occurred_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_readiness(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        reservation_digest TEXT NOT NULL,
+        replacement_session_id TEXT NOT NULL UNIQUE,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL UNIQUE,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        checkpoint_digest TEXT NOT NULL,
+        resume_manifest_digest TEXT NOT NULL,
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        resume_prompt_digest TEXT NOT NULL,
+        resume_prompt TEXT NOT NULL,
+        plan_semantic_digest TEXT NOT NULL,
+        readiness_digest TEXT NOT NULL UNIQUE,
+        ready_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_authorizations(
+        authorization_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES resume_readiness(handoff_id),
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        actor TEXT NOT NULL,
+        readiness_digest TEXT NOT NULL,
+        engaged_latch_generation INTEGER NOT NULL,
+        released_latch_generation INTEGER NOT NULL,
+        authorized_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_admissions(
+        admission_id TEXT PRIMARY KEY,
+        authorization_id TEXT NOT NULL UNIQUE REFERENCES resume_authorizations(authorization_id),
+        handoff_id TEXT NOT NULL UNIQUE,
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        committed_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_dispatch_attempts(
+        dispatch_attempt_id TEXT PRIMARY KEY,
+        admission_id TEXT NOT NULL UNIQUE REFERENCES resume_admissions(admission_id),
+        handoff_id TEXT NOT NULL UNIQUE,
+        attempt_no INTEGER NOT NULL CHECK(attempt_no=1),
+        state TEXT NOT NULL CHECK(state IN ('DISPATCHING','ACKNOWLEDGED','DISPATCHED','FAILED','UNKNOWN')),
+        intent_at TEXT NOT NULL,
+        outcome_at TEXT,
+        error TEXT,
+        CHECK((state='DISPATCHING' AND outcome_at IS NULL AND error IS NULL)
+          OR (state<>'DISPATCHING' AND outcome_at IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS resume_authority_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('RESUME_READY','LATCH_RELEASED','RESUME_AUTHORIZED','RESUME_ADMISSION_COMMITTED','RESUME_DISPATCH_INTENT','RESUME_DISPATCHED','RESUME_ACKNOWLEDGED','RESUME_FAILED','RESUME_DISPATCH_UNKNOWN')),
+        occurred_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS continuity_failures(
+        failed_handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        reservation_digest TEXT NOT NULL,
+        failure_digest TEXT NOT NULL UNIQUE,
+        failed_projection_json TEXT NOT NULL,
+        failure_code TEXT NOT NULL,
+        failure_message TEXT NOT NULL,
+        failed_at TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS continuity_recovery_decisions(
+        decision_id TEXT PRIMARY KEY,
+        failed_handoff_id TEXT NOT NULL UNIQUE REFERENCES continuity_failures(failed_handoff_id),
+        failure_digest TEXT NOT NULL,
+        recovery_handoff_id TEXT NOT NULL UNIQUE,
+        source_session_id TEXT NOT NULL,
+        source_runner_instance_id TEXT NOT NULL,
+        source_lifecycle_incarnation INTEGER NOT NULL CHECK(source_lifecycle_incarnation > 0),
+        actor TEXT NOT NULL,
+        attestation_digest TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        started_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS continuity_recovery_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        failed_handoff_id TEXT NOT NULL REFERENCES continuity_failures(failed_handoff_id),
+        recovery_handoff_id TEXT,
+        event_type TEXT NOT NULL CHECK(event_type IN ('CONTINUITY_FAILED','CONTINUITY_RECOVERY_STARTED')),
+        occurred_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS authority_requests(
+        request_id TEXT PRIMARY KEY,
+        operation_type TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id,state,admitted_at);
+      CREATE INDEX IF NOT EXISTS latch_event_task_sequence ON latch_events(task_id,sequence);
+      CREATE INDEX IF NOT EXISTS handoff_reservation_task_created ON handoff_reservations(task_id,created_at,handoff_id);
+      CREATE INDEX IF NOT EXISTS plan_authority_task_revision ON plan_authority_snapshots(task_id,plan_revision_id);
+      CREATE INDEX IF NOT EXISTS artifact_authority_handoff_kind ON artifact_authority(handoff_id,artifact_kind);
+      CREATE INDEX IF NOT EXISTS lifecycle_binding_session_status ON lifecycle_bindings(replacement_session_id,status);
+      CREATE INDEX IF NOT EXISTS lifecycle_binding_event_handoff_sequence ON lifecycle_binding_events(handoff_id,sequence);
+      CREATE INDEX IF NOT EXISTS resume_authority_event_handoff_sequence ON resume_authority_events(handoff_id,sequence);
+      CREATE INDEX IF NOT EXISTS continuity_recovery_event_failed_sequence ON continuity_recovery_events(failed_handoff_id,sequence);
+    `);
+    for (const reservation of db.prepare("SELECT * FROM handoff_reservations ORDER BY rowid").all()) {
+      this.#bindPlanAuthorityInTransaction(db, JSON.parse(reservation.projection_json), reservation.reservation_digest, reservation.created_at);
+    }
+    const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
+    if (!metadata) {
+      invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
+      db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA, RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version) && this.schema === OPERATION_AUTHORITY_SCHEMA) {
+      db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?").run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
+    }
+  }
+  #verifySchema() {
+    const db = this.#database();
+    const expected = Object.freeze({
+      authority_metadata: ["singleton", "schema_version", "created_at"],
+      operations: ["operation_id", "task_id", "latch_generation", "profile", "state", "outcome", "effect_reference", "admitted_at", "terminal_at", "admission_digest", "terminal_digest"],
+      latches: ["task_id", "state", "generation", "reason", "engaged_at", "engaged_by", "released_at", "released_by", "last_event_id"],
+      latch_events: ["sequence", "event_id", "request_id", "task_id", "event_type", "generation", "from_reason", "reason", "actor", "occurred_at"],
+      handoff_reservations: ["handoff_id", "source_session_id", "task_id", "task_plan_revision", "task_plan_digest", "latch_generation", "latch_reason", "runner_instance_id", "recovery_of_handoff_id", "checkpoint_id", "resume_manifest_id", "reservation_digest", "reservation_event_id", "projection_json", "created_at"],
+      active_sources: ["source_session_id", "handoff_id"],
+      handoff_reservation_events: ["sequence", "event_id", "request_id", "handoff_id", "task_id", "source_session_id", "event_type", "latch_generation", "latch_reason", "occurred_at"],
+      plan_authority_snapshots: ["snapshot_id", "task_id", "plan_revision_id", "plan_content_digest", "plan_semantic_digest", "current_item", "next_item", "next_step", "snapshot_json", "created_at"],
+      handoff_plan_authority: ["handoff_id", "snapshot_id", "reservation_digest", "bound_at"],
+      artifact_authority: ["artifact_kind", "artifact_id", "handoff_id", "snapshot_id", "artifact_digest", "content_digest", "checkpoint_id", "checkpoint_digest", "relationship_digest", "registered_at"],
+      lifecycle_bindings: ["handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "status", "bound_at", "bind_event_id", "superseded_at", "superseded_reason", "supersede_event_id"],
+      lifecycle_binding_events: ["sequence", "event_id", "request_id", "handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "event_type", "from_status", "status", "reason", "occurred_at"],
+      resume_readiness: ["handoff_id", "reservation_digest", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "latch_generation", "latch_reason", "checkpoint_digest", "resume_manifest_digest", "resume_prompt_id", "resume_prompt_digest", "resume_prompt", "plan_semantic_digest", "readiness_digest", "ready_at"],
+      resume_authorizations: ["authorization_id", "handoff_id", "resume_prompt_id", "actor", "readiness_digest", "engaged_latch_generation", "released_latch_generation", "authorized_at"],
+      resume_admissions: ["admission_id", "authorization_id", "handoff_id", "resume_prompt_id", "idempotency_key", "committed_at"],
+      resume_dispatch_attempts: ["dispatch_attempt_id", "admission_id", "handoff_id", "attempt_no", "state", "intent_at", "outcome_at", "error"],
+      resume_authority_events: ["sequence", "event_id", "request_id", "handoff_id", "event_type", "occurred_at", "data_json"],
+      continuity_failures: ["failed_handoff_id", "reservation_digest", "failure_digest", "failed_projection_json", "failure_code", "failure_message", "failed_at", "event_id"],
+      continuity_recovery_decisions: ["decision_id", "failed_handoff_id", "failure_digest", "recovery_handoff_id", "source_session_id", "source_runner_instance_id", "source_lifecycle_incarnation", "actor", "attestation_digest", "request_digest", "started_at"],
+      continuity_recovery_events: ["sequence", "event_id", "request_id", "failed_handoff_id", "recovery_handoff_id", "event_type", "occurred_at", "data_json"],
+      authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"]
+    });
+    for (const [table, columns] of Object.entries(expected)) {
+      const actual = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+      invariant(JSON.stringify(actual) === JSON.stringify(columns), "SECURE_OPERATION_AUTHORITY_SCHEMA_INVALID", `${table} schema is missing or incompatible`);
+    }
+  }
+  #transaction(fn) {
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn(db);
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+      }
+      throw error;
+    }
+  }
+  #recordedRequest(db, requestId, operationType, payloadDigest, conflictCode = "OPERATION_REQUEST_CONFLICT") {
+    const prior = db.prepare("SELECT operation_type,payload_digest,result_json FROM authority_requests WHERE request_id=?").get(requestId);
+    if (!prior) return null;
+    invariant(
+      prior.operation_type === operationType && prior.payload_digest === payloadDigest,
+      conflictCode,
+      "The protected request identity already binds different authority payload"
+    );
+    return Object.freeze({ ...JSON.parse(prior.result_json), idempotent: true, request_code: "IDEMPOTENT_RECORDED_RESULT" });
+  }
+  #saveRequest(db, requestId, operationType, payloadDigest, result) {
+    db.prepare("INSERT INTO authority_requests(request_id,operation_type,payload_digest,result_json,recorded_at) VALUES(?,?,?,?,?)").run(requestId, operationType, payloadDigest, JSON.stringify(result), utcNow());
+  }
+  #ensureLatchInTransaction(db, taskId) {
+    const prior = db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+    if (prior) return prior;
+    const occurredAt = utcNow();
+    const eventId = opaqueId("LEV");
+    db.prepare("INSERT INTO latch_events(event_id,task_id,event_type,generation,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?)").run(eventId, taskId, "LATCH_BOOTSTRAPPED", 0, null, "human:bootstrap", occurredAt);
+    db.prepare("INSERT INTO latches(task_id,state,generation,released_at,released_by,last_event_id) VALUES(?,?,?,?,?,?)").run(taskId, "RELEASED", 0, occurredAt, "human:bootstrap", eventId);
+    return db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+  }
+  ensureLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.#transaction((db) => this.#ensureLatchInTransaction(db, taskId)));
+  }
+  getLatch(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(this.#database().prepare("SELECT * FROM latches WHERE task_id=?").get(taskId));
+  }
+  #claimLatchInTransaction(db, value, requestId, payloadDigest) {
+    const recorded = this.#recordedRequest(db, requestId, "LATCH_CLAIM", payloadDigest, "LATCH_REQUEST_CONFLICT");
+    if (recorded) return recorded;
+    const latch = this.#ensureLatchInTransaction(db, value.taskId);
+    if (value.reason !== "HUMAN_TAKEOVER" && latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover has priority over safe-point acquisition");
+    }
+    if (value.expected && (latch.state !== value.expected.state || latch.generation !== value.expected.generation || (latch.reason ?? null) !== value.expected.reason)) {
+      throw new GuardianError("LATCH_GENERATION_MISMATCH", "Canonical latch no longer matches the expected safe-point precondition", { expected: value.expected, observed: latch });
+    }
+    let changedLatch = latch;
+    let idempotent = true;
+    let requestCode = "IDEMPOTENT_LATCH";
+    if (latch.state === "ENGAGED") {
+      if (value.reason === "HUMAN_TAKEOVER" && latch.reason !== value.reason) {
+        const eventId = opaqueId("LEV");
+        const occurredAt = utcNow();
+        db.prepare("INSERT INTO latch_events(event_id,request_id,task_id,event_type,generation,from_reason,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?,?,?)").run(eventId, requestId, value.taskId, "LATCH_ESCALATED", latch.generation, latch.reason, value.reason, value.actor, occurredAt);
+        const changed = db.prepare("UPDATE latches SET reason=?,engaged_by=?,last_event_id=? WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason IS ?").run(value.reason, value.actor, eventId, value.taskId, latch.generation, latch.reason);
+        invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch escalation raced");
+        changedLatch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+        idempotent = false;
+        requestCode = "MUTATION_ACCEPTED";
+      } else {
+        invariant(latch.reason === value.reason, "LATCH_REASON_MISMATCH", `${latch.reason} != ${value.reason}`);
+      }
+    } else {
+      const generation = latch.generation + 1;
+      const eventId = opaqueId("LEV");
+      const occurredAt = utcNow();
+      db.prepare("INSERT INTO latch_events(event_id,request_id,task_id,event_type,generation,reason,actor,occurred_at) VALUES(?,?,?,?,?,?,?,?)").run(eventId, requestId, value.taskId, "LATCH_ENGAGED", generation, value.reason, value.actor, occurredAt);
+      const changed = db.prepare("UPDATE latches SET state='ENGAGED',generation=?,reason=?,engaged_at=?,engaged_by=?,released_at=NULL,released_by=NULL,last_event_id=? WHERE task_id=? AND state='RELEASED' AND generation=? AND reason IS NULL").run(generation, value.reason, occurredAt, value.actor, eventId, value.taskId, latch.generation);
+      invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Latch acquisition raced");
+      changedLatch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+      idempotent = false;
+      requestCode = "MUTATION_ACCEPTED";
+    }
+    const result = { latch: changedLatch, idempotent, request_code: requestCode };
+    this.#saveRequest(db, requestId, "LATCH_CLAIM", payloadDigest, result);
+    return Object.freeze(result);
+  }
+  requestLatchClaim(requestId, request) {
+    operationIdentifier(requestId, "LATCH_REQUEST_ID_INVALID", "requestId");
+    const value = validateLatchClaim(request);
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    const ledgerRequestId = `latch:${requestId}`;
+    return this.#transaction((db) => this.#claimLatchInTransaction(db, value, ledgerRequestId, payloadDigest));
+  }
+  claimLatch(request) {
+    const requestId = request?.requestId ?? opaqueId("LREQ");
+    return detachedLatch(this.requestLatchClaim(requestId, request).latch);
+  }
+  claimHumanTakeover({ taskId, actor, requestId = void 0, expected = null }) {
+    return this.claimLatch({ taskId, reason: "HUMAN_TAKEOVER", actor, requestId, expected });
+  }
+  assertLatchIdentity(taskId, expected, options = {}) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return detachedLatch(assertLatchIdentityValue(this.getLatch(taskId), expected, options));
+  }
+  isAdmissionOpen(taskId) {
+    try {
+      return this.getLatch(taskId)?.state === "RELEASED";
+    } catch {
+      return false;
+    }
+  }
+  latchEventsForTask(taskId) {
+    operationIdentifier(taskId, "LATCH_TASK_INVALID", "taskId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM latch_events WHERE task_id=? ORDER BY sequence").all(taskId).map((row) => Object.freeze({ ...row })));
+  }
+  #reservationRow(db, handoffId) {
+    return db.prepare("SELECT * FROM handoff_reservations WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+  #planAuthorityRow(db, handoffId) {
+    return db.prepare(`SELECT p.*,h.handoff_id,h.reservation_digest FROM handoff_plan_authority h
+      JOIN plan_authority_snapshots p ON p.snapshot_id=h.snapshot_id WHERE h.handoff_id=?`).get(handoffId) ?? null;
+  }
+  #bindPlanAuthorityInTransaction(db, projection, reservationDigest, occurredAt) {
+    const value = protectedPlanSnapshot(projection);
+    const priorRevision = db.prepare("SELECT * FROM plan_authority_snapshots WHERE task_id=? AND plan_revision_id=?").get(
+      projection.task_id,
+      projection.task_plan_revision
+    );
+    if (priorRevision) {
+      invariant(
+        priorRevision.snapshot_id === value.snapshot_id && priorRevision.plan_content_digest === projection.task_plan_digest && priorRevision.plan_semantic_digest === value.semantic_digest && priorRevision.snapshot_json === canonicalJson(value.snapshot),
+        "PLAN_AUTHORITY_CONFLICT",
+        "The protected task/revision already binds different canonical plan content"
+      );
+    } else {
+      db.prepare(`INSERT INTO plan_authority_snapshots(
+        snapshot_id,task_id,plan_revision_id,plan_content_digest,plan_semantic_digest,current_item,next_item,next_step,snapshot_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        value.snapshot_id,
+        projection.task_id,
+        projection.task_plan_revision,
+        projection.task_plan_digest,
+        value.semantic_digest,
+        value.snapshot.current_item,
+        value.snapshot.next_item,
+        value.snapshot.next_step,
+        canonicalJson(value.snapshot),
+        occurredAt
+      );
+    }
+    const priorBinding = db.prepare("SELECT * FROM handoff_plan_authority WHERE handoff_id=?").get(projection.handoff_id);
+    if (priorBinding) {
+      invariant(
+        priorBinding.snapshot_id === value.snapshot_id && priorBinding.reservation_digest === reservationDigest,
+        "PLAN_AUTHORITY_CONFLICT",
+        "The protected handoff already binds a different plan identity"
+      );
+    } else {
+      db.prepare("INSERT INTO handoff_plan_authority(handoff_id,snapshot_id,reservation_digest,bound_at) VALUES(?,?,?,?)").run(projection.handoff_id, value.snapshot_id, reservationDigest, occurredAt);
+    }
+    return this.#planAuthorityRow(db, projection.handoff_id);
+  }
+  #reservationResult(db, handoffId, created, requestCode) {
+    const reservation = this.#reservationRow(db, handoffId);
+    const activeSource = db.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE handoff_id=?").get(handoffId) ?? null;
+    const event = db.prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=?").get(handoffId) ?? null;
+    const planAuthority = this.#planAuthorityRow(db, handoffId);
+    return Object.freeze({ reservation, plan_authority: planAuthority, active_source: activeSource, event, created, idempotent: !created, request_code: requestCode });
+  }
+  #reserveHandoffInTransaction(db, value, ledgerRequestId, payloadDigest, { crashBeforeEvent = false, recoveryFailure = null, crashSeam = null } = {}) {
+    const recorded = this.#recordedRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, "HANDOFF_REQUEST_CONFLICT");
+    if (recorded) return Object.freeze({ ...recorded, created: false, idempotent: true });
+    const projection = value.projection;
+    const exact = this.#reservationRow(db, projection.handoff_id);
+    if (exact) {
+      const existingProjection = JSON.parse(exact.projection_json);
+      invariant(
+        exact.reservation_digest === payloadDigest && exact.latch_reason === value.expectedLatch.reason && sameHandoffReservationIdentity(existingProjection, projection) && canonicalJson(existingProjection) === canonicalJson(projection),
+        "HANDOFF_RESERVATION_CONFLICT",
+        "The handoff identity already binds different canonical reservation provenance"
+      );
+      const result2 = this.#reservationResult(db, projection.handoff_id, false, "IDEMPOTENT_HANDOFF_RESERVATION");
+      this.#saveRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, result2);
+      return result2;
+    }
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(projection.task_id);
+    if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+      throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover committed before protected handoff reservation");
+    }
+    invariant(
+      latch?.state === value.expectedLatch.state && latch.generation === value.expectedLatch.generation && latch.reason === value.expectedLatch.reason,
+      "LATCH_GENERATION_MISMATCH",
+      "Protected handoff reservation used stale canonical latch identity"
+    );
+    const active = db.prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
+    if (active) {
+      const existing = this.#reservationRow(db, active.handoff_id);
+      throw new GuardianError("HANDOFF_ACTIVE_SOURCE_CONFLICT", "The canonical source session is already reserved by a different handoff operation", {
+        source_session_id: projection.source_session_id,
+        existing_handoff_id: existing?.handoff_id ?? active.handoff_id,
+        requested_handoff_id: projection.handoff_id
+      });
+    }
+    const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(projection.task_id) ?? null;
+    const expectedLatest = value.expectedLatest;
+    invariant(
+      latest === null && expectedLatest === null || latest !== null && expectedLatest !== null && latest.handoff_id === expectedLatest.handoff_id && latest.reservation_digest === expectedLatest.reservation_digest,
+      "HANDOFF_LATEST_RESERVATION_STALE",
+      "Canonical latest handoff reservation changed"
+    );
+    if (latest) {
+      const priorBinding = this.#lifecycleBindingRow(db, latest.handoff_id);
+      if (recoveryFailure) {
+        invariant(
+          latest.handoff_id === recoveryFailure.failed_handoff_id && latest.reservation_digest === recoveryFailure.reservation_digest && projection.recovery_of_handoff_id === recoveryFailure.failed_handoff_id && priorBinding?.status === "SUPERSEDED",
+          "CONTINUITY_RECOVERY_CONFLICT",
+          "Recovery child does not transfer the exact failed protected lifecycle"
+        );
+      } else {
+        invariant(
+          priorBinding?.status === "ACTIVE" && priorBinding.replacement_session_id === projection.source_session_id && priorBinding.runner_instance_id === projection.runner_instance_id,
+          "HANDOFF_TASK_RESERVATION_CONFLICT",
+          "The latest protected lifecycle does not authorize this exact active target as the next source",
+          {
+            task_id: projection.task_id,
+            existing_handoff_id: latest.handoff_id
+          }
+        );
+      }
+    }
+    const eventId = opaqueId("HEV");
+    const occurredAt = utcNow();
+    db.prepare(`INSERT INTO handoff_reservations(
+      handoff_id,source_session_id,task_id,task_plan_revision,task_plan_digest,latch_generation,latch_reason,
+      runner_instance_id,recovery_of_handoff_id,checkpoint_id,resume_manifest_id,reservation_digest,reservation_event_id,projection_json,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      projection.handoff_id,
+      projection.source_session_id,
+      projection.task_id,
+      projection.task_plan_revision,
+      projection.task_plan_digest,
+      projection.latch_generation,
+      value.expectedLatch.reason,
+      projection.runner_instance_id,
+      projection.recovery_of_handoff_id ?? null,
+      projection.checkpoint_id,
+      projection.resume_manifest_id,
+      payloadDigest,
+      eventId,
+      JSON.stringify(projection),
+      occurredAt
+    );
+    this.#bindPlanAuthorityInTransaction(db, projection, payloadDigest, occurredAt);
+    db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)").run(projection.source_session_id, projection.handoff_id);
+    if (crashSeam === "after_child_reservation") process.exit(107);
+    if (crashBeforeEvent) process.exit(99);
+    db.prepare(`INSERT INTO handoff_reservation_events(
+      event_id,request_id,handoff_id,task_id,source_session_id,event_type,latch_generation,latch_reason,occurred_at
+    ) VALUES(?,?,?,?,?,'HANDOFF_RESERVED',?,?,?)`).run(
+      eventId,
+      ledgerRequestId,
+      projection.handoff_id,
+      projection.task_id,
+      projection.source_session_id,
+      projection.latch_generation,
+      value.expectedLatch.reason,
+      occurredAt
+    );
+    const result = this.#reservationResult(db, projection.handoff_id, true, "MUTATION_ACCEPTED");
+    this.#saveRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, result);
+    return result;
+  }
+  assertHandoffOwnerAuthority({ taskId, expectedLatch, expectedLatest = null }) {
+    operationIdentifier(taskId, "HANDOFF_TASK_INVALID", "taskId");
+    return this.#transaction((db) => {
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(taskId);
+      if (latch?.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover won protected owner-gate arbitration");
+      }
+      invariant(
+        latch?.state === expectedLatch?.state && latch.generation === expectedLatch?.generation && (latch.reason ?? null) === (expectedLatch?.reason ?? null),
+        "LATCH_GENERATION_MISMATCH",
+        "Protected latch changed before owner-gate mutation"
+      );
+      const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(taskId) ?? null;
+      invariant(
+        latest === null && expectedLatest === null || latest !== null && expectedLatest?.handoff_id === latest.handoff_id && expectedLatest?.reservation_digest === latest.reservation_digest,
+        "HANDOFF_LATEST_RESERVATION_STALE",
+        "Protected handoff lifecycle changed before owner-gate mutation"
+      );
+      if (latest) {
+        const binding = this.#lifecycleBindingRow(db, latest.handoff_id);
+        invariant(binding?.status === "ACTIVE", "HANDOFF_TASK_RESERVATION_CONFLICT", "Latest protected reservation has no ACTIVE lifecycle successor");
+      }
+      return Object.freeze({ task_id: taskId, eligible: true });
+    });
+  }
+  requestHandoffReservation(requestId, request) {
+    operationIdentifier(requestId, "HANDOFF_REQUEST_ID_INVALID", "requestId");
+    const value = validateHandoffReservationRequest(request);
+    const payload = { projection: value.projection, expectedLatch: value.expectedLatch, expectedLatest: value.expectedLatest };
+    const payloadDigest = sha256(Buffer.from(canonicalJson(payload), "utf8"));
+    return this.#transaction((db) => this.#reserveHandoffInTransaction(db, value, `handoff:${requestId}`, payloadDigest));
+  }
+  reserveHandoff(request) {
+    const requestId = request?.requestId ?? request?.projection?.handoff_id;
+    return this.requestHandoffReservation(requestId, request);
+  }
+  getHandoffReservation(handoffId) {
+    operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
+    return detachedReservation(this.#reservationRow(this.#database(), handoffId));
+  }
+  latestHandoffReservationForTask(taskId) {
+    operationIdentifier(taskId, "HANDOFF_TASK_INVALID", "taskId");
+    const row = this.#database().prepare("SELECT * FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(taskId);
+    return detachedReservation(row);
+  }
+  getActiveSource(sourceSessionId) {
+    operationIdentifier(sourceSessionId, "HANDOFF_SOURCE_INVALID", "sourceSessionId");
+    const row = this.#database().prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id=?").get(sourceSessionId);
+    return row ? Object.freeze({ ...row }) : null;
+  }
+  handoffReservationEvents(handoffId) {
+    operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
+  }
+  getPlanAuthorityForHandoff(handoffId) {
+    operationIdentifier(handoffId, "PLAN_AUTHORITY_HANDOFF_INVALID", "handoffId");
+    return detachedPlanAuthority(this.#planAuthorityRow(this.#database(), handoffId));
+  }
+  getPlanAuthority(taskId, planRevisionId) {
+    operationIdentifier(taskId, "PLAN_AUTHORITY_TASK_INVALID", "taskId");
+    operationIdentifier(planRevisionId, "PLAN_AUTHORITY_REVISION_INVALID", "planRevisionId");
+    const row = this.#database().prepare("SELECT * FROM plan_authority_snapshots WHERE task_id=? AND plan_revision_id=?").get(taskId, planRevisionId);
+    return detachedPlanAuthority(row);
+  }
+  requestArtifactRegistration(requestId, request) {
+    operationIdentifier(requestId, "ARTIFACT_AUTHORITY_REQUEST_INVALID", "requestId");
+    const validated = validateArtifactRegistration(request);
+    const value = validated.value;
+    const ledgerRequestId = `artifact:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, "ARTIFACT_AUTHORITY_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, artifact: detachedArtifactAuthority(
+        db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id)
+      ) });
+      const reservation = this.#reservationRow(db, value.handoff_id);
+      invariant(reservation, "ARTIFACT_AUTHORITY_HANDOFF_NOT_FOUND");
+      const projection = JSON.parse(reservation.projection_json);
+      const plan = this.#planAuthorityRow(db, value.handoff_id);
+      invariant(
+        plan && plan.plan_semantic_digest === value.plan_semantic_digest,
+        "ARTIFACT_AUTHORITY_PLAN_MISMATCH",
+        "Artifact does not bind the protected handoff plan snapshot"
+      );
+      const expectedId = value.kind === "checkpoint" ? reservation.checkpoint_id : reservation.resume_manifest_id;
+      invariant(value.artifact_id === expectedId, "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH", "Artifact ID is not reserved for this handoff");
+      if (value.kind === "manifest") {
+        const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+        invariant(binding?.status === "ACTIVE", "LIFECYCLE_BINDING_STALE", "Manifest registration requires the exact protected ACTIVE target binding");
+        const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint_id);
+        invariant(
+          checkpoint?.handoff_id === value.handoff_id && checkpoint.artifact_digest === value.checkpoint_digest && checkpoint.snapshot_id === plan.snapshot_id,
+          "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH",
+          "Manifest checkpoint link is absent, stale, or cross-handoff"
+        );
+      }
+      invariant(projection.task_id === plan.task_id, "ARTIFACT_AUTHORITY_PLAN_MISMATCH");
+      const prior = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id);
+      if (prior) {
+        invariant(
+          prior.relationship_digest === validated.payload_digest,
+          "ARTIFACT_AUTHORITY_CONFLICT",
+          "Artifact identity already binds different bytes or relationships"
+        );
+        const result2 = { artifact: detachedArtifactAuthority(prior), created: false, idempotent: true, request_code: "IDEMPOTENT_ARTIFACT_AUTHORITY" };
+        this.#saveRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const now = utcNow();
+      db.prepare(`INSERT INTO artifact_authority(
+        artifact_kind,artifact_id,handoff_id,snapshot_id,artifact_digest,content_digest,checkpoint_id,checkpoint_digest,relationship_digest,registered_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        value.kind,
+        value.artifact_id,
+        value.handoff_id,
+        plan.snapshot_id,
+        value.artifact_digest,
+        value.content_digest,
+        value.checkpoint_id,
+        value.checkpoint_digest,
+        validated.payload_digest,
+        now
+      );
+      const artifact = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id);
+      const result = { artifact: detachedArtifactAuthority(artifact), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  getArtifactAuthority(kind, artifactId) {
+    invariant(kind === "checkpoint" || kind === "manifest", "ARTIFACT_AUTHORITY_KIND_INVALID");
+    operationIdentifier(artifactId, "ARTIFACT_AUTHORITY_ID_INVALID", "artifactId");
+    return detachedArtifactAuthority(this.#database().prepare(
+      "SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?"
+    ).get(kind, artifactId));
+  }
+  verifyArtifactAuthority(actual) {
+    const value = validateArtifactActual(actual);
+    const expected = this.getArtifactAuthority(value.kind, value.artifact_id);
+    invariant(
+      expected && expected.handoff_id === value.handoff_id && expected.artifact_digest === value.artifact_digest && expected.content_digest === value.content_digest,
+      value.kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH",
+      "Physical artifact bytes do not match protected expected identity or relationship"
+    );
+    return expected;
+  }
+  recoveryInputReadiness(request) {
+    invariant(request && typeof request === "object" && !Array.isArray(request), "RECOVERY_INPUT_INVALID");
+    const handoffId = operationIdentifier(request.handoff_id, "RECOVERY_INPUT_HANDOFF_INVALID", "handoff_id");
+    const db = this.#database();
+    const reservation = this.#reservationRow(db, handoffId);
+    const plan = this.#planAuthorityRow(db, handoffId);
+    invariant(reservation && plan, "RECOVERY_INPUT_PLAN_UNAVAILABLE");
+    const suppliedPlan = protectedPlanSnapshot({
+      task_id: request.plan?.task_id,
+      task_plan_revision: request.plan?.plan_revision_id,
+      task_plan_digest: request.plan?.content_digest,
+      current_item: request.plan?.current_item ?? null,
+      next_item: request.plan?.next_item ?? null,
+      next_step: request.plan?.next_step,
+      requirements_version: request.plan?.requirements_version,
+      model_policy: request.plan?.model_policy ?? null,
+      reasoning_policy: request.plan?.reasoning_policy ?? null,
+      reserved_plan_snapshot: request.plan
+    });
+    invariant(
+      suppliedPlan.semantic_digest === plan.plan_semantic_digest && canonicalJson(suppliedPlan.snapshot) === plan.snapshot_json,
+      "RECOVERY_INPUT_PLAN_MISMATCH",
+      "Supplied plan input does not equal the protected authoritative snapshot"
+    );
+    const checkpointActual = validateArtifactActual({ ...request.checkpoint, kind: "checkpoint", handoff_id: handoffId });
+    const manifestActual = validateArtifactActual({ ...request.manifest, kind: "manifest", handoff_id: handoffId });
+    const checkpoint = this.verifyArtifactAuthority(checkpointActual);
+    const manifest = this.verifyArtifactAuthority(manifestActual);
+    invariant(
+      checkpoint.snapshot_id === plan.snapshot_id && manifest.snapshot_id === plan.snapshot_id && manifest.checkpoint_id === checkpoint.artifact_id && manifest.checkpoint_digest === checkpoint.artifact_digest,
+      "RECOVERY_INPUT_RELATIONSHIP_MISMATCH",
+      "Protected recovery inputs are individually valid but not mutually related"
+    );
+    const binding = this.#lifecycleBindingRow(db, handoffId);
+    invariant(binding?.status === "ACTIVE", "RECOVERY_INPUT_LIFECYCLE_STALE");
+    const readiness = this.#resumeReadinessRow(db, handoffId);
+    if (readiness) invariant(
+      readiness.plan_semantic_digest === plan.plan_semantic_digest && readiness.checkpoint_digest === checkpoint.artifact_digest && readiness.resume_manifest_digest === manifest.artifact_digest,
+      "RECOVERY_INPUT_READINESS_MISMATCH",
+      "Protected resume readiness does not bind the exact recovery inputs"
+    );
+    const dispatch = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null;
+    return Object.freeze({
+      ready: true,
+      result: "RECOVERY_INPUT_READY",
+      handoff_id: handoffId,
+      plan: detachedPlanAuthority(plan),
+      checkpoint: detachedArtifactAuthority(checkpoint),
+      manifest: detachedArtifactAuthority(manifest),
+      lifecycle: this.#detachedLifecycleBinding(db, binding),
+      resume_readiness: detachedResumeReadiness(readiness),
+      dispatch: dispatch ? Object.freeze({ ...dispatch }) : null,
+      recovery_authority_available: true,
+      reconciliation: dispatch ? this.#dispatchReconciliation(dispatch) : null
+    });
+  }
+  #continuityFailureRow(db, handoffId) {
+    return db.prepare("SELECT * FROM continuity_failures WHERE failed_handoff_id=?").get(handoffId) ?? null;
+  }
+  #continuityRecoveryState(db, handoffId) {
+    const failure = this.#continuityFailureRow(db, handoffId);
+    if (!failure) return null;
+    const decision = db.prepare("SELECT * FROM continuity_recovery_decisions WHERE failed_handoff_id=?").get(handoffId) ?? null;
+    const event = db.prepare("SELECT * FROM continuity_recovery_events WHERE failed_handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(handoffId) ?? null;
+    return detachedContinuityRecovery({
+      failure,
+      decision,
+      event,
+      child: decision ? detachedReservation(this.#reservationRow(db, decision.recovery_handoff_id)) : null,
+      binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, handoffId))
+    });
+  }
+  requestContinuityFailure(requestId, request) {
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityFailure(request);
+    const value = validated.value;
+    const handoffId = value.failed_handoff.handoff_id;
+    const ledgerRequestId = `continuity-failure:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "CONTINUITY_FAILURE", validated.payload_digest, "RECOVERY_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, recovery: this.#continuityRecoveryState(db, handoffId) });
+      const reservation = this.#reservationRow(db, handoffId);
+      invariant(reservation?.reservation_digest === value.reservation_digest, "CONTINUITY_FAILURE_RESERVATION_STALE");
+      const initial = JSON.parse(reservation.projection_json);
+      invariant(
+        sameHandoffReservationIdentity(initial, value.failed_handoff) && value.failed_handoff.target_session_id === value.binding.replacement_session_id && value.failed_handoff.runner_instance_id === value.binding.runner_instance_id && value.failed_handoff.session_binding_id === value.binding.session_binding_id && value.failed_handoff.checkpoint_id === value.checkpoint.id && value.failed_handoff.checkpoint_digest === value.checkpoint.digest && value.failed_handoff.resume_manifest_id === value.manifest.id && value.failed_handoff.resume_manifest_digest === value.manifest.digest && value.failed_handoff.authorization_state === "NOT_AUTHORIZED" && value.failed_handoff.admission_state === "NOT_COMMITTED" && value.failed_handoff.dispatch_state === "NOT_STARTED" && canonicalJson(value.failed_handoff.reserved_plan_snapshot) === canonicalJson(initial.reserved_plan_snapshot) && canonicalJson(value.failed_handoff.expected_git_state) === canonicalJson(initial.expected_git_state),
+        "CONTINUITY_FAILURE_SUBJECT_MISMATCH",
+        "Continuity failure does not equal its protected reservation subject"
+      );
+      const plan = this.#planAuthorityRow(db, handoffId);
+      invariant(plan?.plan_semantic_digest === value.plan_semantic_digest, "CONTINUITY_FAILURE_PLAN_STALE");
+      const binding = this.#lifecycleBindingRow(db, handoffId);
+      invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding), "LIFECYCLE_BINDING_STALE");
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason && latch.generation === reservation.latch_generation, "LATCH_GENERATION_MISMATCH");
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint.id);
+      const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(value.manifest.id);
+      invariant(
+        checkpoint?.handoff_id === handoffId && checkpoint.artifact_digest === value.checkpoint.digest && checkpoint.content_digest === value.checkpoint.content_digest && manifest?.handoff_id === handoffId && manifest.artifact_digest === value.manifest.digest && manifest.content_digest === value.manifest.content_digest && manifest.checkpoint_id === checkpoint.artifact_id && manifest.checkpoint_digest === checkpoint.artifact_digest,
+        "CONTINUITY_FAILURE_ARTIFACT_STALE"
+      );
+      invariant(
+        !this.#resumeReadinessRow(db, handoffId) && !db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(handoffId) && !db.prepare("SELECT 1 present FROM resume_admissions WHERE handoff_id=?").get(handoffId) && !db.prepare("SELECT 1 present FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId),
+        "CONTINUITY_RECOVERY_UNSAFE",
+        "Continuity failure cannot coexist with protected resume effects"
+      );
+      const prior = this.#continuityFailureRow(db, handoffId);
+      if (prior) {
+        invariant(prior.failure_digest === validated.payload_digest, "CONTINUITY_FAILURE_CONFLICT");
+      } else {
+        const now = utcNow();
+        const eventId = opaqueId("RFEV");
+        db.prepare(`INSERT INTO continuity_failures(
+          failed_handoff_id,reservation_digest,failure_digest,failed_projection_json,failure_code,failure_message,failed_at,event_id
+        ) VALUES(?,?,?,?,?,?,?,?)`).run(
+          handoffId,
+          reservation.reservation_digest,
+          validated.payload_digest,
+          canonicalJson(value.failed_handoff),
+          value.failed_handoff.failure.code,
+          value.failed_handoff.failure.message,
+          now,
+          eventId
+        );
+        db.prepare(`INSERT INTO continuity_recovery_events(
+          event_id,request_id,failed_handoff_id,recovery_handoff_id,event_type,occurred_at,data_json
+        ) VALUES(?,?,?,?,?,?,?)`).run(
+          eventId,
+          ledgerRequestId,
+          handoffId,
+          null,
+          "CONTINUITY_FAILED",
+          now,
+          JSON.stringify({ code: value.failed_handoff.failure.code, error: value.failed_handoff.failure.message })
+        );
+      }
+      const result = { recovery: this.#continuityRecoveryState(db, handoffId), created: !prior, idempotent: Boolean(prior), request_code: prior ? "IDEMPOTENT_CONTINUITY_FAILURE" : "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "CONTINUITY_FAILURE", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  #recoverContinuityInTransaction(db, requestId, validated, { crashSeam = null } = {}) {
+    const value = validated.value;
+    const ledgerRequestId = `continuity-recovery:${requestId}`;
+    const recorded = this.#recordedRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, "RECOVERY_REQUEST_CONFLICT");
+    if (recorded) return Object.freeze({ ...recorded, recovery: this.#continuityRecoveryState(db, value.failed_handoff_id) });
+    const failure = this.#continuityFailureRow(db, value.failed_handoff_id);
+    invariant(failure?.failure_digest === value.failure_digest, "CONTINUITY_RECOVERY_SOURCE_INVALID", "Protected failure identity changed");
+    const failed = JSON.parse(failure.failed_projection_json);
+    const priorDecision = db.prepare("SELECT * FROM continuity_recovery_decisions WHERE failed_handoff_id=? OR decision_id=? OR recovery_handoff_id=? LIMIT 1").get(value.failed_handoff_id, value.decision_id, value.child_projection.handoff_id);
+    if (priorDecision) {
+      invariant(
+        priorDecision.failed_handoff_id === value.failed_handoff_id && priorDecision.decision_id === value.decision_id && priorDecision.recovery_handoff_id === value.child_projection.handoff_id && priorDecision.request_digest === validated.payload_digest,
+        "CONTINUITY_RECOVERY_CONFLICT",
+        "Failed handoff already binds a different recovery identity"
+      );
+      const childReserved2 = this.#reservationResult(db, priorDecision.recovery_handoff_id, false, "IDEMPOTENT_HANDOFF_RESERVATION");
+      const result2 = {
+        recovery: this.#continuityRecoveryState(db, value.failed_handoff_id),
+        child_projection_proof: {
+          canonical: true,
+          created: true,
+          reservation_digest: childReserved2.reservation.reservation_digest,
+          active_source: childReserved2.active_source,
+          event: childReserved2.event
+        },
+        created: false,
+        idempotent: true,
+        request_code: "IDEMPOTENT_CONTINUITY_RECOVERY"
+      };
+      this.#saveRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, result2);
+      return Object.freeze(result2);
+    }
+    const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(failed.task_id) ?? null;
+    invariant(
+      latest?.handoff_id === value.expected_latest.handoff_id && latest.reservation_digest === value.expected_latest.reservation_digest && latest.handoff_id === value.failed_handoff_id,
+      "HANDOFF_LATEST_RESERVATION_STALE",
+      "Failed handoff is no longer the exact protected task owner"
+    );
+    const binding = this.#lifecycleBindingRow(db, value.failed_handoff_id);
+    invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding), "LIFECYCLE_BINDING_STALE");
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+    if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+    invariant(latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
+    const plan = this.#planAuthorityRow(db, value.failed_handoff_id);
+    invariant(
+      plan?.plan_semantic_digest === value.plan_semantic_digest && value.child_projection.task_plan_revision === plan.plan_revision_id && value.child_projection.task_plan_digest === plan.plan_content_digest && canonicalJson(value.child_projection.reserved_plan_snapshot) === plan.snapshot_json,
+      "CONTINUITY_RECOVERY_SOURCE_INVALID",
+      "Recovery child plan does not equal protected failed plan authority"
+    );
+    invariant(
+      sameProtectedGit(value.git, failed.expected_git_state),
+      "GIT_STATE_MISMATCH",
+      "Final recovery Git attestation differs from the protected failed subject"
+    );
+    invariant(
+      sameProtectedGit(value.child_projection.expected_git_state, failed.expected_git_state),
+      "GIT_STATE_MISMATCH",
+      "Recovery child Git provenance differs from the protected failed subject"
+    );
+    invariant(
+      value.model_policy === failed.model_policy && value.reasoning_policy === failed.reasoning_policy && value.child_projection.model_policy === failed.model_policy && value.child_projection.reasoning_policy === failed.reasoning_policy,
+      "MODEL_POLICY_MISMATCH",
+      "Recovery model/reasoning provenance changed after final attestation"
+    );
+    invariant(
+      value.child_projection.parent_checkpoint_id === failed.checkpoint_id,
+      "CONTINUITY_RECOVERY_SOURCE_INVALID",
+      "Recovery parent checkpoint changed after final attestation"
+    );
+    const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint.id);
+    const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(value.manifest.id);
+    invariant(
+      checkpoint?.handoff_id === value.failed_handoff_id && checkpoint.artifact_digest === value.checkpoint.digest && checkpoint.content_digest === value.checkpoint.content_digest && manifest?.handoff_id === value.failed_handoff_id && manifest.artifact_digest === value.manifest.digest && manifest.content_digest === value.manifest.content_digest && failed.checkpoint_id === value.checkpoint.id && failed.resume_manifest_id === value.manifest.id,
+      "CONTINUITY_RECOVERY_SOURCE_INVALID",
+      "Recovery artifacts changed after final attestation"
+    );
+    invariant(
+      !this.#resumeReadinessRow(db, value.failed_handoff_id) && !db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(value.failed_handoff_id) && !db.prepare("SELECT 1 present FROM resume_admissions WHERE handoff_id=?").get(value.failed_handoff_id) && !db.prepare("SELECT 1 present FROM resume_dispatch_attempts WHERE handoff_id=?").get(value.failed_handoff_id),
+      "CONTINUITY_RECOVERY_UNSAFE"
+    );
+    invariant(
+      !db.prepare("SELECT 1 present FROM active_sources WHERE source_session_id=?").get(value.source.session_id) && !db.prepare("SELECT 1 present FROM handoff_reservations WHERE source_session_id=?").get(value.source.session_id) && !db.prepare("SELECT 1 present FROM lifecycle_bindings WHERE replacement_session_id=?").get(value.source.session_id),
+      "CONTINUITY_RECOVERY_SOURCE_INVALID",
+      "Recovery source already participates in protected lifecycle authority"
+    );
+    const now = utcNow();
+    db.prepare(`INSERT INTO continuity_recovery_decisions(
+      decision_id,failed_handoff_id,failure_digest,recovery_handoff_id,source_session_id,source_runner_instance_id,
+      source_lifecycle_incarnation,actor,attestation_digest,request_digest,started_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+      value.decision_id,
+      value.failed_handoff_id,
+      value.failure_digest,
+      value.child_projection.handoff_id,
+      value.source.session_id,
+      value.source.runner_instance_id,
+      value.source.lifecycle_incarnation,
+      value.actor,
+      validated.attestation_digest,
+      validated.payload_digest,
+      now
+    );
+    if (crashSeam === "after_decision") process.exit(104);
+    const bindingEventId = opaqueId("BEV");
+    const reason = `explicit continuity recovery by ${value.actor}`;
+    const changed = db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE' AND lifecycle_incarnation=?").run(now, reason, bindingEventId, value.failed_handoff_id, value.binding.lifecycle_incarnation);
+    invariant(changed.changes === 1, "CONTINUITY_RECOVERY_UNSAFE", "Failed binding supersession raced");
+    db.prepare(`INSERT INTO lifecycle_binding_events(
+      event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+    ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+      bindingEventId,
+      `recovery-binding:${value.decision_id}`,
+      value.failed_handoff_id,
+      value.binding.replacement_session_id,
+      value.binding.runner_instance_id,
+      value.binding.session_binding_id,
+      value.binding.lifecycle_incarnation,
+      reason,
+      now
+    );
+    if (crashSeam === "after_binding") process.exit(105);
+    const recoveryEventId = opaqueId("RCEV");
+    db.prepare(`INSERT INTO continuity_recovery_events(
+      event_id,request_id,failed_handoff_id,recovery_handoff_id,event_type,occurred_at,data_json
+    ) VALUES(?,?,?,?,?,?,?)`).run(
+      recoveryEventId,
+      ledgerRequestId,
+      value.failed_handoff_id,
+      value.child_projection.handoff_id,
+      "CONTINUITY_RECOVERY_STARTED",
+      now,
+      JSON.stringify({
+        decision_id: value.decision_id,
+        failed_target_session_id: value.binding.replacement_session_id,
+        failed_runner_instance_id: value.binding.runner_instance_id,
+        current_source_session_id: value.source.session_id,
+        current_runner_instance_id: value.source.runner_instance_id,
+        actor: value.actor
+      })
+    );
+    if (crashSeam === "after_recovery_event") process.exit(106);
+    const childValue = { projection: value.child_projection, expectedLatch: value.latch, expectedLatest: value.expected_latest };
+    const childReserved = this.#reserveHandoffInTransaction(db, childValue, `recovery-child:${value.decision_id}`, validated.child_reservation_digest, {
+      recoveryFailure: failure,
+      crashSeam
+    });
+    if (crashSeam === "before_commit") process.exit(108);
+    const result = {
+      recovery: this.#continuityRecoveryState(db, value.failed_handoff_id),
+      child_projection_proof: {
+        canonical: true,
+        created: childReserved.created,
+        reservation_digest: childReserved.reservation.reservation_digest,
+        active_source: childReserved.active_source,
+        event: childReserved.event
+      },
+      created: true,
+      idempotent: false,
+      request_code: "MUTATION_ACCEPTED"
+    };
+    this.#saveRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, result);
+    return Object.freeze(result);
+  }
+  requestContinuityRecovery(requestId, request) {
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityRecovery(request);
+    return this.#transaction((db) => this.#recoverContinuityInTransaction(db, requestId, validated));
+  }
+  getContinuityRecovery(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    return this.#continuityRecoveryState(this.#database(), handoffId);
+  }
+  continuityRecoveryEvents(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM continuity_recovery_events WHERE failed_handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row, data: JSON.parse(row.data_json) })));
+  }
+  #dispatchReconciliation(dispatch) {
+    if (!dispatch) return null;
+    const evidenceClass = dispatch.state === "ACKNOWLEDGED" || dispatch.state === "DISPATCHED" ? "KNOWN_SUCCESS" : dispatch.state === "FAILED" ? "KNOWN_FAILURE" : "STILL_UNKNOWN";
+    return Object.freeze({
+      dispatch_attempt_id: dispatch.dispatch_attempt_id,
+      handoff_id: dispatch.handoff_id,
+      protected_state: dispatch.state,
+      evidence_class: evidenceClass,
+      evidence_authority: evidenceClass === "STILL_UNKNOWN" ? "PROTECTED_INTENT_WITHOUT_INDEPENDENT_EXTERNAL_EFFECT_EVIDENCE" : "PROTECTED_TRUSTED_WORKFLOW_OUTCOME",
+      retry_permitted: false,
+      requires_human_or_external_evidence: evidenceClass === "STILL_UNKNOWN",
+      disposition: evidenceClass === "STILL_UNKNOWN" ? "FAIL_CLOSED_NO_REPLAY" : "TERMINAL_NO_REPLAY"
+    });
+  }
+  inspectDispatchReconciliation(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    const dispatch = this.#database().prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null;
+    return this.#dispatchReconciliation(dispatch);
+  }
+  #lifecycleBindingRow(db, handoffId) {
+    return db.prepare("SELECT * FROM lifecycle_bindings WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+  #detachedLifecycleBinding(db, row) {
+    if (!row) return null;
+    const event = db.prepare("SELECT event_type,reason AS event_reason,occurred_at FROM lifecycle_binding_events WHERE event_id=? AND handoff_id=?").get(row.bind_event_id, row.handoff_id);
+    invariant(event?.event_type === "RUNNER_SESSION_BOUND", "LIFECYCLE_BINDING_EVENT_MISMATCH");
+    return detachedLifecycleBinding(row, { event_data: {
+      handoff_id: row.handoff_id,
+      replacement_session_id: row.replacement_session_id,
+      runner_instance_id: row.runner_instance_id,
+      session_binding_id: row.session_binding_id,
+      lifecycle_incarnation: row.lifecycle_incarnation
+    } });
+  }
+  requestLifecycleBindingCreate(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingCreate(request);
+    const ledgerRequestId = `lifecycle-bind:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, "LIFECYCLE_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, binding: this.getLifecycleBinding(value.binding.handoff_id) });
+      const reservation = this.#reservationRow(db, value.binding.handoff_id);
+      invariant(reservation, "LIFECYCLE_RESERVATION_NOT_FOUND", "A protected binding requires an existing canonical reservation");
+      const projection = JSON.parse(reservation.projection_json);
+      invariant(
+        reservation.runner_instance_id === value.binding.runner_instance_id && projection.session_binding_id === value.binding.session_binding_id,
+        "LIFECYCLE_RESERVATION_MISMATCH",
+        "Binding identity does not match its protected reservation"
+      );
+      const prior = this.#lifecycleBindingRow(db, value.binding.handoff_id);
+      if (prior) {
+        invariant(
+          prior.status === "ACTIVE" && sameLifecycleBindingIdentity(prior, value.binding),
+          "LIFECYCLE_BINDING_CONFLICT",
+          "The protected handoff already binds a different lifecycle identity"
+        );
+        const result2 = { binding: this.#detachedLifecycleBinding(db, prior), created: false, idempotent: true, request_code: "IDEMPOTENT_LIFECYCLE_BINDING" };
+        this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const sessionConflict = db.prepare("SELECT handoff_id FROM lifecycle_bindings WHERE replacement_session_id=? OR session_binding_id=? LIMIT 1").get(value.binding.replacement_session_id, value.binding.session_binding_id);
+      invariant(!sessionConflict, "LIFECYCLE_BINDING_CONFLICT", "Session or binding identity is already canonical for another handoff");
+      const eventId = opaqueId("BEV");
+      const occurredAt = utcNow();
+      db.prepare(`INSERT INTO lifecycle_bindings(
+        handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,status,bound_at,bind_event_id
+      ) VALUES(?,?,?,?,?,'ACTIVE',?,?)`).run(
+        value.binding.handoff_id,
+        value.binding.replacement_session_id,
+        value.binding.runner_instance_id,
+        value.binding.session_binding_id,
+        value.binding.lifecycle_incarnation,
+        occurredAt,
+        eventId
+      );
+      db.prepare(`INSERT INTO lifecycle_binding_events(
+        event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+      ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BOUND',NULL,'ACTIVE',NULL,?)`).run(
+        eventId,
+        ledgerRequestId,
+        value.binding.handoff_id,
+        value.binding.replacement_session_id,
+        value.binding.runner_instance_id,
+        value.binding.session_binding_id,
+        value.binding.lifecycle_incarnation,
+        occurredAt
+      );
+      const result = { binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, value.binding.handoff_id)), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_BIND", value.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  requestLifecycleBindingTransition(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingTransition(request);
+    const ledgerRequestId = `lifecycle-transition:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, "LIFECYCLE_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, binding: this.getLifecycleBinding(value.expected.handoff_id) });
+      const prior = this.#lifecycleBindingRow(db, value.expected.handoff_id);
+      invariant(
+        prior && sameLifecycleBindingIdentity(prior, value.expected),
+        "LIFECYCLE_BINDING_STALE",
+        "Expected protected lifecycle identity is stale or absent"
+      );
+      if (prior.status === "SUPERSEDED") {
+        invariant(prior.superseded_reason === value.reason, "LIFECYCLE_TRANSITION_CONFLICT", "Protected lifecycle already has different terminal provenance");
+        const result2 = { binding: this.#detachedLifecycleBinding(db, prior), transitioned: false, idempotent: true, request_code: "IDEMPOTENT_LIFECYCLE_TRANSITION" };
+        this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      invariant(prior.status === "ACTIVE", "LIFECYCLE_TRANSITION_INVALID");
+      const eventId = opaqueId("BEV");
+      const occurredAt = utcNow();
+      const changed = db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE' AND lifecycle_incarnation=?").run(occurredAt, value.reason, eventId, prior.handoff_id, prior.lifecycle_incarnation);
+      invariant(changed.changes === 1, "LIFECYCLE_BINDING_STALE", "Protected lifecycle transition raced");
+      db.prepare(`INSERT INTO lifecycle_binding_events(
+        event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+      ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+        eventId,
+        ledgerRequestId,
+        prior.handoff_id,
+        prior.replacement_session_id,
+        prior.runner_instance_id,
+        prior.session_binding_id,
+        prior.lifecycle_incarnation,
+        value.reason,
+        occurredAt
+      );
+      const result = { binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, prior.handoff_id)), transitioned: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "LIFECYCLE_TRANSITION", value.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  getLifecycleBinding(handoffId) {
+    operationIdentifier(handoffId, "LIFECYCLE_HANDOFF_INVALID", "handoffId");
+    return this.#detachedLifecycleBinding(this.#database(), this.#lifecycleBindingRow(this.#database(), handoffId));
+  }
+  getLifecycleBindingBySession(sessionId) {
+    operationIdentifier(sessionId, "LIFECYCLE_SESSION_INVALID", "sessionId");
+    const db = this.#database();
+    return this.#detachedLifecycleBinding(db, db.prepare("SELECT * FROM lifecycle_bindings WHERE replacement_session_id=? ORDER BY bound_at DESC LIMIT 1").get(sessionId) ?? null);
+  }
+  lifecycleBindingEvents(handoffId) {
+    operationIdentifier(handoffId, "LIFECYCLE_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM lifecycle_binding_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
+  }
+  #resumeReadinessRow(db, handoffId) {
+    return db.prepare("SELECT * FROM resume_readiness WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+  #resumeState(db, handoffId) {
+    return detachedResumeState({
+      readiness: this.#resumeReadinessRow(db, handoffId),
+      authorization: db.prepare("SELECT * FROM resume_authorizations WHERE handoff_id=?").get(handoffId) ?? null,
+      admission: db.prepare("SELECT * FROM resume_admissions WHERE handoff_id=?").get(handoffId) ?? null,
+      dispatch: db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null
+    });
+  }
+  #resumeEvent(db, requestId, handoffId, eventType, occurredAt, data) {
+    db.prepare("INSERT INTO resume_authority_events(event_id,request_id,handoff_id,event_type,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(opaqueId("REV"), requestId, handoffId, eventType, occurredAt, JSON.stringify(data));
+  }
+  requestResumeReadiness(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeReadiness(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-ready:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, "RESUME_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, readiness: detachedResumeReadiness(this.#resumeReadinessRow(db, value.handoff_id)) });
+      const reservation = this.#reservationRow(db, value.handoff_id);
+      invariant(
+        reservation && reservation.reservation_digest === value.reservation_digest,
+        "RESUME_RESERVATION_STALE",
+        "Resume readiness does not match the protected reservation"
+      );
+      const projection = JSON.parse(reservation.projection_json);
+      invariant(
+        reservation.task_id === value.latch.task_id && reservation.runner_instance_id === value.binding.runner_instance_id && projection.session_binding_id === value.binding.session_binding_id,
+        "RESUME_RESERVATION_STALE",
+        "Resume readiness identity conflicts with protected reservation provenance"
+      );
+      const plan = this.#planAuthorityRow(db, value.handoff_id);
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(reservation.checkpoint_id);
+      const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(reservation.resume_manifest_id);
+      invariant(
+        plan?.plan_semantic_digest === value.plan_semantic_digest && checkpoint?.handoff_id === value.handoff_id && checkpoint.artifact_digest === value.checkpoint_digest && manifest?.handoff_id === value.handoff_id && manifest.artifact_digest === value.resume_manifest_digest && checkpoint.snapshot_id === plan.snapshot_id && manifest.snapshot_id === plan.snapshot_id && manifest.checkpoint_id === checkpoint.artifact_id && manifest.checkpoint_digest === checkpoint.artifact_digest,
+        "RESUME_RECOVERY_INPUT_STALE",
+        "Resume readiness requires authentic protected plan/checkpoint/manifest relationships"
+      );
+      const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+      invariant(
+        binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding),
+        "LIFECYCLE_BINDING_STALE",
+        "Resume readiness requires the exact protected ACTIVE lifecycle binding"
+      );
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(
+        latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason && latch.generation === reservation.latch_generation,
+        "LATCH_GENERATION_MISMATCH",
+        "Resume readiness used stale protected latch authority"
+      );
+      const prior = this.#resumeReadinessRow(db, value.handoff_id);
+      if (prior) {
+        invariant(prior.readiness_digest === validated.payload_digest, "RESUME_READINESS_CONFLICT");
+        const result2 = { readiness: detachedResumeReadiness(prior), created: false, idempotent: true, request_code: "IDEMPOTENT_RESUME_READY" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const now = utcNow();
+      db.prepare(`INSERT INTO resume_readiness(
+        handoff_id,reservation_digest,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,
+        latch_generation,latch_reason,checkpoint_digest,resume_manifest_digest,resume_prompt_id,resume_prompt_digest,
+        resume_prompt,plan_semantic_digest,readiness_digest,ready_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        value.handoff_id,
+        value.reservation_digest,
+        value.binding.replacement_session_id,
+        value.binding.runner_instance_id,
+        value.binding.session_binding_id,
+        value.binding.lifecycle_incarnation,
+        value.latch.generation,
+        value.latch.reason,
+        value.checkpoint_digest,
+        value.resume_manifest_digest,
+        value.resume_prompt_id,
+        value.resume_prompt_digest,
+        value.resume_prompt,
+        value.plan_semantic_digest,
+        validated.payload_digest,
+        now
+      );
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_READY", now, {
+        resume_prompt_id: value.resume_prompt_id,
+        readiness_digest: validated.payload_digest
+      });
+      const result = { readiness: detachedResumeReadiness(this.#resumeReadinessRow(db, value.handoff_id)), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  requestResumeDecision(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeDecision(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-decision:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, "RESUME_DECISION_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id) });
+      const readiness = this.#resumeReadinessRow(db, value.handoff_id);
+      invariant(
+        readiness && readiness.readiness_digest === value.readiness_digest && readiness.resume_prompt_id === value.resume_prompt_id,
+        "RESUME_READINESS_STALE",
+        "The protected resume readiness identity changed"
+      );
+      if (value.answer === "NO") {
+        invariant(
+          !db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(value.handoff_id),
+          "RESUME_ALREADY_ADMITTED_CONFLICT",
+          "A later NO cannot revoke an already committed protected YES"
+        );
+        const result2 = { answer: "NO", authorized: false, admitted: false, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id), idempotent: false, request_code: "RESUME_DECLINED" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const priorAuthorization = db.prepare("SELECT * FROM resume_authorizations WHERE handoff_id=? OR authorization_id=? OR resume_prompt_id=? LIMIT 1").get(value.handoff_id, value.authorization_id, value.resume_prompt_id);
+      const priorAdmission = db.prepare("SELECT * FROM resume_admissions WHERE handoff_id=? OR admission_id=? OR resume_prompt_id=? OR idempotency_key=? LIMIT 1").get(value.handoff_id, value.admission_id, value.resume_prompt_id, value.idempotency_key);
+      const priorDispatch = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=? OR dispatch_attempt_id=? LIMIT 1").get(value.handoff_id, value.dispatch_attempt_id);
+      if (priorAuthorization || priorAdmission || priorDispatch) {
+        invariant(
+          priorAuthorization?.authorization_id === value.authorization_id && priorAuthorization.actor === value.actor && priorAuthorization.readiness_digest === value.readiness_digest && priorAdmission?.admission_id === value.admission_id && priorAdmission.authorization_id === value.authorization_id && priorAdmission.idempotency_key === value.idempotency_key && priorDispatch?.dispatch_attempt_id === value.dispatch_attempt_id && priorDispatch.admission_id === value.admission_id,
+          "RESUME_ALREADY_ADMITTED_CONFLICT",
+          "The protected handoff already binds a different resume decision"
+        );
+        const result2 = { answer: "YES", authorized: true, admitted: true, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id), idempotent: true, request_code: "IDEMPOTENT_RESUME_ADMISSION" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+      invariant(
+        binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding) && binding.lifecycle_incarnation === readiness.lifecycle_incarnation,
+        "LIFECYCLE_BINDING_STALE",
+        "Protected lifecycle changed before resume admission and dispatch intent"
+      );
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(
+        latch?.state === "ENGAGED" && latch.generation === value.latch.generation && latch.reason === value.latch.reason && latch.generation === readiness.latch_generation,
+        "LATCH_GENERATION_MISMATCH",
+        "Protected latch changed before resume admission and dispatch intent"
+      );
+      const now = utcNow();
+      const releasedGeneration = latch.generation + 1;
+      const releaseEventId = opaqueId("REV");
+      const changed = db.prepare(`UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=?
+        WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason=?`).run(releasedGeneration, now, value.actor, releaseEventId, value.latch.task_id, latch.generation, latch.reason);
+      invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Protected latch release raced resume admission");
+      db.prepare("INSERT INTO resume_authority_events(event_id,request_id,handoff_id,event_type,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(releaseEventId, ledgerRequestId, value.handoff_id, "LATCH_RELEASED", now, JSON.stringify({ task_id: value.latch.task_id, from_generation: latch.generation, generation: releasedGeneration, actor: value.actor }));
+      db.prepare(`INSERT INTO resume_authorizations(
+        authorization_id,handoff_id,resume_prompt_id,actor,readiness_digest,engaged_latch_generation,released_latch_generation,authorized_at
+      ) VALUES(?,?,?,?,?,?,?,?)`).run(
+        value.authorization_id,
+        value.handoff_id,
+        value.resume_prompt_id,
+        value.actor,
+        value.readiness_digest,
+        latch.generation,
+        releasedGeneration,
+        now
+      );
+      db.prepare(`INSERT INTO resume_admissions(
+        admission_id,authorization_id,handoff_id,resume_prompt_id,idempotency_key,committed_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        value.admission_id,
+        value.authorization_id,
+        value.handoff_id,
+        value.resume_prompt_id,
+        value.idempotency_key,
+        now
+      );
+      db.prepare(`INSERT INTO resume_dispatch_attempts(
+        dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        value.dispatch_attempt_id,
+        value.admission_id,
+        value.handoff_id,
+        value.attempt_no,
+        "DISPATCHING",
+        now
+      );
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_AUTHORIZED", now, { authorization_id: value.authorization_id, resume_prompt_id: value.resume_prompt_id, actor: value.actor });
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_ADMISSION_COMMITTED", now, { authorization_id: value.authorization_id, admission_id: value.admission_id, idempotency_key: value.idempotency_key });
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_DISPATCH_INTENT", now, { admission_id: value.admission_id, dispatch_attempt_id: value.dispatch_attempt_id, attempt_no: 1 });
+      const result = { answer: "YES", authorized: true, admitted: true, dispatch_permit: true, state: this.#resumeState(db, value.handoff_id), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  requestResumeDispatchOutcome(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeDispatchOutcome(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-outcome:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, "RESUME_DISPATCH_OUTCOME_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, state: this.#resumeState(db, recorded.handoff_id) });
+      const attempt = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE dispatch_attempt_id=?").get(value.dispatch_attempt_id);
+      invariant(attempt, "RESUME_DISPATCH_INTENT_REQUIRED");
+      if (attempt.state !== "DISPATCHING") {
+        invariant(
+          attempt.state === value.outcome && (attempt.error ?? null) === value.error,
+          "RESUME_DISPATCH_OUTCOME_CONFLICT",
+          "Dispatch attempt already has a different terminal outcome"
+        );
+        const result2 = { handoff_id: attempt.handoff_id, outcome: attempt.state, state: this.#resumeState(db, attempt.handoff_id), idempotent: true, request_code: "IDEMPOTENT_DISPATCH_OUTCOME" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, result2);
+        return Object.freeze(result2);
+      }
+      const now = utcNow();
+      const changed = db.prepare("UPDATE resume_dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=? AND state='DISPATCHING'").run(value.outcome, now, value.error, value.dispatch_attempt_id);
+      invariant(changed.changes === 1, "RESUME_DISPATCH_OUTCOME_CONFLICT");
+      if (value.outcome === "ACKNOWLEDGED") {
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, "RESUME_DISPATCHED", now, { dispatch_attempt_id: value.dispatch_attempt_id });
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, "RESUME_ACKNOWLEDGED", now, { dispatch_attempt_id: value.dispatch_attempt_id });
+      } else {
+        const eventType = value.outcome === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : value.outcome === "FAILED" ? "RESUME_FAILED" : "RESUME_DISPATCHED";
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, eventType, now, { dispatch_attempt_id: value.dispatch_attempt_id, error: value.error });
+      }
+      const result = { handoff_id: attempt.handoff_id, outcome: value.outcome, state: this.#resumeState(db, attempt.handoff_id), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+  getResumeReadiness(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return detachedResumeReadiness(this.#resumeReadinessRow(this.#database(), handoffId));
+  }
+  getResumeState(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return this.#resumeState(this.#database(), handoffId);
+  }
+  resumeAuthorityEvents(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM resume_authority_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row, data: JSON.parse(row.data_json) })));
+  }
+  admitOperation(request) {
+    const value = validateOperationAdmission(request);
+    const requestId = `admit:${value.operationId}`;
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, requestId, "OPERATION_ADMIT", payloadDigest);
+      if (recorded) return recorded;
+      const prior = db.prepare("SELECT * FROM operations WHERE operation_id=?").get(value.operationId);
+      if (prior) {
+        invariant(prior.admission_digest === payloadDigest, "OPERATION_ID_CONFLICT", "Operation identity already binds different admission payload");
+        const result2 = { operation: prior, idempotent: true, request_code: "IDEMPOTENT_OPERATION" };
+        this.#saveRequest(db, requestId, "OPERATION_ADMIT", payloadDigest, result2);
+        return Object.freeze(result2);
+      }
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.taskId);
+      invariant(latch, "SECURE_LATCH_MISSING", "Protected operation admission requires an initialized canonical latch");
+      if (latch.state === "ENGAGED" && latch.reason === "HUMAN_TAKEOVER") {
+        throw new GuardianError("HUMAN_TAKEOVER_ACTIVE", "Human takeover committed before operation admission");
+      }
+      invariant(latch.state === "RELEASED", "TOOL_ADMISSION_BLOCKED", "Canonical latch is engaged");
+      invariant(latch.generation === value.generation, "LATCH_GENERATION_MISMATCH", "Operation admission used a stale canonical latch generation", { expected: value.generation, observed: latch.generation });
+      const admittedAt = utcNow();
+      db.prepare("INSERT INTO operations(operation_id,task_id,latch_generation,profile,state,admitted_at,admission_digest) VALUES(?,?,?,?,?,?,?)").run(value.operationId, value.taskId, value.generation, value.profile, "ACTIVE", admittedAt, payloadDigest);
+      const result = { operation: db.prepare("SELECT * FROM operations WHERE operation_id=?").get(value.operationId), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, requestId, "OPERATION_ADMIT", payloadDigest, result);
+      return Object.freeze(result);
+    });
+  }
+  finishOperation(operationId, outcome, effectReference = null) {
+    const value = validateOperationTerminal(operationId, outcome, effectReference);
+    const requestId = `terminal:${value.operationId}`;
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, requestId, "OPERATION_TERMINAL", payloadDigest);
+      if (recorded) return recorded;
+      const prior = db.prepare("SELECT * FROM operations WHERE operation_id=?").get(value.operationId);
+      invariant(prior, "OPERATION_NOT_FOUND", "A terminal outcome requires an admitted protected operation");
+      if (prior.state === "TERMINAL") {
+        invariant(prior.terminal_digest === payloadDigest, "OPERATION_TERMINAL_CONFLICT", "Terminal operation already binds a different outcome");
+        const result2 = { operation: prior, idempotent: true, request_code: "IDEMPOTENT_OPERATION" };
+        this.#saveRequest(db, requestId, "OPERATION_TERMINAL", payloadDigest, result2);
+        return Object.freeze(result2);
+      }
+      const terminalAt = utcNow();
+      const changed = db.prepare("UPDATE operations SET state='TERMINAL',outcome=?,effect_reference=?,terminal_at=?,terminal_digest=? WHERE operation_id=? AND state='ACTIVE'").run(value.outcome, value.effectReference, terminalAt, payloadDigest, value.operationId);
+      invariant(changed.changes === 1, "OPERATION_TERMINAL_CONFLICT");
+      const result = { operation: db.prepare("SELECT * FROM operations WHERE operation_id=?").get(value.operationId), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, requestId, "OPERATION_TERMINAL", payloadDigest, result);
+      return Object.freeze(result);
+    });
+  }
+  getOperation(operationId) {
+    operationIdentifier(operationId, "OPERATION_ID_INVALID", "operationId");
+    return detachedOperation(this.#database().prepare("SELECT * FROM operations WHERE operation_id=?").get(operationId));
+  }
+  operationsForTask(taskId) {
+    operationIdentifier(taskId, "OPERATION_TASK_INVALID", "taskId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM operations WHERE task_id=? ORDER BY admitted_at,operation_id").all(taskId).map(detachedOperation));
+  }
+  status() {
+    const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
+    const journal = this.#database().prepare("PRAGMA journal_mode").get();
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, recovery_input_canonical: true, recovery_authority_canonical: true, reconciliation_authority_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+  }
+  crashContinuityRecoveryForPhysicalTest(requestId, request, seam) {
+    invariant(["after_decision", "after_binding", "after_recovery_event", "after_child_reservation", "before_commit"].includes(seam), "RECOVERY_CRASH_SEAM_INVALID");
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityRecovery(request);
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#recoverContinuityInTransaction(db, requestId, validated, { crashSeam: seam });
+    process.exit(109);
+  }
+  crashBeforeArtifactCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "ARTIFACT_AUTHORITY_REQUEST_INVALID", "requestId");
+    const validated = validateArtifactRegistration(request);
+    const value = validated.value;
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const reservation = this.#reservationRow(db, value.handoff_id);
+    const plan = this.#planAuthorityRow(db, value.handoff_id);
+    invariant(reservation && plan?.plan_semantic_digest === value.plan_semantic_digest, "ARTIFACT_AUTHORITY_PLAN_MISMATCH");
+    if (value.kind === "manifest") {
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint_id);
+      invariant(
+        checkpoint?.handoff_id === value.handoff_id && checkpoint.artifact_digest === value.checkpoint_digest,
+        "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH"
+      );
+    }
+    db.prepare(`INSERT INTO artifact_authority(
+      artifact_kind,artifact_id,handoff_id,snapshot_id,artifact_digest,content_digest,checkpoint_id,checkpoint_digest,relationship_digest,registered_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      value.kind,
+      value.artifact_id,
+      value.handoff_id,
+      plan.snapshot_id,
+      value.artifact_digest,
+      value.content_digest,
+      value.checkpoint_id,
+      value.checkpoint_digest,
+      validated.payload_digest,
+      utcNow()
+    );
+    process.exit(103);
+  }
+  crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const value = validateResumeDecision(request).value;
+    invariant(value.answer === "YES", "RESUME_CRASH_SEAM_INVALID");
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const readiness = this.#resumeReadinessRow(db, value.handoff_id);
+    const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+    invariant(
+      readiness?.readiness_digest === value.readiness_digest && binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding) && latch?.state === "ENGAGED" && latch.generation === value.latch.generation && latch.reason === value.latch.reason,
+      "RESUME_CRASH_SEAM_INVALID"
+    );
+    const now = utcNow();
+    const releasedGeneration = latch.generation + 1;
+    const eventId = opaqueId("REV");
+    db.prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?").run(releasedGeneration, now, value.actor, eventId, value.latch.task_id);
+    db.prepare("INSERT INTO resume_authorizations(authorization_id,handoff_id,resume_prompt_id,actor,readiness_digest,engaged_latch_generation,released_latch_generation,authorized_at) VALUES(?,?,?,?,?,?,?,?)").run(value.authorization_id, value.handoff_id, value.resume_prompt_id, value.actor, value.readiness_digest, latch.generation, releasedGeneration, now);
+    db.prepare("INSERT INTO resume_admissions(admission_id,authorization_id,handoff_id,resume_prompt_id,idempotency_key,committed_at) VALUES(?,?,?,?,?,?)").run(value.admission_id, value.authorization_id, value.handoff_id, value.resume_prompt_id, value.idempotency_key, now);
+    db.prepare("INSERT INTO resume_dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)").run(value.dispatch_attempt_id, value.admission_id, value.handoff_id, 1, "DISPATCHING", now);
+    process.exit(101);
+  }
+  crashBeforeResumeOutcomeCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const value = validateResumeDispatchOutcome(request).value;
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const attempt = db.prepare("SELECT state FROM resume_dispatch_attempts WHERE dispatch_attempt_id=?").get(value.dispatch_attempt_id);
+    invariant(attempt?.state === "DISPATCHING", "RESUME_CRASH_SEAM_INVALID");
+    db.prepare("UPDATE resume_dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?").run(value.outcome, utcNow(), value.error, value.dispatch_attempt_id);
+    process.exit(102);
+  }
+  crashBeforeTerminalCommitForPhysicalTest(operationId, outcome, effectReference = null) {
+    const value = validateOperationTerminal(operationId, outcome, effectReference);
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const prior = db.prepare("SELECT state FROM operations WHERE operation_id=?").get(value.operationId);
+    invariant(prior?.state === "ACTIVE", "OPERATION_CRASH_SEAM_INVALID");
+    db.prepare("UPDATE operations SET state='TERMINAL',outcome=?,effect_reference=?,terminal_at=?,terminal_digest=? WHERE operation_id=?").run(value.outcome, value.effectReference, utcNow(), payloadDigest, value.operationId);
+    process.exit(97);
+  }
+  crashBeforeLatchCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "LATCH_REQUEST_ID_INVALID", "requestId");
+    const value = validateLatchClaim(request);
+    const payloadDigest = sha256(Buffer.from(canonicalJson(value), "utf8"));
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#claimLatchInTransaction(db, value, `latch:${requestId}`, payloadDigest);
+    process.exit(98);
+  }
+  crashBeforeHandoffCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "HANDOFF_REQUEST_ID_INVALID", "requestId");
+    const value = validateHandoffReservationRequest(request);
+    const payload = { projection: value.projection, expectedLatch: value.expectedLatch, expectedLatest: value.expectedLatest };
+    const payloadDigest = sha256(Buffer.from(canonicalJson(payload), "utf8"));
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#reserveHandoffInTransaction(db, value, `handoff:${requestId}`, payloadDigest, { crashBeforeEvent: true });
+    process.exit(99);
+  }
+  crashBeforeLifecycleTransitionCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "LIFECYCLE_REQUEST_ID_INVALID", "requestId");
+    const value = validateLifecycleBindingTransition(request);
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    const prior = this.#lifecycleBindingRow(db, value.expected.handoff_id);
+    invariant(prior?.status === "ACTIVE" && sameLifecycleBindingIdentity(prior, value.expected), "LIFECYCLE_BINDING_STALE");
+    const eventId = opaqueId("BEV");
+    const occurredAt = utcNow();
+    db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE'").run(occurredAt, value.reason, eventId, prior.handoff_id);
+    db.prepare(`INSERT INTO lifecycle_binding_events(
+      event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+    ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+      eventId,
+      `lifecycle-transition:${requestId}`,
+      prior.handoff_id,
+      prior.replacement_session_id,
+      prior.runner_instance_id,
+      prior.session_binding_id,
+      prior.lifecycle_incarnation,
+      value.reason,
+      occurredAt
+    );
+    process.exit(100);
+  }
+  close() {
+    const db = this.#database();
+    this.#connection = null;
+    db.close();
+  }
+};
+
+// src/safety.mjs
+var TOOL_PROFILES = Object.freeze({
+  read: "READ_ONLY",
+  grep: "READ_ONLY",
+  find: "READ_ONLY",
+  ls: "READ_ONLY",
+  edit: "LOCAL_ATOMIC_MUTATION",
+  write: "LOCAL_ATOMIC_MUTATION",
+  bash: "SHELL_ATOMIC_OPERATION"
+});
+function shellEffectReference(toolCallId) {
+  return `shell:${sha256(Buffer.from(toolCallId, "utf8"))}`;
+}
+function bashTerminalOutcome(isError, result, interrupted) {
+  if (interrupted) return "UNKNOWN";
+  if (typeof isError !== "boolean" || !result || !Array.isArray(result.content)) return "UNKNOWN";
+  if (!isError) return "KNOWN_SUCCESS";
+  const text = result.content.filter((entry) => entry?.type === "text" && typeof entry.text === "string").map((entry) => entry.text).join("\n");
+  if (text === "Command aborted" || text.endsWith("\n\nCommand aborted")) return "UNKNOWN";
+  return "KNOWN_FAILURE";
+}
+var ToolOperationTracker = class {
+  constructor(storage, taskId, { operationAuthority = null, latchAuthority = null } = {}) {
+    this.storage = storage;
+    this.operationAuthority = operationAuthority ?? portableOperationAuthority(storage);
+    this.latchAuthority = latchAuthority ?? portableLatchAuthority(storage);
+    if (this.operationAuthority.security?.mode === "SECURE") {
+      requireSecureLatchAuthority(this.latchAuthority);
+      invariant(
+        this.operationAuthority === this.latchAuthority,
+        "SECURE_ADMISSION_TRANSACTION_REQUIRED",
+        "Secure operation admission and latch arbitration must share one protected transaction"
+      );
+    }
+    this.authoritySecurity = this.operationAuthority.security;
+    this.taskId = taskId;
+    this.admittedTools = /* @__PURE__ */ new Map();
+    this.effectReferences = /* @__PURE__ */ new Map();
+  }
+  admit(toolCallId, toolName, input = {}) {
+    const profile = TOOL_PROFILES[toolName];
+    invariant(profile, "TOOL_PROFILE_REQUIRED", `Tool ${toolName} is outside the M1-H0 allowlist`);
+    const latch = this.latchAuthority.ensureLatch(this.taskId);
+    this.operationAuthority.admitOperation({ operationId: toolCallId, taskId: this.taskId, generation: latch.generation, profile });
+    this.admittedTools.set(toolCallId, toolName);
+    if (toolName === "bash") {
+      this.effectReferences.set(toolCallId, shellEffectReference(toolCallId));
+    } else if (profile !== "READ_ONLY" && typeof input.path === "string" && input.path.length > 0) {
+      this.effectReferences.set(toolCallId, `file:${input.path.replaceAll("\\", "/")}`);
+    }
+  }
+  finish(toolCallId, isError, result = void 0, interrupted = false) {
+    const toolName = this.admittedTools.get(toolCallId);
+    const outcome = toolName === "bash" ? bashTerminalOutcome(isError, result, interrupted) : isError ? "KNOWN_FAILURE" : "KNOWN_SUCCESS";
+    const effectReference = outcome === "KNOWN_SUCCESS" ? this.effectReferences.get(toolCallId) ?? null : null;
+    this.admittedTools.delete(toolCallId);
+    this.effectReferences.delete(toolCallId);
+    this.operationAuthority.finishOperation(toolCallId, outcome, effectReference);
+  }
+  unknown(toolCallId) {
+    this.admittedTools.delete(toolCallId);
+    this.effectReferences.delete(toolCallId);
+    this.operationAuthority.finishOperation(toolCallId, "UNKNOWN");
+  }
+};
+
+// src/operation-authority-worker.mjs
+async function operationAuthorityWorkerEntrypoint() {
+  const MAX_FRAME_BYTES = 262144;
+  const MAX_REQUESTS = 128;
+  const SERVICE_NAME = /^AiopagoOperationAuthority(?:Test-[A-Za-z0-9-]{1,64})?$/;
+  const SERVICE_SID = /^S-1-5-80-(?:\d+-){4}\d+$/;
+  const CAPABILITY = /^[a-f0-9]{64}$/;
+  const lines = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  let capability = null;
+  let authority = null;
+  let requestCount = 0;
+  const trackers = /* @__PURE__ */ new Map();
+  function output(value) {
+    process.stdout.write(`${JSON.stringify(value)}
+`);
+  }
+  async function readFrame() {
+    const item = await iterator.next();
+    if (item.done) throw Object.assign(new Error("PRIVATE_CHANNEL_CLOSED"), { code: "PRIVATE_CHANNEL_CLOSED" });
+    if (Buffer.byteLength(item.value, "utf8") > MAX_FRAME_BYTES) throw Object.assign(new Error("FRAME_TOO_LARGE"), { code: "FRAME_TOO_LARGE" });
+    let value;
+    try {
+      value = JSON.parse(item.value);
+    } catch {
+      throw Object.assign(new Error("FRAME_JSON_INVALID"), { code: "FRAME_JSON_INVALID" });
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw Object.assign(new Error("FRAME_INVALID"), { code: "FRAME_INVALID" });
+    return value;
+  }
+  function fail2(code, message = code) {
+    throw Object.assign(new Error(message), { code });
+  }
+  function identifier(value, code) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$/.test(value)) fail2(code);
+    return value;
+  }
+  function tracker(taskId) {
+    let value = trackers.get(taskId);
+    if (!value) {
+      authority.ensureLatch(taskId);
+      value = new ToolOperationTracker(authority, taskId, {
+        operationAuthority: requireSecureOperationAuthority(authority),
+        latchAuthority: requireSecureLatchAuthority(authority)
+      });
+      trackers.set(taskId, value);
+    }
+    return value;
+  }
+  function requireServiceSid(systemDirectory, expectedSid) {
+    if (process.platform !== "win32" || typeof systemDirectory !== "string" || !/^[A-Za-z]:\\Windows\\System32$/i.test(systemDirectory)) fail2("WINDOWS_SERVICE_IDENTITY_REQUIRED");
+    let groups;
+    try {
+      groups = execFileSync(join(systemDirectory, "whoami.exe"), ["/groups", "/fo", "csv", "/nh"], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5e3
+      });
+    } catch {
+      fail2("WINDOWS_SERVICE_IDENTITY_UNAVAILABLE");
+    }
+    if (!groups.includes(`"${expectedSid}"`)) fail2("WINDOWS_SERVICE_IDENTITY_MISMATCH");
+  }
+  function operationResult(operation) {
+    return operation ? {
+      operation_id: operation.operation_id,
+      task_id: operation.task_id,
+      latch_generation: operation.latch_generation,
+      profile: operation.profile,
+      state: operation.state,
+      outcome: operation.outcome,
+      effect_reference: operation.effect_reference,
+      admitted_at: operation.admitted_at,
+      terminal_at: operation.terminal_at
+    } : null;
+  }
+  function latchResult(latch) {
+    return latch ? {
+      task_id: latch.task_id,
+      state: latch.state,
+      generation: latch.generation,
+      reason: latch.reason,
+      engaged_at: latch.engaged_at,
+      engaged_by: latch.engaged_by,
+      released_at: latch.released_at,
+      released_by: latch.released_by,
+      last_event_id: latch.last_event_id
+    } : null;
+  }
+  function handoffResult(reservation) {
+    return reservation ? {
+      ...reservation,
+      reserved_plan_snapshot: reservation.reserved_plan_snapshot ?? null,
+      expected_git_state: reservation.expected_git_state ?? null
+    } : null;
+  }
+  function lifecycleBindingResult(binding) {
+    return binding ? {
+      handoff_id: binding.handoff_id,
+      replacement_session_id: binding.replacement_session_id,
+      runner_instance_id: binding.runner_instance_id,
+      session_binding_id: binding.session_binding_id,
+      lifecycle_incarnation: binding.lifecycle_incarnation,
+      status: binding.status,
+      bound_at: binding.bound_at,
+      bind_event_id: binding.bind_event_id,
+      superseded_at: binding.superseded_at,
+      superseded_reason: binding.superseded_reason,
+      supersede_event_id: binding.supersede_event_id,
+      event_data: binding.event_data,
+      schema_version: binding.schema_version
+    } : null;
+  }
+  function resumeStateResult(state) {
+    if (!state) return null;
+    return {
+      readiness: state.readiness ?? null,
+      authorization: state.authorization ?? null,
+      admission: state.admission ?? null,
+      dispatch: state.dispatch ?? null
+    };
+  }
+  function planAuthorityResult(plan) {
+    return plan ? {
+      snapshot_id: plan.snapshot_id,
+      handoff_id: plan.handoff_id,
+      task_id: plan.task_id,
+      plan_revision_id: plan.plan_revision_id,
+      content_digest: plan.content_digest,
+      semantic_digest: plan.semantic_digest,
+      current_item: plan.current_item,
+      next_item: plan.next_item,
+      next_step: plan.next_step,
+      snapshot: plan.snapshot,
+      reservation_digest: plan.reservation_digest,
+      created_at: plan.created_at
+    } : null;
+  }
+  function artifactAuthorityResult(artifact) {
+    return artifact ? { ...artifact } : null;
+  }
+  async function dispatch(frame, hello) {
+    if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail2("PRIVATE_FRAME_BINDING_REJECTED");
+    const requestId = identifier(frame.requestId, "REQUEST_ID_INVALID");
+    const payload = frame.payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail2("REQUEST_PAYLOAD_INVALID");
+    requestCount += 1;
+    if (requestCount > MAX_REQUESTS) fail2("SESSION_REQUEST_LIMIT_EXCEEDED");
+    let result;
+    switch (frame.operationType) {
+      case "OPERATION_ADMIT_TOOL": {
+        const taskId = identifier(payload.taskId, "OPERATION_TASK_INVALID");
+        const operationId = identifier(payload.operationId, "OPERATION_ID_INVALID");
+        identifier(payload.toolName, "TOOL_NAME_INVALID");
+        const expectedGeneration = payload.generation;
+        if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) fail2("OPERATION_GENERATION_INVALID");
+        const latch = authority.getLatch(taskId) ?? authority.ensureLatch(taskId);
+        if (latch.generation !== expectedGeneration) fail2("LATCH_GENERATION_MISMATCH");
+        tracker(taskId).admit(operationId, payload.toolName, payload.input ?? {});
+        result = operationResult(authority.getOperation(operationId));
+        break;
+      }
+      case "OPERATION_FINISH_TOOL": {
+        const taskId = identifier(payload.taskId, "OPERATION_TASK_INVALID");
+        const operationId = identifier(payload.operationId, "OPERATION_ID_INVALID");
+        tracker(taskId).finish(operationId, payload.isError, payload.result, payload.interrupted === true);
+        result = operationResult(authority.getOperation(operationId));
+        break;
+      }
+      case "OPERATION_MARK_UNKNOWN": {
+        const taskId = identifier(payload.taskId, "OPERATION_TASK_INVALID");
+        const operationId = identifier(payload.operationId, "OPERATION_ID_INVALID");
+        tracker(taskId).unknown(operationId);
+        result = operationResult(authority.getOperation(operationId));
+        break;
+      }
+      case "LATCH_ENSURE":
+        result = latchResult(authority.ensureLatch(identifier(payload.taskId, "LATCH_TASK_INVALID")));
+        break;
+      case "LATCH_GET":
+        result = latchResult(authority.getLatch(identifier(payload.taskId, "LATCH_TASK_INVALID")));
+        break;
+      case "LATCH_CLAIM_HUMAN_TAKEOVER": {
+        const request = authority.requestLatchClaim(requestId, {
+          taskId: payload.taskId,
+          reason: "HUMAN_TAKEOVER",
+          actor: payload.actor,
+          expected: payload.expected ?? null
+        });
+        result = { ...request, latch: latchResult(request.latch) };
+        break;
+      }
+      case "LATCH_CLAIM_SAFEPOINT": {
+        if (payload.reason === "HUMAN_TAKEOVER") fail2("LATCH_SAFEPOINT_REASON_INVALID");
+        const request = authority.requestLatchClaim(requestId, {
+          taskId: payload.taskId,
+          reason: payload.reason,
+          actor: payload.actor,
+          expected: payload.expected ?? null
+        });
+        result = { ...request, latch: latchResult(request.latch) };
+        break;
+      }
+      case "LATCH_ASSERT":
+        result = latchResult(authority.assertLatchIdentity(payload.taskId, payload.expected, { allowHumanTakeover: payload.allowHumanTakeover === true }));
+        break;
+      case "HANDOFF_RESERVE": {
+        const reserved = authority.requestHandoffReservation(requestId, {
+          projection: payload.projection,
+          expectedLatch: payload.expectedLatch,
+          expectedLatest: payload.expectedLatest ?? null
+        });
+        result = {
+          ...reserved,
+          reservation: handoffResult(authority.getHandoffReservation(payload.projection?.handoff_id))
+        };
+        break;
+      }
+      case "HANDOFF_GET":
+        result = handoffResult(authority.getHandoffReservation(payload.handoffId));
+        break;
+      case "HANDOFF_LATEST_TASK":
+        result = handoffResult(authority.latestHandoffReservationForTask(payload.taskId));
+        break;
+      case "ACTIVE_SOURCE_GET":
+        result = authority.getActiveSource(payload.sourceSessionId);
+        break;
+      case "PLAN_AUTHORITY_GET_HANDOFF":
+        result = planAuthorityResult(authority.getPlanAuthorityForHandoff(payload.handoffId));
+        break;
+      case "PLAN_AUTHORITY_GET_REVISION":
+        result = planAuthorityResult(authority.getPlanAuthority(payload.taskId, payload.planRevisionId));
+        break;
+      case "ARTIFACT_AUTHORITY_REGISTER": {
+        const registered = authority.requestArtifactRegistration(requestId, payload);
+        result = { ...registered, artifact: artifactAuthorityResult(registered.artifact) };
+        break;
+      }
+      case "ARTIFACT_AUTHORITY_GET":
+        result = artifactAuthorityResult(authority.getArtifactAuthority(payload.kind, payload.artifactId));
+        break;
+      case "RECOVERY_INPUT_CHECK": {
+        const ready = authority.recoveryInputReadiness(payload);
+        result = { ...ready, plan: planAuthorityResult(ready.plan), checkpoint: artifactAuthorityResult(ready.checkpoint), manifest: artifactAuthorityResult(ready.manifest) };
+        break;
+      }
+      case "CONTINUITY_FAILURE_COMMIT":
+        result = authority.requestContinuityFailure(requestId, payload);
+        break;
+      case "CONTINUITY_RECOVERY_COMMIT":
+        result = authority.requestContinuityRecovery(requestId, payload);
+        break;
+      case "CONTINUITY_RECOVERY_GET":
+        result = authority.getContinuityRecovery(payload.handoffId);
+        break;
+      case "CONTINUITY_RECOVERY_EVENTS":
+        result = authority.continuityRecoveryEvents(payload.handoffId);
+        break;
+      case "DISPATCH_RECONCILIATION_INSPECT":
+        result = authority.inspectDispatchReconciliation(payload.handoffId);
+        break;
+      case "LIFECYCLE_BIND_CREATE": {
+        const created = authority.requestLifecycleBindingCreate(requestId, { binding: payload.binding });
+        result = { ...created, binding: lifecycleBindingResult(created.binding) };
+        break;
+      }
+      case "LIFECYCLE_BIND_GET":
+        result = lifecycleBindingResult(authority.getLifecycleBinding(payload.handoffId));
+        break;
+      case "LIFECYCLE_BIND_GET_SESSION":
+        result = lifecycleBindingResult(authority.getLifecycleBindingBySession(payload.sessionId));
+        break;
+      case "LIFECYCLE_BIND_TRANSITION": {
+        const transitioned = authority.requestLifecycleBindingTransition(requestId, {
+          expected: payload.expected,
+          nextStatus: payload.nextStatus,
+          reason: payload.reason
+        });
+        result = { ...transitioned, binding: lifecycleBindingResult(transitioned.binding) };
+        break;
+      }
+      case "LIFECYCLE_BIND_EVENTS":
+        result = authority.lifecycleBindingEvents(payload.handoffId);
+        break;
+      case "RESUME_READY_COMMIT": {
+        const ready = authority.requestResumeReadiness(requestId, payload);
+        result = { ...ready, readiness: authority.getResumeReadiness(payload.handoff_id) };
+        break;
+      }
+      case "RESUME_DECIDE": {
+        const decided = authority.requestResumeDecision(requestId, payload);
+        result = { ...decided, state: resumeStateResult(decided.state) };
+        break;
+      }
+      case "RESUME_DISPATCH_OUTCOME": {
+        const outcome = authority.requestResumeDispatchOutcome(requestId, payload);
+        result = { ...outcome, state: resumeStateResult(outcome.state) };
+        break;
+      }
+      case "RESUME_GET":
+        result = resumeStateResult(authority.getResumeState(payload.handoffId));
+        break;
+      case "RESUME_EVENTS":
+        result = authority.resumeAuthorityEvents(payload.handoffId);
+        break;
+      case "OPERATION_RETRY_ADMISSION": {
+        result = authority.admitOperation({
+          operationId: payload.operationId,
+          taskId: payload.taskId,
+          generation: payload.generation,
+          profile: payload.profile
+        });
+        result = { ...result, operation: operationResult(result.operation) };
+        break;
+      }
+      case "OPERATION_RETRY_TERMINAL": {
+        result = authority.finishOperation(payload.operationId, payload.outcome, payload.effectReference ?? null);
+        result = { ...result, operation: operationResult(result.operation) };
+        break;
+      }
+      case "OPERATION_GET":
+        result = operationResult(authority.getOperation(payload.operationId));
+        break;
+      case "OPERATION_LIST_TASK":
+        result = authority.operationsForTask(payload.taskId).map(operationResult);
+        break;
+      case "TEST_CRASH_BEFORE_TERMINAL_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeTerminalCommitForPhysicalTest(payload.operationId, payload.outcome, payload.effectReference ?? null);
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_LATCH_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeLatchCommitForPhysicalTest(requestId, {
+          taskId: payload.taskId,
+          reason: payload.reason,
+          actor: payload.actor,
+          expected: payload.expected ?? null
+        });
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_HANDOFF_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeHandoffCommitForPhysicalTest(requestId, {
+          projection: payload.projection,
+          expectedLatch: payload.expectedLatch,
+          expectedLatest: payload.expectedLatest ?? null
+        });
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_LIFECYCLE_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeLifecycleTransitionCommitForPhysicalTest(requestId, {
+          expected: payload.expected,
+          nextStatus: payload.nextStatus,
+          reason: payload.reason
+        });
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_ARTIFACT_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeArtifactCommitForPhysicalTest(requestId, payload);
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, payload);
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_BEFORE_RESUME_OUTCOME_COMMIT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashBeforeResumeOutcomeCommitForPhysicalTest(requestId, payload);
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_CRASH_CONTINUITY_RECOVERY":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        authority.crashContinuityRecoveryForPhysicalTest(requestId, payload.request, payload.seam);
+        fail2("CRASH_SEAM_RETURNED");
+        break;
+      case "TEST_AUTHORITY_TIMEOUT":
+        if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail2("TEST_OPERATION_FORBIDDEN");
+        await new Promise(() => {
+        });
+        break;
+      default:
+        fail2("OPERATION_TYPE_INVALID");
+    }
+    return { version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, requestId, operationType: "OPERATION_RESULT", ok: true, result };
+  }
+  try {
+    const hello = await readFrame();
+    if (hello.version !== 1 || hello.protocol !== OPERATION_AUTHORITY_PROTOCOL || hello.operationType !== "SESSION_BIND" || !CAPABILITY.test(hello.capability ?? "") || hello.p1Pid !== process.ppid || hello.p2Pid !== process.pid || !SERVICE_NAME.test(hello.serviceName ?? "") || !SERVICE_SID.test(hello.serviceSid ?? "") || !/^[a-f0-9]{64}$/.test(hello.identityFingerprint ?? "") || typeof hello.canonicalPath !== "string" || typeof hello.allowInitialize !== "boolean") fail2("SESSION_BIND_REJECTED");
+    requireServiceSid(hello.systemDirectory, hello.serviceSid);
+    capability = hello.capability;
+    authority = new ProtectedSqliteOperationAuthority(hello.canonicalPath, { allowInitialize: hello.allowInitialize });
+    requireSecureOperationAuthority(authority);
+    requireSecureLatchAuthority(authority);
+    requireSecureHandoffAuthority(authority);
+    requireSecureLifecycleAuthority(authority);
+    requireSecureResumeAuthority(authority);
+    requireSecureRecoveryInputAuthority(authority);
+    requireSecureRecoveryAuthority(authority);
+    output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
+    while (true) {
+      const frame = await readFrame();
+      if (frame.operationType === "SESSION_END") {
+        if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail2("PRIVATE_FRAME_BINDING_REJECTED");
+        output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_COMPLETE", requestCount, authority: authority.status() });
+        break;
+      }
+      try {
+        output(await dispatch(frame, hello));
+      } catch (error) {
+        output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, requestId: frame.requestId ?? null, operationType: "OPERATION_RESULT", ok: false, error: { code: error?.code ?? "OPERATION_AUTHORITY_FAILED", message: error?.message ?? String(error) } });
+      }
+    }
+    authority.close();
+    lines.close();
+  } catch (error) {
+    try {
+      authority?.close();
+    } catch {
+    }
+    process.stderr.write(`operation-authority-worker: ${error?.code ?? "FAILED"}: ${error?.message ?? String(error)}
+`);
+    process.exitCode = 2;
+  }
+}
+if (process.env.AIOPAGO_PROTECTED_OPERATION_WORKER === "1") await operationAuthorityWorkerEntrypoint();

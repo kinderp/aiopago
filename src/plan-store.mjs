@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -17,6 +18,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import { TextDecoder } from "node:util";
 import { sha256 } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
@@ -28,7 +30,10 @@ const LEDGER_BLOCK = /```json task-ledger[^\S\r\n]*(\r?\n)([\s\S]*?)(\r?\n)```/;
 const SCHEMA_HEADER = /^\*\*Schema:\*\*[ \t]*`([^`]+)`[ \t]*$/gm;
 export const MAX_PLAN_BYTES = 32 * 1024 * 1024;
 export const MAX_PLAN_STATE_BYTES = 128 * 1024 * 1024;
-const LOCK_SCHEMA = "aiopago.plan-write-lock/0.2.0";
+const LOCK_SCHEMA = "aiopago.plan-write-lock/0.3.0";
+const LOCK_METADATA_KEYS = Object.freeze([
+  "schema", "ownership_nonce", "pid", "process_identity", "created_at", "plan_path", "guardian_root",
+]);
 
 const DEFAULT_IO = Object.freeze({
   closeSync,
@@ -165,6 +170,119 @@ function randomToken() {
   return randomBytes(32).toString("hex");
 }
 
+const PROCESS_LIVE = (identity) => Object.freeze({ status: "LIVE", identity });
+const PROCESS_DEAD = Object.freeze({ status: "DEAD", identity: null });
+const PROCESS_UNKNOWN = Object.freeze({ status: "UNKNOWN", identity: null });
+const WINDOWS_LIVE_SENTINEL = "AIOPAGO_PROCESS_LIVE_V1:";
+const WINDOWS_UNKNOWN_SENTINEL = "AIOPAGO_PROCESS_UNKNOWN_V1";
+// Process probes are diagnostics only. They never authorize removal of an
+// existing plan lock or recovery marker. Same-process JavaScript can replace
+// every primitive used here, so availability may fail closed but lock safety
+// must not depend on authenticating these observations.
+function processAbsenceDiagnostic(pid, kill = process.kill.bind(process)) {
+  try { kill(pid, 0); return false; }
+  catch (error) { return error?.code === "ESRCH" ? true : null; }
+}
+
+function windowsProcessIdentityProbe(pid, { timeoutMs = 5_000, spawn = spawnSync, kill } = {}) {
+  const absence = processAbsenceDiagnostic(pid, kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    "$probeErrors=@()",
+    `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue -ErrorVariable +probeErrors`,
+    "if ($null -eq $p) {",
+    `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
+    "}",
+    "try {",
+    `  [Console]::Out.Write('${WINDOWS_LIVE_SENTINEL}'+$p.StartTime.ToUniversalTime().Ticks); exit 0`,
+    "} catch {",
+    `  [Console]::Out.Write('${WINDOWS_UNKNOWN_SENTINEL}'); exit 4`,
+    "}",
+  ].join(";");
+  const result = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: Math.max(1, Math.floor(timeoutMs)),
+    windowsHide: true,
+  });
+  if (result?.error) return PROCESS_UNKNOWN;
+  const stdout = String(result?.stdout ?? "").trim();
+  if (result?.status === 0 && stdout.startsWith(WINDOWS_LIVE_SENTINEL)) {
+    const ticks = stdout.slice(WINDOWS_LIVE_SENTINEL.length);
+    return /^\d+$/.test(ticks) ? PROCESS_LIVE(`win32:${ticks}`) : PROCESS_UNKNOWN;
+  }
+  return PROCESS_UNKNOWN;
+}
+
+function processIdentityProbe(pid, options = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return PROCESS_UNKNOWN;
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 5_000;
+  if (process.platform === "linux") {
+    let stat;
+    try { stat = (options.readFileSync ?? readFileSync)(`/proc/${pid}/stat`, "utf8"); }
+    catch (error) { return error?.code === "ENOENT" ? PROCESS_DEAD : PROCESS_UNKNOWN; }
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return PROCESS_UNKNOWN;
+    const fields = stat.slice(close + 2).split(" ");
+    const startTicks = fields[19];
+    let bootId;
+    try { bootId = (options.readFileSync ?? readFileSync)("/proc/sys/kernel/random/boot_id", "utf8").trim(); }
+    catch { return PROCESS_UNKNOWN; }
+    if (!/^\d+$/.test(startTicks) || !/^[a-f0-9-]{16,}$/i.test(bootId)) return PROCESS_UNKNOWN;
+    return PROCESS_LIVE(`linux:${bootId}:${startTicks}`);
+  }
+  if (process.platform === "win32") return windowsProcessIdentityProbe(pid, { ...options, timeoutMs });
+
+  const absence = processAbsenceDiagnostic(pid, options.kill);
+  if (absence === true) return PROCESS_DEAD;
+  if (absence === null) return PROCESS_UNKNOWN;
+  try {
+    const started = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs,
+    }).trim().replace(/\s+/g, " ");
+    if (!started) return PROCESS_UNKNOWN;
+    const boot = execFileSync("sysctl", ["-n", "kern.boottime"], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: timeoutMs,
+    }).trim().replace(/\s+/g, " ");
+    return boot ? PROCESS_LIVE(`${process.platform}:${boot}:${started}`) : PROCESS_UNKNOWN;
+  } catch {
+    return PROCESS_UNKNOWN;
+  }
+}
+
+export function processIdentityProbeForInternalTest(pid, options = {}) { return processIdentityProbe(pid, options); }
+
+let cachedCurrentProcessIdentity = null;
+const deadlineVerifiedLockOwners = new WeakMap();
+function defaultProcessIdentityProbe(pid, options = {}) {
+  if (pid !== process.pid) return processIdentityProbe(pid, options);
+  if (cachedCurrentProcessIdentity?.status === "LIVE") return cachedCurrentProcessIdentity;
+  const observed = processIdentityProbe(pid, options);
+  if (observed.status === "LIVE") cachedCurrentProcessIdentity = observed;
+  return observed;
+}
+
+function deadlineRemaining(deadline) {
+  if (deadline === null || deadline === undefined) return null;
+  invariant(deadline && Number.isFinite(deadline.expiresAt), "PLAN_COORDINATION_DEADLINE_INVALID");
+  const remaining = deadline.expiresAt - performance.now();
+  if (remaining <= 0) throw new GuardianError("PLAN_COORDINATION_DEADLINE_EXCEEDED", "Plan coordination deadline expired before canonical authority acquisition");
+  return remaining;
+}
+
+function exactObjectKeys(value, keys) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
+}
+
+function canonicalIsoTimestamp(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
 function temporaryPath(path, label) {
   return `${path}.${process.pid}.${randomBytes(16).toString("hex")}.${label}.tmp`;
 }
@@ -172,13 +290,16 @@ function temporaryPath(path, label) {
 export class PlanRevisionWriter {
   #io;
   #testHooks;
+  #processIdentityProbe;
 
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
     this.guardianRoot = resolve(options.guardianRoot ?? join(dirname(this.path), ".guardian"));
     this.lockPath = resolve(options.lockPath ?? join(this.guardianRoot, "plan-write.lock"));
+    this.lockRecoveryPath = `${this.lockPath}.recovery`;
     this.#io = Object.freeze({ ...DEFAULT_IO, ...(options.io ?? {}) });
     this.#testHooks = options.testHooks ?? null;
+    this.#processIdentityProbe = options.processIdentityProbe ?? defaultProcessIdentityProbe;
   }
 
   #ensureRealDirectory(path) {
@@ -227,31 +348,123 @@ export class PlanRevisionWriter {
     }
   }
 
-  #acquireLock() {
-    this.#ensureRealDirectory(this.guardianRoot);
+  #lockError(code, message, details = undefined) {
+    return new GuardianError(code, `${message}: ${this.lockPath}`, details);
+  }
+
+  #parseLock(record, path = this.lockPath) {
+    let metadata;
+    try { metadata = JSON.parse(record.bytes.toString("utf8")); }
+    catch { throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "Plan lock metadata is malformed; verify that no Aiopago owner is operating, then explicitly reconcile stale state"); }
+    invariant(exactObjectKeys(metadata, LOCK_METADATA_KEYS)
+      && metadata.schema === LOCK_SCHEMA
+      && /^[a-f0-9]{64}$/.test(metadata.ownership_nonce ?? "")
+      && Number.isSafeInteger(metadata.pid) && metadata.pid > 0
+      && typeof metadata.process_identity === "string" && metadata.process_identity.length > 0 && metadata.process_identity.length <= 2048
+      && canonicalIsoTimestamp(metadata.created_at)
+      && typeof metadata.plan_path === "string" && samePath(metadata.plan_path, this.path)
+      && typeof metadata.guardian_root === "string" && samePath(metadata.guardian_root, this.guardianRoot),
+    "PLAN_LOCK_RECONCILIATION_REQUIRED", `Plan lock metadata at ${path} is unknown, incomplete, or belongs to another plan; verify that no Aiopago owner is operating, then explicitly reconcile stale state`);
+    return Object.freeze(metadata);
+  }
+
+  #ownerState(metadata, deadline = null) {
+    const remaining = deadlineRemaining(deadline);
+    const deadlineOwnerKey = `${metadata.ownership_nonce}\0${metadata.pid}\0${metadata.process_identity}`;
+    const verifiedOwners = deadline && process.platform === "win32"
+      ? (deadlineVerifiedLockOwners.get(deadline) ?? new Set())
+      : null;
+    if (verifiedOwners && !deadlineVerifiedLockOwners.has(deadline)) deadlineVerifiedLockOwners.set(deadline, verifiedOwners);
+    if (verifiedOwners?.has(deadlineOwnerKey)) return "LIVE";
+    const observed = this.#processIdentityProbe(metadata.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
+    invariant(observed && ["LIVE", "DEAD", "UNKNOWN"].includes(observed.status), "PLAN_PROCESS_IDENTITY_UNAVAILABLE");
+    if (observed.status === "LIVE" && observed.identity === metadata.process_identity) {
+      verifiedOwners?.add(deadlineOwnerKey);
+      return "LIVE";
+    }
+    return observed.status === "DEAD" ? "DEAD" : "UNKNOWN";
+  }
+
+  #rejectExistingLock(deadline = null) {
+    deadlineRemaining(deadline);
+    if (this.#pathExists(this.lockRecoveryPath)) {
+      // Historical recovery markers are evidence for a human, not deferred
+      // cleanup authority. Preserve both paths byte-for-byte.
+      try { this.#readRegular(this.lockRecoveryPath, { maximum: 4096, code: "PLAN_LOCK_RECOVERY_INVALID", allowHardlinks: true }); }
+      catch (error) {
+        if (error?.code === "ENOENT") return true;
+        throw error;
+      }
+      throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", "A plan-lock recovery marker exists; verify that no Aiopago owner is operating, then explicitly reconcile the lock and marker");
+    }
+    let observed;
+    try { observed = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_INVALID" }); }
+    catch (error) { if (error?.code === "ENOENT") return true; throw error; }
+    const metadata = this.#parseLock(observed, this.lockPath);
+    const state = this.#ownerState(metadata, deadline);
+    if (state === "LIVE") throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is held by the exact live process owner");
+    throw this.#lockError("PLAN_LOCK_RECONCILIATION_REQUIRED", `Plan lock owner is ${state.toLowerCase()}; verify that no Aiopago owner is operating, then explicitly reconcile stale state`);
+  }
+
+  #publishLock(bytes, deadline = null) {
+    deadlineRemaining(deadline);
+    const temp = temporaryPath(this.lockPath, "owner");
     let fd;
-    let identity;
-    const token = randomToken();
-    const bytes = Buffer.from(`${JSON.stringify({ schema: LOCK_SCHEMA, ownership_token: token, pid: process.pid, created_at: new Date().toISOString() })}\n`, "utf8");
+    let ownsTemp = false;
     try {
-      fd = this.#io.openSync(this.lockPath, "wx", 0o600);
-      identity = fileIdentity(this.#io.fstatSync(fd, { bigint: true }));
+      fd = this.#io.openSync(temp, "wx", 0o600);
+      ownsTemp = true;
       this.#io.writeFileSync(fd, bytes);
       this.#io.fsyncSync(fd);
-      return Object.freeze({ fd, identity, token, bytes });
-    } catch (error) {
+      this.#io.closeSync(fd);
+      fd = undefined;
+      this.#testHooks?.afterLockMetadataWrite?.(Object.freeze({ temp, lockPath: this.lockPath }));
+      if (this.#pathExists(this.lockRecoveryPath)) throw Object.assign(new Error("stale recovery in progress"), { code: "EEXIST" });
+      deadlineRemaining(deadline);
+      this.#io.linkSync(temp, this.lockPath);
+      this.#io.unlinkSync(temp);
+      ownsTemp = false;
+      syncDirectory(this.#io, dirname(this.lockPath));
+      this.#testHooks?.afterLockCreate?.(Object.freeze({ lockPath: this.lockPath }));
+      if (this.#pathExists(this.lockRecoveryPath)) {
+        const own = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_OWNERSHIP_LOST" });
+        if (own.bytes.equals(bytes)) this.#io.unlinkSync(this.lockPath);
+        throw Object.assign(new Error("stale recovery raced lock publication"), { code: "EEXIST" });
+      }
+      const published = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_OWNERSHIP_LOST" });
+      invariant(published.bytes.equals(bytes), "PLAN_LOCK_OWNERSHIP_LOST", "Published plan lock metadata differs from its immutable owner record");
+      return Object.freeze({ identity: published.identity, bytes });
+    } finally {
       closeQuietly(this.#io, fd);
-      if (error?.code === "EEXIST") {
-        throw new GuardianError("PLAN_WRITE_LOCKED", `Aiopago plan mutation is already locked: ${this.lockPath}. Stale or corrupt locks require explicit human inspection and removal.`);
-      }
-      if (identity && this.#pathExists(this.lockPath)) {
-        try {
-          const current = this.#readRegular(this.lockPath, { maximum: 4096, code: "PLAN_LOCK_OWNERSHIP_LOST" });
-          if (sameFilesystemIdentity(current.identity, identity)) this.#io.unlinkSync(this.lockPath);
-        } catch {}
-      }
-      throw error;
+      if (ownsTemp) { try { this.#io.unlinkSync(temp); } catch {} }
     }
+  }
+
+  #acquireLock(deadline = null) {
+    deadlineRemaining(deadline);
+    this.#ensureRealDirectory(this.guardianRoot);
+    if (this.#pathExists(this.lockRecoveryPath) || this.#pathExists(this.lockPath)) this.#rejectExistingLock(deadline);
+    const remaining = deadlineRemaining(deadline);
+    const own = this.#processIdentityProbe(process.pid, { timeoutMs: remaining === null ? 5_000 : Math.min(5_000, remaining) });
+    invariant(own?.status === "LIVE" && typeof own.identity === "string", "PLAN_PROCESS_IDENTITY_UNAVAILABLE", "Cannot establish the current process start identity for plan locking");
+    const bytes = Buffer.from(`${JSON.stringify({
+      schema: LOCK_SCHEMA,
+      ownership_nonce: randomToken(),
+      pid: process.pid,
+      process_identity: own.identity,
+      created_at: new Date().toISOString(),
+      plan_path: this.path,
+      guardian_root: this.guardianRoot,
+    })}\n`, "utf8");
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      deadlineRemaining(deadline);
+      try { return this.#publishLock(bytes, deadline); }
+      catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        if (!this.#rejectExistingLock(deadline)) throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation is already locked");
+      }
+    }
+    throw this.#lockError("PLAN_WRITE_LOCKED", "Aiopago plan mutation could not acquire coordination");
   }
 
   #attestLock(lock) {
@@ -261,19 +474,19 @@ export class PlanRevisionWriter {
       if (error?.code === "ENOENT") throw new GuardianError("PLAN_LOCK_OWNERSHIP_LOST", "The acquired plan lock path no longer exists");
       throw error;
     }
-    invariant(sameFilesystemIdentity(current.identity, lock.identity) && current.bytes.equals(lock.bytes), "PLAN_LOCK_OWNERSHIP_LOST", "The plan write lock was removed, replaced, or its ownership token changed");
+    invariant(sameFilesystemIdentity(current.identity, lock.identity) && current.bytes.equals(lock.bytes), "PLAN_LOCK_OWNERSHIP_LOST", "The plan write lock was removed, replaced, or its ownership nonce changed");
+    this.#testHooks?.afterLockAttestation?.(Object.freeze({ lockPath: this.lockPath }));
   }
 
   #releaseLock(lock) {
     let releaseError;
     try {
       this.#attestLock(lock);
+      this.#testHooks?.beforeLockRelease?.(Object.freeze({ lockPath: this.lockPath }));
       this.#io.unlinkSync(this.lockPath);
       syncDirectory(this.#io, dirname(this.lockPath));
     } catch (error) {
       releaseError = error?.code === "PLAN_LOCK_OWNERSHIP_LOST" ? error : new GuardianError("PLAN_LOCK_RELEASE_FAILED", error.message);
-    } finally {
-      closeQuietly(this.#io, lock.fd);
     }
     if (releaseError) throw releaseError;
   }
@@ -410,10 +623,14 @@ export class PlanRevisionWriter {
   }
 
   #casConflict(expected, observed, phase) {
+    const taskMatches = expected.taskId === undefined || observed.task.task_id === expected.taskId;
     const revisionMatches = observed.task.plan_revision_id === expected.planRevisionId;
     const digestMatches = observed.contentDigest === expected.contentDigest;
-    if (!revisionMatches || !digestMatches) {
+    if (!taskMatches || !revisionMatches || !digestMatches) {
       throw new GuardianError("PLAN_CAS_CONFLICT", `TASK_PLAN.md no longer matches the proposal base during ${phase}; create a new proposal from a fresh observation`, {
+        expected_task_id: expected.taskId ?? null,
+        observed_task_id: observed.task.task_id,
+        task_matches: taskMatches,
         expected_plan_revision_id: expected.planRevisionId,
         observed_plan_revision_id: observed.task.plan_revision_id,
         revision_matches: revisionMatches,
@@ -463,6 +680,31 @@ export class PlanRevisionWriter {
     const stored = this.readImmutable(path, MAX_PLAN_BYTES);
     invariant(sha256(stored) === current.contentDigest && stored.equals(current.bytes), "PLAN_HISTORY_CORRUPT", "Previous plan history does not contain the exact base bytes");
     return reference;
+  }
+
+  coordinate({ requireSingleBlock = false, validate, use, deadline = null }) {
+    invariant(typeof validate === "function", "PLAN_VALIDATOR_REQUIRED", "Plan coordination requires the canonical semantic validator");
+    invariant(typeof use === "function", "PLAN_COORDINATION_CALLBACK_REQUIRED");
+    deadlineRemaining(deadline);
+    this.readCurrent({ requireSingleBlock, validate });
+    deadlineRemaining(deadline);
+    const lock = this.#acquireLock(deadline);
+    let operationError;
+    try {
+      const current = this.readCurrent({ requireSingleBlock, validate });
+      this.#attestLock(lock);
+      deadlineRemaining(deadline);
+      const result = use(current);
+      invariant(!result || typeof result.then !== "function", "PLAN_COORDINATION_ASYNC_FORBIDDEN", "Plan coordination callback must remain synchronous and bounded");
+      this.#attestLock(lock);
+      return result;
+    } catch (error) {
+      operationError = error;
+      throw error;
+    } finally {
+      try { this.#releaseLock(lock); }
+      catch (releaseError) { if (!operationError) throw releaseError; }
+    }
   }
 
   commit({

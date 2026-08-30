@@ -22,27 +22,30 @@
     "aio": "bin/aio.mjs",
     "eio": "bin/eio.mjs"
   },
-  "main": "./src/index.mjs",
+  "main": "./dist/index.mjs",
   "exports": {
-    ".": "./src/index.mjs"
+    ".": "./dist/index.mjs"
   },
   "files": [
     "bin/",
-    "src/",
+    "dist/",
     "README.md",
     "docs/0.2-b-plan-proposal-foundation.md",
     "docs/0.2-c-intent-adapter.md",
     "docs/0.2-d-start-objective.md",
+    "docs/0.2-e-unified-human-ux.md",
     "docs/portable-alpha.md",
     "docs/rename-aiopago-migration.md"
   ],
   "engines": {
     "node": ">=22.19.0"
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.84.0"
+  "devDependencies": {
+    "esbuild": "0.25.9"
   },
   "scripts": {
+    "build:package": "node scripts/build-package.mjs",
+    "prepack": "npm run build:package",
     "check": "node scripts/check.mjs",
     "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs",
@@ -51,5 +54,8 @@
     "calibration": "node scripts/calibration-run.mjs",
     "calibration:quality": "node scripts/calibration-quality-record.mjs",
     "calibration:finalize": "node scripts/calibration-finalize.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0"
   }
 }

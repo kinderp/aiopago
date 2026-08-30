@@ -2,6 +2,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { dirname, join, resolve } from "node:path";
 import { canonicalJson, digestObject, sha256, utcNow } from "./canonical.mjs";
 import { fail, invariant } from "./errors.mjs";
+import { requireSecureRecoveryInputAuthority } from "./recovery-input-authority.mjs";
 
 const SECRET_KEY = /(^|_)(api_?key|access_?token|refresh_?token|password|secret|credential)s?($|_)/i;
 const SECRET_VALUE = /\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})\b/;
@@ -22,13 +23,20 @@ function safeId(id) {
 }
 
 export class ArtifactStore {
-  constructor(root, storage) {
+  constructor(root, storage, { authority = null } = {}) {
     this.root = resolve(root);
     this.storage = storage;
+    this.authority = authority ? requireSecureRecoveryInputAuthority(authority) : null;
     mkdirSync(this.root, { recursive: true });
   }
 
-  persist(kind, id, payload) {
+  path(kind, id) {
+    safeId(id);
+    invariant(kind === "checkpoint" || kind === "manifest", "ARTIFACT_KIND_INVALID");
+    return join(this.root, kind === "checkpoint" ? "checkpoints" : "manifests", `${id}.json`);
+  }
+
+  persist(kind, id, payload, relationship = null) {
     safeId(id);
     scan(payload);
     const contentBase = { ...structuredClone(payload), content_digest: null };
@@ -43,9 +51,9 @@ export class ArtifactStore {
     };
     const bytes = Buffer.from(`${canonicalJson(envelope)}\n`, "utf8");
     const digest = sha256(bytes);
-    const directory = join(this.root, kind === "checkpoint" ? "checkpoints" : "manifests");
+    const path = this.path(kind, id);
+    const directory = dirname(path);
     mkdirSync(directory, { recursive: true });
-    const path = join(directory, `${id}.json`);
     if (existsSync(path)) {
       const prior = readFileSync(path);
       invariant(prior.equals(bytes), "ARTIFACT_ID_CONFLICT", `${id} already exists with different bytes`);
@@ -65,21 +73,63 @@ export class ArtifactStore {
         throw error;
       }
     }
+    let protectedIdentity = null;
+    if (this.authority) {
+      invariant(relationship && typeof relationship === "object", "ARTIFACT_AUTHORITY_RELATIONSHIP_REQUIRED");
+      protectedIdentity = this.authority.requestArtifactRegistration(`${kind}:${id}`, {
+        kind,
+        artifact_id: id,
+        handoff_id: relationship.handoffId,
+        artifact_digest: digest,
+        content_digest: contentDigest,
+        plan_semantic_digest: relationship.planSemanticDigest,
+        checkpoint_id: relationship.checkpointId ?? null,
+        checkpoint_digest: relationship.checkpointDigest ?? null,
+      }).artifact;
+    }
     this.storage.indexArtifact({ kind, id, path: path.replaceAll("\\", "/"), digest, contentDigest });
-    return { id, kind, path: path.replaceAll("\\", "/"), digest, content_digest: contentDigest, payload: sealedPayload, bytes };
+    return { id, kind, path: path.replaceAll("\\", "/"), digest, content_digest: contentDigest, payload: sealedPayload, bytes, protected_identity: protectedIdentity };
   }
 
-  verify(kind, id, expectedDigest = undefined) {
-    const index = this.storage.getArtifact(kind, id);
-    invariant(index && !index.superseded, index?.superseded ? "SUPERSEDED_CHECKPOINT" : "ARTIFACT_NOT_FOUND", id);
-    const bytes = readFileSync(index.path);
+  recoveryInputReadiness(handoffId) {
+    const authority = requireSecureRecoveryInputAuthority(this.authority);
+    const reservation = authority.getHandoffReservation(handoffId);
+    const plan = authority.getPlanAuthorityForHandoff(handoffId);
+    invariant(reservation && plan, "RECOVERY_INPUT_PLAN_UNAVAILABLE");
+    const checkpoint = this.verify("checkpoint", reservation.checkpoint_id, undefined, handoffId);
+    const manifest = this.verify("manifest", reservation.resume_manifest_id, undefined, handoffId);
+    return authority.recoveryInputReadiness({
+      handoff_id: handoffId,
+      plan: plan.snapshot,
+      checkpoint: { artifact_id: checkpoint.artifact_id, artifact_digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+      manifest: { artifact_id: manifest.artifact_id, artifact_digest: manifest.digest, content_digest: manifest.content_digest },
+    });
+  }
+
+  verify(kind, id, expectedDigest = undefined, expectedHandoffId = undefined) {
+    const protectedIdentity = this.authority?.getArtifactAuthority(kind, id) ?? null;
+    const index = this.authority ? null : this.storage.getArtifact(kind, id);
+    invariant(protectedIdentity || (index && !index.superseded), index?.superseded ? "SUPERSEDED_CHECKPOINT" : "ARTIFACT_NOT_FOUND", id);
+    if (this.authority && expectedHandoffId !== undefined) invariant(protectedIdentity?.handoff_id === expectedHandoffId,
+      kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH", "Artifact belongs to another protected handoff");
+    const path = this.authority ? this.path(kind, id) : index.path;
+    // One physical read produces the exact detached bytes that are hashed,
+    // parsed, and returned to the privileged consumer. The path is never
+    // reopened after verification, so a replacement cannot alter this use.
+    const bytes = readFileSync(path);
     const digest = sha256(bytes);
-    invariant(digest === index.digest && (!expectedDigest || digest === expectedDigest), kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH");
+    const authoritativeDigest = protectedIdentity?.artifact_digest ?? index.digest;
+    invariant(digest === authoritativeDigest && (!expectedDigest || digest === expectedDigest), kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH");
     const envelope = JSON.parse(bytes.toString("utf8"));
     invariant(envelope.artifact_kind === kind && envelope.artifact_id === id, "ARTIFACT_IDENTITY_MISMATCH");
     const contentDigest = envelope.payload.content_digest;
-    invariant(digestObject({ ...envelope.payload, content_digest: null }) === contentDigest && contentDigest === index.content_digest, "ARTIFACT_CONTENT_MISMATCH");
+    const authoritativeContentDigest = protectedIdentity?.content_digest ?? index.content_digest;
+    invariant(digestObject({ ...envelope.payload, content_digest: null }) === contentDigest && contentDigest === authoritativeContentDigest, "ARTIFACT_CONTENT_MISMATCH");
+    if (this.authority) this.authority.verifyArtifactAuthority({
+      kind, artifact_id: id, handoff_id: protectedIdentity.handoff_id,
+      artifact_digest: digest, content_digest: contentDigest,
+    });
     scan(envelope.payload);
-    return { ...index, bytes, digest, payload: envelope.payload };
+    return { ...(protectedIdentity ?? index), path: path.replaceAll("\\", "/"), bytes, digest, content_digest: contentDigest, payload: envelope.payload };
   }
 }

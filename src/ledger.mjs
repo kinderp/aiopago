@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { sha256, strictJsonClone, utcNow } from "./canonical.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
+import { registerTrustedHandoffPlanCapability } from "./handoff-plan-internal.mjs";
 import {
   assertExactSatisfiedOwnerGateTransition,
   canonicalOwnerCommand,
@@ -313,21 +314,55 @@ function ledgerResult(task, contentDigest, path) {
 }
 
 export class TaskLedger {
+  #writer;
+
   constructor(path = "TASK_PLAN.md", options = {}) {
     this.path = resolve(path);
-    this.writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
+    this.#writer = options.writer ?? new PlanRevisionWriter(this.path, options.writerOptions);
+    const coordinateExactPlan = (expected, use, code, message) => this.#writer.coordinate({
+      validate: validateTaskLedger,
+      use: (observed) => {
+        const plan = ledgerResult(observed.task, observed.contentDigest, this.path);
+        invariant(plan.task_id === expected?.taskId
+          && plan.plan_revision_id === expected?.planRevisionId
+          && plan.content_digest === expected?.contentDigest,
+        code, message);
+        return use(plan);
+      },
+    });
+    registerTrustedHandoffPlanCapability(this, {
+      attest: (expected, reserve) => coordinateExactPlan(
+        expected, reserve, "HANDOFF_CONSENT_STALE", "The authoritative plan changed before durable handoff reservation",
+      ),
+      attestRecovery: (expected, capture) => coordinateExactPlan(
+        expected, capture, "PLAN_REVISION_MISMATCH", "The authoritative plan no longer matches the failed handoff recovery provenance",
+      ),
+      attestResume: (expected, capture) => coordinateExactPlan(
+        expected, capture, "RESUME_EXPECTATION_STALE", "The authoritative plan changed after resume confirmation was displayed",
+      ),
+      attestCurrentTakeover: (claim, deadline = null) => this.#writer.coordinate({
+        validate: validateTaskLedger,
+        use: (observed) => claim(ledgerResult(observed.task, observed.contentDigest, this.path)),
+        deadline,
+      }),
+      satisfyOwnerGate: (request, assertEligible) => this.#satisfyOwnerGate(request, assertEligible),
+    });
   }
 
   read() {
-    const observed = this.writer.readCurrent({ validate: validateTaskLedger });
+    const observed = this.#writer.readCurrent({ validate: validateTaskLedger });
     return ledgerResult(observed.task, observed.contentDigest, this.path);
   }
 
-  satisfyOwnerGate({ command, actor }) {
-    return this.writer.commit({
+  #satisfyOwnerGate({ command, actor, expected = null }, assertEligible = null) {
+    return this.#writer.commit({
+      expected,
       validate: validateTaskLedger,
       prepare: (observed) => {
         const task = structuredClone(observed.task);
+        const eligibility = assertEligible?.();
+        invariant(!eligibility || typeof eligibility.then !== "function",
+          "HANDOFF_OWNER_GATE_AUTHORITY_INVALID", "Task ownership eligibility must remain synchronous under plan coordination");
         const gate = task.owner_gate;
         if (!gate || gate.status === "SATISFIED") return { noWrite: true, result: ledgerResult(task, observed.contentDigest, this.path) };
         invariant(gate.kind === "HANDOFF_CONFIRM" && gate.status === "BLOCKED", "OWNER_GATE_INVALID");
