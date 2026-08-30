@@ -69,7 +69,7 @@ $nodeSha=(Get-FileHash -Algorithm SHA256 -LiteralPath $node).Hash.ToLowerInvaria
 $workerSha=(Get-FileHash -Algorithm SHA256 -LiteralPath $worker).Hash.ToLowerInvariant()
 if($brokerSha -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $BrokerSource).Hash.ToLowerInvariant()){throw 'BROKER_COPY_HASH_MISMATCH'}
 if($workerSha -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $WorkerSource).Hash.ToLowerInvariant()){throw 'WORKER_COPY_HASH_MISMATCH'}
-$config=[ordered]@{schema='aiopago.operation-authority-service-config/1';serviceName=$ServiceName;serviceSid=$sid;root=$Root;protocol='aiopago.operation-authority-protocol/6';testScope=$true;brokerSha256=$brokerSha;nodeSha256=$nodeSha;workerSha256=$workerSha}
+$config=[ordered]@{schema='aiopago.operation-authority-service-config/1';serviceName=$ServiceName;serviceSid=$sid;root=$Root;protocol='aiopago.operation-authority-protocol/7';testScope=$true;brokerSha256=$brokerSha;nodeSha256=$nodeSha;workerSha256=$workerSha}
 $config|ConvertTo-Json -Compress|Set-Content -LiteralPath (Join-Path $control 'service-config.json') -Encoding UTF8
 [ordered]@{schema='aiopago.operation-authority-test-scenario/1';requests=@()}|ConvertTo-Json -Depth 20 -Compress|Set-Content -LiteralPath (Join-Path $control 'scenario.json') -Encoding UTF8
 # Service is created last; P1S creates identity and canonical DB on first start.

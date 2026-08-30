@@ -15,7 +15,7 @@ using System.Web.Script.Serialization;
 
 namespace Aiopago.OperationAuthority {
   internal static class Program {
-    internal const string Protocol = "aiopago.operation-authority-protocol/6";
+    internal const string Protocol = "aiopago.operation-authority-protocol/7";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144, RecursionLimit = 32 };
 
     public static int Main(string[] args) {

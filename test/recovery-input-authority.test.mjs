@@ -127,7 +127,7 @@ test("bounded 1.4 upgrade backfills protected reservation plan identity but neve
   legacy.close();
   const upgraded = new ProtectedSqliteOperationAuthority(join(x.root, "canonical", "operations.sqlite"));
   try {
-    assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.5.0");
+    assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.6.0");
     assert.equal(upgraded.getPlanAuthorityForHandoff(p.handoff_id).plan_revision_id, p.task_plan_revision);
     assert.equal(upgraded.getArtifactAuthority("checkpoint", p.checkpoint_id), null, "old project digest/index must not become protected authority");
   } finally { upgraded.close(); }
@@ -140,7 +140,7 @@ test("checkpoint and manifest identities are protected, mutually bound, idempote
     const sealed = seal(x, p);
     const before = { cp: x.authority.getArtifactAuthority("checkpoint", p.checkpoint_id), rm: x.authority.getArtifactAuthority("manifest", p.resume_manifest_id) };
     const ready = x.artifacts.recoveryInputReadiness(p.handoff_id);
-    assert.equal(ready.result, "RECOVERY_INPUT_READY"); assert.equal(ready.ready, true); assert.equal(ready.recovery_authority_available, false);
+    assert.equal(ready.result, "RECOVERY_INPUT_READY"); assert.equal(ready.ready, true); assert.equal(ready.recovery_authority_available, true);
     storageDatabaseForInternalTest(x.storage).prepare("INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)")
       .run(p.handoff_id, p.source_session_id, "TARGET-FORGED", p.task_id, "RESUME_DISPATCH_UNKNOWN", 999999, JSON.stringify({ ...p, state: "RESUME_DISPATCH_UNKNOWN", dispatch_state: "UNKNOWN" }), p.created_at, "2099-01-01T00:00:00.000Z");
     assert.equal(x.artifacts.recoveryInputReadiness(p.handoff_id).result, "RECOVERY_INPUT_READY", "forged project UNKNOWN is not a protected recovery subject");
@@ -268,7 +268,7 @@ test("protected manifest expected identity rejects every behavior-significant P0
   } finally { x.close(); }
 });
 
-test("ambiguous protected DISPATCHING subject is recovery-input ready while recovery authority stays unavailable", () => {
+test("ambiguous protected DISPATCHING subject is recovery-input ready while reconciliation remains fail-closed", () => {
   const x = fixture("ambiguous");
   try {
     const p = projection(); const { result, engaged } = reserve(x.authority, p); const binding = bind(x.authority, p); const sealed = seal(x, p);
@@ -290,7 +290,9 @@ test("ambiguous protected DISPATCHING subject is recovery-input ready while reco
     const ready = x.artifacts.recoveryInputReadiness(p.handoff_id);
     assert.equal(ready.result, "RECOVERY_INPUT_READY");
     assert.equal(ready.dispatch.state, "DISPATCHING");
-    assert.equal(ready.recovery_authority_available, false);
+    assert.equal(ready.recovery_authority_available, true);
+    assert.equal(ready.reconciliation.evidence_class, "STILL_UNKNOWN");
+    assert.equal(ready.reconciliation.retry_permitted, false);
   } finally { x.close(); }
 });
 

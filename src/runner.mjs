@@ -85,6 +85,15 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
     if (!handoffAuthority) return storage.getHandoff(handoffId);
     const reservation = handoffAuthority.getHandoffReservation(handoffId);
     if (!reservation) return null;
+    const recovery = handoffAuthority.getContinuityRecovery?.(handoffId) ?? null;
+    if (recovery?.failure) {
+      return {
+        ...recovery.failure.failed_handoff,
+        recovery_decision_id: recovery.decision?.decision_id ?? null,
+        recovery_child_handoff_id: recovery.decision?.recovery_handoff_id ?? null,
+        recovery_state: recovery.decision ? "CONTINUITY_RECOVERY_STARTED" : "CONTINUITY_FAILED",
+      };
+    }
     const resume = handoffAuthority.getResumeState?.(handoffId) ?? null;
     if (!resume?.readiness) return reservation;
     const dispatchState = resume.dispatch?.state ?? "NOT_STARTED";
@@ -130,14 +139,25 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
       const latest = handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args);
       return detached(handoffAuthority && latest ? protectedHandoff(latest.handoff_id) : latest);
     },
-    operationsForTask: read("operationsForTask"),
+    operationsForTask: (...args) => detached(handoffAuthority?.operationsForTask
+      ? handoffAuthority.operationsForTask(...args)
+      : storage.operationsForTask(...args)),
     getMetricSession: read("getMetricSession"),
     metricSessions: read("metricSessions"),
     metricSamples: read("metricSamples"),
     handoffMetricEvents: read("handoffMetricEvents"),
     metricDiagnostics: read("metricDiagnostics"),
-    getArtifact: read("getArtifact"),
-    events: (...args) => detached(handoffAuthority ? handoffAuthority.handoffReservationEvents(...args) : storage.events(...args)),
+    getArtifact: (...args) => detached(handoffAuthority?.getArtifactAuthority
+      ? handoffAuthority.getArtifactAuthority(...args)
+      : storage.getArtifact(...args)),
+    events: (...args) => detached(handoffAuthority
+      ? [
+        ...handoffAuthority.handoffReservationEvents(...args),
+        ...(handoffAuthority.lifecycleBindingEvents?.(...args) ?? []),
+        ...(handoffAuthority.resumeAuthorityEvents?.(...args) ?? []),
+        ...(handoffAuthority.continuityRecoveryEvents?.(...args) ?? []),
+      ]
+      : storage.events(...args)),
   }));
   storageReadFacades.set(authorityKey, facade);
   return facade;

@@ -73,7 +73,7 @@ test("protected handoff authority shares the current schema and canonical latch 
   const x = fixture();
   try {
     assert.equal(requireSecureHandoffAuthority(x.authority), x.authority);
-    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.5.0");
+    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.6.0");
     assert.equal(x.authority.status().handoff_reservation_canonical, true);
     assert.equal(typeof x.authority.authorizeAndAdmit, "undefined");
     assert.equal(typeof x.authority.releaseLatch, "undefined");
@@ -91,7 +91,7 @@ test("bounded 1.1 latch store upgrade adds reservation schema while missing curr
   legacy.exec("DROP TABLE handoff_reservation_events; DROP TABLE active_sources; DROP TABLE handoff_reservations; UPDATE authority_metadata SET schema_version='aiopago.operation-authority/1.1.0' WHERE singleton=1;");
   legacy.close();
   const upgraded = new ProtectedSqliteOperationAuthority(x.path);
-  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.5.0");
+  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.6.0");
   assert.deepEqual(expected(upgraded.getLatch("TASK-UPGRADE")), expected(latch));
   upgraded.close();
   const damaged = new DatabaseSync(x.path); damaged.exec("ALTER TABLE active_sources RENAME TO active_sources_missing"); damaged.close();

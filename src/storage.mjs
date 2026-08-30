@@ -280,6 +280,7 @@ export class GuardianStorage {
       prepareRecovery: ({ failedHandoffId, preparation, reservation, attestation }) => this.prepareContinuityRecovery(
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
+      projectCanonicalRecovery: (result) => this.#projectCanonicalContinuityRecovery(result),
       authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
       projectCanonicalResumeDecision: (result) => this.#projectCanonicalResumeDecision(result),
       projectCanonicalResumeOutcome: (result) => this.#projectCanonicalResumeOutcome(result),
@@ -633,12 +634,69 @@ export class GuardianStorage {
         .run(proof.event.event_id, projection.handoff_id, "HANDOFF_STARTED", eventKey, proof.event.occurred_at, JSON.stringify({
           source_session_id: projection.source_session_id,
           latch_generation: projection.latch_generation,
-          recovery_of_handoff_id: null,
+          recovery_of_handoff_id: projection.recovery_of_handoff_id ?? null,
           canonical_reservation_digest: proof.reservation_digest,
           projection_only: true,
         }));
       return this.getHandoff(projection.handoff_id);
     });
+  }
+
+  #projectCanonicalContinuityRecovery(result) {
+    const recovery = result?.recovery;
+    const failure = recovery?.failure;
+    const decision = recovery?.decision;
+    const event = recovery?.event;
+    const binding = recovery?.binding;
+    const child = recovery?.child;
+    const proof = result?.child_projection_proof;
+    invariant(failure?.failed_handoff?.state === "CONTINUITY_FAILED"
+      && decision?.failed_handoff_id === failure.failed_handoff_id
+      && decision?.recovery_handoff_id === child?.handoff_id
+      && event?.event_type === "CONTINUITY_RECOVERY_STARTED"
+      && event?.failed_handoff_id === failure.failed_handoff_id
+      && binding?.handoff_id === failure.failed_handoff_id && binding.status === "SUPERSEDED"
+      && child?.recovery_of_handoff_id === failure.failed_handoff_id
+      && proof?.canonical === true && proof?.event?.handoff_id === child.handoff_id,
+    "RECOVERY_PROJECTION_PROOF_INVALID");
+    const failed = failure.failed_handoff;
+    this.transaction(() => {
+      const now = utcNow();
+      database(this).prepare(`INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(handoff_id) DO UPDATE SET source_session_id=excluded.source_session_id,target_session_id=excluded.target_session_id,
+          task_id=excluded.task_id,state=excluded.state,latch_generation=excluded.latch_generation,projection_json=excluded.projection_json,updated_at=excluded.updated_at`)
+        .run(failed.handoff_id, failed.source_session_id, failed.target_session_id, failed.task_id, "CONTINUITY_FAILED",
+          failed.latch_generation, JSON.stringify(failed), failed.created_at ?? failure.failed_at, now);
+      const conflicts = database(this).prepare("SELECT handoff_id,bind_event_id FROM runner_session_bindings WHERE handoff_id=? OR replacement_session_id=? OR session_binding_id=?")
+        .all(binding.handoff_id, binding.replacement_session_id, binding.session_binding_id);
+      for (const conflict of conflicts) database(this).prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(conflict.handoff_id);
+      for (const conflict of conflicts) database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(conflict.bind_event_id, `runner-binding:${conflict.handoff_id}`);
+      const bindData = {
+        handoff_id: binding.handoff_id, replacement_session_id: binding.replacement_session_id,
+        runner_instance_id: binding.runner_instance_id, session_binding_id: binding.session_binding_id,
+      };
+      database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(binding.bind_event_id, `runner-binding:${binding.handoff_id}`);
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(binding.bind_event_id, binding.handoff_id, "RUNNER_SESSION_BOUND", `runner-binding:${binding.handoff_id}`, binding.bound_at, JSON.stringify(bindData));
+      database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)")
+        .run(binding.handoff_id, binding.replacement_session_id, binding.runner_instance_id, binding.session_binding_id,
+          "SUPERSEDED", binding.bound_at, binding.bind_event_id, binding.superseded_at, binding.superseded_reason);
+      database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(binding.supersede_event_id, `runner-binding-superseded:${binding.handoff_id}`);
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(binding.supersede_event_id, binding.handoff_id, "RUNNER_SESSION_BINDING_SUPERSEDED", `runner-binding-superseded:${binding.handoff_id}`,
+          binding.superseded_at, JSON.stringify({ reason: binding.superseded_reason, projection_only: true }));
+      database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(event.event_id, `continuity-recovery:${failure.failed_handoff_id}`);
+      database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(event.event_id, failure.failed_handoff_id, "CONTINUITY_RECOVERY_STARTED", `continuity-recovery:${failure.failed_handoff_id}`,
+          event.occurred_at, event.data_json);
+    });
+    const projectedChild = this.#projectCanonicalHandoffReservation(child, {
+      ...proof,
+      created: true,
+      reservation_digest: proof.reservation_digest,
+    });
+    return Object.freeze({ failed: this.getHandoff(failure.failed_handoff_id), child: projectedChild });
   }
 
   getHandoff(id) {

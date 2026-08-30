@@ -344,6 +344,32 @@ var init_resume_authority = __esm({
   }
 });
 
+// src/recovery-authority.mjs
+function requireSecureRecoveryAuthority(authority) {
+  invariant(
+    authority?.recoverySecurity?.mode === RECOVERY_AUTHORITY_MODES.SECURE && authority.recoverySecurity.canonical === true && authority.recoverySecurity.r1_m_13_recovery_reconciliation_isolation === true,
+    "SECURE_RECOVERY_AUTHORITY_REQUIRED",
+    "Secure recovery/reconciliation cannot use or fall back to project recovery state"
+  );
+  return authority;
+}
+var RECOVERY_AUTHORITY_MODES, SECURE_RECOVERY_AUTHORITY_LABEL;
+var init_recovery_authority = __esm({
+  "src/recovery-authority.mjs"() {
+    init_canonical();
+    init_errors();
+    init_operation_authority();
+    init_handoff_reservation_authority();
+    RECOVERY_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+    SECURE_RECOVERY_AUTHORITY_LABEL = Object.freeze({
+      mode: RECOVERY_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_recovery_reconciliation_isolation: true
+    });
+  }
+});
+
 // src/handoff-plan-internal.mjs
 function registerTrustedHandoffPlanCapability(ledger, capability) {
   invariant(ledger && typeof capability?.attest === "function" && typeof capability?.attestRecovery === "function" && typeof capability?.attestResume === "function" && typeof capability?.attestCurrentTakeover === "function" && typeof capability?.satisfyOwnerGate === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
@@ -357,12 +383,13 @@ function registerTrustedHandoffPlanCapability(ledger, capability) {
   }));
 }
 function registerTrustedHandoffStorageCapability(storage, capability) {
-  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.projectCanonicalResumeDecision === "function" && typeof capability?.projectCanonicalResumeOutcome === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.projectCanonicalRunnerSessionBinding === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.projectCanonicalRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.projectCanonicalResumeDecision === "function" && typeof capability?.projectCanonicalResumeOutcome === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.projectCanonicalRunnerSessionBinding === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
     projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
+    projectCanonicalRecovery: capability.projectCanonicalRecovery,
     authorizeResume: capability.authorizeResume,
     projectCanonicalResumeDecision: capability.projectCanonicalResumeDecision,
     projectCanonicalResumeOutcome: capability.projectCanonicalResumeOutcome,
@@ -525,7 +552,19 @@ function prepareTrustedContinuityRecovery(ledger, request) {
   return planCapability.attestRecovery(request.expected, (plan2) => {
     const captured = request.capture(plan2);
     invariant(captured && !captured?.then, "CONTINUITY_RECOVERY_ATTESTATION_INVALID", "Final recovery attestation must be synchronous");
-    return storageCapability.prepareRecovery(captured);
+    if (!request.recoveryAuthority) return storageCapability.prepareRecovery(captured);
+    const canonical = requireSecureRecoveryAuthority(request.recoveryAuthority).requestContinuityRecovery(captured.requestId, captured.recovery);
+    const projected = storageCapability.projectCanonicalRecovery(canonical);
+    return Object.freeze({
+      reserved: {
+        created: canonical.created,
+        canonical: true,
+        reservation: canonical.recovery.child,
+        handoff: projected.child
+      },
+      attestation: captured.attestation,
+      recovery: canonical.recovery
+    });
   });
 }
 function authorizeTrustedResume(ledger, request) {
@@ -547,6 +586,7 @@ var init_handoff_plan_internal = __esm({
     init_handoff_reservation_authority();
     init_latch_authority();
     init_resume_authority();
+    init_recovery_authority();
     handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
     handoffStorageCapabilities = /* @__PURE__ */ new WeakMap();
   }
@@ -6071,6 +6111,7 @@ var init_handoff = __esm({
     init_handoff_reservation_authority();
     init_lifecycle_binding_authority();
     init_resume_authority();
+    init_recovery_authority();
     init_handoff_plan_internal();
     init_handoff_consent();
     init_ledger();
@@ -6123,6 +6164,7 @@ var init_handoff = __esm({
           requireSecureHandoffAuthority(reservationAuthority);
           requireSecureLifecycleAuthority(reservationAuthority);
           requireSecureResumeAuthority(reservationAuthority);
+          requireSecureRecoveryAuthority(reservationAuthority);
           invariant(
             safePoint?.latchAuthority === reservationAuthority,
             "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED",
@@ -6158,6 +6200,31 @@ var init_handoff = __esm({
           "Protected handoff plan identity is absent; project plan state was not substituted"
         );
         return captureReservedPlanSnapshot(authority.snapshot);
+      }
+      #protectedContinuityFailure(handoffId) {
+        if (!this.reservationAuthority) return null;
+        const recovery = this.reservationAuthority.getContinuityRecovery(handoffId);
+        return recovery?.failure ?? null;
+      }
+      #commitProtectedContinuityFailure(handoff, error, { plan: plan2, checkpoint, manifest }) {
+        if (!this.reservationAuthority) return null;
+        const reservation = this.reservationAuthority.getHandoffReservation(handoff.handoff_id);
+        const binding = this.bindingAuthority.getLifecycleBinding(handoff.handoff_id);
+        const latch = this.latchAuthority.getLatch(handoff.task_id);
+        const failed = structuredClone(handoff);
+        failed.state = "CONTINUITY_FAILED";
+        failed.failure = boundedFailure(error, "CONTINUITY_FAILED");
+        failed.updated_at = utcNow();
+        const committed = this.reservationAuthority.requestContinuityFailure(`failure:${handoff.handoff_id}`, {
+          failed_handoff: failed,
+          reservation_digest: reservation?.reservation_digest,
+          binding,
+          latch: { task_id: latch?.task_id, state: latch?.state, generation: latch?.generation, reason: latch?.reason },
+          plan_semantic_digest: planSemanticDigest(plan2, { requireAll: true }),
+          checkpoint: { id: checkpoint.id ?? checkpoint.artifact_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+          manifest: { id: manifest.id ?? manifest.artifact_id, digest: manifest.digest, content_digest: manifest.content_digest }
+        });
+        return committed.recovery.failure;
       }
       verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
         invariant(!required || typeof currentSourceVerifier === "function", "HANDOFF_SOURCE_ATTESTATION_REQUIRED");
@@ -6233,7 +6300,8 @@ var init_handoff = __esm({
         };
       }
       #captureRecoveryAttestation({ failedHandoffId, expectedFailed, sourceSession, currentSourceVerifier, sourceAttestation, plan: plan2, expectedLatch, safe = null }) {
-        const failed = this.storage.getHandoff(failedHandoffId);
+        const protectedFailure = this.#protectedContinuityFailure(failedHandoffId);
+        const failed = protectedFailure?.failed_handoff ?? this.storage.getHandoff(failedHandoffId);
         invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
         invariant(
           sameCanonicalJson(failed, expectedFailed),
@@ -6299,11 +6367,14 @@ var init_handoff = __esm({
         return deepFreeze5(structuredClone({
           schema: "aiopago.internal-recovery-attestation/1",
           failedHandoff: failed,
+          failure_digest: protectedFailure?.failure_digest ?? null,
           failedBinding: {
+            handoff_id: binding.handoff_id ?? failedHandoffId,
             status: binding.status,
             replacement_session_id: binding.replacement_session_id,
             runner_instance_id: binding.runner_instance_id,
-            session_binding_id: binding.session_binding_id
+            session_binding_id: binding.session_binding_id,
+            lifecycle_incarnation: binding.lifecycle_incarnation ?? lifecycle.lifecycleEpoch
           },
           source: {
             session_id: sourceSession.sessionId,
@@ -6318,8 +6389,8 @@ var init_handoff = __esm({
           model_policy: failed.model_policy,
           reasoning_policy: failed.reasoning_policy,
           git: git3,
-          checkpoint: { id: checkpoint.id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
-          manifest: { id: manifest.id, digest: manifest.digest, content_digest: manifest.content_digest },
+          checkpoint: { id: checkpoint.id ?? checkpoint.artifact_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+          manifest: { id: manifest.id ?? manifest.artifact_id, digest: manifest.digest, content_digest: manifest.content_digest },
           latch: { task_id: failed.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
           safe_operations: safe?.operations ?? []
         }));
@@ -6346,8 +6417,8 @@ var init_handoff = __esm({
         const secureReservation = this.reservationAuthority !== null;
         invariant(
           !secureReservation || recoveryOf === null,
-          "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE",
-          "Secure recovery remains fail-closed until its authority domain is migrated"
+          "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED",
+          "Protected recovery children can be reserved only by the final R-star recovery transaction"
         );
         const canonicalLatest = secureReservation ? this.reservationAuthority.latestHandoffReservationForTask(plan2.task_id) : null;
         const expectedLatest = canonicalLatest ? {
@@ -6639,7 +6710,7 @@ var init_handoff = __esm({
         try {
           h = this.continuity(handoffId, session);
         } catch (error) {
-          h = this.storage.getHandoff(handoffId);
+          h = error.canonicalContinuityFailure ? structuredClone(error.canonicalContinuityFailure) : this.storage.getHandoff(handoffId);
           h.state = "CONTINUITY_FAILED";
           h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
           saveTrustedHandoff(this.storage, h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
@@ -6662,8 +6733,8 @@ var init_handoff = __esm({
         return h;
       }
       async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume, verifyCurrentTarget = null }) {
-        invariant(this.reservationAuthority === null, "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until recovery/lifecycle authority is migrated");
-        const failed = this.storage.getHandoff(failedHandoffId);
+        const protectedFailure = this.#protectedContinuityFailure(failedHandoffId);
+        const failed = protectedFailure?.failed_handoff ?? this.storage.getHandoff(failedHandoffId);
         invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
         const initial = this.#captureRecoveryAttestation({
           failedHandoffId,
@@ -6680,10 +6751,12 @@ var init_handoff = __esm({
           taskId: initial.plan.task_id,
           reason: initial.latch.reason,
           actor,
-          expectedLatch: initial.latch
+          expectedLatch: initial.latch,
+          latchAuthority: this.reservationAuthority
         });
         const safe = await this.safePoint.request(sourceSession, actor, initial.latch.reason, { expectedLatch: initial.latch, acquiredLatch: recoveryLatch });
         const prepared = prepareTrustedContinuityRecovery(this.ledger, {
+          recoveryAuthority: this.reservationAuthority,
           expected: {
             taskId: initial.plan.task_id,
             planRevisionId: initial.plan.plan_revision_id,
@@ -6711,6 +6784,41 @@ var init_handoff = __esm({
               modelPolicy: attestation2.model_policy,
               reasoningPolicy: attestation2.reasoning_policy
             });
+            if (this.reservationAuthority) {
+              const failedReservation = this.reservationAuthority.getHandoffReservation(failedHandoffId);
+              const decisionId = stableId("RCD", failedHandoffId, projection.handoff_id);
+              return {
+                requestId: decisionId,
+                recovery: {
+                  decision_id: decisionId,
+                  failed_handoff_id: failedHandoffId,
+                  failure_digest: attestation2.failure_digest,
+                  actor,
+                  source: {
+                    session_id: attestation2.source.session_id,
+                    runner_instance_id: attestation2.source.runner_instance_id,
+                    lifecycle_incarnation: attestation2.source.lifecycle_epoch,
+                    active: attestation2.source.active,
+                    history_length: attestation2.source.history_length,
+                    idle: attestation2.source.idle
+                  },
+                  binding: attestation2.failedBinding,
+                  latch: attestation2.latch,
+                  plan_semantic_digest: attestation2.plan_semantic_digest,
+                  model_policy: attestation2.model_policy,
+                  reasoning_policy: attestation2.reasoning_policy,
+                  git: attestation2.git,
+                  checkpoint: attestation2.checkpoint,
+                  manifest: attestation2.manifest,
+                  child_projection: projection,
+                  expected_latest: {
+                    handoff_id: failedHandoffId,
+                    reservation_digest: failedReservation.reservation_digest
+                  }
+                },
+                attestation: attestation2
+              };
+            }
             return {
               failedHandoffId,
               preparation: {
@@ -6767,93 +6875,105 @@ var init_handoff = __esm({
         const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
         const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
         const reservedPlan = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
-        const m = manifest.payload;
-        assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
-        assertManifestPlanConsistency(h, reservedPlan, m);
-        const plan2 = this.ledger.read();
-        const currentGit = this.observeGit();
-        invariant(m.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
-        const header = targetSession.sessionManager.getHeader();
-        const entries = targetSession.sessionManager.getEntries();
-        const historyEntries = entries.filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
-        invariant(plan2.task_id === h.task_id && m.task_id === h.task_id, "CONTINUITY_FAILED", "task_id");
-        invariant(plan2.plan_revision_id === h.task_plan_revision && plan2.content_digest === h.task_plan_digest && m.task_plan_revision === h.task_plan_revision && m.task_plan_digest === h.task_plan_digest, "PLAN_REVISION_MISMATCH");
-        invariant(plan2.requirements_version === h.requirements_version && m.requirements_version === h.requirements_version, "REQUIREMENTS_VERSION_MISMATCH");
-        invariant(checkpoint.payload.checkpoint_id === h.checkpoint_id && m.checkpoint_id === h.checkpoint_id && m.checkpoint_digest === h.checkpoint_digest, "CHECKPOINT_MISMATCH");
-        invariant(sameGitState(checkpoint.payload.git_state, h.expected_git_state), "CHECKPOINT_MISMATCH", "git state");
-        invariant(m.resume_manifest_id === h.resume_manifest_id && m.handoff_id === h.handoff_id && m.resume_prompt_id === h.resume_prompt_id, "MANIFEST_MISMATCH");
-        invariant(m.source_session_id === h.source_session_id && m.replacement_session_id === h.target_session_id && m.parent_session_id === h.source_session_id, "STALE_HANDOFF");
-        this.attestRunnerOwnership(h, targetSession, m);
-        invariant(m.repository === h.expected_git_state.repository_id && m.worktree === h.expected_git_state.workdir && m.branch === h.expected_git_state.branch && m.base_sha === h.expected_git_state.base_sha && m.head_sha === h.expected_git_state.head_sha && m.index_digest === h.expected_git_state.index_digest && m.worktree_digest === h.expected_git_state.worktree_digest && JSON.stringify(m.git_status_summary) === JSON.stringify(h.expected_git_state.status_entries), "MANIFEST_MISMATCH", "git state");
-        invariant(targetSession.sessionId === h.target_session_id && historyEntries.length === 0 && targetSession.isIdle, "REPLACEMENT_NOT_PAUSED_NO_HISTORY");
-        invariant(normalizePath(header.parentSession) === h.parent_session_file, "PARENT_LINEAGE_MISMATCH");
-        invariant(sameGitState(h.expected_git_state, currentGit), "GIT_STATE_MISMATCH");
-        invariant(m.current_item === plan2.current_item && m.next_item === plan2.next_item && m.next_step === plan2.next_step, "CONTINUITY_FAILED", "current item/next item/next step");
-        invariant(m.model_policy === h.model_policy && m.reasoning_policy === h.reasoning_policy, "CONTINUITY_FAILED", "model/reasoning policy");
-        const semanticMinimalReads = plan2.minimal_reads ?? [];
-        invariant(Array.isArray(m.minimal_reads) && JSON.stringify(m.minimal_reads) === JSON.stringify(semanticMinimalReads), "MANIFEST_MISMATCH", "semantic minimal reads");
-        validateRequiredLocalPaths(m.required_local_paths, "REQUIRED_LOCAL_PATH_INVALID");
-        const expectedLocalPaths = canonicalRequiredLocalPaths(plan2.required_local_paths ?? [], "REQUIRED_LOCAL_PATH_INVALID");
-        invariant(JSON.stringify(m.required_local_paths) === JSON.stringify(expectedLocalPaths), "MANIFEST_MISMATCH", "required local paths");
-        verifyRequiredLocalPaths(dirname7(this.ledger.path), m.required_local_paths);
-        const latch = this.latchAuthority.getLatch(h.task_id);
-        invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
-        this.assertModelPolicy(plan2, targetSession);
-        const resumePrompt = this.buildPrompt(h, m);
-        const resumePromptDigest = sha256(Buffer.from(resumePrompt, "utf8"));
-        const alreadyReady = h.state === "RESUME_READY";
-        if (alreadyReady) {
-          invariant(
-            h.resume_prompt === resumePrompt && h.resume_prompt_digest === resumePromptDigest,
-            "RESUME_EXPECTATION_STALE",
-            "Existing resume prompt no longer equals current continuity evidence"
-          );
-        } else {
-          h.resume_prompt = resumePrompt;
-          h.resume_prompt_digest = resumePromptDigest;
-          h.state = "RESUME_READY";
-        }
-        if (this.reservationAuthority) {
-          const reservation = this.reservationAuthority.getHandoffReservation(handoffId);
-          invariant(
-            reservation && sameHandoffReservationIdentity(reservation, h),
-            "RESUME_RESERVATION_STALE",
-            "Portable handoff projection no longer matches protected reservation identity"
-          );
-          const binding = this.bindingAuthority.getLifecycleBinding(handoffId);
-          invariant(binding?.status === "ACTIVE", "LIFECYCLE_BINDING_STALE");
-          const readiness = this.reservationAuthority.requestResumeReadiness(`ready:${h.resume_prompt_id}`, {
-            handoff_id: h.handoff_id,
-            reservation_digest: reservation.reservation_digest,
-            binding,
-            latch: { task_id: h.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
-            checkpoint_digest: h.checkpoint_digest,
-            resume_manifest_digest: h.resume_manifest_digest,
-            resume_prompt_id: h.resume_prompt_id,
-            resume_prompt_digest: h.resume_prompt_digest,
-            resume_prompt: h.resume_prompt,
-            plan_semantic_digest: planSemanticDigest(reservedPlan, { requireAll: true })
+        try {
+          const m = manifest.payload;
+          assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
+          assertManifestPlanConsistency(h, reservedPlan, m);
+          const plan2 = this.ledger.read();
+          const currentGit = this.observeGit();
+          invariant(m.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
+          const header = targetSession.sessionManager.getHeader();
+          const entries = targetSession.sessionManager.getEntries();
+          const historyEntries = entries.filter((entry) => HISTORY_ENTRY_TYPES.has(entry.type));
+          invariant(plan2.task_id === h.task_id && m.task_id === h.task_id, "CONTINUITY_FAILED", "task_id");
+          invariant(plan2.plan_revision_id === h.task_plan_revision && plan2.content_digest === h.task_plan_digest && m.task_plan_revision === h.task_plan_revision && m.task_plan_digest === h.task_plan_digest, "PLAN_REVISION_MISMATCH");
+          invariant(plan2.requirements_version === h.requirements_version && m.requirements_version === h.requirements_version, "REQUIREMENTS_VERSION_MISMATCH");
+          invariant(checkpoint.payload.checkpoint_id === h.checkpoint_id && m.checkpoint_id === h.checkpoint_id && m.checkpoint_digest === h.checkpoint_digest, "CHECKPOINT_MISMATCH");
+          invariant(sameGitState(checkpoint.payload.git_state, h.expected_git_state), "CHECKPOINT_MISMATCH", "git state");
+          invariant(m.resume_manifest_id === h.resume_manifest_id && m.handoff_id === h.handoff_id && m.resume_prompt_id === h.resume_prompt_id, "MANIFEST_MISMATCH");
+          invariant(m.source_session_id === h.source_session_id && m.replacement_session_id === h.target_session_id && m.parent_session_id === h.source_session_id, "STALE_HANDOFF");
+          this.attestRunnerOwnership(h, targetSession, m);
+          invariant(m.repository === h.expected_git_state.repository_id && m.worktree === h.expected_git_state.workdir && m.branch === h.expected_git_state.branch && m.base_sha === h.expected_git_state.base_sha && m.head_sha === h.expected_git_state.head_sha && m.index_digest === h.expected_git_state.index_digest && m.worktree_digest === h.expected_git_state.worktree_digest && JSON.stringify(m.git_status_summary) === JSON.stringify(h.expected_git_state.status_entries), "MANIFEST_MISMATCH", "git state");
+          invariant(targetSession.sessionId === h.target_session_id && historyEntries.length === 0 && targetSession.isIdle, "REPLACEMENT_NOT_PAUSED_NO_HISTORY");
+          invariant(normalizePath(header.parentSession) === h.parent_session_file, "PARENT_LINEAGE_MISMATCH");
+          invariant(sameGitState(h.expected_git_state, currentGit), "GIT_STATE_MISMATCH");
+          invariant(m.current_item === plan2.current_item && m.next_item === plan2.next_item && m.next_step === plan2.next_step, "CONTINUITY_FAILED", "current item/next item/next step");
+          invariant(m.model_policy === h.model_policy && m.reasoning_policy === h.reasoning_policy, "CONTINUITY_FAILED", "model/reasoning policy");
+          const semanticMinimalReads = plan2.minimal_reads ?? [];
+          invariant(Array.isArray(m.minimal_reads) && JSON.stringify(m.minimal_reads) === JSON.stringify(semanticMinimalReads), "MANIFEST_MISMATCH", "semantic minimal reads");
+          validateRequiredLocalPaths(m.required_local_paths, "REQUIRED_LOCAL_PATH_INVALID");
+          const expectedLocalPaths = canonicalRequiredLocalPaths(plan2.required_local_paths ?? [], "REQUIRED_LOCAL_PATH_INVALID");
+          invariant(JSON.stringify(m.required_local_paths) === JSON.stringify(expectedLocalPaths), "MANIFEST_MISMATCH", "required local paths");
+          verifyRequiredLocalPaths(dirname7(this.ledger.path), m.required_local_paths);
+          const latch = this.latchAuthority.getLatch(h.task_id);
+          invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
+          this.assertModelPolicy(plan2, targetSession);
+          const resumePrompt = this.buildPrompt(h, m);
+          const resumePromptDigest = sha256(Buffer.from(resumePrompt, "utf8"));
+          const alreadyReady = h.state === "RESUME_READY";
+          if (alreadyReady) {
+            invariant(
+              h.resume_prompt === resumePrompt && h.resume_prompt_digest === resumePromptDigest,
+              "RESUME_EXPECTATION_STALE",
+              "Existing resume prompt no longer equals current continuity evidence"
+            );
+          } else {
+            h.resume_prompt = resumePrompt;
+            h.resume_prompt_digest = resumePromptDigest;
+            h.state = "RESUME_READY";
+          }
+          if (this.reservationAuthority) {
+            const reservation = this.reservationAuthority.getHandoffReservation(handoffId);
+            invariant(
+              reservation && sameHandoffReservationIdentity(reservation, h),
+              "RESUME_RESERVATION_STALE",
+              "Portable handoff projection no longer matches protected reservation identity"
+            );
+            const binding = this.bindingAuthority.getLifecycleBinding(handoffId);
+            invariant(binding?.status === "ACTIVE", "LIFECYCLE_BINDING_STALE");
+            const readiness = this.reservationAuthority.requestResumeReadiness(`ready:${h.resume_prompt_id}`, {
+              handoff_id: h.handoff_id,
+              reservation_digest: reservation.reservation_digest,
+              binding,
+              latch: { task_id: h.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
+              checkpoint_digest: h.checkpoint_digest,
+              resume_manifest_digest: h.resume_manifest_digest,
+              resume_prompt_id: h.resume_prompt_id,
+              resume_prompt_digest: h.resume_prompt_digest,
+              resume_prompt: h.resume_prompt,
+              plan_semantic_digest: planSemanticDigest(reservedPlan, { requireAll: true })
+            });
+            invariant(readiness?.readiness?.readiness_digest, "RESUME_READINESS_COMMIT_FAILED");
+          }
+          if (alreadyReady) return h;
+          saveTrustedHandoff(this.storage, h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
+          const ready = this.storage.getHandoff(handoffId);
+          this.metric("RESUME_READY", {
+            handoff: ready,
+            session_id: ready.target_session_id,
+            checkpoint_id: ready.checkpoint_id,
+            reason: "CONTINUITY_VALIDATED",
+            continuity_duration_ms: performance3.now() - continuityStarted,
+            artifacts: measureHandoffArtifacts({
+              taskPlanPath: this.ledger.path,
+              checkpointBytes: checkpoint.bytes,
+              manifestBytes: manifest.bytes,
+              resumePrompt: ready.resume_prompt,
+              minimalReads: m.minimal_reads
+            })
           });
-          invariant(readiness?.readiness?.readiness_digest, "RESUME_READINESS_COMMIT_FAILED");
+          return ready;
+        } catch (error) {
+          if (this.reservationAuthority) {
+            const canonicalFailure = this.#commitProtectedContinuityFailure(h, error, {
+              plan: reservedPlan,
+              checkpoint,
+              manifest
+            });
+            error.canonicalContinuityFailure = canonicalFailure?.failed_handoff ?? null;
+          }
+          throw error;
         }
-        if (alreadyReady) return h;
-        saveTrustedHandoff(this.storage, h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
-        const ready = this.storage.getHandoff(handoffId);
-        this.metric("RESUME_READY", {
-          handoff: ready,
-          session_id: ready.target_session_id,
-          checkpoint_id: ready.checkpoint_id,
-          reason: "CONTINUITY_VALIDATED",
-          continuity_duration_ms: performance3.now() - continuityStarted,
-          artifacts: measureHandoffArtifacts({
-            taskPlanPath: this.ledger.path,
-            checkpointBytes: checkpoint.bytes,
-            manifestBytes: manifest.bytes,
-            resumePrompt: ready.resume_prompt,
-            minimalReads: m.minimal_reads
-          })
-        });
-        return ready;
       }
       attestRunnerOwnership(h, targetSession, manifest) {
         invariant(h.runner_instance_id === this.runnerInstanceId, "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "current Runner instance");
@@ -7878,6 +7998,7 @@ var init_storage = __esm({
             preparation,
             { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation }
           ),
+          projectCanonicalRecovery: (result) => this.#projectCanonicalContinuityRecovery(result),
           authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
           projectCanonicalResumeDecision: (result) => this.#projectCanonicalResumeDecision(result),
           projectCanonicalResumeOutcome: (result) => this.#projectCanonicalResumeOutcome(result),
@@ -8209,12 +8330,89 @@ var init_storage = __esm({
           database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(proof.event.event_id, projection.handoff_id, "HANDOFF_STARTED", eventKey, proof.event.occurred_at, JSON.stringify({
             source_session_id: projection.source_session_id,
             latch_generation: projection.latch_generation,
-            recovery_of_handoff_id: null,
+            recovery_of_handoff_id: projection.recovery_of_handoff_id ?? null,
             canonical_reservation_digest: proof.reservation_digest,
             projection_only: true
           }));
           return this.getHandoff(projection.handoff_id);
         });
+      }
+      #projectCanonicalContinuityRecovery(result) {
+        const recovery = result?.recovery;
+        const failure = recovery?.failure;
+        const decision = recovery?.decision;
+        const event = recovery?.event;
+        const binding = recovery?.binding;
+        const child = recovery?.child;
+        const proof = result?.child_projection_proof;
+        invariant(
+          failure?.failed_handoff?.state === "CONTINUITY_FAILED" && decision?.failed_handoff_id === failure.failed_handoff_id && decision?.recovery_handoff_id === child?.handoff_id && event?.event_type === "CONTINUITY_RECOVERY_STARTED" && event?.failed_handoff_id === failure.failed_handoff_id && binding?.handoff_id === failure.failed_handoff_id && binding.status === "SUPERSEDED" && child?.recovery_of_handoff_id === failure.failed_handoff_id && proof?.canonical === true && proof?.event?.handoff_id === child.handoff_id,
+          "RECOVERY_PROJECTION_PROOF_INVALID"
+        );
+        const failed = failure.failed_handoff;
+        this.transaction(() => {
+          const now = utcNow();
+          database(this).prepare(`INSERT INTO handoffs(handoff_id,source_session_id,target_session_id,task_id,state,latch_generation,projection_json,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(handoff_id) DO UPDATE SET source_session_id=excluded.source_session_id,target_session_id=excluded.target_session_id,
+          task_id=excluded.task_id,state=excluded.state,latch_generation=excluded.latch_generation,projection_json=excluded.projection_json,updated_at=excluded.updated_at`).run(
+            failed.handoff_id,
+            failed.source_session_id,
+            failed.target_session_id,
+            failed.task_id,
+            "CONTINUITY_FAILED",
+            failed.latch_generation,
+            JSON.stringify(failed),
+            failed.created_at ?? failure.failed_at,
+            now
+          );
+          const conflicts = database(this).prepare("SELECT handoff_id,bind_event_id FROM runner_session_bindings WHERE handoff_id=? OR replacement_session_id=? OR session_binding_id=?").all(binding.handoff_id, binding.replacement_session_id, binding.session_binding_id);
+          for (const conflict of conflicts) database(this).prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(conflict.handoff_id);
+          for (const conflict of conflicts) database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(conflict.bind_event_id, `runner-binding:${conflict.handoff_id}`);
+          const bindData = {
+            handoff_id: binding.handoff_id,
+            replacement_session_id: binding.replacement_session_id,
+            runner_instance_id: binding.runner_instance_id,
+            session_binding_id: binding.session_binding_id
+          };
+          database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(binding.bind_event_id, `runner-binding:${binding.handoff_id}`);
+          database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(binding.bind_event_id, binding.handoff_id, "RUNNER_SESSION_BOUND", `runner-binding:${binding.handoff_id}`, binding.bound_at, JSON.stringify(bindData));
+          database(this).prepare("INSERT INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)").run(
+            binding.handoff_id,
+            binding.replacement_session_id,
+            binding.runner_instance_id,
+            binding.session_binding_id,
+            "SUPERSEDED",
+            binding.bound_at,
+            binding.bind_event_id,
+            binding.superseded_at,
+            binding.superseded_reason
+          );
+          database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(binding.supersede_event_id, `runner-binding-superseded:${binding.handoff_id}`);
+          database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(
+            binding.supersede_event_id,
+            binding.handoff_id,
+            "RUNNER_SESSION_BINDING_SUPERSEDED",
+            `runner-binding-superseded:${binding.handoff_id}`,
+            binding.superseded_at,
+            JSON.stringify({ reason: binding.superseded_reason, projection_only: true })
+          );
+          database(this).prepare("DELETE FROM journal WHERE event_id=? OR event_key=?").run(event.event_id, `continuity-recovery:${failure.failed_handoff_id}`);
+          database(this).prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)").run(
+            event.event_id,
+            failure.failed_handoff_id,
+            "CONTINUITY_RECOVERY_STARTED",
+            `continuity-recovery:${failure.failed_handoff_id}`,
+            event.occurred_at,
+            event.data_json
+          );
+        });
+        const projectedChild = this.#projectCanonicalHandoffReservation(child, {
+          ...proof,
+          created: true,
+          reservation_digest: proof.reservation_digest
+        });
+        return Object.freeze({ failed: this.getHandoff(failure.failed_handoff_id), child: projectedChild });
       }
       getHandoff(id) {
         const row = database(this).prepare("SELECT * FROM handoffs WHERE handoff_id=?").get(id);
@@ -8668,6 +8866,15 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
     if (!handoffAuthority) return storage.getHandoff(handoffId);
     const reservation = handoffAuthority.getHandoffReservation(handoffId);
     if (!reservation) return null;
+    const recovery = handoffAuthority.getContinuityRecovery?.(handoffId) ?? null;
+    if (recovery?.failure) {
+      return {
+        ...recovery.failure.failed_handoff,
+        recovery_decision_id: recovery.decision?.decision_id ?? null,
+        recovery_child_handoff_id: recovery.decision?.recovery_handoff_id ?? null,
+        recovery_state: recovery.decision ? "CONTINUITY_RECOVERY_STARTED" : "CONTINUITY_FAILED"
+      };
+    }
     const resume = handoffAuthority.getResumeState?.(handoffId) ?? null;
     if (!resume?.readiness) return reservation;
     const dispatchState = resume.dispatch?.state ?? "NOT_STARTED";
@@ -8709,14 +8916,19 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
       const latest = handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args);
       return detached(handoffAuthority && latest ? protectedHandoff(latest.handoff_id) : latest);
     },
-    operationsForTask: read("operationsForTask"),
+    operationsForTask: (...args) => detached(handoffAuthority?.operationsForTask ? handoffAuthority.operationsForTask(...args) : storage.operationsForTask(...args)),
     getMetricSession: read("getMetricSession"),
     metricSessions: read("metricSessions"),
     metricSamples: read("metricSamples"),
     handoffMetricEvents: read("handoffMetricEvents"),
     metricDiagnostics: read("metricDiagnostics"),
-    getArtifact: read("getArtifact"),
-    events: (...args) => detached(handoffAuthority ? handoffAuthority.handoffReservationEvents(...args) : storage.events(...args))
+    getArtifact: (...args) => detached(handoffAuthority?.getArtifactAuthority ? handoffAuthority.getArtifactAuthority(...args) : storage.getArtifact(...args)),
+    events: (...args) => detached(handoffAuthority ? [
+      ...handoffAuthority.handoffReservationEvents(...args),
+      ...handoffAuthority.lifecycleBindingEvents?.(...args) ?? [],
+      ...handoffAuthority.resumeAuthorityEvents?.(...args) ?? [],
+      ...handoffAuthority.continuityRecoveryEvents?.(...args) ?? []
+    ] : storage.events(...args))
   }));
   storageReadFacades.set(authorityKey, facade);
   return facade;

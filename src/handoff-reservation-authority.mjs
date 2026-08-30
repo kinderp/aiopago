@@ -121,7 +121,7 @@ export function validateHandoffReservationRequest(request) {
     });
   }
   invariant(validated.projection.recovery_of_handoff_id === null,
-    "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Continuity recovery remains unavailable until its authority domain is migrated");
+    "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED", "Recovery children require the bounded protected recovery transaction, not generic reservation");
   return Object.freeze({
     projection: validated.projection,
     projectionDigest: validated.projectionDigest,

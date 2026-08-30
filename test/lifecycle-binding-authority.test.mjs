@@ -48,7 +48,7 @@ test("protected lifecycle authority remains in the same canonical store with the
   const x = fixture();
   try {
     assert.equal(requireSecureLifecycleAuthority(x.authority), x.authority);
-    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.5.0");
+    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.6.0");
     assert.equal(x.authority.status().lifecycle_binding_canonical, true);
     const db = new DatabaseSync(x.path, { readOnly: true });
     const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name)); db.close();
@@ -62,7 +62,7 @@ test("bounded 1.2 protected store upgrade adds lifecycle schema and damaged curr
   const legacy = new DatabaseSync(x.path);
   legacy.exec("DROP TABLE lifecycle_binding_events; DROP TABLE lifecycle_bindings; UPDATE authority_metadata SET schema_version='aiopago.operation-authority/1.2.0' WHERE singleton=1;"); legacy.close();
   const upgraded = new ProtectedSqliteOperationAuthority(x.path);
-  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.5.0"); upgraded.close();
+  assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.6.0"); upgraded.close();
   const damaged = new DatabaseSync(x.path); damaged.exec("ALTER TABLE lifecycle_bindings RENAME TO lifecycle_bindings_missing"); damaged.close();
   assert.throws(() => new ProtectedSqliteOperationAuthority(x.path), (error) => error.code === "SECURE_OPERATION_AUTHORITY_SCHEMA_INVALID");
 });

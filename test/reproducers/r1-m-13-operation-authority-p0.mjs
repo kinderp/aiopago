@@ -57,7 +57,7 @@ if (projectPlan) { writeFileSync(projectPlan, "P0 forged later plan revision, di
 if (checkpointPath) { writeFileSync(checkpointPath, "P0 replacement checkpoint bytes\n"); projectRecoveryInputAttack.checkpoint = "MODIFIED"; }
 if (manifestPath) { writeFileSync(manifestPath, "P0 replacement manifest bytes\n"); projectRecoveryInputAttack.manifest = "MODIFIED"; }
 
-let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, falseNegativeAttack = null;
+let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, forgedRecovery, falseNegativeAttack = null;
 {
   const database = new DatabaseSync(projectDatabase);
   database.prepare("INSERT OR REPLACE INTO operations(operation_id,task_id,latch_generation,profile,state,outcome,effect_reference,admitted_at,terminal_at) VALUES(?,?,?,?,?,?,?,?,?)")
@@ -87,6 +87,9 @@ let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, 
   forgedHandoff = database.prepare("SELECT handoff_id,source_session_id,target_session_id,task_id,state,latch_generation FROM handoffs WHERE handoff_id='HO-FORGED-BY-P0'").get();
   forgedActiveSource = database.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE source_session_id='SESSION-FORGED-BY-P0'").get();
   forgedHandoffEvent = database.prepare("SELECT event_id,handoff_id,event_type,event_key FROM journal WHERE event_id='EVT-FORGED-HANDOFF'").get();
+  database.prepare("INSERT OR REPLACE INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+    .run("EVT-FORGED-RECOVERY", handoffProjection.handoff_id, "CONTINUITY_RECOVERY_STARTED", "continuity-recovery:forged-p0", "2099-01-01T00:00:00.002Z", JSON.stringify({ decision_id: "RCD-FORGED", recovery_child_handoff_id: "HO-FORGED-CHILD", actor: "human:forged" }));
+  forgedRecovery = database.prepare("SELECT event_id,handoff_id,event_type,event_key,data_json FROM journal WHERE event_id='EVT-FORGED-RECOVERY'").get();
   database.prepare("INSERT OR REPLACE INTO runner_session_bindings(handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,bind_event_id,superseded_at,superseded_reason) VALUES(?,?,?,?,?,?,?,?,?)")
     .run(handoffProjection.handoff_id, handoffProjection.target_session_id, "RUNNER-FORGED", "BIND-FORGED-BY-P0", "ACTIVE", "2099-01-01T00:00:00.000Z", "EVT-FORGED-HANDOFF", null, null);
   forgedLifecycleBinding = database.prepare("SELECT handoff_id,replacement_session_id,runner_instance_id,session_binding_id,status,bound_at,superseded_at,superseded_reason FROM runner_session_bindings WHERE handoff_id='HO-FORGED-BY-P0'").get();
@@ -123,6 +126,6 @@ let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, 
 
 writeFileSync(output, `${JSON.stringify({
   schema: "aiopago.operation-latch-authority-p0-attack/2", pid: process.pid, ppid: process.ppid,
-  identity, root, service, canonical, key, broker, attempts, projectRecoveryInputAttack, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, falseNegativeAttack,
+  identity, root, service, canonical, key, broker, attempts, projectRecoveryInputAttack, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, forgedRecovery, falseNegativeAttack,
   protectedAllDenied: attempts.every((entry) => entry.denied === true),
 }, null, 2)}\n`);

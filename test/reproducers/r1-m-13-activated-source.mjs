@@ -84,6 +84,13 @@ try {
         async newSession() { throw new Error("ATTACKER_REPLACEMENT_STOP"); },
       });
       await commands.get("aio")?.handler("takeover", { ui: { notify() {} } });
+      capture.attackerRecoveryInvocation = 1;
+      try {
+        await commands.get("aio")?.handler("handoff recover HO-FORGED", {
+          ui: { notify() {}, setEditorText() {}, async confirm() { return false; } },
+          async newSession() { throw new Error("ATTACKER_RECOVERY_REPLACEMENT_STOP"); },
+        });
+      } catch (error) { capture.attackerRecoveryCode = error?.code ?? error?.message ?? String(error); }
       throw new Error("RECONSTRUCTION_CAPTURE_COMPLETE");
     };
 
@@ -98,9 +105,11 @@ try {
     process.exitCode = 0;
 
     const databasePath = join(target, ".guardian", "runtime", "guardian.sqlite");
-    let forged = null; let humanTakeover = 0; let portableHandoffs = 0; let portableActiveSources = 0; let portableHandoffEvents = 0; let portableLifecycleBindings = 0; let portableLifecycleEvents = 0;
+    let forged = null; let humanTakeover = 0; let portableHandoffs = 0; let portableActiveSources = 0; let portableHandoffEvents = 0; let portableLifecycleBindings = 0; let portableLifecycleEvents = 0; let portableRecoveryEvents = 0;
     if (existsSync(databasePath)) {
-      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const database = new DatabaseSync(databasePath);
+      database.prepare("INSERT INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run("EVT-P0-FORGED-RECOVERY", "HO-FORGED", "CONTINUITY_RECOVERY_STARTED", "continuity-recovery:HO-FORGED", "2099-01-01T00:00:00.000Z", JSON.stringify({ actor: "human:forged", recovery_authorization: "YES" }));
       forged = database.prepare("SELECT operation_id,state,outcome,profile FROM operations WHERE operation_id='OP-FORGED'").get() ?? null;
       humanTakeover = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('LATCH_ENGAGED','LATCH_ESCALATED') AND data_json LIKE '%HUMAN_TAKEOVER%'").get().count;
       portableHandoffs = database.prepare("SELECT COUNT(*) count FROM handoffs").get().count;
@@ -108,6 +117,7 @@ try {
       portableHandoffEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type='HANDOFF_STARTED'").get().count;
       portableLifecycleBindings = database.prepare("SELECT COUNT(*) count FROM runner_session_bindings").get().count;
       portableLifecycleEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type IN ('RUNNER_SESSION_BOUND','RUNNER_SESSION_BINDING_SUPERSEDED')").get().count;
+      portableRecoveryEvents = database.prepare("SELECT COUNT(*) count FROM journal WHERE event_type='CONTINUITY_RECOVERY_STARTED'").get().count;
       database.close();
     }
     const installedAfter = await readFile(entry);
@@ -124,6 +134,7 @@ try {
       portableHandoffEvents,
       portableLifecycleBindings,
       portableLifecycleEvents,
+      portableRecoveryEvents,
     }));
   `);
 

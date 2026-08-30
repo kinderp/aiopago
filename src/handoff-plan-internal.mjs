@@ -2,6 +2,7 @@ import { invariant } from "./errors.mjs";
 import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 import { requireSecureResumeAuthority } from "./resume-authority.mjs";
+import { requireSecureRecoveryAuthority } from "./recovery-authority.mjs";
 
 // Package-private capability registries. Public TaskLedger and GuardianStorage
 // objects expose their accepted APIs only; trusted handoff receives one bounded
@@ -31,6 +32,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     && typeof capability?.reserve === "function"
     && typeof capability?.projectCanonicalReservation === "function"
     && typeof capability?.prepareRecovery === "function"
+    && typeof capability?.projectCanonicalRecovery === "function"
     && typeof capability?.authorizeResume === "function"
     && typeof capability?.projectCanonicalResumeDecision === "function"
     && typeof capability?.projectCanonicalResumeOutcome === "function"
@@ -49,6 +51,7 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     reserve: capability.reserve,
     projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
+    projectCanonicalRecovery: capability.projectCanonicalRecovery,
     authorizeResume: capability.authorizeResume,
     projectCanonicalResumeDecision: capability.projectCanonicalResumeDecision,
     projectCanonicalResumeOutcome: capability.projectCanonicalResumeOutcome,
@@ -241,7 +244,20 @@ export function prepareTrustedContinuityRecovery(ledger, request) {
   return planCapability.attestRecovery(request.expected, (plan) => {
     const captured = request.capture(plan);
     invariant(captured && !captured?.then, "CONTINUITY_RECOVERY_ATTESTATION_INVALID", "Final recovery attestation must be synchronous");
-    return storageCapability.prepareRecovery(captured);
+    if (!request.recoveryAuthority) return storageCapability.prepareRecovery(captured);
+    const canonical = requireSecureRecoveryAuthority(request.recoveryAuthority)
+      .requestContinuityRecovery(captured.requestId, captured.recovery);
+    const projected = storageCapability.projectCanonicalRecovery(canonical);
+    return Object.freeze({
+      reserved: {
+        created: canonical.created,
+        canonical: true,
+        reservation: canonical.recovery.child,
+        handoff: projected.child,
+      },
+      attestation: captured.attestation,
+      recovery: canonical.recovery,
+    });
   });
 }
 

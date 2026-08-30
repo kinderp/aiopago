@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { planSemanticDigest } from "../../src/plan-semantics-internal.mjs";
 
 if (process.platform !== "win32") throw new Error("WINDOWS_ONLY_PHYSICAL_ORACLE");
 const here = dirname(fileURLToPath(import.meta.url));
@@ -153,6 +154,20 @@ function canonicalResumeCounts() {
   const result = { readiness: database.prepare("SELECT COUNT(*) count FROM resume_readiness").get().count, authorizations: database.prepare("SELECT COUNT(*) count FROM resume_authorizations").get().count, admissions: database.prepare("SELECT COUNT(*) count FROM resume_admissions").get().count, dispatches: database.prepare("SELECT COUNT(*) count FROM resume_dispatch_attempts").get().count, events: database.prepare("SELECT COUNT(*) count FROM resume_authority_events").get().count };
   database.close(); return result;
 }
+function canonicalRecoveryState(handoffId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const result = {
+    failure: database.prepare("SELECT * FROM continuity_failures WHERE failed_handoff_id=?").get(handoffId) ?? null,
+    decision: database.prepare("SELECT * FROM continuity_recovery_decisions WHERE failed_handoff_id=?").get(handoffId) ?? null,
+    events: database.prepare("SELECT * FROM continuity_recovery_events WHERE failed_handoff_id=? ORDER BY sequence").all(handoffId),
+  };
+  database.close(); return result;
+}
+function canonicalRecoveryCounts() {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const result = { failures: database.prepare("SELECT COUNT(*) count FROM continuity_failures").get().count, decisions: database.prepare("SELECT COUNT(*) count FROM continuity_recovery_decisions").get().count, events: database.prepare("SELECT COUNT(*) count FROM continuity_recovery_events").get().count };
+  database.close(); return result;
+}
 function canonicalRecoveryInputCounts() {
   const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
   const result = { plans: database.prepare("SELECT COUNT(*) count FROM plan_authority_snapshots").get().count, planBindings: database.prepare("SELECT COUNT(*) count FROM handoff_plan_authority").get().count, artifacts: database.prepare("SELECT COUNT(*) count FROM artifact_authority").get().count };
@@ -274,7 +289,7 @@ try {
   const physicalReadiness = operationFrom(resumeReadyRun, "REQ-RESUME-READY-GET").readiness;
   const physicalRecoveryInputs = operationFrom(resumeReadyRun, "REQ-RECOVERY-INPUT-READY");
   assert.ok(physicalReadiness.readiness_digest); assert.equal(operationFrom(resumeReadyRun, "REQ-RESUME-READY-GET").authorization, null);
-  assert.equal(physicalRecoveryInputs.result, "RECOVERY_INPUT_READY"); assert.equal(physicalRecoveryInputs.recovery_authority_available, false);
+  assert.equal(physicalRecoveryInputs.result, "RECOVERY_INPUT_READY"); assert.equal(physicalRecoveryInputs.recovery_authority_available, true);
   await stop();
   const physicalYes = { answer: "YES", actor: "human:/aio-resume", handoff_id: legitimateHandoffProjection.handoff_id, readiness_digest: physicalReadiness.readiness_digest, resume_prompt_id: physicalReadiness.resume_prompt_id, authorization_id: "AUTH-PRODUCTION-RESUME", admission_id: "ADM-PRODUCTION-RESUME", idempotency_key: "resume:RP-PRODUCTION-RESUME", dispatch_attempt_id: "DSP-PRODUCTION-RESUME", attempt_no: 1, binding: physicalBinding, latch: physicalLatch };
   const resumeRun = await startAndResult([
@@ -291,6 +306,53 @@ try {
   assert.equal(physicalNo.authorized, false); assert.equal(physicalAdmission.dispatch_permit, true); assert.equal(physicalDuplicate.dispatch_permit, false);
   assert.equal(physicalResume.authorization.authorization_id, physicalYes.authorization_id); assert.equal(physicalResume.admission.admission_id, physicalYes.admission_id); assert.equal(physicalResume.dispatch.state, "ACKNOWLEDGED");
   evidence.protectedResume = { readiness: physicalReadiness, recoveryInputs: physicalRecoveryInputs, no: physicalNo, admission: physicalAdmission, duplicate: physicalDuplicate, final: physicalResume, externalCallCount: 1, externalCallSemantic: "physical authority oracle uses one instrumented dispatch completion; genuine Pi semantic integration is separate" };
+  await stop();
+
+  const recoveryProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-RECOVERY-FAILED", source: "SESSION-RECOVERY-OLD-SOURCE", task: "TASK-PRODUCTION-RECOVERY" });
+  const recoverySemanticDigest = planSemanticDigest(recoveryProjection.reserved_plan_snapshot, { requireAll: true });
+  const recoveryLatch = { task_id: recoveryProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" };
+  const recoveryBinding = { handoff_id: recoveryProjection.handoff_id, replacement_session_id: "SESSION-RECOVERY-FAILED-TARGET", runner_instance_id: recoveryProjection.runner_instance_id, session_binding_id: recoveryProjection.session_binding_id, lifecycle_incarnation: 7, status: "ACTIVE" };
+  const recoveryCheckpoint = { id: recoveryProjection.checkpoint_id, digest: `sha256:${"4".repeat(64)}`, content_digest: `sha256:${"5".repeat(64)}` };
+  const recoveryManifest = { id: recoveryProjection.resume_manifest_id, digest: `sha256:${"6".repeat(64)}`, content_digest: `sha256:${"7".repeat(64)}` };
+  const recoveryFailed = { ...structuredClone(recoveryProjection), target_session_id: recoveryBinding.replacement_session_id, target_session_file: "sessions/recovery-failed-target.jsonl", checkpoint_digest: recoveryCheckpoint.digest, resume_manifest_digest: recoveryManifest.digest, resume_prompt_id: "RP-PRODUCTION-RECOVERY-FAILED", state: "CONTINUITY_FAILED", failure: { code: "REQUIRED_LOCAL_PATH_MISSING", message: "required local path unavailable" }, updated_at: "2026-08-30T12:01:00.000Z" };
+  const childProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-RECOVERY-CHILD", source: "SESSION-RECOVERY-FRESH-SOURCE", task: recoveryProjection.task_id });
+  childProjection.runner_instance_id = "RUNNER-RECOVERY-P2"; childProjection.session_binding_id = "BIND-HO-PRODUCTION-RECOVERY-CHILD";
+  childProjection.parent_session_id = childProjection.source_session_id; childProjection.parent_session_file = childProjection.source_session_file;
+  childProjection.parent_checkpoint_id = recoveryProjection.checkpoint_id; childProjection.recovery_of_handoff_id = recoveryProjection.handoff_id;
+  const recoveryPrepare = await startAndResult([
+    frame("REQ-RECOVERY-LATCH-ENSURE", "LATCH_ENSURE", { taskId: recoveryProjection.task_id }),
+    frame("REQ-RECOVERY-LATCH-CLAIM", "LATCH_CLAIM_SAFEPOINT", { taskId: recoveryProjection.task_id, reason: "INTEGRITY", actor: "human:/aio-handoff", expected: { task_id: recoveryProjection.task_id, state: "RELEASED", generation: 0, reason: null } }),
+    frame("REQ-RECOVERY-RESERVE-FAILED", "HANDOFF_RESERVE", { projection: recoveryProjection, expectedLatch: recoveryLatch, expectedLatest: null }),
+    frame("REQ-RECOVERY-BIND-FAILED", "LIFECYCLE_BIND_CREATE", { binding: recoveryBinding }),
+    frame("REQ-RECOVERY-CP", "ARTIFACT_AUTHORITY_REGISTER", { kind: "checkpoint", artifact_id: recoveryCheckpoint.id, handoff_id: recoveryProjection.handoff_id, artifact_digest: recoveryCheckpoint.digest, content_digest: recoveryCheckpoint.content_digest, plan_semantic_digest: recoverySemanticDigest }),
+    frame("REQ-RECOVERY-RM", "ARTIFACT_AUTHORITY_REGISTER", { kind: "manifest", artifact_id: recoveryManifest.id, handoff_id: recoveryProjection.handoff_id, artifact_digest: recoveryManifest.digest, content_digest: recoveryManifest.content_digest, plan_semantic_digest: recoverySemanticDigest, checkpoint_id: recoveryCheckpoint.id, checkpoint_digest: recoveryCheckpoint.digest }),
+  ]);
+  const recoveryReservation = operationFrom(recoveryPrepare, "REQ-RECOVERY-RESERVE-FAILED").reservation;
+  await stop();
+  // Re-submit failure with the exact protected reservation digest, then perform the single protected transfer.
+  const failureRun = await startAndResult([
+    frame("REQ-RECOVERY-FAILURE-EXACT", "CONTINUITY_FAILURE_COMMIT", { failed_handoff: recoveryFailed, reservation_digest: recoveryReservation.reservation_digest, binding: recoveryBinding, latch: recoveryLatch, plan_semantic_digest: recoverySemanticDigest, checkpoint: recoveryCheckpoint, manifest: recoveryManifest }),
+  ]);
+  const protectedFailure = operationFrom(failureRun, "REQ-RECOVERY-FAILURE-EXACT").recovery.failure;
+  await stop();
+  const recoveryRequest = { decision_id: "RCD-PRODUCTION-RECOVERY", failed_handoff_id: recoveryProjection.handoff_id, failure_digest: protectedFailure.failure_digest, actor: "human:/aio-handoff-recover", source: { session_id: childProjection.source_session_id, runner_instance_id: childProjection.runner_instance_id, lifecycle_incarnation: 9, active: true, history_length: 0, idle: true }, binding: recoveryBinding, latch: recoveryLatch, plan_semantic_digest: recoverySemanticDigest, model_policy: recoveryProjection.model_policy, reasoning_policy: recoveryProjection.reasoning_policy, git: recoveryProjection.expected_git_state, checkpoint: recoveryCheckpoint, manifest: recoveryManifest, child_projection: childProjection, expected_latest: { handoff_id: recoveryProjection.handoff_id, reservation_digest: recoveryReservation.reservation_digest } };
+  const recoveryCrashMatrix = [];
+  for (const seam of ["after_decision", "after_binding", "after_recovery_event", "after_child_reservation", "before_commit"]) {
+    writeScenario([frame(`REQ-RECOVERY-CRASH-${seam}`, "TEST_CRASH_CONTINUITY_RECOVERY", { request: recoveryRequest, seam })]);
+    scRun(["start", serviceName]); await waitFor(() => serviceState(serviceName) === "STOPPED", `recovery ${seam} crashed service stops`, 30_000);
+    const crashed = canonicalRecoveryState(recoveryProjection.handoff_id);
+    const crashBinding = canonicalLifecycleBinding(recoveryProjection.handoff_id);
+    assert.equal(crashed.decision, null); assert.equal(crashBinding.status, "ACTIVE"); assert.equal(canonicalHandoff(childProjection.handoff_id), null);
+    recoveryCrashMatrix.push({ seam, decision: null, binding: crashBinding.status, child: null });
+  }
+  const physicalRecovery = await startAndResult([
+    frame("REQ-RECOVERY-COMMIT", "CONTINUITY_RECOVERY_COMMIT", recoveryRequest),
+    frame("REQ-RECOVERY-GET", "CONTINUITY_RECOVERY_GET", { handoffId: recoveryProjection.handoff_id }),
+  ]);
+  const recoveryState = operationFrom(physicalRecovery, "REQ-RECOVERY-GET");
+  assert.equal(recoveryState.decision.decision_id, recoveryRequest.decision_id); assert.equal(recoveryState.binding.status, "SUPERSEDED");
+  assert.equal(recoveryState.child.handoff_id, childProjection.handoff_id); assert.equal(recoveryState.child.recovery_of_handoff_id, recoveryProjection.handoff_id);
+  evidence.protectedRecovery = { failure: protectedFailure, decision: recoveryState.decision, child: recoveryState.child, binding: recoveryState.binding, events: recoveryState.event, crashMatrix: recoveryCrashMatrix, externalCalls: 0 };
   await stop();
 
   const compatibility = new DatabaseSync(projectDatabase);
@@ -316,12 +378,14 @@ try {
   assert.equal(p0.forgedLatch.reason, "HUMAN_TAKEOVER");
   assert.equal(p0.forgedHandoff.handoff_id, "HO-FORGED-BY-P0");
   assert.equal(p0.forgedLifecycleBinding.runner_instance_id, "RUNNER-FORGED");
+  assert.equal(p0.forgedRecovery.event_type, "CONTINUITY_RECOVERY_STARTED");
   assert.equal(p0.forgedResume.authorization.actor, "human:forged-yes"); assert.equal(p0.forgedResume.dispatch.state, "ACKNOWLEDGED");
   assert.deepEqual(canonicalLatch("TASK-PRODUCTION-SECURE"), beforeLatch);
   assert.equal(canonicalHandoff("HO-FORGED-BY-P0"), null);
   assert.equal(canonicalActiveSource("SESSION-FORGED-BY-P0"), null);
   assert.equal(canonicalLifecycleBinding("HO-FORGED-BY-P0"), null);
   assert.deepEqual(canonicalResumeState("HO-FORGED-BY-P0"), { readiness: null, authorization: null, admission: null, dispatch: null });
+  assert.deepEqual(canonicalRecoveryState("HO-FORGED-BY-P0"), { failure: null, decision: null, events: [] });
   assert.equal(p0.falseNegativeAttack.deleted_handoff_id, legitimateHandoffProjection.handoff_id);
   assert.equal(canonicalHandoff(legitimateHandoffProjection.handoff_id).handoff_id, legitimateHandoffProjection.handoff_id);
   assert.equal(canonicalActiveSource(legitimateHandoffProjection.source_session_id).handoff_id, legitimateHandoffProjection.handoff_id);
@@ -345,7 +409,7 @@ try {
   assert.equal(p0PlanRejected.ok, false); assert.equal(p0PlanRejected.error.code, "RECOVERY_INPUT_PLAN_MISMATCH");
   assert.equal(p0ArtifactRejected.ok, false); assert.equal(p0ArtifactRejected.error.code, "CHECKPOINT_MISMATCH");
   await stop();
-  evidence.p0Attack = { ...p0, canonicalPlan: legitimatePlanAuthority, canonicalCheckpointDigest: physicalCheckpointDigest, canonicalManifestDigest: physicalManifestDigest, planTamperRejected: p0PlanRejected.error, artifactTamperRejected: p0ArtifactRejected.error, forgedHumanTakeoverCanonicalEffect: "NONE", forgedHandoffCanonical: null, forgedActiveSourceCanonical: null, forgedLifecycleCanonical: null, falseNegativeCanonicalHandoff: canonicalHandoff(legitimateHandoffProjection.handoff_id), falseNegativeCanonicalActiveSource: canonicalActiveSource(legitimateHandoffProjection.source_session_id), falseNegativeCanonicalLifecycle: canonicalLifecycleBinding(legitimateHandoffProjection.handoff_id) };
+  evidence.p0Attack = { ...p0, canonicalPlan: legitimatePlanAuthority, canonicalCheckpointDigest: physicalCheckpointDigest, canonicalManifestDigest: physicalManifestDigest, planTamperRejected: p0PlanRejected.error, artifactTamperRejected: p0ArtifactRejected.error, forgedHumanTakeoverCanonicalEffect: "NONE", forgedHandoffCanonical: null, forgedActiveSourceCanonical: null, forgedLifecycleCanonical: null, forgedRecoveryCanonical: null, falseNegativeCanonicalHandoff: canonicalHandoff(legitimateHandoffProjection.handoff_id), falseNegativeCanonicalActiveSource: canonicalActiveSource(legitimateHandoffProjection.source_session_id), falseNegativeCanonicalLifecycle: canonicalLifecycleBinding(legitimateHandoffProjection.handoff_id) };
 
   const conflictingHandoffProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-CONFLICT", source: legitimateHandoffProjection.source_session_id, task: "TASK-PRODUCTION-CONFLICT" });
   const after = await startAndResult([
@@ -422,6 +486,7 @@ try {
   const canonicalLifecycleBeforeActivated = canonicalLifecycleCounts();
   const canonicalResumeBeforeActivated = canonicalResumeCounts();
   const canonicalRecoveryInputsBeforeActivated = canonicalRecoveryInputCounts();
+  const canonicalRecoveryBeforeActivated = canonicalRecoveryCounts();
   const activated = medium(join(worktree, "test", "reproducers", "r1-m-13-activated-source.mjs"), [], join(publicOutput, "activated-source.json"), 300_000);
   assert.equal(activated.piVersion, "0.83.0"); assert.equal(activated.factory, 1); assert.equal(activated.commands, 4); assert.ok(activated.handlers >= 10); assert.equal(activated.forged?.operation_id, "OP-FORGED"); assert.ok(activated.humanTakeover >= 1);
   assert.equal(canonicalQuery("OP-FORGED"), null);
@@ -430,8 +495,9 @@ try {
   assert.deepEqual(canonicalLifecycleCounts(), canonicalLifecycleBeforeActivated, "activated-source P0 must not create protected lifecycle authority");
   assert.deepEqual(canonicalResumeCounts(), canonicalResumeBeforeActivated, "activated-source P0 must not create protected resume/admission/dispatch authority");
   assert.deepEqual(canonicalRecoveryInputCounts(), canonicalRecoveryInputsBeforeActivated, "activated-source P0 must not create protected plan/artifact authority");
+  assert.deepEqual(canonicalRecoveryCounts(), canonicalRecoveryBeforeActivated, "activated-source P0 must not create protected recovery authority");
   assert.equal(canonicalTakeoverCount(), canonicalTakeoversBeforeActivated, "activated-source P0 must not create a protected takeover");
-  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalPlanOrArtifactAddedByAttack: false, canonicalHandoffAddedByAttack: false, canonicalActiveSourceAddedByAttack: false, canonicalLifecycleBindingAddedByAttack: false, canonicalLifecycleTransitionAddedByAttack: false, canonicalResumeAuthorizationAddedByAttack: false, canonicalResumeAdmissionAddedByAttack: false, canonicalResumeDispatchAddedByAttack: false, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS", handoffDomainResult: "PASS", lifecycleDomainResult: "PASS" };
+  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalPlanOrArtifactAddedByAttack: false, canonicalHandoffAddedByAttack: false, canonicalActiveSourceAddedByAttack: false, canonicalLifecycleBindingAddedByAttack: false, canonicalLifecycleTransitionAddedByAttack: false, canonicalResumeAuthorizationAddedByAttack: false, canonicalResumeAdmissionAddedByAttack: false, canonicalResumeDispatchAddedByAttack: false, canonicalRecoveryDecisionAddedByAttack: false, canonicalRecoveryChildAddedByAttack: false, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS", handoffDomainResult: "PASS", lifecycleDomainResult: "PASS" };
 
   const lifecycleExpected = { handoff_id: legitimateLifecycleBinding.handoff_id, replacement_session_id: legitimateLifecycleBinding.replacement_session_id, runner_instance_id: legitimateLifecycleBinding.runner_instance_id, session_binding_id: legitimateLifecycleBinding.session_binding_id, lifecycle_incarnation: legitimateLifecycleBinding.lifecycle_incarnation, status: "ACTIVE" };
   const lifecycleTransition = await startAndResult([
@@ -625,10 +691,17 @@ try {
   const resumeCrashRecovered = await startAndResult([
     frame("REQ-RESUME-CRASH-REPLAY", "RESUME_DECIDE", resumeCrashYes),
     frame("REQ-RESUME-CRASH-UNKNOWN", "RESUME_DISPATCH_OUTCOME", { dispatch_attempt_id: resumeCrashYes.dispatch_attempt_id, outcome: "UNKNOWN", error: "external success may have occurred before local crash" }),
+    frame("REQ-RESUME-CRASH-RECONCILE-1", "DISPATCH_RECONCILIATION_INSPECT", { handoffId: resumeCrashProjection.handoff_id }),
+    frame("REQ-RESUME-CRASH-RECONCILE-2", "DISPATCH_RECONCILIATION_INSPECT", { handoffId: resumeCrashProjection.handoff_id }),
+    frame("REQ-RESUME-CRASH-RECONCILE-3", "DISPATCH_RECONCILIATION_INSPECT", { handoffId: resumeCrashProjection.handoff_id }),
     frame("REQ-RESUME-CRASH-GET", "RESUME_GET", { handoffId: resumeCrashProjection.handoff_id }),
   ]);
   assert.equal(operationFrom(resumeCrashRecovered, "REQ-RESUME-CRASH-REPLAY").dispatch_permit, false);
   assert.equal(operationFrom(resumeCrashRecovered, "REQ-RESUME-CRASH-GET").dispatch.state, "UNKNOWN");
+  for (const id of ["REQ-RESUME-CRASH-RECONCILE-1", "REQ-RESUME-CRASH-RECONCILE-2", "REQ-RESUME-CRASH-RECONCILE-3"]) {
+    const reconciliation = operationFrom(resumeCrashRecovered, id);
+    assert.equal(reconciliation.evidence_class, "STILL_UNKNOWN"); assert.equal(reconciliation.retry_permitted, false);
+  }
   evidence.resumeCrash = { atomicAdmissionCrash: { canonical: afterAdmissionCrash, latch: latchAfterAdmissionCrash }, externalSuccessBeforeOutcomeCommit: afterOutcomeCrash, restartReplayPermit: false, reconciled: operationFrom(resumeCrashRecovered, "REQ-RESUME-CRASH-GET"), automaticRetry: false };
   await stop();
 
@@ -697,6 +770,13 @@ try {
   const restoreRecoveryInputSchema = new DatabaseSync(databasePath);
   restoreRecoveryInputSchema.exec("ALTER TABLE artifact_authority_admin_held RENAME TO artifact_authority");
   restoreRecoveryInputSchema.close();
+  const recoverySchema = new DatabaseSync(databasePath);
+  recoverySchema.exec("ALTER TABLE continuity_recovery_decisions RENAME TO continuity_recovery_decisions_admin_held");
+  recoverySchema.close();
+  evidence.failClosed.recoverySchemaMissing = await expectStartFailure("recovery schema missing");
+  const restoreRecoverySchema = new DatabaseSync(databasePath);
+  restoreRecoverySchema.exec("ALTER TABLE continuity_recovery_decisions_admin_held RENAME TO continuity_recovery_decisions");
+  restoreRecoverySchema.close();
   const validConfig = config();
   saveConfig({ ...validConfig, serviceSid: sentinelSid });
   evidence.failClosed.identityMismatch = await expectStartFailure("identity mismatch");
@@ -717,7 +797,7 @@ try {
   evidence.acls = JSON.parse(acl);
   evidence.store = { path: databasePath, journalMode: (() => { const db = new DatabaseSync(databasePath, { readOnly: true }); const mode = db.prepare("PRAGMA journal_mode").get().journal_mode; db.close(); return mode; })(), files: [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].filter(existsSync), owner: evidence.acls.find((value) => value.path === databasePath)?.owner, p0Access: "DENIED", otherLocalServiceAccess: "DENIED", p1sP2Access: "READ_WRITE" };
   evidence.binaryIdentity = { broker: sha(join(root, "bin", "broker-service.exe")), node: sha(join(root, "bin", "node.exe")), worker: sha(join(root, "bin", "operation-authority-worker.mjs")), config: validConfig };
-  evidence.result = "RECOVERY INPUT + RESUME AUTHORIZATION/ADMISSION/DISPATCH + LIFECYCLE BINDING + HANDOFF RESERVATION + LATCH + OPERATION AUTHORITY: PASS";
+  evidence.result = "RECOVERY/RECONCILIATION + RECOVERY INPUT + RESUME AUTHORIZATION/ADMISSION/DISPATCH + LIFECYCLE BINDING + HANDOFF RESERVATION + LATCH + OPERATION AUTHORITY: PASS";
   writeFileSync(join(publicOutput, "windows-physical-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
 } finally {

@@ -62,7 +62,7 @@ test("protected resume schema extends the same canonical store and is selected e
   const x = fixture();
   try {
     assert.equal(requireSecureResumeAuthority(x.authority), x.authority);
-    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.5.0");
+    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.6.0");
     assert.equal(x.authority.status().resume_authority_canonical, true);
     assert.deepEqual(counts(x.path), { resume_readiness: 1, resume_authorizations: 0, resume_admissions: 0, resume_dispatch_attempts: 0, resume_authority_events: 1 });
   } finally { x.authority.close(); }
@@ -72,7 +72,7 @@ test("bounded 1.3 lifecycle store upgrade adds resume schema and damaged current
   const x = fixture(); x.authority.close();
   const legacy = new DatabaseSync(x.path);
   legacy.exec("DROP TABLE resume_authority_events; DROP TABLE resume_dispatch_attempts; DROP TABLE resume_admissions; DROP TABLE resume_authorizations; DROP TABLE resume_readiness; UPDATE authority_metadata SET schema_version='aiopago.operation-authority/1.3.0' WHERE singleton=1;"); legacy.close();
-  const upgraded = new ProtectedSqliteOperationAuthority(x.path); assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.5.0"); upgraded.close();
+  const upgraded = new ProtectedSqliteOperationAuthority(x.path); assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.6.0"); upgraded.close();
   const damaged = new DatabaseSync(x.path); damaged.exec("ALTER TABLE resume_admissions RENAME TO resume_admissions_missing"); damaged.close();
   assert.throws(() => new ProtectedSqliteOperationAuthority(x.path), (error) => error.code === "SECURE_OPERATION_AUTHORITY_SCHEMA_INVALID");
 });
@@ -192,6 +192,9 @@ test("dispatch outcome is one-way; success, duplicate, contradiction, and ambigu
       const request = { dispatch_attempt_id: "DSP-RESUME", outcome, error: outcome === "UNKNOWN" ? "timeout after request" : null };
       const first = x.authority.requestResumeDispatchOutcome(`OUTCOME-${outcome}`, request);
       assert.equal(first.state.dispatch.state, outcome);
+      const reconciliation = x.authority.inspectDispatchReconciliation(x.p.handoff_id);
+      assert.equal(reconciliation.evidence_class, outcome === "UNKNOWN" ? "STILL_UNKNOWN" : "KNOWN_SUCCESS");
+      assert.equal(reconciliation.retry_permitted, false);
       assert.equal(x.authority.requestResumeDispatchOutcome(`OUTCOME-${outcome}`, structuredClone(request)).idempotent, true);
       assert.throws(() => x.authority.requestResumeDispatchOutcome("OUTCOME-CONFLICT", { dispatch_attempt_id: "DSP-RESUME", outcome: outcome === "UNKNOWN" ? "ACKNOWLEDGED" : "UNKNOWN", error: outcome === "UNKNOWN" ? null : "ambiguous" }), (error) => error.code === "RESUME_DISPATCH_OUTCOME_CONFLICT");
     } finally { x.authority.close(); }
@@ -239,6 +242,9 @@ test("restart after admission/intent never grants a second external dispatch per
   try {
     const state = restarted.getResumeState(x.p.handoff_id);
     assert.equal(state.dispatch.state, "DISPATCHING");
+    const reconciliation = restarted.inspectDispatchReconciliation(x.p.handoff_id);
+    assert.equal(reconciliation.evidence_class, "STILL_UNKNOWN");
+    assert.equal(reconciliation.retry_permitted, false);
     const retry = restarted.requestResumeDecision("YES-AFTER-RESTART", yes(x));
     assert.equal(retry.dispatch_permit, false); assert.equal(retry.state.dispatch.state, "DISPATCHING");
     assert.deepEqual(counts(x.path), { resume_readiness: 1, resume_authorizations: 1, resume_admissions: 1, resume_dispatch_attempts: 1, resume_authority_events: 5 });

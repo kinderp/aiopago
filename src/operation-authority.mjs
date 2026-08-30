@@ -10,8 +10,9 @@ export const LATCH_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.1
 export const HANDOFF_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.2.0";
 export const LIFECYCLE_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.3.0";
 export const RESUME_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.4.0";
-export const OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.5.0";
-export const OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/6";
+export const RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.5.0";
+export const OPERATION_AUTHORITY_SCHEMA = "aiopago.operation-authority/1.6.0";
+export const OPERATION_AUTHORITY_PROTOCOL = "aiopago.operation-authority-protocol/7";
 
 const PROFILES = new Set(["READ_ONLY", "LOCAL_ATOMIC_MUTATION", "SHELL_ATOMIC_OPERATION"]);
 const OUTCOMES = new Set(["KNOWN_SUCCESS", "KNOWN_FAILURE", "UNKNOWN"]);

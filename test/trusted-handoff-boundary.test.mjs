@@ -1036,6 +1036,10 @@ test("protected dispatch crash seams never blindly replay an external resume", a
     try {
       await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; throw new Error("timeout after request"); } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
       assert.equal(calls, 1); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "UNKNOWN");
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const reconciliation = x.reservationAuthority.inspectDispatchReconciliation(ready.handoff_id);
+        assert.equal(reconciliation.evidence_class, "STILL_UNKNOWN"); assert.equal(reconciliation.retry_permitted, false);
+      }
       await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:retry", sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
       assert.equal(calls, 1);
     } finally { x.close(); }
@@ -1050,6 +1054,10 @@ test("protected dispatch crash seams never blindly replay an external resume", a
     try {
       await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
       assert.equal(calls, 1); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "DISPATCHING");
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const reconciliation = x.reservationAuthority.inspectDispatchReconciliation(ready.handoff_id);
+        assert.equal(reconciliation.evidence_class, "STILL_UNKNOWN"); assert.equal(reconciliation.retry_permitted, false);
+      }
       await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:retry", sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
       assert.equal(calls, 1);
     } finally { x.close(); }

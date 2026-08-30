@@ -10,6 +10,7 @@ import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.m
 import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
 import { requireSecureResumeAuthority } from "./resume-authority.mjs";
 import { requireSecureRecoveryInputAuthority } from "./recovery-input-authority.mjs";
+import { requireSecureRecoveryAuthority } from "./recovery-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
@@ -233,6 +234,21 @@ async function dispatch(frame, hello) {
       result = { ...ready, plan: planAuthorityResult(ready.plan), checkpoint: artifactAuthorityResult(ready.checkpoint), manifest: artifactAuthorityResult(ready.manifest) };
       break;
     }
+    case "CONTINUITY_FAILURE_COMMIT":
+      result = authority.requestContinuityFailure(requestId, payload);
+      break;
+    case "CONTINUITY_RECOVERY_COMMIT":
+      result = authority.requestContinuityRecovery(requestId, payload);
+      break;
+    case "CONTINUITY_RECOVERY_GET":
+      result = authority.getContinuityRecovery(payload.handoffId);
+      break;
+    case "CONTINUITY_RECOVERY_EVENTS":
+      result = authority.continuityRecoveryEvents(payload.handoffId);
+      break;
+    case "DISPATCH_RECONCILIATION_INSPECT":
+      result = authority.inspectDispatchReconciliation(payload.handoffId);
+      break;
     case "LIFECYCLE_BIND_CREATE": {
       const created = authority.requestLifecycleBindingCreate(requestId, { binding: payload.binding });
       result = { ...created, binding: lifecycleBindingResult(created.binding) };
@@ -335,6 +351,11 @@ async function dispatch(frame, hello) {
       authority.crashBeforeResumeOutcomeCommitForPhysicalTest(requestId, payload);
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_CONTINUITY_RECOVERY":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashContinuityRecoveryForPhysicalTest(requestId, payload.request, payload.seam);
+      fail("CRASH_SEAM_RETURNED");
+      break;
     case "TEST_AUTHORITY_TIMEOUT":
       if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
       await new Promise(() => {});
@@ -361,6 +382,7 @@ try {
   requireSecureLifecycleAuthority(authority);
   requireSecureResumeAuthority(authority);
   requireSecureRecoveryInputAuthority(authority);
+  requireSecureRecoveryAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

@@ -372,6 +372,15 @@ var SECURE_RESUME_AUTHORITY_LABEL = Object.freeze({
   r1_m_13_resume_admission_dispatch_isolation: true
 });
 
+// src/recovery-authority.mjs
+var RECOVERY_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_RECOVERY_AUTHORITY_LABEL = Object.freeze({
+  mode: RECOVERY_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_recovery_reconciliation_isolation: true
+});
+
 // src/handoff-plan-internal.mjs
 var handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
 function registerTrustedHandoffPlanCapability(ledger, capability) {

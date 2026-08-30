@@ -7,6 +7,7 @@ import { sameGitState } from "./git-state.mjs";
 import { PORTABLE_HANDOFF_AUTHORITY_LABEL, requireSecureHandoffAuthority, sameHandoffReservationIdentity } from "./handoff-reservation-authority.mjs";
 import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
 import { requireSecureResumeAuthority } from "./resume-authority.mjs";
+import { requireSecureRecoveryAuthority } from "./recovery-authority.mjs";
 import {
   assertNoCompetingResumeEvidence,
   authorizeTrustedResume,
@@ -205,6 +206,7 @@ export class HandoffService {
       requireSecureHandoffAuthority(reservationAuthority);
       requireSecureLifecycleAuthority(reservationAuthority);
       requireSecureResumeAuthority(reservationAuthority);
+      requireSecureRecoveryAuthority(reservationAuthority);
       invariant(safePoint?.latchAuthority === reservationAuthority,
         "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED", "Secure handoff reservation and canonical latch must share one protected authority");
       invariant(artifacts?.authority === reservationAuthority,
@@ -232,6 +234,33 @@ export class HandoffService {
     invariant(authority?.handoff_id === handoffId && authority.snapshot,
       "PLAN_AUTHORITY_UNAVAILABLE", "Protected handoff plan identity is absent; project plan state was not substituted");
     return captureReservedPlanSnapshot(authority.snapshot);
+  }
+
+  #protectedContinuityFailure(handoffId) {
+    if (!this.reservationAuthority) return null;
+    const recovery = this.reservationAuthority.getContinuityRecovery(handoffId);
+    return recovery?.failure ?? null;
+  }
+
+  #commitProtectedContinuityFailure(handoff, error, { plan, checkpoint, manifest }) {
+    if (!this.reservationAuthority) return null;
+    const reservation = this.reservationAuthority.getHandoffReservation(handoff.handoff_id);
+    const binding = this.bindingAuthority.getLifecycleBinding(handoff.handoff_id);
+    const latch = this.latchAuthority.getLatch(handoff.task_id);
+    const failed = structuredClone(handoff);
+    failed.state = "CONTINUITY_FAILED";
+    failed.failure = boundedFailure(error, "CONTINUITY_FAILED");
+    failed.updated_at = utcNow();
+    const committed = this.reservationAuthority.requestContinuityFailure(`failure:${handoff.handoff_id}`, {
+      failed_handoff: failed,
+      reservation_digest: reservation?.reservation_digest,
+      binding,
+      latch: { task_id: latch?.task_id, state: latch?.state, generation: latch?.generation, reason: latch?.reason },
+      plan_semantic_digest: planSemanticDigest(plan, { requireAll: true }),
+      checkpoint: { id: checkpoint.id ?? checkpoint.artifact_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+      manifest: { id: manifest.id ?? manifest.artifact_id, digest: manifest.digest, content_digest: manifest.content_digest },
+    });
+    return committed.recovery.failure;
   }
 
   verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
@@ -302,7 +331,8 @@ export class HandoffService {
   }
 
   #captureRecoveryAttestation({ failedHandoffId, expectedFailed, sourceSession, currentSourceVerifier, sourceAttestation, plan, expectedLatch, safe = null }) {
-    const failed = this.storage.getHandoff(failedHandoffId);
+    const protectedFailure = this.#protectedContinuityFailure(failedHandoffId);
+    const failed = protectedFailure?.failed_handoff ?? this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
     invariant(sameCanonicalJson(failed, expectedFailed),
       "CONTINUITY_RECOVERY_SOURCE_INVALID", "failed handoff authority changed during recovery");
@@ -356,11 +386,14 @@ export class HandoffService {
     return deepFreeze(structuredClone({
       schema: "aiopago.internal-recovery-attestation/1",
       failedHandoff: failed,
+      failure_digest: protectedFailure?.failure_digest ?? null,
       failedBinding: {
+        handoff_id: binding.handoff_id ?? failedHandoffId,
         status: binding.status,
         replacement_session_id: binding.replacement_session_id,
         runner_instance_id: binding.runner_instance_id,
         session_binding_id: binding.session_binding_id,
+        lifecycle_incarnation: binding.lifecycle_incarnation ?? lifecycle.lifecycleEpoch,
       },
       source: {
         session_id: sourceSession.sessionId,
@@ -375,8 +408,8 @@ export class HandoffService {
       model_policy: failed.model_policy,
       reasoning_policy: failed.reasoning_policy,
       git,
-      checkpoint: { id: checkpoint.id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
-      manifest: { id: manifest.id, digest: manifest.digest, content_digest: manifest.content_digest },
+      checkpoint: { id: checkpoint.id ?? checkpoint.artifact_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+      manifest: { id: manifest.id ?? manifest.artifact_id, digest: manifest.digest, content_digest: manifest.content_digest },
       latch: { task_id: failed.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
       safe_operations: safe?.operations ?? [],
     }));
@@ -404,7 +437,7 @@ export class HandoffService {
     });
     const secureReservation = this.reservationAuthority !== null;
     invariant(!secureReservation || recoveryOf === null,
-      "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until its authority domain is migrated");
+      "CONTINUITY_RECOVERY_TRUSTED_PATH_REQUIRED", "Protected recovery children can be reserved only by the final R-star recovery transaction");
     const canonicalLatest = secureReservation ? this.reservationAuthority.latestHandoffReservationForTask(plan.task_id) : null;
     const expectedLatest = canonicalLatest ? {
       handoff_id: canonicalLatest.handoff_id,
@@ -697,7 +730,7 @@ export class HandoffService {
 
     try { h = this.continuity(handoffId, session); }
     catch (error) {
-      h = this.storage.getHandoff(handoffId);
+      h = error.canonicalContinuityFailure ? structuredClone(error.canonicalContinuityFailure) : this.storage.getHandoff(handoffId);
       h.state = "CONTINUITY_FAILED";
       h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
       saveTrustedHandoff(this.storage, h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
@@ -721,8 +754,8 @@ export class HandoffService {
   }
 
   async recoverContinuityFailure({ failedHandoffId, sourceSession, currentSourceVerifier = null, sourceAttestation, replacePaused, actor = "human:/aio-handoff-recover", confirmResume = async () => false, sendResume, verifyCurrentTarget = null }) {
-    invariant(this.reservationAuthority === null, "SECURE_RECOVERY_AUTHORITY_UNAVAILABLE", "Secure recovery remains fail-closed until recovery/lifecycle authority is migrated");
-    const failed = this.storage.getHandoff(failedHandoffId);
+    const protectedFailure = this.#protectedContinuityFailure(failedHandoffId);
+    const failed = protectedFailure?.failed_handoff ?? this.storage.getHandoff(failedHandoffId);
     invariant(failed?.state === "CONTINUITY_FAILED", "CONTINUITY_RECOVERY_NOT_ALLOWED", failed?.state ?? "HANDOFF_NOT_FOUND");
     const initial = this.#captureRecoveryAttestation({
       failedHandoffId,
@@ -740,6 +773,7 @@ export class HandoffService {
       reason: initial.latch.reason,
       actor,
       expectedLatch: initial.latch,
+      latchAuthority: this.reservationAuthority,
     });
     const safe = await this.safePoint.request(sourceSession, actor, initial.latch.reason, { expectedLatch: initial.latch, acquiredLatch: recoveryLatch });
 
@@ -747,6 +781,7 @@ export class HandoffService {
     // prepare+child reservation below run synchronously while compliant plan
     // writers are excluded by the package-private PlanRevisionWriter lock.
     const prepared = prepareTrustedContinuityRecovery(this.ledger, {
+      recoveryAuthority: this.reservationAuthority,
       expected: {
         taskId: initial.plan.task_id,
         planRevisionId: initial.plan.plan_revision_id,
@@ -774,6 +809,41 @@ export class HandoffService {
           modelPolicy: attestation.model_policy,
           reasoningPolicy: attestation.reasoning_policy,
         });
+        if (this.reservationAuthority) {
+          const failedReservation = this.reservationAuthority.getHandoffReservation(failedHandoffId);
+          const decisionId = stableId("RCD", failedHandoffId, projection.handoff_id);
+          return {
+            requestId: decisionId,
+            recovery: {
+              decision_id: decisionId,
+              failed_handoff_id: failedHandoffId,
+              failure_digest: attestation.failure_digest,
+              actor,
+              source: {
+                session_id: attestation.source.session_id,
+                runner_instance_id: attestation.source.runner_instance_id,
+                lifecycle_incarnation: attestation.source.lifecycle_epoch,
+                active: attestation.source.active,
+                history_length: attestation.source.history_length,
+                idle: attestation.source.idle,
+              },
+              binding: attestation.failedBinding,
+              latch: attestation.latch,
+              plan_semantic_digest: attestation.plan_semantic_digest,
+              model_policy: attestation.model_policy,
+              reasoning_policy: attestation.reasoning_policy,
+              git: attestation.git,
+              checkpoint: attestation.checkpoint,
+              manifest: attestation.manifest,
+              child_projection: projection,
+              expected_latest: {
+                handoff_id: failedHandoffId,
+                reservation_digest: failedReservation.reservation_digest,
+              },
+            },
+            attestation,
+          };
+        }
         return {
           failedHandoffId,
           preparation: {
@@ -832,6 +902,7 @@ export class HandoffService {
     const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
     const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
     const reservedPlan = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
+    try {
     const m = manifest.payload;
     assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
     assertManifestPlanConsistency(h, reservedPlan, m);
@@ -913,6 +984,15 @@ export class HandoffService {
       }),
     });
     return ready;
+    } catch (error) {
+      if (this.reservationAuthority) {
+        const canonicalFailure = this.#commitProtectedContinuityFailure(h, error, {
+          plan: reservedPlan, checkpoint, manifest,
+        });
+        error.canonicalContinuityFailure = canonicalFailure?.failed_handoff ?? null;
+      }
+      throw error;
+    }
   }
 
   attestRunnerOwnership(h, targetSession, manifest) {

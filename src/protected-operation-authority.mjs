@@ -9,6 +9,7 @@ import {
   LIFECYCLE_OPERATION_AUTHORITY_SCHEMA,
   OPERATION_AUTHORITY_SCHEMA,
   PREVIOUS_OPERATION_AUTHORITY_SCHEMA,
+  RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA,
   RESUME_OPERATION_AUTHORITY_SCHEMA,
   SECURE_OPERATION_AUTHORITY_LABEL,
   detachedOperation,
@@ -51,10 +52,23 @@ import {
   validateArtifactActual,
   validateArtifactRegistration,
 } from "./recovery-input-authority.mjs";
+import {
+  SECURE_RECOVERY_AUTHORITY_LABEL,
+  detachedContinuityFailure,
+  detachedContinuityRecovery,
+  validateContinuityFailure,
+  validateContinuityRecovery,
+} from "./recovery-authority.mjs";
 
 const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
   ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
   : import.meta.url);
+
+function sameProtectedGit(left, right) {
+  const fields = ["repository_id", "workdir", "branch", "head_sha", "base_sha", "index_digest", "worktree_digest"];
+  return fields.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null))
+    && canonicalJson(left?.status_entries ?? []) === canonicalJson(right?.status_entries ?? []);
+}
 
 function secureUnavailable(error, path) {
   if (error instanceof GuardianError) return error;
@@ -75,6 +89,7 @@ export class ProtectedSqliteOperationAuthority {
     this.lifecycleSecurity = SECURE_LIFECYCLE_AUTHORITY_LABEL;
     this.resumeSecurity = SECURE_RESUME_AUTHORITY_LABEL;
     this.recoveryInputSecurity = SECURE_RECOVERY_INPUT_AUTHORITY_LABEL;
+    this.recoverySecurity = SECURE_RECOVERY_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
     invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
@@ -111,7 +126,7 @@ export class ProtectedSqliteOperationAuthority {
       const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       if (existingMetadata.schema_version === this.schema) return;
-      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA, RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
         && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
     }
     db.exec(`
@@ -314,6 +329,39 @@ export class ProtectedSqliteOperationAuthority {
         occurred_at TEXT NOT NULL,
         data_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS continuity_failures(
+        failed_handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        reservation_digest TEXT NOT NULL,
+        failure_digest TEXT NOT NULL UNIQUE,
+        failed_projection_json TEXT NOT NULL,
+        failure_code TEXT NOT NULL,
+        failure_message TEXT NOT NULL,
+        failed_at TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE
+      );
+      CREATE TABLE IF NOT EXISTS continuity_recovery_decisions(
+        decision_id TEXT PRIMARY KEY,
+        failed_handoff_id TEXT NOT NULL UNIQUE REFERENCES continuity_failures(failed_handoff_id),
+        failure_digest TEXT NOT NULL,
+        recovery_handoff_id TEXT NOT NULL UNIQUE,
+        source_session_id TEXT NOT NULL,
+        source_runner_instance_id TEXT NOT NULL,
+        source_lifecycle_incarnation INTEGER NOT NULL CHECK(source_lifecycle_incarnation > 0),
+        actor TEXT NOT NULL,
+        attestation_digest TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        started_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS continuity_recovery_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL UNIQUE,
+        failed_handoff_id TEXT NOT NULL REFERENCES continuity_failures(failed_handoff_id),
+        recovery_handoff_id TEXT,
+        event_type TEXT NOT NULL CHECK(event_type IN ('CONTINUITY_FAILED','CONTINUITY_RECOVERY_STARTED')),
+        occurred_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authority_requests(
         request_id TEXT PRIMARY KEY,
         operation_type TEXT NOT NULL,
@@ -329,6 +377,7 @@ export class ProtectedSqliteOperationAuthority {
       CREATE INDEX IF NOT EXISTS lifecycle_binding_session_status ON lifecycle_bindings(replacement_session_id,status);
       CREATE INDEX IF NOT EXISTS lifecycle_binding_event_handoff_sequence ON lifecycle_binding_events(handoff_id,sequence);
       CREATE INDEX IF NOT EXISTS resume_authority_event_handoff_sequence ON resume_authority_events(handoff_id,sequence);
+      CREATE INDEX IF NOT EXISTS continuity_recovery_event_failed_sequence ON continuity_recovery_events(failed_handoff_id,sequence);
     `);
     for (const reservation of db.prepare("SELECT * FROM handoff_reservations ORDER BY rowid").all()) {
       this.#bindPlanAuthorityInTransaction(db, JSON.parse(reservation.projection_json), reservation.reservation_digest, reservation.created_at);
@@ -337,7 +386,7 @@ export class ProtectedSqliteOperationAuthority {
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
-    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA, RECOVERY_INPUT_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
       && this.schema === OPERATION_AUTHORITY_SCHEMA) {
       db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?")
         .run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
@@ -364,6 +413,9 @@ export class ProtectedSqliteOperationAuthority {
       resume_admissions: ["admission_id", "authorization_id", "handoff_id", "resume_prompt_id", "idempotency_key", "committed_at"],
       resume_dispatch_attempts: ["dispatch_attempt_id", "admission_id", "handoff_id", "attempt_no", "state", "intent_at", "outcome_at", "error"],
       resume_authority_events: ["sequence", "event_id", "request_id", "handoff_id", "event_type", "occurred_at", "data_json"],
+      continuity_failures: ["failed_handoff_id", "reservation_digest", "failure_digest", "failed_projection_json", "failure_code", "failure_message", "failed_at", "event_id"],
+      continuity_recovery_decisions: ["decision_id", "failed_handoff_id", "failure_digest", "recovery_handoff_id", "source_session_id", "source_runner_instance_id", "source_lifecycle_incarnation", "actor", "attestation_digest", "request_digest", "started_at"],
+      continuity_recovery_events: ["sequence", "event_id", "request_id", "failed_handoff_id", "recovery_handoff_id", "event_type", "occurred_at", "data_json"],
       authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"],
     });
     for (const [table, columns] of Object.entries(expected)) {
@@ -547,7 +599,7 @@ export class ProtectedSqliteOperationAuthority {
     return Object.freeze({ reservation, plan_authority: planAuthority, active_source: activeSource, event, created, idempotent: !created, request_code: requestCode });
   }
 
-  #reserveHandoffInTransaction(db, value, ledgerRequestId, payloadDigest, { crashBeforeEvent = false } = {}) {
+  #reserveHandoffInTransaction(db, value, ledgerRequestId, payloadDigest, { crashBeforeEvent = false, recoveryFailure = null, crashSeam = null } = {}) {
     const recorded = this.#recordedRequest(db, ledgerRequestId, "HANDOFF_RESERVE", payloadDigest, "HANDOFF_REQUEST_CONFLICT");
     if (recorded) return Object.freeze({ ...recorded, created: false, idempotent: true });
     const projection = value.projection;
@@ -590,13 +642,21 @@ export class ProtectedSqliteOperationAuthority {
     "HANDOFF_LATEST_RESERVATION_STALE", "Canonical latest handoff reservation changed");
     if (latest) {
       const priorBinding = this.#lifecycleBindingRow(db, latest.handoff_id);
-      invariant(priorBinding?.status === "ACTIVE"
-        && priorBinding.replacement_session_id === projection.source_session_id
-        && priorBinding.runner_instance_id === projection.runner_instance_id,
-      "HANDOFF_TASK_RESERVATION_CONFLICT", "The latest protected lifecycle does not authorize this exact active target as the next source", {
-        task_id: projection.task_id,
-        existing_handoff_id: latest.handoff_id,
-      });
+      if (recoveryFailure) {
+        invariant(latest.handoff_id === recoveryFailure.failed_handoff_id
+          && latest.reservation_digest === recoveryFailure.reservation_digest
+          && projection.recovery_of_handoff_id === recoveryFailure.failed_handoff_id
+          && priorBinding?.status === "SUPERSEDED",
+        "CONTINUITY_RECOVERY_CONFLICT", "Recovery child does not transfer the exact failed protected lifecycle");
+      } else {
+        invariant(priorBinding?.status === "ACTIVE"
+          && priorBinding.replacement_session_id === projection.source_session_id
+          && priorBinding.runner_instance_id === projection.runner_instance_id,
+        "HANDOFF_TASK_RESERVATION_CONFLICT", "The latest protected lifecycle does not authorize this exact active target as the next source", {
+          task_id: projection.task_id,
+          existing_handoff_id: latest.handoff_id,
+        });
+      }
     }
 
     const eventId = opaqueId("HEV");
@@ -613,6 +673,7 @@ export class ProtectedSqliteOperationAuthority {
     this.#bindPlanAuthorityInTransaction(db, projection, payloadDigest, occurredAt);
     db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)")
       .run(projection.source_session_id, projection.handoff_id);
+    if (crashSeam === "after_child_reservation") process.exit(107);
     if (crashBeforeEvent) process.exit(99);
     db.prepare(`INSERT INTO handoff_reservation_events(
       event_id,request_id,handoff_id,task_id,source_session_id,event_type,latch_generation,latch_reason,occurred_at
@@ -812,8 +873,263 @@ export class ProtectedSqliteOperationAuthority {
       lifecycle: this.#detachedLifecycleBinding(db, binding),
       resume_readiness: detachedResumeReadiness(readiness),
       dispatch: dispatch ? Object.freeze({ ...dispatch }) : null,
-      recovery_authority_available: false,
+      recovery_authority_available: true,
+      reconciliation: dispatch ? this.#dispatchReconciliation(dispatch) : null,
     });
+  }
+
+  #continuityFailureRow(db, handoffId) {
+    return db.prepare("SELECT * FROM continuity_failures WHERE failed_handoff_id=?").get(handoffId) ?? null;
+  }
+
+  #continuityRecoveryState(db, handoffId) {
+    const failure = this.#continuityFailureRow(db, handoffId);
+    if (!failure) return null;
+    const decision = db.prepare("SELECT * FROM continuity_recovery_decisions WHERE failed_handoff_id=?").get(handoffId) ?? null;
+    const event = db.prepare("SELECT * FROM continuity_recovery_events WHERE failed_handoff_id=? AND event_type='CONTINUITY_RECOVERY_STARTED'").get(handoffId) ?? null;
+    return detachedContinuityRecovery({
+      failure,
+      decision,
+      event,
+      child: decision ? detachedReservation(this.#reservationRow(db, decision.recovery_handoff_id)) : null,
+      binding: this.#detachedLifecycleBinding(db, this.#lifecycleBindingRow(db, handoffId)),
+    });
+  }
+
+  requestContinuityFailure(requestId, request) {
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityFailure(request);
+    const value = validated.value;
+    const handoffId = value.failed_handoff.handoff_id;
+    const ledgerRequestId = `continuity-failure:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "CONTINUITY_FAILURE", validated.payload_digest, "RECOVERY_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, recovery: this.#continuityRecoveryState(db, handoffId) });
+      const reservation = this.#reservationRow(db, handoffId);
+      invariant(reservation?.reservation_digest === value.reservation_digest, "CONTINUITY_FAILURE_RESERVATION_STALE");
+      const initial = JSON.parse(reservation.projection_json);
+      invariant(sameHandoffReservationIdentity(initial, value.failed_handoff)
+        && value.failed_handoff.target_session_id === value.binding.replacement_session_id
+        && value.failed_handoff.runner_instance_id === value.binding.runner_instance_id
+        && value.failed_handoff.session_binding_id === value.binding.session_binding_id
+        && value.failed_handoff.checkpoint_id === value.checkpoint.id
+        && value.failed_handoff.checkpoint_digest === value.checkpoint.digest
+        && value.failed_handoff.resume_manifest_id === value.manifest.id
+        && value.failed_handoff.resume_manifest_digest === value.manifest.digest
+        && value.failed_handoff.authorization_state === "NOT_AUTHORIZED"
+        && value.failed_handoff.admission_state === "NOT_COMMITTED"
+        && value.failed_handoff.dispatch_state === "NOT_STARTED"
+        && canonicalJson(value.failed_handoff.reserved_plan_snapshot) === canonicalJson(initial.reserved_plan_snapshot)
+        && canonicalJson(value.failed_handoff.expected_git_state) === canonicalJson(initial.expected_git_state),
+      "CONTINUITY_FAILURE_SUBJECT_MISMATCH", "Continuity failure does not equal its protected reservation subject");
+      const plan = this.#planAuthorityRow(db, handoffId);
+      invariant(plan?.plan_semantic_digest === value.plan_semantic_digest, "CONTINUITY_FAILURE_PLAN_STALE");
+      const binding = this.#lifecycleBindingRow(db, handoffId);
+      invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding), "LIFECYCLE_BINDING_STALE");
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason
+        && latch.generation === reservation.latch_generation, "LATCH_GENERATION_MISMATCH");
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint.id);
+      const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(value.manifest.id);
+      invariant(checkpoint?.handoff_id === handoffId && checkpoint.artifact_digest === value.checkpoint.digest
+        && checkpoint.content_digest === value.checkpoint.content_digest
+        && manifest?.handoff_id === handoffId && manifest.artifact_digest === value.manifest.digest
+        && manifest.content_digest === value.manifest.content_digest
+        && manifest.checkpoint_id === checkpoint.artifact_id && manifest.checkpoint_digest === checkpoint.artifact_digest,
+      "CONTINUITY_FAILURE_ARTIFACT_STALE");
+      invariant(!this.#resumeReadinessRow(db, handoffId)
+        && !db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(handoffId)
+        && !db.prepare("SELECT 1 present FROM resume_admissions WHERE handoff_id=?").get(handoffId)
+        && !db.prepare("SELECT 1 present FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId),
+      "CONTINUITY_RECOVERY_UNSAFE", "Continuity failure cannot coexist with protected resume effects");
+      const prior = this.#continuityFailureRow(db, handoffId);
+      if (prior) {
+        invariant(prior.failure_digest === validated.payload_digest, "CONTINUITY_FAILURE_CONFLICT");
+      } else {
+        const now = utcNow();
+        const eventId = opaqueId("RFEV");
+        db.prepare(`INSERT INTO continuity_failures(
+          failed_handoff_id,reservation_digest,failure_digest,failed_projection_json,failure_code,failure_message,failed_at,event_id
+        ) VALUES(?,?,?,?,?,?,?,?)`).run(
+          handoffId, reservation.reservation_digest, validated.payload_digest, canonicalJson(value.failed_handoff),
+          value.failed_handoff.failure.code, value.failed_handoff.failure.message, now, eventId,
+        );
+        db.prepare(`INSERT INTO continuity_recovery_events(
+          event_id,request_id,failed_handoff_id,recovery_handoff_id,event_type,occurred_at,data_json
+        ) VALUES(?,?,?,?,?,?,?)`).run(
+          eventId, ledgerRequestId, handoffId, null, "CONTINUITY_FAILED", now,
+          JSON.stringify({ code: value.failed_handoff.failure.code, error: value.failed_handoff.failure.message }),
+        );
+      }
+      const result = { recovery: this.#continuityRecoveryState(db, handoffId), created: !prior, idempotent: Boolean(prior), request_code: prior ? "IDEMPOTENT_CONTINUITY_FAILURE" : "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "CONTINUITY_FAILURE", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+
+  #recoverContinuityInTransaction(db, requestId, validated, { crashSeam = null } = {}) {
+    const value = validated.value;
+    const ledgerRequestId = `continuity-recovery:${requestId}`;
+    const recorded = this.#recordedRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, "RECOVERY_REQUEST_CONFLICT");
+    if (recorded) return Object.freeze({ ...recorded, recovery: this.#continuityRecoveryState(db, value.failed_handoff_id) });
+    const failure = this.#continuityFailureRow(db, value.failed_handoff_id);
+    invariant(failure?.failure_digest === value.failure_digest, "CONTINUITY_RECOVERY_SOURCE_INVALID", "Protected failure identity changed");
+    const failed = JSON.parse(failure.failed_projection_json);
+    const priorDecision = db.prepare("SELECT * FROM continuity_recovery_decisions WHERE failed_handoff_id=? OR decision_id=? OR recovery_handoff_id=? LIMIT 1")
+      .get(value.failed_handoff_id, value.decision_id, value.child_projection.handoff_id);
+    if (priorDecision) {
+      invariant(priorDecision.failed_handoff_id === value.failed_handoff_id
+        && priorDecision.decision_id === value.decision_id
+        && priorDecision.recovery_handoff_id === value.child_projection.handoff_id
+        && priorDecision.request_digest === validated.payload_digest,
+      "CONTINUITY_RECOVERY_CONFLICT", "Failed handoff already binds a different recovery identity");
+      const childReserved = this.#reservationResult(db, priorDecision.recovery_handoff_id, false, "IDEMPOTENT_HANDOFF_RESERVATION");
+      const result = {
+        recovery: this.#continuityRecoveryState(db, value.failed_handoff_id),
+        child_projection_proof: {
+          canonical: true, created: true, reservation_digest: childReserved.reservation.reservation_digest,
+          active_source: childReserved.active_source, event: childReserved.event,
+        },
+        created: false, idempotent: true, request_code: "IDEMPOTENT_CONTINUITY_RECOVERY",
+      };
+      this.#saveRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, result);
+      return Object.freeze(result);
+    }
+    const latest = db.prepare("SELECT handoff_id,reservation_digest FROM handoff_reservations WHERE task_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(failed.task_id) ?? null;
+    invariant(latest?.handoff_id === value.expected_latest.handoff_id
+      && latest.reservation_digest === value.expected_latest.reservation_digest
+      && latest.handoff_id === value.failed_handoff_id,
+    "HANDOFF_LATEST_RESERVATION_STALE", "Failed handoff is no longer the exact protected task owner");
+    const binding = this.#lifecycleBindingRow(db, value.failed_handoff_id);
+    invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding), "LIFECYCLE_BINDING_STALE");
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+    if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+    invariant(latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason
+      && latch.generation === failed.latch_generation, "LATCH_GENERATION_MISMATCH");
+    const plan = this.#planAuthorityRow(db, value.failed_handoff_id);
+    invariant(plan?.plan_semantic_digest === value.plan_semantic_digest
+      && value.child_projection.task_plan_revision === plan.plan_revision_id
+      && value.child_projection.task_plan_digest === plan.plan_content_digest
+      && canonicalJson(value.child_projection.reserved_plan_snapshot) === plan.snapshot_json,
+    "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery child plan does not equal protected failed plan authority");
+    invariant(sameProtectedGit(value.git, failed.expected_git_state),
+      "GIT_STATE_MISMATCH", "Final recovery Git attestation differs from the protected failed subject");
+    invariant(sameProtectedGit(value.child_projection.expected_git_state, failed.expected_git_state),
+      "GIT_STATE_MISMATCH", "Recovery child Git provenance differs from the protected failed subject");
+    invariant(value.model_policy === failed.model_policy && value.reasoning_policy === failed.reasoning_policy
+      && value.child_projection.model_policy === failed.model_policy && value.child_projection.reasoning_policy === failed.reasoning_policy,
+    "MODEL_POLICY_MISMATCH", "Recovery model/reasoning provenance changed after final attestation");
+    invariant(value.child_projection.parent_checkpoint_id === failed.checkpoint_id,
+      "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery parent checkpoint changed after final attestation");
+    const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint.id);
+    const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(value.manifest.id);
+    invariant(checkpoint?.handoff_id === value.failed_handoff_id && checkpoint.artifact_digest === value.checkpoint.digest
+      && checkpoint.content_digest === value.checkpoint.content_digest
+      && manifest?.handoff_id === value.failed_handoff_id && manifest.artifact_digest === value.manifest.digest
+      && manifest.content_digest === value.manifest.content_digest
+      && failed.checkpoint_id === value.checkpoint.id && failed.resume_manifest_id === value.manifest.id,
+    "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery artifacts changed after final attestation");
+    invariant(!this.#resumeReadinessRow(db, value.failed_handoff_id)
+      && !db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(value.failed_handoff_id)
+      && !db.prepare("SELECT 1 present FROM resume_admissions WHERE handoff_id=?").get(value.failed_handoff_id)
+      && !db.prepare("SELECT 1 present FROM resume_dispatch_attempts WHERE handoff_id=?").get(value.failed_handoff_id),
+    "CONTINUITY_RECOVERY_UNSAFE");
+    invariant(!db.prepare("SELECT 1 present FROM active_sources WHERE source_session_id=?").get(value.source.session_id)
+      && !db.prepare("SELECT 1 present FROM handoff_reservations WHERE source_session_id=?").get(value.source.session_id)
+      && !db.prepare("SELECT 1 present FROM lifecycle_bindings WHERE replacement_session_id=?").get(value.source.session_id),
+    "CONTINUITY_RECOVERY_SOURCE_INVALID", "Recovery source already participates in protected lifecycle authority");
+
+    const now = utcNow();
+    db.prepare(`INSERT INTO continuity_recovery_decisions(
+      decision_id,failed_handoff_id,failure_digest,recovery_handoff_id,source_session_id,source_runner_instance_id,
+      source_lifecycle_incarnation,actor,attestation_digest,request_digest,started_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(
+      value.decision_id, value.failed_handoff_id, value.failure_digest, value.child_projection.handoff_id,
+      value.source.session_id, value.source.runner_instance_id, value.source.lifecycle_incarnation,
+      value.actor, validated.attestation_digest, validated.payload_digest, now,
+    );
+    if (crashSeam === "after_decision") process.exit(104);
+    const bindingEventId = opaqueId("BEV");
+    const reason = `explicit continuity recovery by ${value.actor}`;
+    const changed = db.prepare("UPDATE lifecycle_bindings SET status='SUPERSEDED',superseded_at=?,superseded_reason=?,supersede_event_id=? WHERE handoff_id=? AND status='ACTIVE' AND lifecycle_incarnation=?")
+      .run(now, reason, bindingEventId, value.failed_handoff_id, value.binding.lifecycle_incarnation);
+    invariant(changed.changes === 1, "CONTINUITY_RECOVERY_UNSAFE", "Failed binding supersession raced");
+    db.prepare(`INSERT INTO lifecycle_binding_events(
+      event_id,request_id,handoff_id,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,event_type,from_status,status,reason,occurred_at
+    ) VALUES(?,?,?,?,?,?,?,'RUNNER_SESSION_BINDING_SUPERSEDED','ACTIVE','SUPERSEDED',?,?)`).run(
+      bindingEventId, `recovery-binding:${value.decision_id}`, value.failed_handoff_id, value.binding.replacement_session_id,
+      value.binding.runner_instance_id, value.binding.session_binding_id, value.binding.lifecycle_incarnation, reason, now,
+    );
+    if (crashSeam === "after_binding") process.exit(105);
+    const recoveryEventId = opaqueId("RCEV");
+    db.prepare(`INSERT INTO continuity_recovery_events(
+      event_id,request_id,failed_handoff_id,recovery_handoff_id,event_type,occurred_at,data_json
+    ) VALUES(?,?,?,?,?,?,?)`).run(
+      recoveryEventId, ledgerRequestId, value.failed_handoff_id, value.child_projection.handoff_id,
+      "CONTINUITY_RECOVERY_STARTED", now, JSON.stringify({
+        decision_id: value.decision_id, failed_target_session_id: value.binding.replacement_session_id,
+        failed_runner_instance_id: value.binding.runner_instance_id, current_source_session_id: value.source.session_id,
+        current_runner_instance_id: value.source.runner_instance_id, actor: value.actor,
+      }),
+    );
+    if (crashSeam === "after_recovery_event") process.exit(106);
+    const childValue = { projection: value.child_projection, expectedLatch: value.latch, expectedLatest: value.expected_latest };
+    const childReserved = this.#reserveHandoffInTransaction(db, childValue, `recovery-child:${value.decision_id}`, validated.child_reservation_digest, {
+      recoveryFailure: failure, crashSeam,
+    });
+    if (crashSeam === "before_commit") process.exit(108);
+    const result = {
+      recovery: this.#continuityRecoveryState(db, value.failed_handoff_id),
+      child_projection_proof: {
+        canonical: true, created: childReserved.created, reservation_digest: childReserved.reservation.reservation_digest,
+        active_source: childReserved.active_source, event: childReserved.event,
+      },
+      created: true, idempotent: false, request_code: "MUTATION_ACCEPTED",
+    };
+    this.#saveRequest(db, ledgerRequestId, "CONTINUITY_RECOVERY", validated.payload_digest, result);
+    return Object.freeze(result);
+  }
+
+  requestContinuityRecovery(requestId, request) {
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityRecovery(request);
+    return this.#transaction((db) => this.#recoverContinuityInTransaction(db, requestId, validated));
+  }
+
+  getContinuityRecovery(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    return this.#continuityRecoveryState(this.#database(), handoffId);
+  }
+
+  continuityRecoveryEvents(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM continuity_recovery_events WHERE failed_handoff_id=? ORDER BY sequence").all(handoffId)
+      .map((row) => Object.freeze({ ...row, data: JSON.parse(row.data_json) })));
+  }
+
+  #dispatchReconciliation(dispatch) {
+    if (!dispatch) return null;
+    const evidenceClass = dispatch.state === "ACKNOWLEDGED" || dispatch.state === "DISPATCHED" ? "KNOWN_SUCCESS"
+      : dispatch.state === "FAILED" ? "KNOWN_FAILURE" : "STILL_UNKNOWN";
+    return Object.freeze({
+      dispatch_attempt_id: dispatch.dispatch_attempt_id,
+      handoff_id: dispatch.handoff_id,
+      protected_state: dispatch.state,
+      evidence_class: evidenceClass,
+      evidence_authority: evidenceClass === "STILL_UNKNOWN"
+        ? "PROTECTED_INTENT_WITHOUT_INDEPENDENT_EXTERNAL_EFFECT_EVIDENCE"
+        : "PROTECTED_TRUSTED_WORKFLOW_OUTCOME",
+      retry_permitted: false,
+      requires_human_or_external_evidence: evidenceClass === "STILL_UNKNOWN",
+      disposition: evidenceClass === "STILL_UNKNOWN" ? "FAIL_CLOSED_NO_REPLAY" : "TERMINAL_NO_REPLAY",
+    });
+  }
+
+  inspectDispatchReconciliation(handoffId) {
+    operationIdentifier(handoffId, "RECOVERY_HANDOFF_INVALID", "handoffId");
+    const dispatch = this.#database().prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null;
+    return this.#dispatchReconciliation(dispatch);
   }
 
   #lifecycleBindingRow(db, handoffId) {
@@ -1208,7 +1524,17 @@ export class ProtectedSqliteOperationAuthority {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, recovery_input_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, recovery_input_canonical: true, recovery_authority_canonical: true, reconciliation_authority_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+  }
+
+  crashContinuityRecoveryForPhysicalTest(requestId, request, seam) {
+    invariant(["after_decision", "after_binding", "after_recovery_event", "after_child_reservation", "before_commit"].includes(seam), "RECOVERY_CRASH_SEAM_INVALID");
+    operationIdentifier(requestId, "RECOVERY_REQUEST_ID_INVALID", "requestId");
+    const validated = validateContinuityRecovery(request);
+    const db = this.#database();
+    db.exec("BEGIN IMMEDIATE");
+    this.#recoverContinuityInTransaction(db, requestId, validated, { crashSeam: seam });
+    process.exit(109);
   }
 
   crashBeforeArtifactCommitForPhysicalTest(requestId, request) {

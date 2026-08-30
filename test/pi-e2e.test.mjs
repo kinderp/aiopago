@@ -86,7 +86,7 @@ function writeOwnerGateLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# E2E owner gate Ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null, modelReasoning = false, reasoningPolicy = "off", secureReservation = false } = {}) {
+async function makeRunner({ ownerGate = false, portableModelPolicy = false, requiredLocalPaths = undefined, existingRoot = null, existingAuthorityPath = null, modelReasoning = false, reasoningPolicy = "off", secureReservation = false } = {}) {
   const root = existingRoot ?? mkdtempSync(join(tmpdir(), "aiopago-pi-e2e-"));
   if (!existingRoot) {
     fixtureLedger(root, portableModelPolicy ? null : "offline-fake/offline-fake", requiredLocalPaths);
@@ -118,8 +118,8 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
   const sessions = mkdtempSync(join(tmpdir(), "aiopago-pi-sessions-"));
   let reservationAuthority = null;
   if (secureReservation) {
-    const protectedRoot = mkdtempSync(join(tmpdir(), "aiopago-pi-protected-"));
-    reservationAuthority = new ProtectedSqliteOperationAuthority(join(protectedRoot, "operations.sqlite"), { allowInitialize: true });
+    const authorityPath = existingAuthorityPath ?? join(mkdtempSync(join(tmpdir(), "aiopago-pi-protected-")), "operations.sqlite");
+    reservationAuthority = new ProtectedSqliteOperationAuthority(authorityPath, { allowInitialize: existingAuthorityPath === null });
   }
   const runner = runnerForInternalTest(await createRunnerForInternalTest({ cwd: root, pi, modelRuntime, model, ...(portableModelPolicy ? {} : { modelPolicy: "offline-fake/offline-fake" }), reasoningPolicy, contextHandoffThresholdPercent: 50, settingsManager: settings, sessionDir: sessions, noTools: "all", ...(reservationAuthority ? { reservationAuthority } : {}) }));
   await runner.runtime.session.bindExtensions({
@@ -133,7 +133,7 @@ async function makeRunner({ ownerGate = false, portableModelPolicy = false, requ
       reload: async () => {},
     },
   });
-  return { root, runner, reservationAuthority, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
+  return { root, runner, reservationAuthority, authorityPath: reservationAuthority?.path ?? null, get calls() { return calls; }, get networkAttempts() { return networkAttempts; }, restoreFetch() { globalThis.fetch = previousFetch; } };
 }
 
 async function makeContinuityRecoveryFixture(options = {}) {
@@ -361,7 +361,7 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
     assert.equal(protectedManifest.checkpoint_id, result.checkpoint_id);
     const recoveryInputs = x.runner.artifacts.recoveryInputReadiness(result.handoff_id);
     assert.equal(recoveryInputs.result, "RECOVERY_INPUT_READY");
-    assert.equal(recoveryInputs.recovery_authority_available, false);
+    assert.equal(recoveryInputs.recovery_authority_available, true);
     const db = storageDatabaseForInternalTest(x.runner.storage);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, 0);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
@@ -528,6 +528,97 @@ test("Pi SDK lifecycle: registered session_shutdown during SafePoint invalidates
     assert.equal(x.calls, 0);
     assert.equal(x.networkAttempts, 0);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("real Pi 0.83.0 protected continuity recovery commits final R-star and prepares one paused child", async () => {
+  let x = await makeRunner({ secureReservation: true, requiredLocalPaths: ["TASK_PLAN.md", "docs/recovery-ready.md"] });
+  let current = null;
+  try {
+    const requiredPath = join(x.root, "docs", "recovery-ready.md");
+    writeFileSync(requiredPath, "# Required docs/recovery-ready.md\n");
+    x.runner.handoffService.testHooks = {
+      async beforeManifest() { unlinkSync(requiredPath); },
+    };
+    await assert.rejects(() => x.runner.handoffDirect({ mode: "manual", confirm: false }),
+      (error) => ["GIT_STATE_MISMATCH", "REQUIRED_LOCAL_PATH_MISSING"].includes(error.code));
+    const canonicalFailedReservation = x.reservationAuthority.latestHandoffReservationForTask("TASK-E2E");
+    const failure = x.reservationAuthority.getContinuityRecovery(canonicalFailedReservation.handoff_id);
+    assert.equal(failure.failure.failed_handoff.state, "CONTINUITY_FAILED");
+    assert.equal(failure.decision, null);
+    assert.equal(failure.binding.status, "ACTIVE");
+    const failedId = canonicalFailedReservation.handoff_id;
+    const authorityPath = x.authorityPath;
+    const root = x.root;
+    const project = storageDatabaseForInternalTest(x.runner.storage);
+    project.prepare("DELETE FROM runner_session_bindings WHERE handoff_id=?").run(failedId);
+    project.prepare("DELETE FROM active_sources WHERE handoff_id=?").run(failedId);
+    project.prepare("DELETE FROM handoffs WHERE handoff_id=?").run(failedId);
+    project.prepare("INSERT OR REPLACE INTO journal(event_id,handoff_id,event_type,event_key,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+      .run("EVT-P0-FAKE-RECOVERY", failedId, "CONTINUITY_RECOVERY_STARTED", `continuity-recovery:${failedId}`, "2099-01-01T00:00:00.000Z", JSON.stringify({ actor: "human:forged" }));
+    assert.equal(x.reservationAuthority.getContinuityRecovery(failedId).decision, null);
+    writeFileSync(requiredPath, "# Required docs/recovery-ready.md\n");
+    current = await makeRunner({ secureReservation: true, existingRoot: root, existingAuthorityPath: authorityPath,
+      requiredLocalPaths: ["TASK_PLAN.md", "docs/recovery-ready.md"] });
+    const secureFailedView = current.runner.authorityStorage.getHandoff(failedId);
+    assert.equal(secureFailedView.state, "CONTINUITY_FAILED"); assert.equal(secureFailedView.recovery_state, "CONTINUITY_FAILED");
+    const recovered = await current.runner.recoverHandoffDirect(failedId, { confirm: false });
+    const canonical = current.reservationAuthority.getContinuityRecovery(failedId);
+    assert.equal(canonical.decision.decision_id.startsWith("RCD-"), true);
+    assert.equal(canonical.child.handoff_id, recovered.handoff_id);
+    assert.equal(canonical.child.recovery_of_handoff_id, failedId);
+    assert.equal(canonical.binding.status, "SUPERSEDED");
+    const secureRecoveredView = current.runner.authorityStorage.getHandoff(failedId);
+    assert.equal(secureRecoveredView.recovery_state, "CONTINUITY_RECOVERY_STARTED");
+    assert.equal(secureRecoveredView.recovery_child_handoff_id, recovered.handoff_id);
+    assert.equal(recovered.state, "RESUME_READY");
+    assert.equal(current.reservationAuthority.getResumeState(recovered.handoff_id).authorization, null);
+    assert.equal(current.calls, 0); assert.equal(current.networkAttempts, 0);
+  } finally {
+    if (current) { await current.runner.dispose(); current.restoreFetch(); }
+    if (x) { await x.runner.dispose(); x.restoreFetch(); }
+  }
+});
+
+test("protected recovery final R-star rejects plan, Git, model, history, artifact, lifecycle, and takeover movement", async (t) => {
+  async function secureFailure() {
+    const old = await makeRunner({ secureReservation: true, requiredLocalPaths: ["TASK_PLAN.md", "docs/recovery-race.md"] });
+    const requiredPath = join(old.root, "docs", "recovery-race.md");
+    writeFileSync(requiredPath, "# Required docs/recovery-race.md\n");
+    old.runner.handoffService.testHooks = { async beforeManifest() { unlinkSync(requiredPath); } };
+    await assert.rejects(() => old.runner.handoffDirect({ mode: "manual", confirm: false }));
+    writeFileSync(requiredPath, "# Required docs/recovery-race.md\n");
+    const failed = old.reservationAuthority.latestHandoffReservationForTask("TASK-E2E");
+    const current = await makeRunner({ secureReservation: true, existingRoot: old.root, existingAuthorityPath: old.authorityPath,
+      requiredLocalPaths: ["TASK_PLAN.md", "docs/recovery-race.md"] });
+    return { old, current, failed, async close() {
+      await current.runner.dispose(); current.restoreFetch();
+      await old.runner.dispose(); old.restoreFetch();
+    } };
+  }
+  const attacks = {
+    "plan movement": async (x) => { writeFixtureLedger(x.current.root, true, "offline-fake/offline-fake", ["TASK_PLAN.md", "docs/recovery-race.md"]); },
+    "Git movement": async (x) => { writeFileSync(join(x.current.root, "r-star-git-drift.txt"), "G2\n"); },
+    "model movement": async (x, source) => { await source.setModel({ ...source.model, id: "offline-fake-r-star-drift" }); },
+    "history movement": async (_x, source) => { source.sessionManager.appendMessage({ role: "user", content: "R-star history drift", timestamp: Date.now() }); },
+    "checkpoint tamper": async (x) => { const f = x.current.reservationAuthority.getContinuityRecovery(x.failed.handoff_id).failure.failed_handoff; writeFileSync(x.current.runner.artifacts.path("checkpoint", f.checkpoint_id), "tampered checkpoint\n"); },
+    "manifest tamper": async (x) => { const f = x.current.reservationAuthority.getContinuityRecovery(x.failed.handoff_id).failure.failed_handoff; writeFileSync(x.current.runner.artifacts.path("manifest", f.resume_manifest_id), "tampered manifest\n"); },
+    "source lifecycle shutdown": async (x, source) => { await source.extensionRunner.emit({ type: "session_shutdown", reason: "R-star race" }); },
+    "HUMAN_TAKEOVER": async (x) => { const latch = x.current.reservationAuthority.getLatch("TASK-E2E"); x.current.reservationAuthority.claimHumanTakeover({ taskId: "TASK-E2E", actor: "human:/aio-takeover", expected: { task_id: latch.task_id, state: latch.state, generation: latch.generation, reason: latch.reason }, requestId: "R-STAR-TAKEOVER" }); },
+  };
+  for (const [name, mutate] of Object.entries(attacks)) await t.test(name, async () => {
+    const x = await secureFailure();
+    try {
+      const source = x.current.runner.runtime.session;
+      const wait = source.waitForIdle.bind(source);
+      source.waitForIdle = async () => { await wait(); await mutate(x, source); };
+      await assert.rejects(() => x.current.runner.recoverHandoffDirect(x.failed.handoff_id, { confirm: false }));
+      const canonical = x.current.reservationAuthority.getContinuityRecovery(x.failed.handoff_id);
+      assert.equal(canonical.decision, null);
+      assert.equal(canonical.binding.status, "ACTIVE");
+      assert.equal(x.current.reservationAuthority.latestHandoffReservationForTask("TASK-E2E").handoff_id, x.failed.handoff_id);
+      assert.equal(x.current.calls, 0); assert.equal(x.current.networkAttempts, 0);
+    } finally { await x.close(); }
+  });
 });
 
 test("M-06 Pi recovery revalidates the actual registered source lifecycle before durable preparation", async (t) => {
