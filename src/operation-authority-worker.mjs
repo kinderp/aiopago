@@ -9,6 +9,7 @@ import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
 import { requireSecureResumeAuthority } from "./resume-authority.mjs";
+import { requireSecureRecoveryInputAuthority } from "./recovery-input-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
@@ -122,6 +123,16 @@ function resumeStateResult(state) {
     dispatch: state.dispatch ?? null,
   };
 }
+function planAuthorityResult(plan) {
+  return plan ? {
+    snapshot_id: plan.snapshot_id, handoff_id: plan.handoff_id, task_id: plan.task_id,
+    plan_revision_id: plan.plan_revision_id, content_digest: plan.content_digest,
+    semantic_digest: plan.semantic_digest, current_item: plan.current_item, next_item: plan.next_item,
+    next_step: plan.next_step, snapshot: plan.snapshot, reservation_digest: plan.reservation_digest,
+    created_at: plan.created_at,
+  } : null;
+}
+function artifactAuthorityResult(artifact) { return artifact ? { ...artifact } : null; }
 
 async function dispatch(frame, hello) {
   if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail("PRIVATE_FRAME_BINDING_REJECTED");
@@ -203,6 +214,25 @@ async function dispatch(frame, hello) {
     case "ACTIVE_SOURCE_GET":
       result = authority.getActiveSource(payload.sourceSessionId);
       break;
+    case "PLAN_AUTHORITY_GET_HANDOFF":
+      result = planAuthorityResult(authority.getPlanAuthorityForHandoff(payload.handoffId));
+      break;
+    case "PLAN_AUTHORITY_GET_REVISION":
+      result = planAuthorityResult(authority.getPlanAuthority(payload.taskId, payload.planRevisionId));
+      break;
+    case "ARTIFACT_AUTHORITY_REGISTER": {
+      const registered = authority.requestArtifactRegistration(requestId, payload);
+      result = { ...registered, artifact: artifactAuthorityResult(registered.artifact) };
+      break;
+    }
+    case "ARTIFACT_AUTHORITY_GET":
+      result = artifactAuthorityResult(authority.getArtifactAuthority(payload.kind, payload.artifactId));
+      break;
+    case "RECOVERY_INPUT_CHECK": {
+      const ready = authority.recoveryInputReadiness(payload);
+      result = { ...ready, plan: planAuthorityResult(ready.plan), checkpoint: artifactAuthorityResult(ready.checkpoint), manifest: artifactAuthorityResult(ready.manifest) };
+      break;
+    }
     case "LIFECYCLE_BIND_CREATE": {
       const created = authority.requestLifecycleBindingCreate(requestId, { binding: payload.binding });
       result = { ...created, binding: lifecycleBindingResult(created.binding) };
@@ -290,6 +320,11 @@ async function dispatch(frame, hello) {
       });
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_BEFORE_ARTIFACT_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeArtifactCommitForPhysicalTest(requestId, payload);
+      fail("CRASH_SEAM_RETURNED");
+      break;
     case "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT":
       if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
       authority.crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, payload);
@@ -325,6 +360,7 @@ try {
   requireSecureHandoffAuthority(authority);
   requireSecureLifecycleAuthority(authority);
   requireSecureResumeAuthority(authority);
+  requireSecureRecoveryInputAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

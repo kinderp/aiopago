@@ -207,6 +207,8 @@ export class HandoffService {
       requireSecureResumeAuthority(reservationAuthority);
       invariant(safePoint?.latchAuthority === reservationAuthority,
         "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED", "Secure handoff reservation and canonical latch must share one protected authority");
+      invariant(artifacts?.authority === reservationAuthority,
+        "SECURE_RECOVERY_INPUT_AUTHORITY_REQUIRED", "Secure handoff artifacts must register and verify against the same protected authority");
     }
     this.storage = storage;
     this.reservationAuthority = reservationAuthority;
@@ -222,6 +224,14 @@ export class HandoffService {
     this.reasoningPolicy = reasoningPolicy;
     this.telemetry = telemetry;
     this.testHooks = testHooks;
+  }
+
+  #protectedPlan(handoffId, portableSnapshot) {
+    if (!this.reservationAuthority) return captureReservedPlanSnapshot(portableSnapshot);
+    const authority = this.reservationAuthority.getPlanAuthorityForHandoff(handoffId);
+    invariant(authority?.handoff_id === handoffId && authority.snapshot,
+      "PLAN_AUTHORITY_UNAVAILABLE", "Protected handoff plan identity is absent; project plan state was not substituted");
+    return captureReservedPlanSnapshot(authority.snapshot);
   }
 
   verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
@@ -505,6 +515,7 @@ export class HandoffService {
   async #continueReservedHandoff({ reserved, sourceSession, plan, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget = null }) {
     let handoff = reserved.handoff;
     if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
+    if (this.reservationAuthority) plan = this.#protectedPlan(handoff.handoff_id, plan);
     assertReservedPlanConsistency(handoff, plan);
     const sourceSessionId = handoff.source_session_id;
     const sourceFile = handoff.source_session_file;
@@ -524,7 +535,10 @@ export class HandoffService {
     handoff.state = "CHECKPOINT_PERSISTING";
     saveTrustedHandoff(this.storage, handoff, "STATE_TRANSITION", { from: "SAFE_TO_HANDOFF", to: handoff.state });
     try {
-      const checkpoint = this.artifacts.persist("checkpoint", checkpointId, this.buildCheckpoint(handoff, plan, safe.operations));
+      const checkpoint = this.artifacts.persist("checkpoint", checkpointId, this.buildCheckpoint(handoff, plan, safe.operations), {
+        handoffId,
+        planSemanticDigest: planSemanticDigest(plan, { requireAll: true }),
+      });
       handoff.checkpoint_digest = checkpoint.digest;
       handoff.state = "CHECKPOINT_PERSISTED";
       saveTrustedHandoff(this.storage, handoff, "CHECKPOINT_PERSISTED", { checkpoint_id: checkpointId, digest: checkpoint.digest, event_key: `checkpoint:${checkpointId}` });
@@ -656,11 +670,16 @@ export class HandoffService {
     h.state = "MANIFEST_PERSISTING";
     saveTrustedHandoff(this.storage, h, "STATE_TRANSITION", { from: "REPLACEMENT_SESSION_CREATED_PAUSED", to: h.state });
     try {
-      const plan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
-      const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
+      const plan = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
+      const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
       assertCheckpointPlanConsistency(h, plan, checkpoint.payload);
       await this.testHooks?.beforeManifest?.({ handoff: h, plan, checkpoint: checkpoint.payload, target });
-      const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan));
+      const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan), {
+        handoffId: h.handoff_id,
+        planSemanticDigest: planSemanticDigest(plan, { requireAll: true }),
+        checkpointId: h.checkpoint_id,
+        checkpointDigest: h.checkpoint_digest,
+      });
       h.resume_manifest_digest = manifest.digest;
       h.state = "MANIFEST_PERSISTED";
       saveTrustedHandoff(this.storage, h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
@@ -810,9 +829,9 @@ export class HandoffService {
     const continuityStarted = performance.now();
     let h = this.storage.getHandoff(handoffId);
     invariant(["MANIFEST_PERSISTED", "RESUME_READY"].includes(h.state), "CONTINUITY_STATE_INVALID", h.state);
-    const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
-    const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
-    const reservedPlan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
+    const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
+    const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
+    const reservedPlan = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
     const m = manifest.payload;
     assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
     assertManifestPlanConsistency(h, reservedPlan, m);
@@ -944,8 +963,8 @@ export class HandoffService {
     });
     const semanticPlan = assertReservedPlanConsistency(h, plan);
     const semanticDigest = planSemanticDigest(semanticPlan, { requireAll: true });
-    const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
-    const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
+    const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
+    const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
     assertCheckpointPlanConsistency(h, semanticPlan, checkpoint.payload);
     assertManifestPlanConsistency(h, semanticPlan, manifest.payload);
     invariant(manifest.payload.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");

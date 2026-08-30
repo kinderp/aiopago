@@ -352,6 +352,16 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
     assert.equal(canonicalBinding.session_binding_id, result.session_binding_id);
     assert.equal(canonicalBinding.lifecycle_incarnation, x.runner.sessionLifecycle.epoch);
     assert.equal(x.reservationAuthority.lifecycleBindingEvents(result.handoff_id).length, 1);
+    const protectedPlan = x.reservationAuthority.getPlanAuthorityForHandoff(result.handoff_id);
+    const protectedCheckpoint = x.reservationAuthority.getArtifactAuthority("checkpoint", result.checkpoint_id);
+    const protectedManifest = x.reservationAuthority.getArtifactAuthority("manifest", result.resume_manifest_id);
+    assert.equal(protectedPlan.plan_revision_id, result.task_plan_revision);
+    assert.equal(protectedPlan.content_digest, result.task_plan_digest);
+    assert.equal(protectedCheckpoint.handoff_id, result.handoff_id);
+    assert.equal(protectedManifest.checkpoint_id, result.checkpoint_id);
+    const recoveryInputs = x.runner.artifacts.recoveryInputReadiness(result.handoff_id);
+    assert.equal(recoveryInputs.result, "RECOVERY_INPUT_READY");
+    assert.equal(recoveryInputs.recovery_authority_available, false);
     const db = storageDatabaseForInternalTest(x.runner.storage);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, 0);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);

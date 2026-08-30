@@ -129,7 +129,7 @@ function fixture({ session = sourceSession(), testHooks = null, planValue = task
     reservationAuthority = new ProtectedSqliteOperationAuthority(join(canonical, "operations.sqlite"), { allowInitialize: true });
     reservationAuthority.ensureLatch(plan.task_id);
   }
-  const artifacts = new ArtifactStore(join(root, ".guardian"), storage);
+  const artifacts = new ArtifactStore(join(root, ".guardian"), storage, { authority: reservationAuthority });
   const latchAuthority = reservationAuthority ?? undefined;
   const gate = new AdmissionGate(storage, plan.task_id, { latchAuthority });
   const safePoint = new SafePointCoordinator({
@@ -872,7 +872,7 @@ test("M-02 P2 drift immediately after reservation cannot contaminate the later P
       }, "23").apply();
     },
   };
-  x = fixture({ planValue: p1, testHooks: hooks });
+  x = fixture({ planValue: p1, testHooks: hooks, secureReservation: true });
   installPausedReplacement(x);
   try {
     await assert.rejects(

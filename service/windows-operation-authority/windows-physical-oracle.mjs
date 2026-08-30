@@ -108,6 +108,16 @@ function canonicalHandoff(handoffId) {
   const row = database.prepare("SELECT handoff_id,source_session_id,task_id,task_plan_revision,task_plan_digest,latch_generation,latch_reason,runner_instance_id,checkpoint_id,resume_manifest_id,reservation_digest,reservation_event_id,projection_json,created_at FROM handoff_reservations WHERE handoff_id=?").get(handoffId) ?? null;
   database.close(); return row ? { ...row, projection: JSON.parse(row.projection_json) } : null;
 }
+function canonicalPlanAuthority(handoffId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT p.*,h.handoff_id,h.reservation_digest FROM handoff_plan_authority h JOIN plan_authority_snapshots p ON p.snapshot_id=h.snapshot_id WHERE h.handoff_id=?").get(handoffId) ?? null;
+  database.close(); return row ? { ...row } : null;
+}
+function canonicalArtifact(kind, artifactId) {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const row = database.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(kind, artifactId) ?? null;
+  database.close(); return row ? { ...row } : null;
+}
 function canonicalHandoffCounts() {
   const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
   const result = { handoffs: database.prepare("SELECT COUNT(*) count FROM handoff_reservations").get().count, activeSources: database.prepare("SELECT COUNT(*) count FROM active_sources").get().count, events: database.prepare("SELECT COUNT(*) count FROM handoff_reservation_events").get().count };
@@ -141,6 +151,11 @@ function canonicalResumeState(handoffId) {
 function canonicalResumeCounts() {
   const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
   const result = { readiness: database.prepare("SELECT COUNT(*) count FROM resume_readiness").get().count, authorizations: database.prepare("SELECT COUNT(*) count FROM resume_authorizations").get().count, admissions: database.prepare("SELECT COUNT(*) count FROM resume_admissions").get().count, dispatches: database.prepare("SELECT COUNT(*) count FROM resume_dispatch_attempts").get().count, events: database.prepare("SELECT COUNT(*) count FROM resume_authority_events").get().count };
+  database.close(); return result;
+}
+function canonicalRecoveryInputCounts() {
+  const database = new DatabaseSync(join(root, "canonical", "operations.sqlite"), { readOnly: true });
+  const result = { plans: database.prepare("SELECT COUNT(*) count FROM plan_authority_snapshots").get().count, planBindings: database.prepare("SELECT COUNT(*) count FROM handoff_plan_authority").get().count, artifacts: database.prepare("SELECT COUNT(*) count FROM artifact_authority").get().count };
   database.close(); return result;
 }
 function physicalHandoffProjection({ handoffId = "HO-PRODUCTION-HANDOFF", source = "SESSION-PRODUCTION-SOURCE", task = "TASK-PRODUCTION-HANDOFF" } = {}) {
@@ -210,6 +225,7 @@ try {
     frame("REQ-HANDOFF-LATCH-CLAIM", "LATCH_CLAIM_SAFEPOINT", { taskId: legitimateHandoffProjection.task_id, reason: "INTEGRITY", actor: "human:/aio-handoff", expected: { task_id: legitimateHandoffProjection.task_id, state: "RELEASED", generation: 0, reason: null } }),
     frame("REQ-HANDOFF-RESERVE", "HANDOFF_RESERVE", { projection: legitimateHandoffProjection, expectedLatch: { task_id: legitimateHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
     frame("REQ-HANDOFF-GET", "HANDOFF_GET", { handoffId: legitimateHandoffProjection.handoff_id }),
+    frame("REQ-PLAN-AUTHORITY-GET", "PLAN_AUTHORITY_GET_HANDOFF", { handoffId: legitimateHandoffProjection.handoff_id }),
     frame("REQ-ACTIVE-SOURCE-GET", "ACTIVE_SOURCE_GET", { sourceSessionId: legitimateHandoffProjection.source_session_id }),
     frame("REQ-LIFECYCLE-BIND", "LIFECYCLE_BIND_CREATE", { binding: { handoff_id: legitimateHandoffProjection.handoff_id, replacement_session_id: "SESSION-PRODUCTION-TARGET", runner_instance_id: legitimateHandoffProjection.runner_instance_id, session_binding_id: legitimateHandoffProjection.session_binding_id, lifecycle_incarnation: 1 } }),
     frame("REQ-LIFECYCLE-GET", "LIFECYCLE_BIND_GET", { handoffId: legitimateHandoffProjection.handoff_id }),
@@ -219,27 +235,46 @@ try {
   const beforeLatch = operationFrom(before, "REQ-BEFORE-LATCH");
   assert.equal(beforeLatch.state, "RELEASED"); assert.equal(beforeLatch.generation, 0);
   const legitimateHandoff = operationFrom(before, "REQ-HANDOFF-GET");
+  const legitimatePlanAuthority = operationFrom(before, "REQ-PLAN-AUTHORITY-GET");
   const legitimateActiveSource = operationFrom(before, "REQ-ACTIVE-SOURCE-GET");
   assert.equal(legitimateHandoff.handoff_id, legitimateHandoffProjection.handoff_id);
   assert.equal(legitimateHandoff.state, "SAFE_TO_HANDOFF");
   assert.equal(legitimateHandoff.authorization_state, "NOT_AUTHORIZED");
+  assert.equal(legitimatePlanAuthority.plan_revision_id, legitimateHandoffProjection.task_plan_revision);
+  assert.deepEqual(legitimatePlanAuthority.snapshot, legitimateHandoffProjection.reserved_plan_snapshot);
   assert.equal(legitimateActiveSource.handoff_id, legitimateHandoffProjection.handoff_id);
   const legitimateLifecycleBinding = operationFrom(before, "REQ-LIFECYCLE-GET");
   assert.equal(legitimateLifecycleBinding.status, "ACTIVE"); assert.equal(legitimateLifecycleBinding.lifecycle_incarnation, 1);
   assert.equal(legitimateLifecycleBinding.session_binding_id, legitimateHandoffProjection.session_binding_id);
-  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, latch: beforeLatch, operation: beforeOperation, handoff: legitimateHandoff, activeSource: legitimateActiveSource, lifecycleBinding: legitimateLifecycleBinding };
+  evidence.phases.beforeRestart = { p1Pid: before.p1Pid, p2Pid: before.p2Pid, fingerprint: before.identityFingerprint, latch: beforeLatch, operation: beforeOperation, handoff: legitimateHandoff, planAuthority: legitimatePlanAuthority, activeSource: legitimateActiveSource, lifecycleBinding: legitimateLifecycleBinding };
   await stop();
 
+  const projectPlanPath = join(projectRoot, "TASK_PLAN.md");
+  const physicalCheckpointPath = join(projectRoot, ".guardian", "checkpoints", `${legitimateHandoffProjection.checkpoint_id}.json`);
+  const physicalManifestPath = join(projectRoot, ".guardian", "manifests", `${legitimateHandoffProjection.resume_manifest_id}.json`);
+  mkdirSync(dirname(physicalCheckpointPath), { recursive: true }); mkdirSync(dirname(physicalManifestPath), { recursive: true });
+  writeFileSync(projectPlanPath, `${JSON.stringify(legitimateHandoffProjection.reserved_plan_snapshot)}\n`);
+  writeFileSync(physicalCheckpointPath, "genuine readable physical checkpoint bytes\n");
+  writeFileSync(physicalManifestPath, "genuine readable physical manifest bytes\n");
   const physicalPrompt = "AIOPAGO_RESUME_V1\ntask_id=TASK-PRODUCTION-HANDOFF";
   const physicalPromptDigest = `sha256:${createHash("sha256").update(physicalPrompt).digest("hex")}`;
   const physicalLatch = { task_id: legitimateHandoffProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" };
   const physicalBinding = { handoff_id: legitimateHandoffProjection.handoff_id, replacement_session_id: legitimateLifecycleBinding.replacement_session_id, runner_instance_id: legitimateLifecycleBinding.runner_instance_id, session_binding_id: legitimateLifecycleBinding.session_binding_id, lifecycle_incarnation: legitimateLifecycleBinding.lifecycle_incarnation, status: "ACTIVE" };
+  const physicalCheckpointDigest = `sha256:${sha(physicalCheckpointPath)}`;
+  const physicalManifestDigest = `sha256:${sha(physicalManifestPath)}`;
+  const physicalCheckpointContentDigest = `sha256:${"1".repeat(64)}`;
+  const physicalManifestContentDigest = `sha256:${"2".repeat(64)}`;
   const resumeReadyRun = await startAndResult([
-    frame("REQ-RESUME-READY", "RESUME_READY_COMMIT", { handoff_id: legitimateHandoffProjection.handoff_id, reservation_digest: legitimateHandoff.reservation_digest, binding: physicalBinding, latch: physicalLatch, checkpoint_digest: `sha256:${"d".repeat(64)}`, resume_manifest_digest: `sha256:${"e".repeat(64)}`, resume_prompt_id: "RP-PRODUCTION-RESUME", resume_prompt_digest: physicalPromptDigest, resume_prompt: physicalPrompt, plan_semantic_digest: `sha256:${"f".repeat(64)}` }),
+    frame("REQ-CHECKPOINT-AUTHORITY", "ARTIFACT_AUTHORITY_REGISTER", { kind: "checkpoint", artifact_id: legitimateHandoffProjection.checkpoint_id, handoff_id: legitimateHandoffProjection.handoff_id, artifact_digest: physicalCheckpointDigest, content_digest: physicalCheckpointContentDigest, plan_semantic_digest: legitimatePlanAuthority.semantic_digest }),
+    frame("REQ-MANIFEST-AUTHORITY", "ARTIFACT_AUTHORITY_REGISTER", { kind: "manifest", artifact_id: legitimateHandoffProjection.resume_manifest_id, handoff_id: legitimateHandoffProjection.handoff_id, artifact_digest: physicalManifestDigest, content_digest: physicalManifestContentDigest, plan_semantic_digest: legitimatePlanAuthority.semantic_digest, checkpoint_id: legitimateHandoffProjection.checkpoint_id, checkpoint_digest: physicalCheckpointDigest }),
+    frame("REQ-RESUME-READY", "RESUME_READY_COMMIT", { handoff_id: legitimateHandoffProjection.handoff_id, reservation_digest: legitimateHandoff.reservation_digest, binding: physicalBinding, latch: physicalLatch, checkpoint_digest: physicalCheckpointDigest, resume_manifest_digest: physicalManifestDigest, resume_prompt_id: "RP-PRODUCTION-RESUME", resume_prompt_digest: physicalPromptDigest, resume_prompt: physicalPrompt, plan_semantic_digest: legitimatePlanAuthority.semantic_digest }),
+    frame("REQ-RECOVERY-INPUT-READY", "RECOVERY_INPUT_CHECK", { handoff_id: legitimateHandoffProjection.handoff_id, plan: legitimatePlanAuthority.snapshot, checkpoint: { artifact_id: legitimateHandoffProjection.checkpoint_id, artifact_digest: physicalCheckpointDigest, content_digest: physicalCheckpointContentDigest }, manifest: { artifact_id: legitimateHandoffProjection.resume_manifest_id, artifact_digest: physicalManifestDigest, content_digest: physicalManifestContentDigest } }),
     frame("REQ-RESUME-READY-GET", "RESUME_GET", { handoffId: legitimateHandoffProjection.handoff_id }),
   ]);
   const physicalReadiness = operationFrom(resumeReadyRun, "REQ-RESUME-READY-GET").readiness;
+  const physicalRecoveryInputs = operationFrom(resumeReadyRun, "REQ-RECOVERY-INPUT-READY");
   assert.ok(physicalReadiness.readiness_digest); assert.equal(operationFrom(resumeReadyRun, "REQ-RESUME-READY-GET").authorization, null);
+  assert.equal(physicalRecoveryInputs.result, "RECOVERY_INPUT_READY"); assert.equal(physicalRecoveryInputs.recovery_authority_available, false);
   await stop();
   const physicalYes = { answer: "YES", actor: "human:/aio-resume", handoff_id: legitimateHandoffProjection.handoff_id, readiness_digest: physicalReadiness.readiness_digest, resume_prompt_id: physicalReadiness.resume_prompt_id, authorization_id: "AUTH-PRODUCTION-RESUME", admission_id: "ADM-PRODUCTION-RESUME", idempotency_key: "resume:RP-PRODUCTION-RESUME", dispatch_attempt_id: "DSP-PRODUCTION-RESUME", attempt_no: 1, binding: physicalBinding, latch: physicalLatch };
   const resumeRun = await startAndResult([
@@ -255,7 +290,7 @@ try {
   const physicalResume = operationFrom(resumeRun, "REQ-RESUME-GET");
   assert.equal(physicalNo.authorized, false); assert.equal(physicalAdmission.dispatch_permit, true); assert.equal(physicalDuplicate.dispatch_permit, false);
   assert.equal(physicalResume.authorization.authorization_id, physicalYes.authorization_id); assert.equal(physicalResume.admission.admission_id, physicalYes.admission_id); assert.equal(physicalResume.dispatch.state, "ACKNOWLEDGED");
-  evidence.protectedResume = { readiness: physicalReadiness, no: physicalNo, admission: physicalAdmission, duplicate: physicalDuplicate, final: physicalResume, externalCallCount: 1, externalCallSemantic: "physical authority oracle uses one instrumented dispatch completion; genuine Pi semantic integration is separate" };
+  evidence.protectedResume = { readiness: physicalReadiness, recoveryInputs: physicalRecoveryInputs, no: physicalNo, admission: physicalAdmission, duplicate: physicalDuplicate, final: physicalResume, externalCallCount: 1, externalCallSemantic: "physical authority oracle uses one instrumented dispatch completion; genuine Pi semantic integration is separate" };
   await stop();
 
   const compatibility = new DatabaseSync(projectDatabase);
@@ -270,9 +305,11 @@ try {
     .run(legitimateHandoffProjection.handoff_id, legitimateLifecycleBinding.replacement_session_id, legitimateLifecycleBinding.runner_instance_id, legitimateLifecycleBinding.session_binding_id, "ACTIVE", legitimateLifecycleBinding.bound_at, "EVT-PROJECT-REAL-BINDING");
   compatibility.close();
 
+  const p0InputsPath = join(publicOutput, "p0-inputs.json");
+  writeFileSync(p0InputsPath, JSON.stringify({ projectPlan: projectPlanPath, checkpointPath: physicalCheckpointPath, manifestPath: physicalManifestPath }));
   const p0 = medium(join(worktree, "test", "reproducers", "r1-m-13-operation-authority-p0.mjs"), [
     "--root", root, "--service", serviceName, "--project-db", projectDatabase, "--service-config-probe", serviceConfigProbe,
-    "--attack-real-handoff-id", legitimateHandoffProjection.handoff_id,
+    "--attack-real-handoff-id", legitimateHandoffProjection.handoff_id, "--project-inputs", p0InputsPath,
   ], join(publicOutput, "p0-attack.json"));
   assert.equal(p0.protectedAllDenied, true, JSON.stringify(p0.attempts.filter((value) => !value.denied), null, 2));
   assert.equal(p0.forged.operation_id, "OP-FORGED-BY-P0");
@@ -292,7 +329,23 @@ try {
   assert.equal(canonicalLifecycleBinding(legitimateHandoffProjection.handoff_id).status, "ACTIVE");
   assert.equal(canonicalResumeState(legitimateHandoffProjection.handoff_id).authorization.authorization_id, physicalYes.authorization_id);
   assert.equal(canonicalResumeState(legitimateHandoffProjection.handoff_id).dispatch.state, "ACKNOWLEDGED");
-  evidence.p0Attack = { ...p0, forgedHumanTakeoverCanonicalEffect: "NONE", forgedHandoffCanonical: null, forgedActiveSourceCanonical: null, forgedLifecycleCanonical: null, falseNegativeCanonicalHandoff: canonicalHandoff(legitimateHandoffProjection.handoff_id), falseNegativeCanonicalActiveSource: canonicalActiveSource(legitimateHandoffProjection.source_session_id), falseNegativeCanonicalLifecycle: canonicalLifecycleBinding(legitimateHandoffProjection.handoff_id) };
+  assert.deepEqual(p0.projectRecoveryInputAttack, { plan: "MODIFIED", checkpoint: "MODIFIED", manifest: "MODIFIED" });
+  const p0InputAttack = await startAndResult([
+    frame("REQ-P0-PLAN-UNCHANGED", "PLAN_AUTHORITY_GET_HANDOFF", { handoffId: legitimateHandoffProjection.handoff_id }),
+    frame("REQ-P0-CP-UNCHANGED", "ARTIFACT_AUTHORITY_GET", { kind: "checkpoint", artifactId: legitimateHandoffProjection.checkpoint_id }),
+    frame("REQ-P0-RM-UNCHANGED", "ARTIFACT_AUTHORITY_GET", { kind: "manifest", artifactId: legitimateHandoffProjection.resume_manifest_id }),
+    frame("REQ-P0-PLAN-TAMPER-CHECK", "RECOVERY_INPUT_CHECK", { handoff_id: legitimateHandoffProjection.handoff_id, plan: { ...legitimatePlanAuthority.snapshot, objective: "P0 forged" }, checkpoint: { artifact_id: legitimateHandoffProjection.checkpoint_id, artifact_digest: physicalCheckpointDigest, content_digest: physicalCheckpointContentDigest }, manifest: { artifact_id: legitimateHandoffProjection.resume_manifest_id, artifact_digest: physicalManifestDigest, content_digest: physicalManifestContentDigest } }),
+    frame("REQ-P0-ARTIFACT-TAMPER-CHECK", "RECOVERY_INPUT_CHECK", { handoff_id: legitimateHandoffProjection.handoff_id, plan: legitimatePlanAuthority.snapshot, checkpoint: { artifact_id: legitimateHandoffProjection.checkpoint_id, artifact_digest: `sha256:${sha(physicalCheckpointPath)}`, content_digest: physicalCheckpointContentDigest }, manifest: { artifact_id: legitimateHandoffProjection.resume_manifest_id, artifact_digest: `sha256:${sha(physicalManifestPath)}`, content_digest: physicalManifestContentDigest } }),
+  ]);
+  assert.deepEqual(operationFrom(p0InputAttack, "REQ-P0-PLAN-UNCHANGED"), legitimatePlanAuthority);
+  assert.equal(operationFrom(p0InputAttack, "REQ-P0-CP-UNCHANGED").artifact_digest, physicalCheckpointDigest);
+  assert.equal(operationFrom(p0InputAttack, "REQ-P0-RM-UNCHANGED").artifact_digest, physicalManifestDigest);
+  const p0PlanRejected = p0InputAttack.results.find((value) => value.requestId === "REQ-P0-PLAN-TAMPER-CHECK");
+  const p0ArtifactRejected = p0InputAttack.results.find((value) => value.requestId === "REQ-P0-ARTIFACT-TAMPER-CHECK");
+  assert.equal(p0PlanRejected.ok, false); assert.equal(p0PlanRejected.error.code, "RECOVERY_INPUT_PLAN_MISMATCH");
+  assert.equal(p0ArtifactRejected.ok, false); assert.equal(p0ArtifactRejected.error.code, "CHECKPOINT_MISMATCH");
+  await stop();
+  evidence.p0Attack = { ...p0, canonicalPlan: legitimatePlanAuthority, canonicalCheckpointDigest: physicalCheckpointDigest, canonicalManifestDigest: physicalManifestDigest, planTamperRejected: p0PlanRejected.error, artifactTamperRejected: p0ArtifactRejected.error, forgedHumanTakeoverCanonicalEffect: "NONE", forgedHandoffCanonical: null, forgedActiveSourceCanonical: null, forgedLifecycleCanonical: null, falseNegativeCanonicalHandoff: canonicalHandoff(legitimateHandoffProjection.handoff_id), falseNegativeCanonicalActiveSource: canonicalActiveSource(legitimateHandoffProjection.source_session_id), falseNegativeCanonicalLifecycle: canonicalLifecycleBinding(legitimateHandoffProjection.handoff_id) };
 
   const conflictingHandoffProjection = physicalHandoffProjection({ handoffId: "HO-PRODUCTION-CONFLICT", source: legitimateHandoffProjection.source_session_id, task: "TASK-PRODUCTION-CONFLICT" });
   const after = await startAndResult([
@@ -368,6 +421,7 @@ try {
   const canonicalHandoffsBeforeActivated = canonicalHandoffCounts();
   const canonicalLifecycleBeforeActivated = canonicalLifecycleCounts();
   const canonicalResumeBeforeActivated = canonicalResumeCounts();
+  const canonicalRecoveryInputsBeforeActivated = canonicalRecoveryInputCounts();
   const activated = medium(join(worktree, "test", "reproducers", "r1-m-13-activated-source.mjs"), [], join(publicOutput, "activated-source.json"), 300_000);
   assert.equal(activated.piVersion, "0.83.0"); assert.equal(activated.factory, 1); assert.equal(activated.commands, 4); assert.ok(activated.handlers >= 10); assert.equal(activated.forged?.operation_id, "OP-FORGED"); assert.ok(activated.humanTakeover >= 1);
   assert.equal(canonicalQuery("OP-FORGED"), null);
@@ -375,8 +429,9 @@ try {
   assert.deepEqual(canonicalHandoffCounts(), canonicalHandoffsBeforeActivated, "activated-source P0 must not create protected reservation authority");
   assert.deepEqual(canonicalLifecycleCounts(), canonicalLifecycleBeforeActivated, "activated-source P0 must not create protected lifecycle authority");
   assert.deepEqual(canonicalResumeCounts(), canonicalResumeBeforeActivated, "activated-source P0 must not create protected resume/admission/dispatch authority");
+  assert.deepEqual(canonicalRecoveryInputCounts(), canonicalRecoveryInputsBeforeActivated, "activated-source P0 must not create protected plan/artifact authority");
   assert.equal(canonicalTakeoverCount(), canonicalTakeoversBeforeActivated, "activated-source P0 must not create a protected takeover");
-  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalHandoffAddedByAttack: false, canonicalActiveSourceAddedByAttack: false, canonicalLifecycleBindingAddedByAttack: false, canonicalLifecycleTransitionAddedByAttack: false, canonicalResumeAuthorizationAddedByAttack: false, canonicalResumeAdmissionAddedByAttack: false, canonicalResumeDispatchAddedByAttack: false, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS", handoffDomainResult: "PASS", lifecycleDomainResult: "PASS" };
+  evidence.activatedSource = { ...activated, canonicalOperation: null, canonicalPlanOrArtifactAddedByAttack: false, canonicalHandoffAddedByAttack: false, canonicalActiveSourceAddedByAttack: false, canonicalLifecycleBindingAddedByAttack: false, canonicalLifecycleTransitionAddedByAttack: false, canonicalResumeAuthorizationAddedByAttack: false, canonicalResumeAdmissionAddedByAttack: false, canonicalResumeDispatchAddedByAttack: false, canonicalTakeoverAddedByAttack: false, legitimateP2Takeover: legitimateTakeover, operationDomainResult: "PASS", latchDomainResult: "PASS", handoffDomainResult: "PASS", lifecycleDomainResult: "PASS" };
 
   const lifecycleExpected = { handoff_id: legitimateLifecycleBinding.handoff_id, replacement_session_id: legitimateLifecycleBinding.replacement_session_id, runner_instance_id: legitimateLifecycleBinding.runner_instance_id, session_binding_id: legitimateLifecycleBinding.session_binding_id, lifecycle_incarnation: legitimateLifecycleBinding.lifecycle_incarnation, status: "ACTIVE" };
   const lifecycleTransition = await startAndResult([
@@ -488,6 +543,7 @@ try {
   scRun(["start", serviceName]);
   await waitFor(() => serviceState(serviceName) === "STOPPED", "handoff crashed service stops", 30_000);
   assert.equal(canonicalHandoff(crashHandoffProjection.handoff_id), null);
+  assert.equal(canonicalPlanAuthority(crashHandoffProjection.handoff_id), null);
   assert.equal(canonicalActiveSource(crashHandoffProjection.source_session_id), null);
   const handoffRecovered = await startAndResult([
     frame("REQ-HANDOFF-CRASH-GET", "HANDOFF_GET", { handoffId: crashHandoffProjection.handoff_id }),
@@ -495,7 +551,7 @@ try {
   ]);
   assert.equal(operationFrom(handoffRecovered, "REQ-HANDOFF-CRASH-GET"), null);
   assert.equal(operationFrom(handoffRecovered, "REQ-HANDOFF-CRASH-ACTIVE"), null);
-  evidence.handoffCrash = { seam: "SQLite BEGIN IMMEDIATE + handoff insert + active-source insert + P2/P1S exit before event/COMMIT", canonicalHandoff: null, canonicalActiveSource: null, restartHandoff: null, restartActiveSource: null, invalidStateAccepted: false };
+  evidence.handoffCrash = { seam: "SQLite BEGIN IMMEDIATE + handoff/plan/relationship/active-source inserts + P2/P1S exit before event/COMMIT", canonicalHandoff: null, canonicalPlan: null, canonicalActiveSource: null, restartHandoff: null, restartActiveSource: null, invalidStateAccepted: false };
   await stop();
 
   const crashLifecycleProjection = physicalHandoffProjection({ handoffId: "HO-LIFECYCLE-CRASH", source: "SESSION-LIFECYCLE-CRASH-SOURCE", task: "TASK-LIFECYCLE-CRASH" });
@@ -513,12 +569,19 @@ try {
   assert.equal(canonicalLifecycleBinding(crashLifecycleProjection.handoff_id).status, "ACTIVE");
   const lifecycleRecovered = await startAndResult([
     frame("REQ-LIFECYCLE-CRASH-GET", "LIFECYCLE_BIND_GET", { handoffId: crashLifecycleProjection.handoff_id }),
+    frame("REQ-LIFECYCLE-CRASH-PLAN", "PLAN_AUTHORITY_GET_HANDOFF", { handoffId: crashLifecycleProjection.handoff_id }),
     frame("REQ-LIFECYCLE-CRASH-RECONCILE", "LIFECYCLE_BIND_TRANSITION", { expected: { ...crashLifecycleIdentity, status: "ACTIVE" }, nextStatus: "SUPERSEDED", reason: "session_shutdown" }),
   ]);
   assert.equal(operationFrom(lifecycleRecovered, "REQ-LIFECYCLE-CRASH-GET").status, "ACTIVE");
   assert.equal(operationFrom(lifecycleRecovered, "REQ-LIFECYCLE-CRASH-RECONCILE").binding.status, "SUPERSEDED");
   evidence.lifecycleCrash = { seam: "SQLite BEGIN IMMEDIATE + lifecycle binding/event mutation + P2/P1S exit before COMMIT", restart: operationFrom(lifecycleRecovered, "REQ-LIFECYCLE-CRASH-GET"), reconciled: operationFrom(lifecycleRecovered, "REQ-LIFECYCLE-CRASH-RECONCILE").binding, invalidStateAccepted: false };
+  const crashLifecyclePlan = operationFrom(lifecycleRecovered, "REQ-LIFECYCLE-CRASH-PLAN");
   await stop();
+  const checkpointCrashRequest = { kind: "checkpoint", artifact_id: crashLifecycleProjection.checkpoint_id, handoff_id: crashLifecycleProjection.handoff_id, artifact_digest: `sha256:${"6".repeat(64)}`, content_digest: `sha256:${"7".repeat(64)}`, plan_semantic_digest: crashLifecyclePlan.semantic_digest };
+  writeScenario([frame("REQ-CHECKPOINT-AUTHORITY-CRASH", "TEST_CRASH_BEFORE_ARTIFACT_COMMIT", checkpointCrashRequest)]);
+  scRun(["start", serviceName]); await waitFor(() => serviceState(serviceName) === "STOPPED", "checkpoint authority crashed service stops", 30_000);
+  assert.equal(canonicalArtifact("checkpoint", crashLifecycleProjection.checkpoint_id), null);
+  evidence.checkpointAuthorityCrash = { seam: "SQLite checkpoint identity insert before COMMIT", canonicalArtifact: null };
 
   const resumeCrashProjection = physicalHandoffProjection({ handoffId: "HO-RESUME-CRASH", source: "SESSION-RESUME-CRASH-SOURCE", task: "TASK-RESUME-CRASH" });
   const resumeCrashBinding = { handoff_id: resumeCrashProjection.handoff_id, replacement_session_id: "SESSION-RESUME-CRASH-TARGET", runner_instance_id: resumeCrashProjection.runner_instance_id, session_binding_id: resumeCrashProjection.session_binding_id, lifecycle_incarnation: 21, status: "ACTIVE" };
@@ -528,11 +591,24 @@ try {
     frame("REQ-RESUME-CRASH-RESERVE", "HANDOFF_RESERVE", { projection: resumeCrashProjection, expectedLatch: { task_id: resumeCrashProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, expectedLatest: null }),
     frame("REQ-RESUME-CRASH-BIND", "LIFECYCLE_BIND_CREATE", { binding: { ...resumeCrashBinding, status: undefined } }),
     frame("REQ-RESUME-CRASH-HANDOFF", "HANDOFF_GET", { handoffId: resumeCrashProjection.handoff_id }),
+    frame("REQ-RESUME-CRASH-PLAN", "PLAN_AUTHORITY_GET_HANDOFF", { handoffId: resumeCrashProjection.handoff_id }),
   ]);
-  const resumeCrashReservation = operationFrom(resumeCrashSetup, "REQ-RESUME-CRASH-HANDOFF"); await stop();
+  const resumeCrashReservation = operationFrom(resumeCrashSetup, "REQ-RESUME-CRASH-HANDOFF");
+  const resumeCrashPlan = operationFrom(resumeCrashSetup, "REQ-RESUME-CRASH-PLAN"); await stop();
   const crashPrompt = "AIOPAGO_RESUME_V1\ntask_id=TASK-RESUME-CRASH";
   const crashPromptDigest = `sha256:${createHash("sha256").update(crashPrompt).digest("hex")}`;
-  const resumeCrashReady = await startAndResult([frame("REQ-RESUME-CRASH-READY", "RESUME_READY_COMMIT", { handoff_id: resumeCrashProjection.handoff_id, reservation_digest: resumeCrashReservation.reservation_digest, binding: resumeCrashBinding, latch: { task_id: resumeCrashProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, checkpoint_digest: `sha256:${"1".repeat(64)}`, resume_manifest_digest: `sha256:${"2".repeat(64)}`, resume_prompt_id: "RP-RESUME-CRASH", resume_prompt_digest: crashPromptDigest, resume_prompt: crashPrompt, plan_semantic_digest: `sha256:${"3".repeat(64)}` })]);
+  await startAndResult([
+    frame("REQ-RESUME-CRASH-CP", "ARTIFACT_AUTHORITY_REGISTER", { kind: "checkpoint", artifact_id: resumeCrashProjection.checkpoint_id, handoff_id: resumeCrashProjection.handoff_id, artifact_digest: `sha256:${"1".repeat(64)}`, content_digest: `sha256:${"4".repeat(64)}`, plan_semantic_digest: resumeCrashPlan.semantic_digest }),
+  ]); await stop();
+  const manifestCrashRequest = { kind: "manifest", artifact_id: resumeCrashProjection.resume_manifest_id, handoff_id: resumeCrashProjection.handoff_id, artifact_digest: `sha256:${"2".repeat(64)}`, content_digest: `sha256:${"5".repeat(64)}`, plan_semantic_digest: resumeCrashPlan.semantic_digest, checkpoint_id: resumeCrashProjection.checkpoint_id, checkpoint_digest: `sha256:${"1".repeat(64)}` };
+  writeScenario([frame("REQ-MANIFEST-AUTHORITY-CRASH", "TEST_CRASH_BEFORE_ARTIFACT_COMMIT", manifestCrashRequest)]);
+  scRun(["start", serviceName]); await waitFor(() => serviceState(serviceName) === "STOPPED", "manifest authority crashed service stops", 30_000);
+  assert.equal(canonicalArtifact("manifest", resumeCrashProjection.resume_manifest_id), null);
+  evidence.manifestAuthorityCrash = { seam: "SQLite manifest relationship insert before COMMIT", canonicalArtifact: null };
+  const resumeCrashReady = await startAndResult([
+    frame("REQ-RESUME-CRASH-RM", "ARTIFACT_AUTHORITY_REGISTER", manifestCrashRequest),
+    frame("REQ-RESUME-CRASH-READY", "RESUME_READY_COMMIT", { handoff_id: resumeCrashProjection.handoff_id, reservation_digest: resumeCrashReservation.reservation_digest, binding: resumeCrashBinding, latch: { task_id: resumeCrashProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" }, checkpoint_digest: `sha256:${"1".repeat(64)}`, resume_manifest_digest: `sha256:${"2".repeat(64)}`, resume_prompt_id: "RP-RESUME-CRASH", resume_prompt_digest: crashPromptDigest, resume_prompt: crashPrompt, plan_semantic_digest: resumeCrashPlan.semantic_digest }),
+  ]);
   const resumeCrashReadiness = operationFrom(resumeCrashReady, "REQ-RESUME-CRASH-READY").readiness; await stop();
   const resumeCrashYes = { answer: "YES", actor: "human:/aio-resume", handoff_id: resumeCrashProjection.handoff_id, readiness_digest: resumeCrashReadiness.readiness_digest, resume_prompt_id: resumeCrashReadiness.resume_prompt_id, authorization_id: "AUTH-RESUME-CRASH", admission_id: "ADM-RESUME-CRASH", idempotency_key: "resume:RP-RESUME-CRASH", dispatch_attempt_id: "DSP-RESUME-CRASH", attempt_no: 1, binding: resumeCrashBinding, latch: { task_id: resumeCrashProjection.task_id, state: "ENGAGED", generation: 1, reason: "INTEGRITY" } };
   writeScenario([frame("REQ-RESUME-CRASH-ADMISSION", "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT", resumeCrashYes)]);
@@ -614,6 +690,13 @@ try {
   const restoreResumeSchema = new DatabaseSync(databasePath);
   restoreResumeSchema.exec("ALTER TABLE resume_authorizations_admin_held RENAME TO resume_authorizations");
   restoreResumeSchema.close();
+  const recoveryInputSchema = new DatabaseSync(databasePath);
+  recoveryInputSchema.exec("ALTER TABLE artifact_authority RENAME TO artifact_authority_admin_held");
+  recoveryInputSchema.close();
+  evidence.failClosed.recoveryInputSchemaMissing = await expectStartFailure("recovery input schema missing");
+  const restoreRecoveryInputSchema = new DatabaseSync(databasePath);
+  restoreRecoveryInputSchema.exec("ALTER TABLE artifact_authority_admin_held RENAME TO artifact_authority");
+  restoreRecoveryInputSchema.close();
   const validConfig = config();
   saveConfig({ ...validConfig, serviceSid: sentinelSid });
   evidence.failClosed.identityMismatch = await expectStartFailure("identity mismatch");
@@ -634,7 +717,7 @@ try {
   evidence.acls = JSON.parse(acl);
   evidence.store = { path: databasePath, journalMode: (() => { const db = new DatabaseSync(databasePath, { readOnly: true }); const mode = db.prepare("PRAGMA journal_mode").get().journal_mode; db.close(); return mode; })(), files: [databasePath, `${databasePath}-wal`, `${databasePath}-shm`].filter(existsSync), owner: evidence.acls.find((value) => value.path === databasePath)?.owner, p0Access: "DENIED", otherLocalServiceAccess: "DENIED", p1sP2Access: "READ_WRITE" };
   evidence.binaryIdentity = { broker: sha(join(root, "bin", "broker-service.exe")), node: sha(join(root, "bin", "node.exe")), worker: sha(join(root, "bin", "operation-authority-worker.mjs")), config: validConfig };
-  evidence.result = "RESUME AUTHORIZATION/ADMISSION/DISPATCH + LIFECYCLE BINDING + HANDOFF RESERVATION + LATCH + OPERATION AUTHORITY: PASS";
+  evidence.result = "RECOVERY INPUT + RESUME AUTHORIZATION/ADMISSION/DISPATCH + LIFECYCLE BINDING + HANDOFF RESERVATION + LATCH + OPERATION AUTHORITY: PASS";
   writeFileSync(join(publicOutput, "windows-physical-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`);
 } finally {

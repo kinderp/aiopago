@@ -199,8 +199,14 @@ export function reserveTrustedHandoffPlan(ledger, request) {
     : storageCapability.reserve(projection, precondition));
   if (!reservationAuthority) return reserved;
   const canonical = reservationAuthority.getHandoffReservation(projection.handoff_id);
-  invariant(canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest,
-    "HANDOFF_CANONICAL_RESULT_INVALID", "Protected reservation result could not be re-observed exactly");
+  const planAuthority = reservationAuthority.getPlanAuthorityForHandoff(projection.handoff_id);
+  invariant(canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest
+    && planAuthority?.handoff_id === projection.handoff_id
+    && planAuthority.reservation_digest === canonical.reservation_digest
+    && planAuthority.task_id === projection.task_id
+    && planAuthority.plan_revision_id === projection.task_plan_revision
+    && planAuthority.content_digest === projection.task_plan_digest,
+    "HANDOFF_CANONICAL_RESULT_INVALID", "Protected reservation and plan identity could not be re-observed exactly");
   let handoff = projection;
   if (reserved.created) {
     handoff = storageCapability.projectCanonicalReservation(projection, {
@@ -215,6 +221,7 @@ export function reserveTrustedHandoffPlan(ledger, request) {
     created: reserved.created,
     canonical: true,
     reservation: canonical,
+    plan_authority: planAuthority,
     active_source: reserved.active_source,
     event: reserved.event,
     handoff: handoff ?? projection,

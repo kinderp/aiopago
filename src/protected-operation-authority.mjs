@@ -9,6 +9,7 @@ import {
   LIFECYCLE_OPERATION_AUTHORITY_SCHEMA,
   OPERATION_AUTHORITY_SCHEMA,
   PREVIOUS_OPERATION_AUTHORITY_SCHEMA,
+  RESUME_OPERATION_AUTHORITY_SCHEMA,
   SECURE_OPERATION_AUTHORITY_LABEL,
   detachedOperation,
   operationIdentifier,
@@ -42,6 +43,14 @@ import {
   validateResumeDispatchOutcome,
   validateResumeReadiness,
 } from "./resume-authority.mjs";
+import {
+  SECURE_RECOVERY_INPUT_AUTHORITY_LABEL,
+  detachedArtifactAuthority,
+  detachedPlanAuthority,
+  protectedPlanSnapshot,
+  validateArtifactActual,
+  validateArtifactRegistration,
+} from "./recovery-input-authority.mjs";
 
 const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
   ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
@@ -65,6 +74,7 @@ export class ProtectedSqliteOperationAuthority {
     this.handoffSecurity = SECURE_HANDOFF_AUTHORITY_LABEL;
     this.lifecycleSecurity = SECURE_LIFECYCLE_AUTHORITY_LABEL;
     this.resumeSecurity = SECURE_RESUME_AUTHORITY_LABEL;
+    this.recoveryInputSecurity = SECURE_RECOVERY_INPUT_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
     invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
@@ -101,7 +111,7 @@ export class ProtectedSqliteOperationAuthority {
       const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       if (existingMetadata.schema_version === this.schema) return;
-      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
         && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
     }
     db.exec(`
@@ -182,6 +192,40 @@ export class ProtectedSqliteOperationAuthority {
         latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
         latch_reason TEXT NOT NULL,
         occurred_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS plan_authority_snapshots(
+        snapshot_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        plan_revision_id TEXT NOT NULL,
+        plan_content_digest TEXT NOT NULL,
+        plan_semantic_digest TEXT NOT NULL UNIQUE,
+        current_item TEXT,
+        next_item TEXT,
+        next_step TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id,plan_revision_id)
+      );
+      CREATE TABLE IF NOT EXISTS handoff_plan_authority(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        snapshot_id TEXT NOT NULL REFERENCES plan_authority_snapshots(snapshot_id),
+        reservation_digest TEXT NOT NULL,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS artifact_authority(
+        artifact_kind TEXT NOT NULL CHECK(artifact_kind IN ('checkpoint','manifest')),
+        artifact_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL REFERENCES handoff_reservations(handoff_id),
+        snapshot_id TEXT NOT NULL REFERENCES plan_authority_snapshots(snapshot_id),
+        artifact_digest TEXT NOT NULL,
+        content_digest TEXT NOT NULL,
+        checkpoint_id TEXT,
+        checkpoint_digest TEXT,
+        relationship_digest TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        PRIMARY KEY(artifact_kind,artifact_id),
+        CHECK((artifact_kind='checkpoint' AND checkpoint_id IS NULL AND checkpoint_digest IS NULL)
+          OR (artifact_kind='manifest' AND checkpoint_id IS NOT NULL AND checkpoint_digest IS NOT NULL))
       );
       CREATE TABLE IF NOT EXISTS lifecycle_bindings(
         handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
@@ -280,15 +324,20 @@ export class ProtectedSqliteOperationAuthority {
       CREATE INDEX IF NOT EXISTS operation_task_state ON operations(task_id,state,admitted_at);
       CREATE INDEX IF NOT EXISTS latch_event_task_sequence ON latch_events(task_id,sequence);
       CREATE INDEX IF NOT EXISTS handoff_reservation_task_created ON handoff_reservations(task_id,created_at,handoff_id);
+      CREATE INDEX IF NOT EXISTS plan_authority_task_revision ON plan_authority_snapshots(task_id,plan_revision_id);
+      CREATE INDEX IF NOT EXISTS artifact_authority_handoff_kind ON artifact_authority(handoff_id,artifact_kind);
       CREATE INDEX IF NOT EXISTS lifecycle_binding_session_status ON lifecycle_bindings(replacement_session_id,status);
       CREATE INDEX IF NOT EXISTS lifecycle_binding_event_handoff_sequence ON lifecycle_binding_events(handoff_id,sequence);
       CREATE INDEX IF NOT EXISTS resume_authority_event_handoff_sequence ON resume_authority_events(handoff_id,sequence);
     `);
+    for (const reservation of db.prepare("SELECT * FROM handoff_reservations ORDER BY rowid").all()) {
+      this.#bindPlanAuthorityInTransaction(db, JSON.parse(reservation.projection_json), reservation.reservation_digest, reservation.created_at);
+    }
     const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
-    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA, RESUME_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
       && this.schema === OPERATION_AUTHORITY_SCHEMA) {
       db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?")
         .run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
@@ -305,6 +354,9 @@ export class ProtectedSqliteOperationAuthority {
       handoff_reservations: ["handoff_id", "source_session_id", "task_id", "task_plan_revision", "task_plan_digest", "latch_generation", "latch_reason", "runner_instance_id", "recovery_of_handoff_id", "checkpoint_id", "resume_manifest_id", "reservation_digest", "reservation_event_id", "projection_json", "created_at"],
       active_sources: ["source_session_id", "handoff_id"],
       handoff_reservation_events: ["sequence", "event_id", "request_id", "handoff_id", "task_id", "source_session_id", "event_type", "latch_generation", "latch_reason", "occurred_at"],
+      plan_authority_snapshots: ["snapshot_id", "task_id", "plan_revision_id", "plan_content_digest", "plan_semantic_digest", "current_item", "next_item", "next_step", "snapshot_json", "created_at"],
+      handoff_plan_authority: ["handoff_id", "snapshot_id", "reservation_digest", "bound_at"],
+      artifact_authority: ["artifact_kind", "artifact_id", "handoff_id", "snapshot_id", "artifact_digest", "content_digest", "checkpoint_id", "checkpoint_digest", "relationship_digest", "registered_at"],
       lifecycle_bindings: ["handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "status", "bound_at", "bind_event_id", "superseded_at", "superseded_reason", "supersede_event_id"],
       lifecycle_binding_events: ["sequence", "event_id", "request_id", "handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "event_type", "from_status", "status", "reason", "occurred_at"],
       resume_readiness: ["handoff_id", "reservation_digest", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "latch_generation", "latch_reason", "checkpoint_digest", "resume_manifest_digest", "resume_prompt_id", "resume_prompt_digest", "resume_prompt", "plan_semantic_digest", "readiness_digest", "ready_at"],
@@ -451,11 +503,48 @@ export class ProtectedSqliteOperationAuthority {
     return db.prepare("SELECT * FROM handoff_reservations WHERE handoff_id=?").get(handoffId) ?? null;
   }
 
+  #planAuthorityRow(db, handoffId) {
+    return db.prepare(`SELECT p.*,h.handoff_id,h.reservation_digest FROM handoff_plan_authority h
+      JOIN plan_authority_snapshots p ON p.snapshot_id=h.snapshot_id WHERE h.handoff_id=?`).get(handoffId) ?? null;
+  }
+
+  #bindPlanAuthorityInTransaction(db, projection, reservationDigest, occurredAt) {
+    const value = protectedPlanSnapshot(projection);
+    const priorRevision = db.prepare("SELECT * FROM plan_authority_snapshots WHERE task_id=? AND plan_revision_id=?").get(
+      projection.task_id, projection.task_plan_revision,
+    );
+    if (priorRevision) {
+      invariant(priorRevision.snapshot_id === value.snapshot_id
+        && priorRevision.plan_content_digest === projection.task_plan_digest
+        && priorRevision.plan_semantic_digest === value.semantic_digest
+        && priorRevision.snapshot_json === canonicalJson(value.snapshot),
+      "PLAN_AUTHORITY_CONFLICT", "The protected task/revision already binds different canonical plan content");
+    } else {
+      db.prepare(`INSERT INTO plan_authority_snapshots(
+        snapshot_id,task_id,plan_revision_id,plan_content_digest,plan_semantic_digest,current_item,next_item,next_step,snapshot_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        value.snapshot_id, projection.task_id, projection.task_plan_revision, projection.task_plan_digest,
+        value.semantic_digest, value.snapshot.current_item, value.snapshot.next_item, value.snapshot.next_step,
+        canonicalJson(value.snapshot), occurredAt,
+      );
+    }
+    const priorBinding = db.prepare("SELECT * FROM handoff_plan_authority WHERE handoff_id=?").get(projection.handoff_id);
+    if (priorBinding) {
+      invariant(priorBinding.snapshot_id === value.snapshot_id && priorBinding.reservation_digest === reservationDigest,
+        "PLAN_AUTHORITY_CONFLICT", "The protected handoff already binds a different plan identity");
+    } else {
+      db.prepare("INSERT INTO handoff_plan_authority(handoff_id,snapshot_id,reservation_digest,bound_at) VALUES(?,?,?,?)")
+        .run(projection.handoff_id, value.snapshot_id, reservationDigest, occurredAt);
+    }
+    return this.#planAuthorityRow(db, projection.handoff_id);
+  }
+
   #reservationResult(db, handoffId, created, requestCode) {
     const reservation = this.#reservationRow(db, handoffId);
     const activeSource = db.prepare("SELECT source_session_id,handoff_id FROM active_sources WHERE handoff_id=?").get(handoffId) ?? null;
     const event = db.prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=?").get(handoffId) ?? null;
-    return Object.freeze({ reservation, active_source: activeSource, event, created, idempotent: !created, request_code: requestCode });
+    const planAuthority = this.#planAuthorityRow(db, handoffId);
+    return Object.freeze({ reservation, plan_authority: planAuthority, active_source: activeSource, event, created, idempotent: !created, request_code: requestCode });
   }
 
   #reserveHandoffInTransaction(db, value, ledgerRequestId, payloadDigest, { crashBeforeEvent = false } = {}) {
@@ -521,6 +610,7 @@ export class ProtectedSqliteOperationAuthority {
       projection.recovery_of_handoff_id ?? null, projection.checkpoint_id, projection.resume_manifest_id,
       payloadDigest, eventId, JSON.stringify(projection), occurredAt,
     );
+    this.#bindPlanAuthorityInTransaction(db, projection, payloadDigest, occurredAt);
     db.prepare("INSERT INTO active_sources(source_session_id,handoff_id) VALUES(?,?)")
       .run(projection.source_session_id, projection.handoff_id);
     if (crashBeforeEvent) process.exit(99);
@@ -590,6 +680,140 @@ export class ProtectedSqliteOperationAuthority {
   handoffReservationEvents(handoffId) {
     operationIdentifier(handoffId, "HANDOFF_ID_INVALID", "handoffId");
     return Object.freeze(this.#database().prepare("SELECT * FROM handoff_reservation_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
+  }
+
+  getPlanAuthorityForHandoff(handoffId) {
+    operationIdentifier(handoffId, "PLAN_AUTHORITY_HANDOFF_INVALID", "handoffId");
+    return detachedPlanAuthority(this.#planAuthorityRow(this.#database(), handoffId));
+  }
+
+  getPlanAuthority(taskId, planRevisionId) {
+    operationIdentifier(taskId, "PLAN_AUTHORITY_TASK_INVALID", "taskId");
+    operationIdentifier(planRevisionId, "PLAN_AUTHORITY_REVISION_INVALID", "planRevisionId");
+    const row = this.#database().prepare("SELECT * FROM plan_authority_snapshots WHERE task_id=? AND plan_revision_id=?")
+      .get(taskId, planRevisionId);
+    return detachedPlanAuthority(row);
+  }
+
+  requestArtifactRegistration(requestId, request) {
+    operationIdentifier(requestId, "ARTIFACT_AUTHORITY_REQUEST_INVALID", "requestId");
+    const validated = validateArtifactRegistration(request);
+    const value = validated.value;
+    const ledgerRequestId = `artifact:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, "ARTIFACT_AUTHORITY_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, artifact: detachedArtifactAuthority(
+        db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id),
+      ) });
+      const reservation = this.#reservationRow(db, value.handoff_id);
+      invariant(reservation, "ARTIFACT_AUTHORITY_HANDOFF_NOT_FOUND");
+      const projection = JSON.parse(reservation.projection_json);
+      const plan = this.#planAuthorityRow(db, value.handoff_id);
+      invariant(plan && plan.plan_semantic_digest === value.plan_semantic_digest,
+        "ARTIFACT_AUTHORITY_PLAN_MISMATCH", "Artifact does not bind the protected handoff plan snapshot");
+      const expectedId = value.kind === "checkpoint" ? reservation.checkpoint_id : reservation.resume_manifest_id;
+      invariant(value.artifact_id === expectedId, "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH", "Artifact ID is not reserved for this handoff");
+      if (value.kind === "manifest") {
+        const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+        invariant(binding?.status === "ACTIVE", "LIFECYCLE_BINDING_STALE", "Manifest registration requires the exact protected ACTIVE target binding");
+        const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint_id);
+        invariant(checkpoint?.handoff_id === value.handoff_id
+          && checkpoint.artifact_digest === value.checkpoint_digest
+          && checkpoint.snapshot_id === plan.snapshot_id,
+        "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH", "Manifest checkpoint link is absent, stale, or cross-handoff");
+      }
+      invariant(projection.task_id === plan.task_id, "ARTIFACT_AUTHORITY_PLAN_MISMATCH");
+      const prior = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id);
+      if (prior) {
+        invariant(prior.relationship_digest === validated.payload_digest,
+          "ARTIFACT_AUTHORITY_CONFLICT", "Artifact identity already binds different bytes or relationships");
+        const result = { artifact: detachedArtifactAuthority(prior), created: false, idempotent: true, request_code: "IDEMPOTENT_ARTIFACT_AUTHORITY" };
+        this.#saveRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, result);
+        return Object.freeze(result);
+      }
+      const now = utcNow();
+      db.prepare(`INSERT INTO artifact_authority(
+        artifact_kind,artifact_id,handoff_id,snapshot_id,artifact_digest,content_digest,checkpoint_id,checkpoint_digest,relationship_digest,registered_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        value.kind, value.artifact_id, value.handoff_id, plan.snapshot_id, value.artifact_digest,
+        value.content_digest, value.checkpoint_id, value.checkpoint_digest, validated.payload_digest, now,
+      );
+      const artifact = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?").get(value.kind, value.artifact_id);
+      const result = { artifact: detachedArtifactAuthority(artifact), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "ARTIFACT_REGISTER", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+
+  getArtifactAuthority(kind, artifactId) {
+    invariant(kind === "checkpoint" || kind === "manifest", "ARTIFACT_AUTHORITY_KIND_INVALID");
+    operationIdentifier(artifactId, "ARTIFACT_AUTHORITY_ID_INVALID", "artifactId");
+    return detachedArtifactAuthority(this.#database().prepare(
+      "SELECT * FROM artifact_authority WHERE artifact_kind=? AND artifact_id=?",
+    ).get(kind, artifactId));
+  }
+
+  verifyArtifactAuthority(actual) {
+    const value = validateArtifactActual(actual);
+    const expected = this.getArtifactAuthority(value.kind, value.artifact_id);
+    invariant(expected && expected.handoff_id === value.handoff_id
+      && expected.artifact_digest === value.artifact_digest
+      && expected.content_digest === value.content_digest,
+    value.kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH",
+    "Physical artifact bytes do not match protected expected identity or relationship");
+    return expected;
+  }
+
+  recoveryInputReadiness(request) {
+    invariant(request && typeof request === "object" && !Array.isArray(request), "RECOVERY_INPUT_INVALID");
+    const handoffId = operationIdentifier(request.handoff_id, "RECOVERY_INPUT_HANDOFF_INVALID", "handoff_id");
+    const db = this.#database();
+    const reservation = this.#reservationRow(db, handoffId);
+    const plan = this.#planAuthorityRow(db, handoffId);
+    invariant(reservation && plan, "RECOVERY_INPUT_PLAN_UNAVAILABLE");
+    const suppliedPlan = protectedPlanSnapshot({
+      task_id: request.plan?.task_id,
+      task_plan_revision: request.plan?.plan_revision_id,
+      task_plan_digest: request.plan?.content_digest,
+      current_item: request.plan?.current_item ?? null,
+      next_item: request.plan?.next_item ?? null,
+      next_step: request.plan?.next_step,
+      requirements_version: request.plan?.requirements_version,
+      model_policy: request.plan?.model_policy ?? null,
+      reasoning_policy: request.plan?.reasoning_policy ?? null,
+      reserved_plan_snapshot: request.plan,
+    });
+    invariant(suppliedPlan.semantic_digest === plan.plan_semantic_digest
+      && canonicalJson(suppliedPlan.snapshot) === plan.snapshot_json,
+    "RECOVERY_INPUT_PLAN_MISMATCH", "Supplied plan input does not equal the protected authoritative snapshot");
+    const checkpointActual = validateArtifactActual({ ...request.checkpoint, kind: "checkpoint", handoff_id: handoffId });
+    const manifestActual = validateArtifactActual({ ...request.manifest, kind: "manifest", handoff_id: handoffId });
+    const checkpoint = this.verifyArtifactAuthority(checkpointActual);
+    const manifest = this.verifyArtifactAuthority(manifestActual);
+    invariant(checkpoint.snapshot_id === plan.snapshot_id && manifest.snapshot_id === plan.snapshot_id
+      && manifest.checkpoint_id === checkpoint.artifact_id
+      && manifest.checkpoint_digest === checkpoint.artifact_digest,
+    "RECOVERY_INPUT_RELATIONSHIP_MISMATCH", "Protected recovery inputs are individually valid but not mutually related");
+    const binding = this.#lifecycleBindingRow(db, handoffId);
+    invariant(binding?.status === "ACTIVE", "RECOVERY_INPUT_LIFECYCLE_STALE");
+    const readiness = this.#resumeReadinessRow(db, handoffId);
+    if (readiness) invariant(readiness.plan_semantic_digest === plan.plan_semantic_digest
+      && readiness.checkpoint_digest === checkpoint.artifact_digest
+      && readiness.resume_manifest_digest === manifest.artifact_digest,
+    "RECOVERY_INPUT_READINESS_MISMATCH", "Protected resume readiness does not bind the exact recovery inputs");
+    const dispatch = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null;
+    return Object.freeze({
+      ready: true,
+      result: "RECOVERY_INPUT_READY",
+      handoff_id: handoffId,
+      plan: detachedPlanAuthority(plan),
+      checkpoint: detachedArtifactAuthority(checkpoint),
+      manifest: detachedArtifactAuthority(manifest),
+      lifecycle: this.#detachedLifecycleBinding(db, binding),
+      resume_readiness: detachedResumeReadiness(readiness),
+      dispatch: dispatch ? Object.freeze({ ...dispatch }) : null,
+      recovery_authority_available: false,
+    });
   }
 
   #lifecycleBindingRow(db, handoffId) {
@@ -738,6 +962,15 @@ export class ProtectedSqliteOperationAuthority {
         && reservation.runner_instance_id === value.binding.runner_instance_id
         && projection.session_binding_id === value.binding.session_binding_id,
       "RESUME_RESERVATION_STALE", "Resume readiness identity conflicts with protected reservation provenance");
+      const plan = this.#planAuthorityRow(db, value.handoff_id);
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(reservation.checkpoint_id);
+      const manifest = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='manifest' AND artifact_id=?").get(reservation.resume_manifest_id);
+      invariant(plan?.plan_semantic_digest === value.plan_semantic_digest
+        && checkpoint?.handoff_id === value.handoff_id && checkpoint.artifact_digest === value.checkpoint_digest
+        && manifest?.handoff_id === value.handoff_id && manifest.artifact_digest === value.resume_manifest_digest
+        && checkpoint.snapshot_id === plan.snapshot_id && manifest.snapshot_id === plan.snapshot_id
+        && manifest.checkpoint_id === checkpoint.artifact_id && manifest.checkpoint_digest === checkpoint.artifact_digest,
+      "RESUME_RECOVERY_INPUT_STALE", "Resume readiness requires authentic protected plan/checkpoint/manifest relationships");
       const binding = this.#lifecycleBindingRow(db, value.handoff_id);
       invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding),
         "LIFECYCLE_BINDING_STALE", "Resume readiness requires the exact protected ACTIVE lifecycle binding");
@@ -975,7 +1208,29 @@ export class ProtectedSqliteOperationAuthority {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, recovery_input_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+  }
+
+  crashBeforeArtifactCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "ARTIFACT_AUTHORITY_REQUEST_INVALID", "requestId");
+    const validated = validateArtifactRegistration(request);
+    const value = validated.value;
+    const db = this.#database(); db.exec("BEGIN IMMEDIATE");
+    const reservation = this.#reservationRow(db, value.handoff_id);
+    const plan = this.#planAuthorityRow(db, value.handoff_id);
+    invariant(reservation && plan?.plan_semantic_digest === value.plan_semantic_digest, "ARTIFACT_AUTHORITY_PLAN_MISMATCH");
+    if (value.kind === "manifest") {
+      const checkpoint = db.prepare("SELECT * FROM artifact_authority WHERE artifact_kind='checkpoint' AND artifact_id=?").get(value.checkpoint_id);
+      invariant(checkpoint?.handoff_id === value.handoff_id && checkpoint.artifact_digest === value.checkpoint_digest,
+        "ARTIFACT_AUTHORITY_RELATIONSHIP_MISMATCH");
+    }
+    db.prepare(`INSERT INTO artifact_authority(
+      artifact_kind,artifact_id,handoff_id,snapshot_id,artifact_digest,content_digest,checkpoint_id,checkpoint_digest,relationship_digest,registered_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+      value.kind, value.artifact_id, value.handoff_id, plan.snapshot_id, value.artifact_digest,
+      value.content_digest, value.checkpoint_id, value.checkpoint_digest, validated.payload_digest, utcNow(),
+    );
+    process.exit(103);
   }
 
   crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, request) {

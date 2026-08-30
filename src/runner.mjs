@@ -228,7 +228,9 @@ async function createGuardianRunner(options, authority = null) {
   const reservationAuthority = injectedOption(options, "reservationAuthority", authority, () => null);
   reservationAuthority?.ensureLatch(plan.task_id);
   const artifacts = injectedOption(options, "artifacts", authority,
-    () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage));
+    () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage, {
+      authority: reservationAuthority,
+    }));
   const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
   const latchAuthority = reservationAuthority ?? portableLatchAuthority(storage);
   const gate = new AdmissionGate(storage, plan.task_id, { latchAuthority });

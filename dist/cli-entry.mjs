@@ -490,10 +490,11 @@ function reserveTrustedHandoffPlan(ledger, request) {
   }) : storageCapability.reserve(projection, precondition));
   if (!reservationAuthority) return reserved;
   const canonical = reservationAuthority.getHandoffReservation(projection.handoff_id);
+  const planAuthority = reservationAuthority.getPlanAuthorityForHandoff(projection.handoff_id);
   invariant(
-    canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest,
+    canonical && reserved?.reservation?.reservation_digest === canonical.reservation_digest && planAuthority?.handoff_id === projection.handoff_id && planAuthority.reservation_digest === canonical.reservation_digest && planAuthority.task_id === projection.task_id && planAuthority.plan_revision_id === projection.task_plan_revision && planAuthority.content_digest === projection.task_plan_digest,
     "HANDOFF_CANONICAL_RESULT_INVALID",
-    "Protected reservation result could not be re-observed exactly"
+    "Protected reservation and plan identity could not be re-observed exactly"
   );
   let handoff = projection;
   if (reserved.created) {
@@ -509,6 +510,7 @@ function reserveTrustedHandoffPlan(ledger, request) {
     created: reserved.created,
     canonical: true,
     reservation: canonical,
+    plan_authority: planAuthority,
     active_source: reserved.active_source,
     event: reserved.event,
     handoff: handoff ?? projection
@@ -4700,6 +4702,150 @@ var init_human_workflow = __esm({
   }
 });
 
+// src/plan-semantics-internal.mjs
+function semanticList(plan2, field, { required, code }) {
+  if (!Object.hasOwn(plan2, field)) {
+    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
+    return [];
+  }
+  invariant(Array.isArray(plan2[field]), code, `Canonical plan semantic field ${field} must be an array`);
+  return strictJsonClone(plan2[field], { code, field: `plan.${field}` });
+}
+function semanticScalar(plan2, field, { nullable = false, required = true, code }) {
+  if (!Object.hasOwn(plan2, field)) {
+    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
+    return null;
+  }
+  const value = plan2[field];
+  invariant(nullable && value === null || typeof value === "string", code, `Canonical plan semantic field ${field} is invalid`);
+  return value;
+}
+function canonicalPlanSemantics(plan2, {
+  requireAll = false,
+  modelPolicy = void 0,
+  reasoningPolicy = void 0,
+  code = "HANDOFF_PLAN_PROVENANCE_MISMATCH"
+} = {}) {
+  invariant(plan2 && typeof plan2 === "object" && !Array.isArray(plan2), code, "Canonical plan semantics require a plan object");
+  if (requireAll) {
+    for (const field of PLAN_SEMANTIC_FIELDS) invariant(Object.hasOwn(plan2, field), code, `Canonical plan semantics are missing ${field}`);
+  }
+  const required = requireAll;
+  const projection = {
+    task_id: semanticScalar(plan2, "task_id", { code }),
+    objective: semanticScalar(plan2, "objective", { code }),
+    current_item: semanticScalar(plan2, "current_item", { nullable: true, code }),
+    next_item: semanticScalar(plan2, "next_item", { nullable: true, code }),
+    next_step: semanticScalar(plan2, "next_step", { code }),
+    plan_revision_id: semanticScalar(plan2, "plan_revision_id", { code }),
+    content_digest: semanticScalar(plan2, "content_digest", { code }),
+    requirements_version: semanticScalar(plan2, "requirements_version", { code }),
+    completion_criteria: semanticList(plan2, "completion_criteria", { required, code }),
+    relevant_decisions: semanticList(plan2, "relevant_decisions", { required, code }),
+    relevant_tests: semanticList(plan2, "relevant_tests", { required, code }),
+    evidence_references: semanticList(plan2, "evidence_references", { required, code }),
+    minimal_reads: semanticList(plan2, "minimal_reads", { required, code }),
+    required_local_paths: canonicalRequiredLocalPaths(
+      Object.hasOwn(plan2, "required_local_paths") ? plan2.required_local_paths : [],
+      code
+    ),
+    model_policy: modelPolicy === void 0 ? semanticScalar(plan2, "model_policy", { nullable: true, required, code }) : modelPolicy,
+    reasoning_policy: reasoningPolicy === void 0 ? semanticScalar(plan2, "reasoning_policy", { nullable: true, required, code }) : reasoningPolicy
+  };
+  invariant(projection.model_policy === null || typeof projection.model_policy === "string", code, "Canonical model policy is invalid");
+  invariant(projection.reasoning_policy === null || typeof projection.reasoning_policy === "string", code, "Canonical reasoning policy is invalid");
+  return strictJsonClone(projection, { code, field: "canonical plan semantics" });
+}
+function planSemanticDigest(plan2, options = {}) {
+  return digestObject(canonicalPlanSemantics(plan2, options));
+}
+function sameCanonicalJson(left, right) {
+  try {
+    return canonicalJson(strictJsonClone(left, { clone: true })) === canonicalJson(strictJsonClone(right, { clone: true }));
+  } catch {
+    return false;
+  }
+}
+function samePlanSemantics(left, right, { leftRequireAll = false, rightRequireAll = false } = {}) {
+  try {
+    return canonicalJson(canonicalPlanSemantics(left, { requireAll: leftRequireAll })) === canonicalJson(canonicalPlanSemantics(right, { requireAll: rightRequireAll }));
+  } catch {
+    return false;
+  }
+}
+function assertPlanSemanticSubset(expectedPlan, representation, fieldMap, {
+  code = "HANDOFF_PLAN_PROVENANCE_MISMATCH",
+  label = "plan evidence",
+  optionalFields = []
+} = {}) {
+  const expected = canonicalPlanSemantics(expectedPlan, { requireAll: true, code });
+  const optional = new Set(optionalFields);
+  invariant(representation && typeof representation === "object" && !Array.isArray(representation), code, `${label} is not an object`);
+  for (const [evidenceField, planField] of Object.entries(fieldMap)) {
+    if (!Object.hasOwn(representation, evidenceField)) {
+      invariant(optional.has(evidenceField), code, `${label} is missing ${evidenceField}`);
+      continue;
+    }
+    let actual = representation[evidenceField];
+    if (planField === "required_local_paths") actual = canonicalRequiredLocalPaths(actual, code);
+    else actual = strictJsonClone(actual, { code, field: `${label}.${evidenceField}` });
+    invariant(sameCanonicalJson(actual, expected[planField]), code, `${label}.${evidenceField} conflicts with canonical plan semantics`);
+  }
+  return expected;
+}
+var PLAN_SEMANTIC_FIELDS;
+var init_plan_semantics_internal = __esm({
+  "src/plan-semantics-internal.mjs"() {
+    init_canonical();
+    init_errors();
+    init_ledger();
+    PLAN_SEMANTIC_FIELDS = Object.freeze([
+      "task_id",
+      "objective",
+      "current_item",
+      "next_item",
+      "next_step",
+      "plan_revision_id",
+      "content_digest",
+      "requirements_version",
+      "completion_criteria",
+      "relevant_decisions",
+      "relevant_tests",
+      "evidence_references",
+      "minimal_reads",
+      "required_local_paths",
+      "model_policy",
+      "reasoning_policy"
+    ]);
+  }
+});
+
+// src/recovery-input-authority.mjs
+function requireSecureRecoveryInputAuthority(authority) {
+  invariant(
+    authority?.recoveryInputSecurity?.mode === RECOVERY_INPUT_AUTHORITY_MODES.SECURE && authority.recoveryInputSecurity.canonical === true && authority.recoveryInputSecurity.r1_m_13_recovery_input_isolation === true,
+    "SECURE_RECOVERY_INPUT_AUTHORITY_REQUIRED",
+    "Secure recovery-input reads cannot use or fall back to project plan/artifact state"
+  );
+  return authority;
+}
+var RECOVERY_INPUT_AUTHORITY_MODES, SECURE_RECOVERY_INPUT_AUTHORITY_LABEL;
+var init_recovery_input_authority = __esm({
+  "src/recovery-input-authority.mjs"() {
+    init_canonical();
+    init_errors();
+    init_operation_authority();
+    init_plan_semantics_internal();
+    RECOVERY_INPUT_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+    SECURE_RECOVERY_INPUT_AUTHORITY_LABEL = Object.freeze({
+      mode: RECOVERY_INPUT_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_recovery_input_isolation: true
+    });
+  }
+});
+
 // src/artifact-store.mjs
 import { closeSync as closeSync2, existsSync as existsSync6, fsyncSync as fsyncSync2, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync6, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
 import { dirname as dirname5, join as join7, resolve as resolve7 } from "node:path";
@@ -4721,15 +4867,22 @@ var init_artifact_store = __esm({
   "src/artifact-store.mjs"() {
     init_canonical();
     init_errors();
+    init_recovery_input_authority();
     SECRET_KEY = /(^|_)(api_?key|access_?token|refresh_?token|password|secret|credential)s?($|_)/i;
     SECRET_VALUE = /\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})\b/;
     ArtifactStore = class {
-      constructor(root, storage) {
+      constructor(root, storage, { authority = null } = {}) {
         this.root = resolve7(root);
         this.storage = storage;
+        this.authority = authority ? requireSecureRecoveryInputAuthority(authority) : null;
         mkdirSync3(this.root, { recursive: true });
       }
-      persist(kind, id, payload) {
+      path(kind, id) {
+        safeId(id);
+        invariant(kind === "checkpoint" || kind === "manifest", "ARTIFACT_KIND_INVALID");
+        return join7(this.root, kind === "checkpoint" ? "checkpoints" : "manifests", `${id}.json`);
+      }
+      persist(kind, id, payload, relationship = null) {
         safeId(id);
         scan(payload);
         const contentBase = { ...structuredClone(payload), content_digest: null };
@@ -4745,9 +4898,9 @@ var init_artifact_store = __esm({
         const bytes = Buffer.from(`${canonicalJson(envelope)}
 `, "utf8");
         const digest = sha256(bytes);
-        const directory = join7(this.root, kind === "checkpoint" ? "checkpoints" : "manifests");
+        const path = this.path(kind, id);
+        const directory = dirname5(path);
         mkdirSync3(directory, { recursive: true });
-        const path = join7(directory, `${id}.json`);
         if (existsSync6(path)) {
           const prior = readFileSync6(path);
           invariant(prior.equals(bytes), "ARTIFACT_ID_CONFLICT", `${id} already exists with different bytes`);
@@ -4773,21 +4926,65 @@ var init_artifact_store = __esm({
             throw error;
           }
         }
+        let protectedIdentity = null;
+        if (this.authority) {
+          invariant(relationship && typeof relationship === "object", "ARTIFACT_AUTHORITY_RELATIONSHIP_REQUIRED");
+          protectedIdentity = this.authority.requestArtifactRegistration(`${kind}:${id}`, {
+            kind,
+            artifact_id: id,
+            handoff_id: relationship.handoffId,
+            artifact_digest: digest,
+            content_digest: contentDigest,
+            plan_semantic_digest: relationship.planSemanticDigest,
+            checkpoint_id: relationship.checkpointId ?? null,
+            checkpoint_digest: relationship.checkpointDigest ?? null
+          }).artifact;
+        }
         this.storage.indexArtifact({ kind, id, path: path.replaceAll("\\", "/"), digest, contentDigest });
-        return { id, kind, path: path.replaceAll("\\", "/"), digest, content_digest: contentDigest, payload: sealedPayload, bytes };
+        return { id, kind, path: path.replaceAll("\\", "/"), digest, content_digest: contentDigest, payload: sealedPayload, bytes, protected_identity: protectedIdentity };
       }
-      verify(kind, id, expectedDigest = void 0) {
-        const index = this.storage.getArtifact(kind, id);
-        invariant(index && !index.superseded, index?.superseded ? "SUPERSEDED_CHECKPOINT" : "ARTIFACT_NOT_FOUND", id);
-        const bytes = readFileSync6(index.path);
+      recoveryInputReadiness(handoffId) {
+        const authority = requireSecureRecoveryInputAuthority(this.authority);
+        const reservation = authority.getHandoffReservation(handoffId);
+        const plan2 = authority.getPlanAuthorityForHandoff(handoffId);
+        invariant(reservation && plan2, "RECOVERY_INPUT_PLAN_UNAVAILABLE");
+        const checkpoint = this.verify("checkpoint", reservation.checkpoint_id, void 0, handoffId);
+        const manifest = this.verify("manifest", reservation.resume_manifest_id, void 0, handoffId);
+        return authority.recoveryInputReadiness({
+          handoff_id: handoffId,
+          plan: plan2.snapshot,
+          checkpoint: { artifact_id: checkpoint.artifact_id, artifact_digest: checkpoint.digest, content_digest: checkpoint.content_digest },
+          manifest: { artifact_id: manifest.artifact_id, artifact_digest: manifest.digest, content_digest: manifest.content_digest }
+        });
+      }
+      verify(kind, id, expectedDigest = void 0, expectedHandoffId = void 0) {
+        const protectedIdentity = this.authority?.getArtifactAuthority(kind, id) ?? null;
+        const index = this.authority ? null : this.storage.getArtifact(kind, id);
+        invariant(protectedIdentity || index && !index.superseded, index?.superseded ? "SUPERSEDED_CHECKPOINT" : "ARTIFACT_NOT_FOUND", id);
+        if (this.authority && expectedHandoffId !== void 0) invariant(
+          protectedIdentity?.handoff_id === expectedHandoffId,
+          kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH",
+          "Artifact belongs to another protected handoff"
+        );
+        const path = this.authority ? this.path(kind, id) : index.path;
+        const bytes = readFileSync6(path);
         const digest = sha256(bytes);
-        invariant(digest === index.digest && (!expectedDigest || digest === expectedDigest), kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH");
+        const authoritativeDigest = protectedIdentity?.artifact_digest ?? index.digest;
+        invariant(digest === authoritativeDigest && (!expectedDigest || digest === expectedDigest), kind === "checkpoint" ? "CHECKPOINT_MISMATCH" : "MANIFEST_MISMATCH");
         const envelope = JSON.parse(bytes.toString("utf8"));
         invariant(envelope.artifact_kind === kind && envelope.artifact_id === id, "ARTIFACT_IDENTITY_MISMATCH");
         const contentDigest = envelope.payload.content_digest;
-        invariant(digestObject({ ...envelope.payload, content_digest: null }) === contentDigest && contentDigest === index.content_digest, "ARTIFACT_CONTENT_MISMATCH");
+        const authoritativeContentDigest = protectedIdentity?.content_digest ?? index.content_digest;
+        invariant(digestObject({ ...envelope.payload, content_digest: null }) === contentDigest && contentDigest === authoritativeContentDigest, "ARTIFACT_CONTENT_MISMATCH");
+        if (this.authority) this.authority.verifyArtifactAuthority({
+          kind,
+          artifact_id: id,
+          handoff_id: protectedIdentity.handoff_id,
+          artifact_digest: digest,
+          content_digest: contentDigest
+        });
         scan(envelope.payload);
-        return { ...index, bytes, digest, payload: envelope.payload };
+        return { ...protectedIdentity ?? index, path: path.replaceAll("\\", "/"), bytes, digest, content_digest: contentDigest, payload: envelope.payload };
       }
     };
   }
@@ -5709,124 +5906,6 @@ var init_metrics = __esm({
   }
 });
 
-// src/plan-semantics-internal.mjs
-function semanticList(plan2, field, { required, code }) {
-  if (!Object.hasOwn(plan2, field)) {
-    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
-    return [];
-  }
-  invariant(Array.isArray(plan2[field]), code, `Canonical plan semantic field ${field} must be an array`);
-  return strictJsonClone(plan2[field], { code, field: `plan.${field}` });
-}
-function semanticScalar(plan2, field, { nullable = false, required = true, code }) {
-  if (!Object.hasOwn(plan2, field)) {
-    invariant(!required, code, `Canonical plan semantics are missing ${field}`);
-    return null;
-  }
-  const value = plan2[field];
-  invariant(nullable && value === null || typeof value === "string", code, `Canonical plan semantic field ${field} is invalid`);
-  return value;
-}
-function canonicalPlanSemantics(plan2, {
-  requireAll = false,
-  modelPolicy = void 0,
-  reasoningPolicy = void 0,
-  code = "HANDOFF_PLAN_PROVENANCE_MISMATCH"
-} = {}) {
-  invariant(plan2 && typeof plan2 === "object" && !Array.isArray(plan2), code, "Canonical plan semantics require a plan object");
-  if (requireAll) {
-    for (const field of PLAN_SEMANTIC_FIELDS) invariant(Object.hasOwn(plan2, field), code, `Canonical plan semantics are missing ${field}`);
-  }
-  const required = requireAll;
-  const projection = {
-    task_id: semanticScalar(plan2, "task_id", { code }),
-    objective: semanticScalar(plan2, "objective", { code }),
-    current_item: semanticScalar(plan2, "current_item", { nullable: true, code }),
-    next_item: semanticScalar(plan2, "next_item", { nullable: true, code }),
-    next_step: semanticScalar(plan2, "next_step", { code }),
-    plan_revision_id: semanticScalar(plan2, "plan_revision_id", { code }),
-    content_digest: semanticScalar(plan2, "content_digest", { code }),
-    requirements_version: semanticScalar(plan2, "requirements_version", { code }),
-    completion_criteria: semanticList(plan2, "completion_criteria", { required, code }),
-    relevant_decisions: semanticList(plan2, "relevant_decisions", { required, code }),
-    relevant_tests: semanticList(plan2, "relevant_tests", { required, code }),
-    evidence_references: semanticList(plan2, "evidence_references", { required, code }),
-    minimal_reads: semanticList(plan2, "minimal_reads", { required, code }),
-    required_local_paths: canonicalRequiredLocalPaths(
-      Object.hasOwn(plan2, "required_local_paths") ? plan2.required_local_paths : [],
-      code
-    ),
-    model_policy: modelPolicy === void 0 ? semanticScalar(plan2, "model_policy", { nullable: true, required, code }) : modelPolicy,
-    reasoning_policy: reasoningPolicy === void 0 ? semanticScalar(plan2, "reasoning_policy", { nullable: true, required, code }) : reasoningPolicy
-  };
-  invariant(projection.model_policy === null || typeof projection.model_policy === "string", code, "Canonical model policy is invalid");
-  invariant(projection.reasoning_policy === null || typeof projection.reasoning_policy === "string", code, "Canonical reasoning policy is invalid");
-  return strictJsonClone(projection, { code, field: "canonical plan semantics" });
-}
-function planSemanticDigest(plan2, options = {}) {
-  return digestObject(canonicalPlanSemantics(plan2, options));
-}
-function sameCanonicalJson(left, right) {
-  try {
-    return canonicalJson(strictJsonClone(left, { clone: true })) === canonicalJson(strictJsonClone(right, { clone: true }));
-  } catch {
-    return false;
-  }
-}
-function samePlanSemantics(left, right, { leftRequireAll = false, rightRequireAll = false } = {}) {
-  try {
-    return canonicalJson(canonicalPlanSemantics(left, { requireAll: leftRequireAll })) === canonicalJson(canonicalPlanSemantics(right, { requireAll: rightRequireAll }));
-  } catch {
-    return false;
-  }
-}
-function assertPlanSemanticSubset(expectedPlan, representation, fieldMap, {
-  code = "HANDOFF_PLAN_PROVENANCE_MISMATCH",
-  label = "plan evidence",
-  optionalFields = []
-} = {}) {
-  const expected = canonicalPlanSemantics(expectedPlan, { requireAll: true, code });
-  const optional = new Set(optionalFields);
-  invariant(representation && typeof representation === "object" && !Array.isArray(representation), code, `${label} is not an object`);
-  for (const [evidenceField, planField] of Object.entries(fieldMap)) {
-    if (!Object.hasOwn(representation, evidenceField)) {
-      invariant(optional.has(evidenceField), code, `${label} is missing ${evidenceField}`);
-      continue;
-    }
-    let actual = representation[evidenceField];
-    if (planField === "required_local_paths") actual = canonicalRequiredLocalPaths(actual, code);
-    else actual = strictJsonClone(actual, { code, field: `${label}.${evidenceField}` });
-    invariant(sameCanonicalJson(actual, expected[planField]), code, `${label}.${evidenceField} conflicts with canonical plan semantics`);
-  }
-  return expected;
-}
-var PLAN_SEMANTIC_FIELDS;
-var init_plan_semantics_internal = __esm({
-  "src/plan-semantics-internal.mjs"() {
-    init_canonical();
-    init_errors();
-    init_ledger();
-    PLAN_SEMANTIC_FIELDS = Object.freeze([
-      "task_id",
-      "objective",
-      "current_item",
-      "next_item",
-      "next_step",
-      "plan_revision_id",
-      "content_digest",
-      "requirements_version",
-      "completion_criteria",
-      "relevant_decisions",
-      "relevant_tests",
-      "evidence_references",
-      "minimal_reads",
-      "required_local_paths",
-      "model_policy",
-      "reasoning_policy"
-    ]);
-  }
-});
-
 // src/runner-ownership.mjs
 function assertBindingShape(binding) {
   invariant(binding && typeof binding === "object", "RUNNER_OWNERSHIP_ATTESTATION_FAILED", "binding missing");
@@ -6049,6 +6128,11 @@ var init_handoff = __esm({
             "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED",
             "Secure handoff reservation and canonical latch must share one protected authority"
           );
+          invariant(
+            artifacts?.authority === reservationAuthority,
+            "SECURE_RECOVERY_INPUT_AUTHORITY_REQUIRED",
+            "Secure handoff artifacts must register and verify against the same protected authority"
+          );
         }
         this.storage = storage;
         this.reservationAuthority = reservationAuthority;
@@ -6064,6 +6148,16 @@ var init_handoff = __esm({
         this.reasoningPolicy = reasoningPolicy;
         this.telemetry = telemetry;
         this.testHooks = testHooks;
+      }
+      #protectedPlan(handoffId, portableSnapshot) {
+        if (!this.reservationAuthority) return captureReservedPlanSnapshot(portableSnapshot);
+        const authority = this.reservationAuthority.getPlanAuthorityForHandoff(handoffId);
+        invariant(
+          authority?.handoff_id === handoffId && authority.snapshot,
+          "PLAN_AUTHORITY_UNAVAILABLE",
+          "Protected handoff plan identity is absent; project plan state was not substituted"
+        );
+        return captureReservedPlanSnapshot(authority.snapshot);
       }
       verifyCurrentSource(sourceSession, currentSourceVerifier, { required = false } = {}) {
         invariant(!required || typeof currentSourceVerifier === "function", "HANDOFF_SOURCE_ATTESTATION_REQUIRED");
@@ -6368,6 +6462,7 @@ var init_handoff = __esm({
       async #continueReservedHandoff({ reserved, sourceSession, plan: plan2, safe, replacePaused, mode, actor, confirmResume, sendResume, verifyCurrentTarget = null }) {
         let handoff = reserved.handoff;
         if (!reserved.created) return this.resumeExisting(handoff, { mode, actor, confirmResume, sendResume });
+        if (this.reservationAuthority) plan2 = this.#protectedPlan(handoff.handoff_id, plan2);
         assertReservedPlanConsistency(handoff, plan2);
         const sourceSessionId = handoff.source_session_id;
         const sourceFile = handoff.source_session_file;
@@ -6386,7 +6481,10 @@ var init_handoff = __esm({
         handoff.state = "CHECKPOINT_PERSISTING";
         saveTrustedHandoff(this.storage, handoff, "STATE_TRANSITION", { from: "SAFE_TO_HANDOFF", to: handoff.state });
         try {
-          const checkpoint = this.artifacts.persist("checkpoint", checkpointId, this.buildCheckpoint(handoff, plan2, safe.operations));
+          const checkpoint = this.artifacts.persist("checkpoint", checkpointId, this.buildCheckpoint(handoff, plan2, safe.operations), {
+            handoffId,
+            planSemanticDigest: planSemanticDigest(plan2, { requireAll: true })
+          });
           handoff.checkpoint_digest = checkpoint.digest;
           handoff.state = "CHECKPOINT_PERSISTED";
           saveTrustedHandoff(this.storage, handoff, "CHECKPOINT_PERSISTED", { checkpoint_id: checkpointId, digest: checkpoint.digest, event_key: `checkpoint:${checkpointId}` });
@@ -6514,11 +6612,16 @@ var init_handoff = __esm({
         h.state = "MANIFEST_PERSISTING";
         saveTrustedHandoff(this.storage, h, "STATE_TRANSITION", { from: "REPLACEMENT_SESSION_CREATED_PAUSED", to: h.state });
         try {
-          const plan2 = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
-          const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
+          const plan2 = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
+          const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
           assertCheckpointPlanConsistency(h, plan2, checkpoint.payload);
           await this.testHooks?.beforeManifest?.({ handoff: h, plan: plan2, checkpoint: checkpoint.payload, target });
-          const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan2));
+          const manifest = this.artifacts.persist("manifest", h.resume_manifest_id, this.buildManifest(h, plan2), {
+            handoffId: h.handoff_id,
+            planSemanticDigest: planSemanticDigest(plan2, { requireAll: true }),
+            checkpointId: h.checkpoint_id,
+            checkpointDigest: h.checkpoint_digest
+          });
           h.resume_manifest_digest = manifest.digest;
           h.state = "MANIFEST_PERSISTED";
           saveTrustedHandoff(this.storage, h, "MANIFEST_PERSISTED", { manifest_id: h.resume_manifest_id, digest: manifest.digest, event_key: `manifest:${h.resume_manifest_id}` });
@@ -6661,9 +6764,9 @@ var init_handoff = __esm({
         const continuityStarted = performance3.now();
         let h = this.storage.getHandoff(handoffId);
         invariant(["MANIFEST_PERSISTED", "RESUME_READY"].includes(h.state), "CONTINUITY_STATE_INVALID", h.state);
-        const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
-        const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
-        const reservedPlan = captureReservedPlanSnapshot(h.reserved_plan_snapshot);
+        const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
+        const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
+        const reservedPlan = this.#protectedPlan(h.handoff_id, h.reserved_plan_snapshot);
         const m = manifest.payload;
         assertCheckpointPlanConsistency(h, reservedPlan, checkpoint.payload);
         assertManifestPlanConsistency(h, reservedPlan, m);
@@ -6802,8 +6905,8 @@ var init_handoff = __esm({
         });
         const semanticPlan = assertReservedPlanConsistency(h, plan2);
         const semanticDigest = planSemanticDigest(semanticPlan, { requireAll: true });
-        const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest);
-        const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest);
+        const checkpoint = this.artifacts.verify("checkpoint", h.checkpoint_id, h.checkpoint_digest, h.handoff_id);
+        const manifest = this.artifacts.verify("manifest", h.resume_manifest_id, h.resume_manifest_digest, h.handoff_id);
         assertCheckpointPlanConsistency(h, semanticPlan, checkpoint.payload);
         assertManifestPlanConsistency(h, semanticPlan, manifest.payload);
         invariant(manifest.payload.manifest_version === "1.1.0", "MANIFEST_MISMATCH", "manifest version");
@@ -8705,7 +8808,9 @@ async function createGuardianRunner(options, authority = null) {
     options,
     "artifacts",
     authority,
-    () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage)
+    () => new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join9(cwd, ".guardian"), storage, {
+      authority: reservationAuthority
+    })
   );
   const modelRuntime = await injectedOption(options, "modelRuntime", authority, () => pi.coding.ModelRuntime.create());
   const latchAuthority = reservationAuthority ?? portableLatchAuthority(storage);

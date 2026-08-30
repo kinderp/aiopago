@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { sha256 } from "../src/canonical.mjs";
 import { ProtectedSqliteOperationAuthority } from "../src/protected-operation-authority.mjs";
+import { planSemanticDigest } from "../src/plan-semantics-internal.mjs";
 import { requireSecureResumeAuthority } from "../src/resume-authority.mjs";
 
 function projection() {
@@ -22,13 +23,26 @@ function fixture() {
   const reservation = authority.requestHandoffReservation(p.handoff_id, { projection: p, expectedLatch: latch(engaged), expectedLatest: null }).reservation;
   const binding = { handoff_id: p.handoff_id, replacement_session_id: "SESSION-TARGET", runner_instance_id: p.runner_instance_id, session_binding_id: p.session_binding_id, lifecycle_incarnation: 3 };
   authority.requestLifecycleBindingCreate("BIND-RESUME", { binding });
+  const semanticDigest = planSemanticDigest(p.reserved_plan_snapshot, { requireAll: true });
+  const checkpointDigest = `sha256:${"d".repeat(64)}`;
+  const manifestDigest = `sha256:${"e".repeat(64)}`;
+  authority.requestArtifactRegistration("CP-RESUME", {
+    kind: "checkpoint", artifact_id: p.checkpoint_id, handoff_id: p.handoff_id,
+    artifact_digest: checkpointDigest, content_digest: `sha256:${"1".repeat(64)}`,
+    plan_semantic_digest: semanticDigest,
+  });
+  authority.requestArtifactRegistration("RM-RESUME", {
+    kind: "manifest", artifact_id: p.resume_manifest_id, handoff_id: p.handoff_id,
+    artifact_digest: manifestDigest, content_digest: `sha256:${"2".repeat(64)}`,
+    plan_semantic_digest: semanticDigest, checkpoint_id: p.checkpoint_id, checkpoint_digest: checkpointDigest,
+  });
   const prompt = "AIOPAGO_RESUME_V1\ntask_id=TASK-RESUME";
   const ready = authority.requestResumeReadiness("READY-RESUME", {
     handoff_id: p.handoff_id, reservation_digest: reservation.reservation_digest,
     binding: { ...binding, status: "ACTIVE" }, latch: latch(engaged),
-    checkpoint_digest: `sha256:${"d".repeat(64)}`, resume_manifest_digest: `sha256:${"e".repeat(64)}`,
+    checkpoint_digest: checkpointDigest, resume_manifest_digest: manifestDigest,
     resume_prompt_id: "RP-RESUME", resume_prompt_digest: sha256(Buffer.from(prompt)), resume_prompt: prompt,
-    plan_semantic_digest: `sha256:${"f".repeat(64)}`,
+    plan_semantic_digest: semanticDigest,
   }).readiness;
   return { root, path, authority, p, engaged, binding, ready };
 }
@@ -48,7 +62,7 @@ test("protected resume schema extends the same canonical store and is selected e
   const x = fixture();
   try {
     assert.equal(requireSecureResumeAuthority(x.authority), x.authority);
-    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.4.0");
+    assert.equal(x.authority.status().schema, "aiopago.operation-authority/1.5.0");
     assert.equal(x.authority.status().resume_authority_canonical, true);
     assert.deepEqual(counts(x.path), { resume_readiness: 1, resume_authorizations: 0, resume_admissions: 0, resume_dispatch_attempts: 0, resume_authority_events: 1 });
   } finally { x.authority.close(); }
@@ -58,7 +72,7 @@ test("bounded 1.3 lifecycle store upgrade adds resume schema and damaged current
   const x = fixture(); x.authority.close();
   const legacy = new DatabaseSync(x.path);
   legacy.exec("DROP TABLE resume_authority_events; DROP TABLE resume_dispatch_attempts; DROP TABLE resume_admissions; DROP TABLE resume_authorizations; DROP TABLE resume_readiness; UPDATE authority_metadata SET schema_version='aiopago.operation-authority/1.3.0' WHERE singleton=1;"); legacy.close();
-  const upgraded = new ProtectedSqliteOperationAuthority(x.path); assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.4.0"); upgraded.close();
+  const upgraded = new ProtectedSqliteOperationAuthority(x.path); assert.equal(upgraded.status().schema, "aiopago.operation-authority/1.5.0"); upgraded.close();
   const damaged = new DatabaseSync(x.path); damaged.exec("ALTER TABLE resume_admissions RENAME TO resume_admissions_missing"); damaged.close();
   assert.throws(() => new ProtectedSqliteOperationAuthority(x.path), (error) => error.code === "SECURE_OPERATION_AUTHORITY_SCHEMA_INVALID");
 });

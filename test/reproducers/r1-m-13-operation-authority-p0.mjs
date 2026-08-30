@@ -12,6 +12,11 @@ const output = option("--output");
 const serviceConfigProbe = option("--service-config-probe");
 const forgedLatchState = option("--forge-latch-state") ?? "HUMAN_TAKEOVER";
 const attackRealHandoffId = option("--attack-real-handoff-id");
+const projectInputsPath = option("--project-inputs");
+const projectInputs = projectInputsPath ? JSON.parse(readFileSync(projectInputsPath, "utf8")) : {};
+const projectPlan = projectInputs.projectPlan ?? option("--project-plan");
+const checkpointPath = projectInputs.checkpointPath ?? option("--checkpoint-path");
+const manifestPath = projectInputs.manifestPath ?? option("--manifest-path");
 if (!root || !service || !projectDatabase || !output || !serviceConfigProbe) throw new Error("ROOT_SERVICE_PROJECT_DB_OUTPUT_PROBE_REQUIRED");
 if (!["HUMAN_TAKEOVER", "CLEAR"].includes(forgedLatchState)) throw new Error("FORGED_LATCH_STATE_INVALID");
 const system32 = join(process.env.SystemRoot, "System32");
@@ -46,6 +51,11 @@ native("service_binary_path_change", serviceConfigProbe, [service]);
 native("service_account_change", join(system32, "sc.exe"), ["config", service, "obj=", "LocalSystem"]);
 native("service_sid_change", join(system32, "sc.exe"), ["sidtype", service, "none"]);
 native("service_delete", join(system32, "sc.exe"), ["delete", service]);
+
+const projectRecoveryInputAttack = {};
+if (projectPlan) { writeFileSync(projectPlan, "P0 forged later plan revision, digest, position, owner gate, objective, requirements, and timestamp\n"); projectRecoveryInputAttack.plan = "MODIFIED"; }
+if (checkpointPath) { writeFileSync(checkpointPath, "P0 replacement checkpoint bytes\n"); projectRecoveryInputAttack.checkpoint = "MODIFIED"; }
+if (manifestPath) { writeFileSync(manifestPath, "P0 replacement manifest bytes\n"); projectRecoveryInputAttack.manifest = "MODIFIED"; }
 
 let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, falseNegativeAttack = null;
 {
@@ -113,6 +123,6 @@ let forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, 
 
 writeFileSync(output, `${JSON.stringify({
   schema: "aiopago.operation-latch-authority-p0-attack/2", pid: process.pid, ppid: process.ppid,
-  identity, root, service, canonical, key, broker, attempts, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, falseNegativeAttack,
+  identity, root, service, canonical, key, broker, attempts, projectRecoveryInputAttack, forged, forgedLatch, forgedHandoff, forgedActiveSource, forgedHandoffEvent, forgedLifecycleBinding, forgedResume, falseNegativeAttack,
   protectedAllDenied: attempts.every((entry) => entry.denied === true),
 }, null, 2)}\n`);

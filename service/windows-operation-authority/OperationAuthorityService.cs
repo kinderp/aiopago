@@ -15,7 +15,7 @@ using System.Web.Script.Serialization;
 
 namespace Aiopago.OperationAuthority {
   internal static class Program {
-    internal const string Protocol = "aiopago.operation-authority-protocol/5";
+    internal const string Protocol = "aiopago.operation-authority-protocol/6";
     internal static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 262144, RecursionLimit = 32 };
 
     public static int Main(string[] args) {
@@ -205,7 +205,7 @@ namespace Aiopago.OperationAuthority {
           request["version"] = 1; request["protocol"] = Program.Protocol; request["capability"] = capability;
           object operationType;
           crashRequested = request.TryGetValue("operationType", out operationType)
-            && ((string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LATCH_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_HANDOFF_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LIFECYCLE_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_RESUME_OUTCOME_COMMIT");
+            && ((string)operationType == "TEST_CRASH_BEFORE_TERMINAL_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LATCH_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_HANDOFF_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_LIFECYCLE_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_ARTIFACT_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT" || (string)operationType == "TEST_CRASH_BEFORE_RESUME_OUTCOME_COMMIT");
           worker.StandardInput.WriteLine(Program.Json.Serialize(request)); worker.StandardInput.Flush();
           string line = ReadWorkerLine("AUTHORITY_REQUEST_TIMEOUT");
           if (line == null) {
