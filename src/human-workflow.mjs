@@ -206,15 +206,16 @@ export function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
 
   try {
     const taskId = firstPlan.plan.task_id;
+    const authorityStorage = runner.authorityStorage ?? runner.storage;
     const sessionBefore = runner.runtime?.session ?? null;
     if (!sessionBefore?.sessionId) throw new GuardianError("RUNTIME_SESSION_UNAVAILABLE", "The live Runner session cannot be observed");
-    const latchBefore = runner.storage.getLatch(taskId);
+    const latchBefore = authorityStorage.getLatch(taskId);
     if (!latchBefore) throw new GuardianError("RUNTIME_LATCH_UNAVAILABLE", "The live Runner has no latch observation for the authoritative task");
-    const handoffBefore = runner.storage.latestHandoffForTask(taskId);
+    const handoffBefore = authorityStorage.latestHandoffForTask(taskId);
     const git = runner.handoffService.observeGit();
     const context = safeContextUsage(ctx);
-    const latchAfter = runner.storage.getLatch(taskId);
-    const handoffAfter = runner.storage.latestHandoffForTask(taskId);
+    const latchAfter = authorityStorage.getLatch(taskId);
+    const handoffAfter = authorityStorage.latestHandoffForTask(taskId);
     const sessionAfter = runner.runtime?.session ?? null;
     const secondPlan = readPlan(runner.ledger.path, planOptions);
     if (!secondPlan.valid || firstPlan.digest !== secondPlan.digest
@@ -234,7 +235,7 @@ export function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
     const session = sessionAfter;
     const handoff = handoffAfter;
     const binding = handoff?.target_session_id === session?.sessionId
-      ? runner.storage.getRunnerSessionBinding(handoff.handoff_id)
+      ? authorityStorage.getRunnerSessionBinding(handoff.handoff_id)
       : null;
     const model = session?.model?.provider && session?.model?.id
       ? `${session.model.provider}/${session.model.id}`

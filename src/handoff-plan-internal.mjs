@@ -1,6 +1,7 @@
 import { invariant } from "./errors.mjs";
 import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import { requireSecureLatchAuthority } from "./latch-authority.mjs";
+import { requireSecureResumeAuthority } from "./resume-authority.mjs";
 
 // Package-private capability registries. Public TaskLedger and GuardianStorage
 // objects expose their accepted APIs only; trusted handoff receives one bounded
@@ -31,6 +32,8 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     && typeof capability?.projectCanonicalReservation === "function"
     && typeof capability?.prepareRecovery === "function"
     && typeof capability?.authorizeResume === "function"
+    && typeof capability?.projectCanonicalResumeDecision === "function"
+    && typeof capability?.projectCanonicalResumeOutcome === "function"
     && typeof capability?.resumeEvidence === "function"
     && typeof capability?.assertOwnerGateAuthority === "function"
     && typeof capability?.claimTakeover === "function"
@@ -47,6 +50,8 @@ export function registerTrustedHandoffStorageCapability(storage, capability) {
     projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
+    projectCanonicalResumeDecision: capability.projectCanonicalResumeDecision,
+    projectCanonicalResumeOutcome: capability.projectCanonicalResumeOutcome,
     resumeEvidence: capability.resumeEvidence,
     assertOwnerGateAuthority: capability.assertOwnerGateAuthority,
     claimTakeover: capability.claimTakeover,
@@ -167,6 +172,14 @@ export function finishTrustedResumeDispatch(storage, ...args) {
   return trustedStorageCapability(storage).finishDispatch(...args);
 }
 
+export function projectTrustedCanonicalResumeDecision(storage, result) {
+  return trustedStorageCapability(storage).projectCanonicalResumeDecision(result);
+}
+
+export function projectTrustedCanonicalResumeOutcome(storage, result) {
+  return trustedStorageCapability(storage).projectCanonicalResumeOutcome(result);
+}
+
 export function reserveTrustedHandoffPlan(ledger, request) {
   const planCapability = handoffPlanCapabilities.get(ledger);
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
@@ -237,6 +250,8 @@ export function authorizeTrustedResume(ledger, request) {
   return planCapability.attestResume(request.expectedPlan, (plan) => {
     const captured = request.capture(plan);
     invariant(captured && !captured?.then, "RESUME_ATTESTATION_INVALID", "Final resume attestation must be synchronous");
-    return storageCapability.authorizeResume(captured);
+    return request.resumeAuthority
+      ? requireSecureResumeAuthority(request.resumeAuthority).requestResumeDecision(captured.requestId, captured.decision)
+      : storageCapability.authorizeResume(captured);
   });
 }

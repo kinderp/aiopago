@@ -6,6 +6,7 @@ import { GuardianError, invariant } from "./errors.mjs";
 import {
   HANDOFF_OPERATION_AUTHORITY_SCHEMA,
   LATCH_OPERATION_AUTHORITY_SCHEMA,
+  LIFECYCLE_OPERATION_AUTHORITY_SCHEMA,
   OPERATION_AUTHORITY_SCHEMA,
   PREVIOUS_OPERATION_AUTHORITY_SCHEMA,
   SECURE_OPERATION_AUTHORITY_LABEL,
@@ -33,6 +34,14 @@ import {
   validateLifecycleBindingCreate,
   validateLifecycleBindingTransition,
 } from "./lifecycle-binding-authority.mjs";
+import {
+  SECURE_RESUME_AUTHORITY_LABEL,
+  detachedResumeReadiness,
+  detachedResumeState,
+  validateResumeDecision,
+  validateResumeDispatchOutcome,
+  validateResumeReadiness,
+} from "./resume-authority.mjs";
 
 const require = createRequire(typeof __AIOPAGO_OPERATIONAL_ENTRY_URL__ === "string"
   ? __AIOPAGO_OPERATIONAL_ENTRY_URL__
@@ -55,6 +64,7 @@ export class ProtectedSqliteOperationAuthority {
     this.latchSecurity = SECURE_LATCH_AUTHORITY_LABEL;
     this.handoffSecurity = SECURE_HANDOFF_AUTHORITY_LABEL;
     this.lifecycleSecurity = SECURE_LIFECYCLE_AUTHORITY_LABEL;
+    this.resumeSecurity = SECURE_RESUME_AUTHORITY_LABEL;
     this.schema = expectedSchema;
     const existed = existsSync(this.path);
     invariant(existed || allowInitialize, "SECURE_OPERATION_AUTHORITY_MISSING", "Protected operation/latch database is missing; portable storage was not consulted", { path: this.path });
@@ -91,7 +101,7 @@ export class ProtectedSqliteOperationAuthority {
       const existingMetadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
       invariant(existingMetadata, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       if (existingMetadata.schema_version === this.schema) return;
-      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
+      if (!([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA].includes(existingMetadata.schema_version)
         && this.schema === OPERATION_AUTHORITY_SCHEMA)) return;
     }
     db.exec(`
@@ -203,6 +213,63 @@ export class ProtectedSqliteOperationAuthority {
         reason TEXT,
         occurred_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS resume_readiness(
+        handoff_id TEXT PRIMARY KEY REFERENCES handoff_reservations(handoff_id),
+        reservation_digest TEXT NOT NULL,
+        replacement_session_id TEXT NOT NULL UNIQUE,
+        runner_instance_id TEXT NOT NULL,
+        session_binding_id TEXT NOT NULL UNIQUE,
+        lifecycle_incarnation INTEGER NOT NULL CHECK(lifecycle_incarnation > 0),
+        latch_generation INTEGER NOT NULL CHECK(latch_generation >= 0),
+        latch_reason TEXT NOT NULL,
+        checkpoint_digest TEXT NOT NULL,
+        resume_manifest_digest TEXT NOT NULL,
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        resume_prompt_digest TEXT NOT NULL,
+        resume_prompt TEXT NOT NULL,
+        plan_semantic_digest TEXT NOT NULL,
+        readiness_digest TEXT NOT NULL UNIQUE,
+        ready_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_authorizations(
+        authorization_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE REFERENCES resume_readiness(handoff_id),
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        actor TEXT NOT NULL,
+        readiness_digest TEXT NOT NULL,
+        engaged_latch_generation INTEGER NOT NULL,
+        released_latch_generation INTEGER NOT NULL,
+        authorized_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_admissions(
+        admission_id TEXT PRIMARY KEY,
+        authorization_id TEXT NOT NULL UNIQUE REFERENCES resume_authorizations(authorization_id),
+        handoff_id TEXT NOT NULL UNIQUE,
+        resume_prompt_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        committed_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resume_dispatch_attempts(
+        dispatch_attempt_id TEXT PRIMARY KEY,
+        admission_id TEXT NOT NULL UNIQUE REFERENCES resume_admissions(admission_id),
+        handoff_id TEXT NOT NULL UNIQUE,
+        attempt_no INTEGER NOT NULL CHECK(attempt_no=1),
+        state TEXT NOT NULL CHECK(state IN ('DISPATCHING','ACKNOWLEDGED','DISPATCHED','FAILED','UNKNOWN')),
+        intent_at TEXT NOT NULL,
+        outcome_at TEXT,
+        error TEXT,
+        CHECK((state='DISPATCHING' AND outcome_at IS NULL AND error IS NULL)
+          OR (state<>'DISPATCHING' AND outcome_at IS NOT NULL))
+      );
+      CREATE TABLE IF NOT EXISTS resume_authority_events(
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        request_id TEXT NOT NULL,
+        handoff_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('RESUME_READY','LATCH_RELEASED','RESUME_AUTHORIZED','RESUME_ADMISSION_COMMITTED','RESUME_DISPATCH_INTENT','RESUME_DISPATCHED','RESUME_ACKNOWLEDGED','RESUME_FAILED','RESUME_DISPATCH_UNKNOWN')),
+        occurred_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS authority_requests(
         request_id TEXT PRIMARY KEY,
         operation_type TEXT NOT NULL,
@@ -215,12 +282,13 @@ export class ProtectedSqliteOperationAuthority {
       CREATE INDEX IF NOT EXISTS handoff_reservation_task_created ON handoff_reservations(task_id,created_at,handoff_id);
       CREATE INDEX IF NOT EXISTS lifecycle_binding_session_status ON lifecycle_bindings(replacement_session_id,status);
       CREATE INDEX IF NOT EXISTS lifecycle_binding_event_handoff_sequence ON lifecycle_binding_events(handoff_id,sequence);
+      CREATE INDEX IF NOT EXISTS resume_authority_event_handoff_sequence ON resume_authority_events(handoff_id,sequence);
     `);
     const metadata = db.prepare("SELECT schema_version FROM authority_metadata WHERE singleton=1").get();
     if (!metadata) {
       invariant(allowInitialize && !existed, "SECURE_OPERATION_AUTHORITY_METADATA_MISSING");
       db.prepare("INSERT INTO authority_metadata(singleton,schema_version,created_at) VALUES(1,?,?)").run(this.schema, utcNow());
-    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
+    } else if ([PREVIOUS_OPERATION_AUTHORITY_SCHEMA, LATCH_OPERATION_AUTHORITY_SCHEMA, HANDOFF_OPERATION_AUTHORITY_SCHEMA, LIFECYCLE_OPERATION_AUTHORITY_SCHEMA].includes(metadata.schema_version)
       && this.schema === OPERATION_AUTHORITY_SCHEMA) {
       db.prepare("UPDATE authority_metadata SET schema_version=? WHERE singleton=1 AND schema_version=?")
         .run(OPERATION_AUTHORITY_SCHEMA, metadata.schema_version);
@@ -239,6 +307,11 @@ export class ProtectedSqliteOperationAuthority {
       handoff_reservation_events: ["sequence", "event_id", "request_id", "handoff_id", "task_id", "source_session_id", "event_type", "latch_generation", "latch_reason", "occurred_at"],
       lifecycle_bindings: ["handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "status", "bound_at", "bind_event_id", "superseded_at", "superseded_reason", "supersede_event_id"],
       lifecycle_binding_events: ["sequence", "event_id", "request_id", "handoff_id", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "event_type", "from_status", "status", "reason", "occurred_at"],
+      resume_readiness: ["handoff_id", "reservation_digest", "replacement_session_id", "runner_instance_id", "session_binding_id", "lifecycle_incarnation", "latch_generation", "latch_reason", "checkpoint_digest", "resume_manifest_digest", "resume_prompt_id", "resume_prompt_digest", "resume_prompt", "plan_semantic_digest", "readiness_digest", "ready_at"],
+      resume_authorizations: ["authorization_id", "handoff_id", "resume_prompt_id", "actor", "readiness_digest", "engaged_latch_generation", "released_latch_generation", "authorized_at"],
+      resume_admissions: ["admission_id", "authorization_id", "handoff_id", "resume_prompt_id", "idempotency_key", "committed_at"],
+      resume_dispatch_attempts: ["dispatch_attempt_id", "admission_id", "handoff_id", "attempt_no", "state", "intent_at", "outcome_at", "error"],
+      resume_authority_events: ["sequence", "event_id", "request_id", "handoff_id", "event_type", "occurred_at", "data_json"],
       authority_requests: ["request_id", "operation_type", "payload_digest", "result_json", "recorded_at"],
     });
     for (const [table, columns] of Object.entries(expected)) {
@@ -631,6 +704,209 @@ export class ProtectedSqliteOperationAuthority {
     return Object.freeze(this.#database().prepare("SELECT * FROM lifecycle_binding_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row })));
   }
 
+  #resumeReadinessRow(db, handoffId) {
+    return db.prepare("SELECT * FROM resume_readiness WHERE handoff_id=?").get(handoffId) ?? null;
+  }
+
+  #resumeState(db, handoffId) {
+    return detachedResumeState({
+      readiness: this.#resumeReadinessRow(db, handoffId),
+      authorization: db.prepare("SELECT * FROM resume_authorizations WHERE handoff_id=?").get(handoffId) ?? null,
+      admission: db.prepare("SELECT * FROM resume_admissions WHERE handoff_id=?").get(handoffId) ?? null,
+      dispatch: db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=?").get(handoffId) ?? null,
+    });
+  }
+
+  #resumeEvent(db, requestId, handoffId, eventType, occurredAt, data) {
+    db.prepare("INSERT INTO resume_authority_events(event_id,request_id,handoff_id,event_type,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+      .run(opaqueId("REV"), requestId, handoffId, eventType, occurredAt, JSON.stringify(data));
+  }
+
+  requestResumeReadiness(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeReadiness(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-ready:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, "RESUME_REQUEST_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, readiness: detachedResumeReadiness(this.#resumeReadinessRow(db, value.handoff_id)) });
+      const reservation = this.#reservationRow(db, value.handoff_id);
+      invariant(reservation && reservation.reservation_digest === value.reservation_digest,
+        "RESUME_RESERVATION_STALE", "Resume readiness does not match the protected reservation");
+      const projection = JSON.parse(reservation.projection_json);
+      invariant(reservation.task_id === value.latch.task_id
+        && reservation.runner_instance_id === value.binding.runner_instance_id
+        && projection.session_binding_id === value.binding.session_binding_id,
+      "RESUME_RESERVATION_STALE", "Resume readiness identity conflicts with protected reservation provenance");
+      const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+      invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding),
+        "LIFECYCLE_BINDING_STALE", "Resume readiness requires the exact protected ACTIVE lifecycle binding");
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(latch?.state === value.latch.state && latch.generation === value.latch.generation && latch.reason === value.latch.reason
+        && latch.generation === reservation.latch_generation,
+      "LATCH_GENERATION_MISMATCH", "Resume readiness used stale protected latch authority");
+      const prior = this.#resumeReadinessRow(db, value.handoff_id);
+      if (prior) {
+        invariant(prior.readiness_digest === validated.payload_digest, "RESUME_READINESS_CONFLICT");
+        const result = { readiness: detachedResumeReadiness(prior), created: false, idempotent: true, request_code: "IDEMPOTENT_RESUME_READY" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, result);
+        return Object.freeze(result);
+      }
+      const now = utcNow();
+      db.prepare(`INSERT INTO resume_readiness(
+        handoff_id,reservation_digest,replacement_session_id,runner_instance_id,session_binding_id,lifecycle_incarnation,
+        latch_generation,latch_reason,checkpoint_digest,resume_manifest_digest,resume_prompt_id,resume_prompt_digest,
+        resume_prompt,plan_semantic_digest,readiness_digest,ready_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        value.handoff_id, value.reservation_digest, value.binding.replacement_session_id, value.binding.runner_instance_id,
+        value.binding.session_binding_id, value.binding.lifecycle_incarnation, value.latch.generation, value.latch.reason,
+        value.checkpoint_digest, value.resume_manifest_digest, value.resume_prompt_id, value.resume_prompt_digest,
+        value.resume_prompt, value.plan_semantic_digest, validated.payload_digest, now,
+      );
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_READY", now, {
+        resume_prompt_id: value.resume_prompt_id, readiness_digest: validated.payload_digest,
+      });
+      const result = { readiness: detachedResumeReadiness(this.#resumeReadinessRow(db, value.handoff_id)), created: true, idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_READY", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+
+  requestResumeDecision(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeDecision(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-decision:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, "RESUME_DECISION_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id) });
+      const readiness = this.#resumeReadinessRow(db, value.handoff_id);
+      invariant(readiness && readiness.readiness_digest === value.readiness_digest
+        && readiness.resume_prompt_id === value.resume_prompt_id,
+      "RESUME_READINESS_STALE", "The protected resume readiness identity changed");
+      if (value.answer === "NO") {
+        invariant(!db.prepare("SELECT 1 present FROM resume_authorizations WHERE handoff_id=?").get(value.handoff_id),
+          "RESUME_ALREADY_ADMITTED_CONFLICT", "A later NO cannot revoke an already committed protected YES");
+        const result = { answer: "NO", authorized: false, admitted: false, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id), idempotent: false, request_code: "RESUME_DECLINED" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result);
+        return Object.freeze(result);
+      }
+
+      const priorAuthorization = db.prepare("SELECT * FROM resume_authorizations WHERE handoff_id=? OR authorization_id=? OR resume_prompt_id=? LIMIT 1")
+        .get(value.handoff_id, value.authorization_id, value.resume_prompt_id);
+      const priorAdmission = db.prepare("SELECT * FROM resume_admissions WHERE handoff_id=? OR admission_id=? OR resume_prompt_id=? OR idempotency_key=? LIMIT 1")
+        .get(value.handoff_id, value.admission_id, value.resume_prompt_id, value.idempotency_key);
+      const priorDispatch = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE handoff_id=? OR dispatch_attempt_id=? LIMIT 1")
+        .get(value.handoff_id, value.dispatch_attempt_id);
+      if (priorAuthorization || priorAdmission || priorDispatch) {
+        invariant(priorAuthorization?.authorization_id === value.authorization_id
+          && priorAuthorization.actor === value.actor
+          && priorAuthorization.readiness_digest === value.readiness_digest
+          && priorAdmission?.admission_id === value.admission_id
+          && priorAdmission.authorization_id === value.authorization_id
+          && priorAdmission.idempotency_key === value.idempotency_key
+          && priorDispatch?.dispatch_attempt_id === value.dispatch_attempt_id
+          && priorDispatch.admission_id === value.admission_id,
+        "RESUME_ALREADY_ADMITTED_CONFLICT", "The protected handoff already binds a different resume decision");
+        const result = { answer: "YES", authorized: true, admitted: true, dispatch_permit: false, state: this.#resumeState(db, value.handoff_id), idempotent: true, request_code: "IDEMPOTENT_RESUME_ADMISSION" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result);
+        return Object.freeze(result);
+      }
+
+      const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+      invariant(binding?.status === "ACTIVE" && sameLifecycleBindingIdentity(binding, value.binding)
+        && binding.lifecycle_incarnation === readiness.lifecycle_incarnation,
+      "LIFECYCLE_BINDING_STALE", "Protected lifecycle changed before resume admission and dispatch intent");
+      const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+      if (latch?.reason === "HUMAN_TAKEOVER") throw new GuardianError("HUMAN_TAKEOVER_ACTIVE");
+      invariant(latch?.state === "ENGAGED" && latch.generation === value.latch.generation
+        && latch.reason === value.latch.reason && latch.generation === readiness.latch_generation,
+      "LATCH_GENERATION_MISMATCH", "Protected latch changed before resume admission and dispatch intent");
+
+      const now = utcNow();
+      const releasedGeneration = latch.generation + 1;
+      const releaseEventId = opaqueId("REV");
+      const changed = db.prepare(`UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=?
+        WHERE task_id=? AND state='ENGAGED' AND generation=? AND reason=?`)
+        .run(releasedGeneration, now, value.actor, releaseEventId, value.latch.task_id, latch.generation, latch.reason);
+      invariant(changed.changes === 1, "LATCH_GENERATION_MISMATCH", "Protected latch release raced resume admission");
+      db.prepare("INSERT INTO resume_authority_events(event_id,request_id,handoff_id,event_type,occurred_at,data_json) VALUES(?,?,?,?,?,?)")
+        .run(releaseEventId, ledgerRequestId, value.handoff_id, "LATCH_RELEASED", now, JSON.stringify({ task_id: value.latch.task_id, from_generation: latch.generation, generation: releasedGeneration, actor: value.actor }));
+      db.prepare(`INSERT INTO resume_authorizations(
+        authorization_id,handoff_id,resume_prompt_id,actor,readiness_digest,engaged_latch_generation,released_latch_generation,authorized_at
+      ) VALUES(?,?,?,?,?,?,?,?)`).run(
+        value.authorization_id, value.handoff_id, value.resume_prompt_id, value.actor, value.readiness_digest,
+        latch.generation, releasedGeneration, now,
+      );
+      db.prepare(`INSERT INTO resume_admissions(
+        admission_id,authorization_id,handoff_id,resume_prompt_id,idempotency_key,committed_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        value.admission_id, value.authorization_id, value.handoff_id, value.resume_prompt_id, value.idempotency_key, now,
+      );
+      db.prepare(`INSERT INTO resume_dispatch_attempts(
+        dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        value.dispatch_attempt_id, value.admission_id, value.handoff_id, value.attempt_no, "DISPATCHING", now,
+      );
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_AUTHORIZED", now, { authorization_id: value.authorization_id, resume_prompt_id: value.resume_prompt_id, actor: value.actor });
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_ADMISSION_COMMITTED", now, { authorization_id: value.authorization_id, admission_id: value.admission_id, idempotency_key: value.idempotency_key });
+      this.#resumeEvent(db, ledgerRequestId, value.handoff_id, "RESUME_DISPATCH_INTENT", now, { admission_id: value.admission_id, dispatch_attempt_id: value.dispatch_attempt_id, attempt_no: 1 });
+      const result = { answer: "YES", authorized: true, admitted: true, dispatch_permit: true, state: this.#resumeState(db, value.handoff_id), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_DECISION", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+
+  requestResumeDispatchOutcome(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const validated = validateResumeDispatchOutcome(request);
+    const value = validated.value;
+    const ledgerRequestId = `resume-outcome:${requestId}`;
+    return this.#transaction((db) => {
+      const recorded = this.#recordedRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, "RESUME_DISPATCH_OUTCOME_CONFLICT");
+      if (recorded) return Object.freeze({ ...recorded, state: this.#resumeState(db, recorded.handoff_id) });
+      const attempt = db.prepare("SELECT * FROM resume_dispatch_attempts WHERE dispatch_attempt_id=?").get(value.dispatch_attempt_id);
+      invariant(attempt, "RESUME_DISPATCH_INTENT_REQUIRED");
+      if (attempt.state !== "DISPATCHING") {
+        invariant(attempt.state === value.outcome && (attempt.error ?? null) === value.error,
+          "RESUME_DISPATCH_OUTCOME_CONFLICT", "Dispatch attempt already has a different terminal outcome");
+        const result = { handoff_id: attempt.handoff_id, outcome: attempt.state, state: this.#resumeState(db, attempt.handoff_id), idempotent: true, request_code: "IDEMPOTENT_DISPATCH_OUTCOME" };
+        this.#saveRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, result);
+        return Object.freeze(result);
+      }
+      const now = utcNow();
+      const changed = db.prepare("UPDATE resume_dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=? AND state='DISPATCHING'")
+        .run(value.outcome, now, value.error, value.dispatch_attempt_id);
+      invariant(changed.changes === 1, "RESUME_DISPATCH_OUTCOME_CONFLICT");
+      if (value.outcome === "ACKNOWLEDGED") {
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, "RESUME_DISPATCHED", now, { dispatch_attempt_id: value.dispatch_attempt_id });
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, "RESUME_ACKNOWLEDGED", now, { dispatch_attempt_id: value.dispatch_attempt_id });
+      } else {
+        const eventType = value.outcome === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : value.outcome === "FAILED" ? "RESUME_FAILED" : "RESUME_DISPATCHED";
+        this.#resumeEvent(db, ledgerRequestId, attempt.handoff_id, eventType, now, { dispatch_attempt_id: value.dispatch_attempt_id, error: value.error });
+      }
+      const result = { handoff_id: attempt.handoff_id, outcome: value.outcome, state: this.#resumeState(db, attempt.handoff_id), idempotent: false, request_code: "MUTATION_ACCEPTED" };
+      this.#saveRequest(db, ledgerRequestId, "RESUME_DISPATCH_OUTCOME", validated.payload_digest, result);
+      return Object.freeze(result);
+    });
+  }
+
+  getResumeReadiness(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return detachedResumeReadiness(this.#resumeReadinessRow(this.#database(), handoffId));
+  }
+
+  getResumeState(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return this.#resumeState(this.#database(), handoffId);
+  }
+
+  resumeAuthorityEvents(handoffId) {
+    operationIdentifier(handoffId, "RESUME_HANDOFF_INVALID", "handoffId");
+    return Object.freeze(this.#database().prepare("SELECT * FROM resume_authority_events WHERE handoff_id=? ORDER BY sequence").all(handoffId).map((row) => Object.freeze({ ...row, data: JSON.parse(row.data_json) })));
+  }
+
   admitOperation(request) {
     const value = validateOperationAdmission(request);
     const requestId = `admit:${value.operationId}`;
@@ -699,7 +975,42 @@ export class ProtectedSqliteOperationAuthority {
   status() {
     const metadata = this.#database().prepare("SELECT * FROM authority_metadata WHERE singleton=1").get();
     const journal = this.#database().prepare("PRAGMA journal_mode").get();
-    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+    return Object.freeze({ ...this.security, latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, schema: metadata.schema_version, journal_mode: String(journal.journal_mode).toUpperCase(), path: this.path });
+  }
+
+  crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const value = validateResumeDecision(request).value;
+    invariant(value.answer === "YES", "RESUME_CRASH_SEAM_INVALID");
+    const db = this.#database(); db.exec("BEGIN IMMEDIATE");
+    const readiness = this.#resumeReadinessRow(db, value.handoff_id);
+    const binding = this.#lifecycleBindingRow(db, value.handoff_id);
+    const latch = db.prepare("SELECT * FROM latches WHERE task_id=?").get(value.latch.task_id);
+    invariant(readiness?.readiness_digest === value.readiness_digest && binding?.status === "ACTIVE"
+      && sameLifecycleBindingIdentity(binding, value.binding) && latch?.state === "ENGAGED"
+      && latch.generation === value.latch.generation && latch.reason === value.latch.reason,
+    "RESUME_CRASH_SEAM_INVALID");
+    const now = utcNow(); const releasedGeneration = latch.generation + 1; const eventId = opaqueId("REV");
+    db.prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?")
+      .run(releasedGeneration, now, value.actor, eventId, value.latch.task_id);
+    db.prepare("INSERT INTO resume_authorizations(authorization_id,handoff_id,resume_prompt_id,actor,readiness_digest,engaged_latch_generation,released_latch_generation,authorized_at) VALUES(?,?,?,?,?,?,?,?)")
+      .run(value.authorization_id, value.handoff_id, value.resume_prompt_id, value.actor, value.readiness_digest, latch.generation, releasedGeneration, now);
+    db.prepare("INSERT INTO resume_admissions(admission_id,authorization_id,handoff_id,resume_prompt_id,idempotency_key,committed_at) VALUES(?,?,?,?,?,?)")
+      .run(value.admission_id, value.authorization_id, value.handoff_id, value.resume_prompt_id, value.idempotency_key, now);
+    db.prepare("INSERT INTO resume_dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at) VALUES(?,?,?,?,?,?)")
+      .run(value.dispatch_attempt_id, value.admission_id, value.handoff_id, 1, "DISPATCHING", now);
+    process.exit(101);
+  }
+
+  crashBeforeResumeOutcomeCommitForPhysicalTest(requestId, request) {
+    operationIdentifier(requestId, "RESUME_REQUEST_ID_INVALID", "requestId");
+    const value = validateResumeDispatchOutcome(request).value;
+    const db = this.#database(); db.exec("BEGIN IMMEDIATE");
+    const attempt = db.prepare("SELECT state FROM resume_dispatch_attempts WHERE dispatch_attempt_id=?").get(value.dispatch_attempt_id);
+    invariant(attempt?.state === "DISPATCHING", "RESUME_CRASH_SEAM_INVALID");
+    db.prepare("UPDATE resume_dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?")
+      .run(value.outcome, utcNow(), value.error, value.dispatch_attempt_id);
+    process.exit(102);
   }
 
   crashBeforeTerminalCommitForPhysicalTest(operationId, outcome, effectReference = null) {

@@ -361,7 +361,7 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
       .run(result.resume_prompt_id, result.handoff_id, "human:portable-forged", 999999, "2099-01-01T00:00:00.000Z");
     await assert.rejects(() => x.runner.handoffService.resume(result.handoff_id, {
       actor: "human:portable-forged", sendResume: async () => { throw new Error("must remain paused"); },
-    }), (error) => error.code === "SECURE_RESUME_AUTHORITY_UNAVAILABLE");
+    }), (error) => error.code === "RESUME_ATTESTATION_REQUIRED");
     assert.equal(x.runner.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
     const second = await x.runner.handoffDirect({ mode: "manual", confirm: false });
     assert.equal(second.state, "RESUME_READY");
@@ -381,6 +381,35 @@ test("real Pi 0.83.0 secure handoff reaches protected reservation and paused RES
     assert.equal(x.reservationAuthority.getLifecycleBinding(second.handoff_id).status, "SUPERSEDED", "same textual session ID E2 must not revive E1");
     assert.equal(x.calls, 0); assert.equal(x.networkAttempts, 0);
     t.diagnostic(`secure Pi handoff ${JSON.stringify({ task_id: result.task_id, source_session_id: result.source_session_id, target_session_id: result.target_session_id, runner_instance_id: result.runner_instance_id, plan_revision: result.task_plan_revision, plan_digest: result.task_plan_digest, latch_generation: result.latch_generation, latch_reason: canonical.latch_reason, reservation_id: result.handoff_id, active_source: x.reservationAuthority.getActiveSource(result.source_session_id), binding_id: canonicalBinding.session_binding_id, binding_status: canonicalBinding.status, lifecycle_incarnation: canonicalBinding.lifecycle_incarnation, checkpoint_id: result.checkpoint_id, manifest_id: result.resume_manifest_id, handoff_state: result.state, resume_authorizations: legitimateResumeAuthorizations, forged_portable_authorizations_after_boundary_attack: db.prepare("SELECT COUNT(*) count FROM authorizations WHERE handoff_id=?").get(result.handoff_id).count, admissions: 0, dispatches: 0 })}`);
+  } finally { await x.runner.dispose(); x.restoreFetch(); }
+});
+
+test("real Pi 0.83.0 protected NO then YES creates one canonical admission and one external dispatch", async (t) => {
+  const x = await makeRunner({ secureReservation: true });
+  try {
+    const ready = await x.runner.handoffDirect({ mode: "manual", confirm: false });
+    assert.equal(ready.state, "RESUME_READY");
+    const readiness = x.reservationAuthority.getResumeState(ready.handoff_id);
+    assert.ok(readiness.readiness?.readiness_digest);
+    assert.equal(readiness.authorization, null); assert.equal(readiness.admission, null); assert.equal(readiness.dispatch, null);
+    let confirmations = 0;
+    const no = await x.runner.resumeFromCommand({ ui: { async confirm() { confirmations += 1; return false; }, notify() {} } }, ready.handoff_id);
+    assert.equal(no.state, "RESUME_READY"); assert.equal(x.calls, 0);
+    assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).authorization, null);
+    const resumed = await x.runner.resumeFromCommand({ ui: { async confirm() { confirmations += 1; return true; }, notify() {} } }, ready.handoff_id);
+    assert.equal(resumed.state, "RESUMED"); assert.equal(confirmations, 2); assert.equal(x.calls, 1);
+    const canonical = x.reservationAuthority.getResumeState(ready.handoff_id);
+    assert.equal(canonical.authorization.authorization_id.startsWith("AUTH-"), true);
+    assert.equal(canonical.admission.admission_id.startsWith("ADM-"), true);
+    assert.equal(canonical.dispatch.dispatch_attempt_id.startsWith("DSP-"), true);
+    assert.equal(canonical.dispatch.state, "ACKNOWLEDGED");
+    const secureStatus = x.runner.authorityStorage.latestHandoffForTask(ready.task_id);
+    assert.equal(secureStatus.state, "RESUMED"); assert.equal(secureStatus.authorization_state, "AUTHORIZED"); assert.equal(secureStatus.admission_state, "COMMITTED"); assert.equal(secureStatus.dispatch_state, "ACKNOWLEDGED");
+    assert.equal(x.reservationAuthority.resumeAuthorityEvents(ready.handoff_id).filter((event) => event.event_type === "RESUME_AUTHORIZED").length, 1);
+    assert.equal(x.reservationAuthority.resumeAuthorityEvents(ready.handoff_id).filter((event) => event.event_type === "RESUME_DISPATCH_INTENT").length, 1);
+    assert.equal((await x.runner.handoffService.resume(ready.handoff_id, { actor: "human:duplicate" })).state, "RESUMED");
+    assert.equal(x.calls, 1);
+    t.diagnostic(`protected resume ${JSON.stringify({ handoff_id: ready.handoff_id, binding_id: ready.session_binding_id, authorization_id: canonical.authorization.authorization_id, admission_id: canonical.admission.admission_id, dispatch_attempt_id: canonical.dispatch.dispatch_attempt_id, external_calls: x.calls, outcome: canonical.dispatch.state })}`);
   } finally { await x.runner.dispose(); x.restoreFetch(); }
 });
 

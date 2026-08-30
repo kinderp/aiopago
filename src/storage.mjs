@@ -281,6 +281,8 @@ export class GuardianStorage {
         failedHandoffId, preparation, { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation },
       ),
       authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
+      projectCanonicalResumeDecision: (result) => this.#projectCanonicalResumeDecision(result),
+      projectCanonicalResumeOutcome: (result) => this.#projectCanonicalResumeOutcome(result),
       resumeEvidence: (handoffId) => Object.freeze({
         authorizations: database(this).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
         admissions: database(this).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
@@ -796,6 +798,79 @@ export class GuardianStorage {
         .run(next, JSON.stringify(h), now, id, previous);
       this.appendEvent("STATE_TRANSITION", { from: previous, to: next, ...data }, { handoffId: id });
       return this.getHandoff(id);
+    });
+  }
+
+  #projectCanonicalResumeDecision(result) {
+    const state = result?.state;
+    const readiness = state?.readiness;
+    const authorization = state?.authorization;
+    const admission = state?.admission;
+    const dispatch = state?.dispatch;
+    invariant(result?.answer === "YES" && readiness && authorization && admission && dispatch
+      && authorization.handoff_id === readiness.handoff_id
+      && admission.handoff_id === readiness.handoff_id
+      && dispatch.handoff_id === readiness.handoff_id,
+    "RESUME_PROJECTION_PROOF_INVALID");
+    return this.transaction(() => {
+      const h = this.getHandoff(readiness.handoff_id);
+      invariant(h, "HANDOFF_NOT_FOUND");
+      database(this).prepare("DELETE FROM dispatch_attempts WHERE handoff_id=? OR dispatch_attempt_id=?").run(h.handoff_id, dispatch.dispatch_attempt_id);
+      database(this).prepare("DELETE FROM admissions WHERE handoff_id=? OR admission_id=? OR resume_prompt_id=? OR idempotency_key=?")
+        .run(h.handoff_id, admission.admission_id, admission.resume_prompt_id, admission.idempotency_key);
+      database(this).prepare("DELETE FROM authorizations WHERE handoff_id=? OR resume_prompt_id=?").run(h.handoff_id, authorization.resume_prompt_id);
+      database(this).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)")
+        .run(authorization.resume_prompt_id, h.handoff_id, authorization.actor, authorization.released_latch_generation, authorization.authorized_at);
+      database(this).prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)")
+        .run(admission.admission_id, admission.resume_prompt_id, admission.idempotency_key, h.handoff_id, admission.committed_at);
+      database(this).prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at,outcome_at,error) VALUES(?,?,?,?,?,?,?,?)")
+        .run(dispatch.dispatch_attempt_id, admission.admission_id, h.handoff_id, dispatch.attempt_no, dispatch.state, dispatch.intent_at, dispatch.outcome_at, dispatch.error);
+      const latch = this.getLatch(h.task_id);
+      if (latch && latch.generation <= authorization.released_latch_generation) {
+        database(this).prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?")
+          .run(authorization.released_latch_generation, authorization.authorized_at, authorization.actor, `PROTECTED:${authorization.authorization_id}`, h.task_id);
+      }
+      h.authorization_state = "AUTHORIZED";
+      h.admission_state = "COMMITTED";
+      h.admission_id = admission.admission_id;
+      h.dispatch_state = dispatch.state;
+      h.dispatch_attempt_id = dispatch.dispatch_attempt_id;
+      h.dispatch_attempt_no = dispatch.attempt_no;
+      h.state = "RESUME_DISPATCHING";
+      h.updated_at = dispatch.intent_at;
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?")
+        .run(h.state, JSON.stringify(h), h.updated_at, h.handoff_id);
+      database(this).prepare("DELETE FROM journal WHERE event_key IN (?,?,?)")
+        .run(`authorization:${h.resume_prompt_id}`, `admission:${h.resume_prompt_id}`, `dispatch-intent:${dispatch.dispatch_attempt_id}`);
+      this.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor: authorization.actor, authorization_id: authorization.authorization_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `authorization:${h.resume_prompt_id}` });
+      this.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admission.admission_id, idempotency_key: admission.idempotency_key, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `admission:${h.resume_prompt_id}` });
+      this.appendEvent("RESUME_DISPATCH_INTENT", { dispatch_attempt_id: dispatch.dispatch_attempt_id, admission_id: admission.admission_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-intent:${dispatch.dispatch_attempt_id}` });
+      return this.getHandoff(h.handoff_id);
+    });
+  }
+
+  #projectCanonicalResumeOutcome(result) {
+    const state = result?.state;
+    const dispatch = state?.dispatch;
+    invariant(dispatch && dispatch.handoff_id === result.handoff_id && dispatch.state === result.outcome,
+      "RESUME_PROJECTION_PROOF_INVALID");
+    return this.transaction(() => {
+      const h = this.getHandoff(result.handoff_id);
+      invariant(h, "HANDOFF_NOT_FOUND");
+      database(this).prepare("UPDATE dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?")
+        .run(dispatch.state, dispatch.outcome_at, dispatch.error, dispatch.dispatch_attempt_id);
+      h.dispatch_state = dispatch.state;
+      h.state = dispatch.state === "ACKNOWLEDGED" ? "RESUMED" : dispatch.state === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : dispatch.state === "FAILED" ? "RESUME_DISPATCH_FAILED" : "RESUME_DISPATCHED";
+      h.updated_at = dispatch.outcome_at;
+      database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?")
+        .run(h.state, JSON.stringify(h), h.updated_at, h.handoff_id);
+      database(this).prepare("DELETE FROM journal WHERE event_key IN (?,?,?)")
+        .run(`dispatch-dispatched:${dispatch.dispatch_attempt_id}`, `dispatch-acknowledged:${dispatch.dispatch_attempt_id}`, `dispatch-${dispatch.state.toLowerCase()}:${dispatch.dispatch_attempt_id}`);
+      if (dispatch.state === "ACKNOWLEDGED") {
+        this.appendEvent("RESUME_DISPATCHED", { dispatch_attempt_id: dispatch.dispatch_attempt_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-dispatched:${dispatch.dispatch_attempt_id}` });
+        this.appendEvent("RESUME_ACKNOWLEDGED", { dispatch_attempt_id: dispatch.dispatch_attempt_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-acknowledged:${dispatch.dispatch_attempt_id}` });
+      } else this.appendEvent(dispatch.state === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : `RESUME_${dispatch.state}`, { dispatch_attempt_id: dispatch.dispatch_attempt_id, error: dispatch.error, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-${dispatch.state.toLowerCase()}:${dispatch.dispatch_attempt_id}` });
+      return this.getHandoff(h.handoff_id);
     });
   }
 

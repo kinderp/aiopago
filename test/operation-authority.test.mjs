@@ -60,7 +60,7 @@ test("protected operation authority preserves Tracker profiles, outcomes, idempo
   assert.equal(requireSecureOperationAuthority(authority), authority);
   assert.deepEqual(authority.status(), {
     mode: "SECURE", canonical: true, isolation: "OS_PROTECTED_DISTINCT_IDENTITY", r1_m_13_operation_isolation: true,
-    latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, schema: "aiopago.operation-authority/1.3.0", journal_mode: "WAL", path: join(canonical, "operations.sqlite"),
+    latch_canonical: true, handoff_reservation_canonical: true, lifecycle_binding_canonical: true, resume_authority_canonical: true, schema: "aiopago.operation-authority/1.4.0", journal_mode: "WAL", path: join(canonical, "operations.sqlite"),
   });
 
   const tracker = new ToolOperationTracker(authority, "TASK-SECURE", { operationAuthority: authority, latchAuthority: authority });

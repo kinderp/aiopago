@@ -66,10 +66,14 @@ function guidedHandoffFailure(error, projection) {
   ].join("\n");
 }
 
+function admissionOpen(runner, taskId) {
+  return (runner.authorityStorage ?? runner.storage).isAdmissionOpen(taskId);
+}
+
 async function adviseHandoff(runner, ctx, guided) {
   if (guided.inFlight || !ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
   const task = readLedgerForHook(runner, ctx, "warning");
-  if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return;
+  if (!task || !admissionOpen(runner, task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
   const expectedEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
@@ -86,7 +90,7 @@ async function adviseHandoff(runner, ctx, guided) {
     if (!prepare || guided.shutdownEpoch !== epoch) return;
     const currentEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
     if (!sameGuidedHandoffEligibility(expectedEligibility, currentEligibility)
-      || !runner.storage.isAdmissionOpen(currentEligibility?.taskId)) {
+      || !admissionOpen(runner, currentEligibility?.taskId)) {
       safeNotify(ctx, "Lo stato è cambiato mentre la conferma era aperta; l’handoff non è stato avviato. Ispeziona /aio status e conferma di nuovo a una futura advisory.", "warning");
       return;
     }
@@ -186,7 +190,7 @@ export function createGuardianExtension(runner) {
       }
       const task = readLedgerForHook(runner, ctx);
       if (!task) return { action: "handled" };
-      if (!runner.storage.isAdmissionOpen(task.task_id)) {
+      if (!admissionOpen(runner, task.task_id)) {
         safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning");
         return { action: "handled" };
       }
@@ -207,11 +211,11 @@ export function createGuardianExtension(runner) {
     });
     pi.on("session_before_compact", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+      if (!task || !admissionOpen(runner, task.task_id)) return { cancel: true };
     });
     pi.on("session_before_tree", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+      if (!task || !admissionOpen(runner, task.task_id)) return { cancel: true };
     });
     pi.on("session_before_switch", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);

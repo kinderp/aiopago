@@ -995,11 +995,81 @@ test("secure production workflow reserves canonically, projects compatibly, paus
       .run(result.resume_prompt_id, result.handoff_id, "human:forged-portable-yes", 999999, "2099-01-01T00:00:01.000Z");
     await assert.rejects(() => x.service.resume(result.handoff_id, {
       actor: "human:forged-portable-yes", sendResume: async () => { throw new Error("must not dispatch"); },
-    }), (error) => error.code === "SECURE_RESUME_AUTHORITY_UNAVAILABLE");
+    }), (error) => error.code === "RESUME_ATTESTATION_REQUIRED");
     assert.equal(x.storage.getHandoff(result.handoff_id).state, "RESUME_READY");
     assert.equal(db.prepare("SELECT COUNT(*) count FROM admissions WHERE handoff_id=?").get(result.handoff_id).count, 0);
     assert.equal(db.prepare("SELECT COUNT(*) count FROM dispatch_attempts WHERE handoff_id=?").get(result.handoff_id).count, 0);
   } finally { x.close(); }
+});
+
+test("protected dispatch crash seams never blindly replay an external resume", async (t) => {
+  async function readyFixture() {
+    const x = fixture({ secureReservation: true });
+    installPausedReplacement(x, { targetId: `SESSION-DISPATCH-${Math.random().toString(16).slice(2)}` });
+    const ready = await x.runner.handoffFromCommand(x.ctx, "manual", { intent: "explicit-command" });
+    const target = x.runner.runtime.session;
+    const expectedResume = x.service.prepareResumeConfirmation(ready.handoff_id, target, { currentTargetVerifier: () => x.runner.verifyCurrentTarget(target) });
+    return { x, ready, target, expectedResume };
+  }
+  for (const race of ["shutdown", "takeover"]) await t.test(`${race} after admission/intent before external call is known not dispatched`, async () => {
+    const { x, ready, target, expectedResume } = await readyFixture(); let calls = 0;
+    const transaction = x.storage.transaction.bind(x.storage);
+    x.storage.transaction = (operation) => {
+      x.storage.transaction = transaction;
+      if (race === "shutdown") {
+        const binding = x.reservationAuthority.getLifecycleBinding(ready.handoff_id);
+        x.reservationAuthority.requestLifecycleBindingTransition("SHUTDOWN-AFTER-ADMISSION", { expected: binding, nextStatus: "SUPERSEDED", reason: "session_shutdown" });
+      } else {
+        const released = x.reservationAuthority.getLatch(ready.task_id);
+        x.reservationAuthority.claimHumanTakeover({ taskId: ready.task_id, actor: "human:/aio-takeover", expected: expectedLatch(released), requestId: "TAKEOVER-AFTER-ADMISSION" });
+      }
+      return transaction(operation);
+    };
+    try {
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; } }),
+        (error) => ["LIFECYCLE_BINDING_STALE", "HUMAN_TAKEOVER_ACTIVE", "RESUME_EXPECTATION_STALE"].includes(error.code));
+      assert.equal(calls, 0); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "FAILED");
+    } finally { x.close(); }
+  });
+  await t.test("external exception is UNKNOWN and retry makes zero calls", async () => {
+    const { x, ready, target, expectedResume } = await readyFixture(); let calls = 0;
+    try {
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; throw new Error("timeout after request"); } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+      assert.equal(calls, 1); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "UNKNOWN");
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:retry", sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+      assert.equal(calls, 1);
+    } finally { x.close(); }
+  });
+  await t.test("external success before outcome commit leaves DISPATCHING and retry makes zero calls", async () => {
+    const { x, ready, target, expectedResume } = await readyFixture(); let calls = 0;
+    const outcome = x.reservationAuthority.requestResumeDispatchOutcome.bind(x.reservationAuthority);
+    x.reservationAuthority.requestResumeDispatchOutcome = (requestId, request) => {
+      if (request.outcome === "ACKNOWLEDGED") throw new Error("crash before outcome commit");
+      return outcome(requestId, request);
+    };
+    try {
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+      assert.equal(calls, 1); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "DISPATCHING");
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:retry", sendResume: async () => { calls += 1; } }), (error) => error.code === "RESUME_DISPATCH_UNKNOWN");
+      assert.equal(calls, 1);
+    } finally { x.close(); }
+  });
+  await t.test("outcome commit before projection failure is healed from canonical ACK without replay", async () => {
+    const { x, ready, target, expectedResume } = await readyFixture(); let calls = 0;
+    const outcome = x.reservationAuthority.requestResumeDispatchOutcome.bind(x.reservationAuthority);
+    const transaction = x.storage.transaction.bind(x.storage);
+    x.reservationAuthority.requestResumeDispatchOutcome = (requestId, request) => {
+      const result = outcome(requestId, request);
+      if (request.outcome === "ACKNOWLEDGED") x.storage.transaction = () => { x.storage.transaction = transaction; throw new Error("projection unavailable"); };
+      return result;
+    };
+    try {
+      await assert.rejects(() => x.service.resume(ready.handoff_id, { actor: "human:test", targetSession: target, expectedResume, sendResume: async () => { calls += 1; } }), /projection unavailable/);
+      assert.equal(calls, 1); assert.equal(x.reservationAuthority.getResumeState(ready.handoff_id).dispatch.state, "ACKNOWLEDGED");
+      assert.equal((await x.service.resume(ready.handoff_id, { actor: "human:retry" })).state, "RESUMED");
+      assert.equal(calls, 1);
+    } finally { x.close(); }
+  });
 });
 
 test("shutdown linearized before final binding attestation rejects a dead target with no canonical binding", async () => {

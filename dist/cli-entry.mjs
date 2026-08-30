@@ -198,6 +198,9 @@ var init_operation_authority = __esm({
 });
 
 // src/handoff-reservation-authority.mjs
+function sameHandoffReservationIdentity(left, right) {
+  return HANDOFF_RESERVATION_IDENTITY_FIELDS.every((field) => (left?.[field] ?? null) === (right?.[field] ?? null));
+}
 function requireSecureHandoffAuthority(authority) {
   invariant(
     authority?.handoffSecurity?.mode === HANDOFF_AUTHORITY_MODES.SECURE && authority.handoffSecurity.canonical === true && authority.handoffSecurity.r1_m_13_handoff_reservation_isolation === true,
@@ -316,6 +319,31 @@ var init_latch_authority = __esm({
   }
 });
 
+// src/resume-authority.mjs
+function requireSecureResumeAuthority(authority) {
+  invariant(
+    authority?.resumeSecurity?.mode === RESUME_AUTHORITY_MODES.SECURE && authority.resumeSecurity.canonical === true && authority.resumeSecurity.r1_m_13_resume_admission_dispatch_isolation === true,
+    "SECURE_RESUME_AUTHORITY_REQUIRED",
+    "Secure resume cannot use or fall back to portable authorization/admission/dispatch state"
+  );
+  return authority;
+}
+var RESUME_AUTHORITY_MODES, SECURE_RESUME_AUTHORITY_LABEL;
+var init_resume_authority = __esm({
+  "src/resume-authority.mjs"() {
+    init_canonical();
+    init_errors();
+    init_operation_authority();
+    RESUME_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+    SECURE_RESUME_AUTHORITY_LABEL = Object.freeze({
+      mode: RESUME_AUTHORITY_MODES.SECURE,
+      canonical: true,
+      isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+      r1_m_13_resume_admission_dispatch_isolation: true
+    });
+  }
+});
+
 // src/handoff-plan-internal.mjs
 function registerTrustedHandoffPlanCapability(ledger, capability) {
   invariant(ledger && typeof capability?.attest === "function" && typeof capability?.attestRecovery === "function" && typeof capability?.attestResume === "function" && typeof capability?.attestCurrentTakeover === "function" && typeof capability?.satisfyOwnerGate === "function", "HANDOFF_PLAN_CAPABILITY_INVALID");
@@ -329,13 +357,15 @@ function registerTrustedHandoffPlanCapability(ledger, capability) {
   }));
 }
 function registerTrustedHandoffStorageCapability(storage, capability) {
-  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.projectCanonicalRunnerSessionBinding === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
+  invariant(storage && typeof capability?.reserve === "function" && typeof capability?.projectCanonicalReservation === "function" && typeof capability?.prepareRecovery === "function" && typeof capability?.authorizeResume === "function" && typeof capability?.projectCanonicalResumeDecision === "function" && typeof capability?.projectCanonicalResumeOutcome === "function" && typeof capability?.resumeEvidence === "function" && typeof capability?.assertOwnerGateAuthority === "function" && typeof capability?.claimTakeover === "function" && typeof capability?.claimHandoffLatch === "function" && typeof capability?.saveHandoff === "function" && typeof capability?.bindRunnerSession === "function" && typeof capability?.projectCanonicalRunnerSessionBinding === "function" && typeof capability?.supersedeRunnerSessionBinding === "function" && typeof capability?.beginDispatch === "function" && typeof capability?.finishDispatch === "function", "HANDOFF_STORAGE_CAPABILITY_INVALID");
   invariant(!handoffStorageCapabilities.has(storage), "HANDOFF_STORAGE_CAPABILITY_DUPLICATE");
   handoffStorageCapabilities.set(storage, Object.freeze({
     reserve: capability.reserve,
     projectCanonicalReservation: capability.projectCanonicalReservation,
     prepareRecovery: capability.prepareRecovery,
     authorizeResume: capability.authorizeResume,
+    projectCanonicalResumeDecision: capability.projectCanonicalResumeDecision,
+    projectCanonicalResumeOutcome: capability.projectCanonicalResumeOutcome,
     resumeEvidence: capability.resumeEvidence,
     assertOwnerGateAuthority: capability.assertOwnerGateAuthority,
     claimTakeover: capability.claimTakeover,
@@ -436,6 +466,12 @@ function beginTrustedResumeDispatch(storage, ...args) {
 function finishTrustedResumeDispatch(storage, ...args) {
   return trustedStorageCapability(storage).finishDispatch(...args);
 }
+function projectTrustedCanonicalResumeDecision(storage, result) {
+  return trustedStorageCapability(storage).projectCanonicalResumeDecision(result);
+}
+function projectTrustedCanonicalResumeOutcome(storage, result) {
+  return trustedStorageCapability(storage).projectCanonicalResumeOutcome(result);
+}
 function reserveTrustedHandoffPlan(ledger, request) {
   const planCapability = handoffPlanCapabilities.get(ledger);
   const storageCapability = handoffStorageCapabilities.get(request?.storage);
@@ -499,7 +535,7 @@ function authorizeTrustedResume(ledger, request) {
   return planCapability.attestResume(request.expectedPlan, (plan2) => {
     const captured = request.capture(plan2);
     invariant(captured && !captured?.then, "RESUME_ATTESTATION_INVALID", "Final resume attestation must be synchronous");
-    return storageCapability.authorizeResume(captured);
+    return request.resumeAuthority ? requireSecureResumeAuthority(request.resumeAuthority).requestResumeDecision(captured.requestId, captured.decision) : storageCapability.authorizeResume(captured);
   });
 }
 var handoffPlanCapabilities, handoffStorageCapabilities;
@@ -508,6 +544,7 @@ var init_handoff_plan_internal = __esm({
     init_errors();
     init_handoff_reservation_authority();
     init_latch_authority();
+    init_resume_authority();
     handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
     handoffStorageCapabilities = /* @__PURE__ */ new WeakMap();
   }
@@ -4002,15 +4039,16 @@ function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
   if (!firstPlan.valid) return Object.freeze({ ...base, runtime: EMPTY_RUNTIME });
   try {
     const taskId2 = firstPlan.plan.task_id;
+    const authorityStorage = runner.authorityStorage ?? runner.storage;
     const sessionBefore = runner.runtime?.session ?? null;
     if (!sessionBefore?.sessionId) throw new GuardianError("RUNTIME_SESSION_UNAVAILABLE", "The live Runner session cannot be observed");
-    const latchBefore = runner.storage.getLatch(taskId2);
+    const latchBefore = authorityStorage.getLatch(taskId2);
     if (!latchBefore) throw new GuardianError("RUNTIME_LATCH_UNAVAILABLE", "The live Runner has no latch observation for the authoritative task");
-    const handoffBefore = runner.storage.latestHandoffForTask(taskId2);
+    const handoffBefore = authorityStorage.latestHandoffForTask(taskId2);
     const git3 = runner.handoffService.observeGit();
     const context = safeContextUsage(ctx);
-    const latchAfter = runner.storage.getLatch(taskId2);
-    const handoffAfter = runner.storage.latestHandoffForTask(taskId2);
+    const latchAfter = authorityStorage.getLatch(taskId2);
+    const handoffAfter = authorityStorage.latestHandoffForTask(taskId2);
     const sessionAfter = runner.runtime?.session ?? null;
     const secondPlan = readPlan(runner.ledger.path, planOptions);
     if (!secondPlan.valid || firstPlan.digest !== secondPlan.digest || sessionBefore?.sessionId !== sessionAfter?.sessionId || !sameIdentity(latchIdentity(latchBefore), latchIdentity(latchAfter)) || !sameIdentity(handoffIdentity(handoffBefore), handoffIdentity(handoffAfter))) {
@@ -4028,7 +4066,7 @@ function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
     }
     const session = sessionAfter;
     const handoff = handoffAfter;
-    const binding = handoff?.target_session_id === session?.sessionId ? runner.storage.getRunnerSessionBinding(handoff.handoff_id) : null;
+    const binding = handoff?.target_session_id === session?.sessionId ? authorityStorage.getRunnerSessionBinding(handoff.handoff_id) : null;
     const model = session?.model?.provider && session?.model?.id ? `${session.model.provider}/${session.model.id}` : null;
     return Object.freeze({
       ...base,
@@ -5024,10 +5062,13 @@ function guidedHandoffFailure(error, projection) {
     "Aiopago non ritenterà automaticamente."
   ].join("\n");
 }
+function admissionOpen(runner, taskId2) {
+  return (runner.authorityStorage ?? runner.storage).isAdmissionOpen(taskId2);
+}
 async function adviseHandoff(runner, ctx, guided) {
   if (guided.inFlight || !ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
   const task = readLedgerForHook(runner, ctx, "warning");
-  if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return;
+  if (!task || !admissionOpen(runner, task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
   const expectedEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
@@ -5045,7 +5086,7 @@ Preparare una nuova sessione?`
     );
     if (!prepare || guided.shutdownEpoch !== epoch) return;
     const currentEligibility = guidedHandoffEligibilityIdentity(observeRunnerHumanWorkflow(runner, ctx));
-    if (!sameGuidedHandoffEligibility(expectedEligibility, currentEligibility) || !runner.storage.isAdmissionOpen(currentEligibility?.taskId)) {
+    if (!sameGuidedHandoffEligibility(expectedEligibility, currentEligibility) || !admissionOpen(runner, currentEligibility?.taskId)) {
       safeNotify(ctx, "Lo stato è cambiato mentre la conferma era aperta; l’handoff non è stato avviato. Ispeziona /aio status e conferma di nuovo a una futura advisory.", "warning");
       return;
     }
@@ -5145,7 +5186,7 @@ function createGuardianExtension(runner) {
       }
       const task = readLedgerForHook(runner, ctx);
       if (!task) return { action: "handled" };
-      if (!runner.storage.isAdmissionOpen(task.task_id)) {
+      if (!admissionOpen(runner, task.task_id)) {
         safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning");
         return { action: "handled" };
       }
@@ -5167,11 +5208,11 @@ function createGuardianExtension(runner) {
     });
     pi.on("session_before_compact", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+      if (!task || !admissionOpen(runner, task.task_id)) return { cancel: true };
     });
     pi.on("session_before_tree", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
+      if (!task || !admissionOpen(runner, task.task_id)) return { cancel: true };
     });
     pi.on("session_before_switch", (_event, ctx) => {
       const task = readLedgerForHook(runner, ctx);
@@ -5950,6 +5991,7 @@ var init_handoff = __esm({
     init_git_state();
     init_handoff_reservation_authority();
     init_lifecycle_binding_authority();
+    init_resume_authority();
     init_handoff_plan_internal();
     init_handoff_consent();
     init_ledger();
@@ -6001,6 +6043,7 @@ var init_handoff = __esm({
         if (reservationAuthority) {
           requireSecureHandoffAuthority(reservationAuthority);
           requireSecureLifecycleAuthority(reservationAuthority);
+          requireSecureResumeAuthority(reservationAuthority);
           invariant(
             safePoint?.latchAuthority === reservationAuthority,
             "SECURE_HANDOFF_LATCH_TRANSACTION_REQUIRED",
@@ -6511,7 +6554,7 @@ var init_handoff = __esm({
             expectedResume,
             targetSession: session
           });
-          this.discardResumeConfirmation(expectedResume);
+          this.declineResumeConfirmation(expectedResume, options.actor);
         }
         return h;
       }
@@ -6655,17 +6698,42 @@ var init_handoff = __esm({
         this.assertModelPolicy(plan2, targetSession);
         const resumePrompt = this.buildPrompt(h, m);
         const resumePromptDigest = sha256(Buffer.from(resumePrompt, "utf8"));
-        if (h.state === "RESUME_READY") {
+        const alreadyReady = h.state === "RESUME_READY";
+        if (alreadyReady) {
           invariant(
             h.resume_prompt === resumePrompt && h.resume_prompt_digest === resumePromptDigest,
             "RESUME_EXPECTATION_STALE",
             "Existing resume prompt no longer equals current continuity evidence"
           );
-          return h;
+        } else {
+          h.resume_prompt = resumePrompt;
+          h.resume_prompt_digest = resumePromptDigest;
+          h.state = "RESUME_READY";
         }
-        h.resume_prompt = resumePrompt;
-        h.resume_prompt_digest = resumePromptDigest;
-        h.state = "RESUME_READY";
+        if (this.reservationAuthority) {
+          const reservation = this.reservationAuthority.getHandoffReservation(handoffId);
+          invariant(
+            reservation && sameHandoffReservationIdentity(reservation, h),
+            "RESUME_RESERVATION_STALE",
+            "Portable handoff projection no longer matches protected reservation identity"
+          );
+          const binding = this.bindingAuthority.getLifecycleBinding(handoffId);
+          invariant(binding?.status === "ACTIVE", "LIFECYCLE_BINDING_STALE");
+          const readiness = this.reservationAuthority.requestResumeReadiness(`ready:${h.resume_prompt_id}`, {
+            handoff_id: h.handoff_id,
+            reservation_digest: reservation.reservation_digest,
+            binding,
+            latch: { task_id: h.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
+            checkpoint_digest: h.checkpoint_digest,
+            resume_manifest_digest: h.resume_manifest_digest,
+            resume_prompt_id: h.resume_prompt_id,
+            resume_prompt_digest: h.resume_prompt_digest,
+            resume_prompt: h.resume_prompt,
+            plan_semantic_digest: planSemanticDigest(reservedPlan, { requireAll: true })
+          });
+          invariant(readiness?.readiness?.readiness_digest, "RESUME_READINESS_COMMIT_FAILED");
+        }
+        if (alreadyReady) return h;
         saveTrustedHandoff(this.storage, h, "CONTINUITY_VALIDATED", { manifest_digest: h.resume_manifest_digest, resume_prompt_digest: h.resume_prompt_digest });
         const ready = this.storage.getHandoff(handoffId);
         this.metric("RESUME_READY", {
@@ -6709,6 +6777,15 @@ var init_handoff = __esm({
       #captureResumeAuthority(handoffId, targetSession, coordinatedPlan, expectedAuthority = null) {
         const h = this.storage.getHandoff(handoffId);
         invariant(h?.state === "RESUME_READY", "RESUME_NOT_READY", h?.state ?? "HANDOFF_NOT_FOUND");
+        const protectedResume = this.reservationAuthority?.getResumeState?.(handoffId) ?? null;
+        const protectedReadiness = protectedResume?.readiness ?? null;
+        if (this.reservationAuthority) {
+          invariant(
+            protectedReadiness && protectedReadiness.resume_prompt_id === h.resume_prompt_id && protectedReadiness.resume_prompt_digest === h.resume_prompt_digest && protectedReadiness.checkpoint_digest === h.checkpoint_digest && protectedReadiness.resume_manifest_digest === h.resume_manifest_digest && protectedResume.authorization === null && protectedResume.admission === null && protectedResume.dispatch === null,
+            "RESUME_READINESS_STALE",
+            "Protected resume readiness is absent, changed, or already consumed"
+          );
+        }
         invariant(
           targetSession && typeof targetSession === "object" && targetSession.sessionId === h.target_session_id,
           "RESUME_EXPECTATION_STALE",
@@ -6765,9 +6842,9 @@ var init_handoff = __esm({
           "RESUME_EXPECTATION_STALE",
           "Resume authorization, admission, or dispatch is no longer empty"
         );
-        const latest = this.storage.latestHandoffForTask(h.task_id);
+        const latest = this.reservationAuthority ? this.reservationAuthority.latestHandoffReservationForTask(h.task_id) : this.storage.latestHandoffForTask(h.task_id);
         invariant(latest?.handoff_id === h.handoff_id, "TASK_OPERATION_CONFLICT", "The handoff no longer owns the task operation");
-        const durableCounts = assertNoCompetingResumeEvidence(this.storage, handoffId);
+        const durableCounts = this.reservationAuthority ? { authorizations: 0, admissions: 0, dispatch_attempts: 0 } : assertNoCompetingResumeEvidence(this.storage, handoffId);
         const authority = deepFreeze5(structuredClone({
           schema: "aiopago.internal-resume-attestation/1",
           handoff: h,
@@ -6794,6 +6871,7 @@ var init_handoff = __esm({
             replacement_session_id: binding.replacement_session_id,
             runner_instance_id: binding.runner_instance_id,
             session_binding_id: binding.session_binding_id,
+            lifecycle_incarnation: binding.lifecycle_incarnation ?? null,
             status: binding.status
           },
           checkpoint: { id: h.checkpoint_id, digest: checkpoint.digest, content_digest: checkpoint.content_digest },
@@ -6801,6 +6879,7 @@ var init_handoff = __esm({
           resume_prompt: { id: h.resume_prompt_id, digest: h.resume_prompt_digest, text: h.resume_prompt },
           latch: { task_id: h.task_id, state: latch.state, generation: latch.generation, reason: latch.reason },
           authorization: { state: h.authorization_state, admission: h.admission_state, dispatch: h.dispatch_state, durable_counts: durableCounts },
+          protected_readiness: protectedReadiness,
           task_operation_handoff_id: latest.handoff_id
         }));
         if (expectedAuthority) {
@@ -6814,7 +6893,6 @@ var init_handoff = __esm({
         return authority;
       }
       prepareResumeConfirmation(handoffId, targetSession, { currentTargetVerifier = null } = {}) {
-        invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Secure resume authorization/admission is not available in this reservation-only slice");
         const targetAttestation = currentTargetVerifier?.();
         invariant(!targetAttestation || typeof targetAttestation.then !== "function", "RESUME_ATTESTATION_INVALID", "Current target attestation must be synchronous");
         const h = this.storage.getHandoff(handoffId);
@@ -6853,13 +6931,38 @@ var init_handoff = __esm({
       discardResumeConfirmation(expectation) {
         return this.#resumeExpectations.delete(expectation);
       }
+      declineResumeConfirmation(expectation, actor = "human:resume") {
+        const prepared = expectation && typeof expectation === "object" ? this.#resumeExpectations.get(expectation) : null;
+        invariant(prepared, "RESUME_ATTESTATION_REQUIRED", "Resume NO requires the invocation-local expectation shown by this trusted interaction");
+        this.#resumeExpectations.delete(expectation);
+        if (!this.reservationAuthority) return { answer: "NO", authorized: false, admitted: false, dispatch_permit: false };
+        const readiness = prepared.authority.protected_readiness;
+        invariant(readiness?.readiness_digest, "RESUME_READINESS_STALE");
+        return this.reservationAuthority.requestResumeDecision(expectation.expectation_id, {
+          answer: "NO",
+          actor,
+          handoff_id: expectation.handoff_id,
+          readiness_digest: readiness.readiness_digest,
+          resume_prompt_id: expectation.resume_prompt_id
+        });
+      }
       async resume(handoffId, { actor = "human:resume", sendResume, expectedResume = null, targetSession = null } = {}) {
-        invariant(this.reservationAuthority === null, "SECURE_RESUME_AUTHORITY_UNAVAILABLE", "Portable resume authority cannot progress a protected handoff reservation");
         let h = this.storage.getHandoff(handoffId);
         invariant(h, "HANDOFF_NOT_FOUND");
+        const canonicalBefore = this.reservationAuthority?.getResumeState?.(handoffId) ?? null;
+        if (canonicalBefore?.dispatch?.state === "ACKNOWLEDGED") {
+          if (h.state !== "RESUMED") h = projectTrustedCanonicalResumeOutcome(this.storage, {
+            handoff_id: handoffId,
+            outcome: "ACKNOWLEDGED",
+            state: canonicalBefore
+          });
+          return h;
+        }
         if (h.state === "RESUMED") return h;
         if (h.state === "CONTINUITY_FAILED") throw new GuardianError("CONTINUITY_RECOVERY_REQUIRED", `Use /aio handoff recover ${h.handoff_id}`);
-        if (h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Automatic redispatch is forbidden");
+        if (canonicalBefore?.dispatch || h.state === "RESUME_DISPATCH_UNKNOWN" || h.dispatch_state === "UNKNOWN") {
+          throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "A durable dispatch intent already exists and has no safe replay");
+        }
         invariant(typeof sendResume === "function", "RESUME_TRANSPORT_REQUIRED");
         const prepared = expectedResume && typeof expectedResume === "object" ? this.#resumeExpectations.get(expectedResume) : null;
         invariant(
@@ -6869,9 +6972,12 @@ var init_handoff = __esm({
         );
         this.#resumeExpectations.delete(expectedResume);
         const resumeStarted = performance3.now();
+        const authorizationId = stableId("AUTH", expectedResume.resume_prompt_id);
         const admissionId = stableId("ADM", expectedResume.resume_prompt_id);
+        const attemptId = stableId("DSP", admissionId, "1");
         const admission = authorizeTrustedResume(this.ledger, {
           storage: this.storage,
+          resumeAuthority: this.reservationAuthority,
           expectedPlan: {
             taskId: expectedResume.task_id,
             planRevisionId: expectedResume.task_plan_revision,
@@ -6886,6 +6992,24 @@ var init_handoff = __esm({
               "Current Runner target ownership changed after resume confirmation was displayed"
             );
             const authority = this.#captureResumeAuthority(handoffId, targetSession, coordinatedPlan, prepared.authority);
+            if (this.reservationAuthority) return {
+              requestId: expectedResume.expectation_id,
+              decision: {
+                answer: "YES",
+                actor,
+                handoff_id: handoffId,
+                readiness_digest: authority.protected_readiness.readiness_digest,
+                resume_prompt_id: authority.resume_prompt.id,
+                authorization_id: authorizationId,
+                admission_id: admissionId,
+                idempotency_key: `resume:${authority.resume_prompt.id}`,
+                dispatch_attempt_id: attemptId,
+                attempt_no: 1,
+                binding: authority.binding,
+                latch: authority.latch
+              },
+              attestation: authority
+            };
             return {
               handoffId,
               actor,
@@ -6902,36 +7026,82 @@ var init_handoff = __esm({
             };
           }
         });
-        h = admission.handoff;
+        let dispatchPermit;
+        let prompt;
+        if (this.reservationAuthority) {
+          h = projectTrustedCanonicalResumeDecision(this.storage, admission);
+          dispatchPermit = admission.dispatch_permit === true;
+          prompt = admission.state.readiness.resume_prompt;
+        } else {
+          h = admission.handoff;
+          const dispatch = beginTrustedResumeDispatch(this.storage, handoffId, attemptId, 1);
+          if (dispatch.idempotent) {
+            if (dispatch.attempt.state === "ACKNOWLEDGED") return this.storage.getHandoff(handoffId);
+            throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Durable dispatch intent has no safe replay");
+          }
+          dispatchPermit = true;
+          prompt = h.resume_prompt;
+        }
         this.metric("RESUME_STARTED", {
           handoff: h,
           session_id: h.target_session_id,
           checkpoint_id: h.checkpoint_id,
           reason: "HUMAN_RESUME_AUTHORIZED"
         });
-        const attemptId = stableId("DSP", admissionId, "1");
-        const dispatch = beginTrustedResumeDispatch(this.storage, handoffId, attemptId, 1);
-        if (dispatch.idempotent) {
-          const state = dispatch.attempt.state;
-          if (state === "ACKNOWLEDGED") return this.storage.getHandoff(handoffId);
-          finishTrustedResumeDispatch(this.storage, handoffId, "UNKNOWN", "reload/retry after durable dispatch intent");
-          throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Durable dispatch intent has no safe replay");
+        if (!dispatchPermit) throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Duplicate admission cannot replay the durable external dispatch intent");
+        if (this.reservationAuthority) {
+          try {
+            const finalTarget = prepared.currentTargetVerifier?.();
+            invariant(
+              !finalTarget || typeof finalTarget.then !== "function" && sameCanonicalJson(finalTarget, prepared.targetAttestation),
+              "RESUME_EXPECTATION_STALE",
+              "Target lifecycle changed after admission but before external dispatch"
+            );
+            const finalBinding = this.reservationAuthority.getLifecycleBinding(handoffId);
+            invariant(
+              finalBinding?.status === "ACTIVE" && finalBinding.lifecycle_incarnation === admission.state.readiness.lifecycle_incarnation,
+              "LIFECYCLE_BINDING_STALE",
+              "Protected target shut down after admission but before external dispatch"
+            );
+            const finalLatch = this.reservationAuthority.getLatch(h.task_id);
+            invariant(
+              finalLatch?.state === "RELEASED" && finalLatch.generation === admission.state.authorization.released_latch_generation,
+              finalLatch?.reason === "HUMAN_TAKEOVER" ? "HUMAN_TAKEOVER_ACTIVE" : "LATCH_GENERATION_MISMATCH",
+              "Protected latch changed after admission but before external dispatch"
+            );
+          } catch (error) {
+            const failed = this.reservationAuthority.requestResumeDispatchOutcome(`failed:${attemptId}`, {
+              dispatch_attempt_id: attemptId,
+              outcome: "FAILED",
+              error: String(error?.code ?? error?.message ?? error).replace(/\s+/g, " ").slice(0, 2048)
+            });
+            projectTrustedCanonicalResumeOutcome(this.storage, failed);
+            throw error;
+          }
         }
         try {
-          await sendResume(h.resume_prompt);
-          const completed = finishTrustedResumeDispatch(this.storage, handoffId, "ACKNOWLEDGED");
-          this.metric("COMPLETED", {
-            handoff: completed,
-            session_id: completed.target_session_id,
-            checkpoint_id: completed.checkpoint_id,
-            reason: "RESUME_ACKNOWLEDGED",
-            resume_duration_ms: performance3.now() - resumeStarted
-          });
-          return completed;
+          await sendResume(prompt);
         } catch (error) {
-          finishTrustedResumeDispatch(this.storage, handoffId, "UNKNOWN", error.message);
+          const unknown = this.reservationAuthority ? this.reservationAuthority.requestResumeDispatchOutcome(`unknown:${attemptId}`, { dispatch_attempt_id: attemptId, outcome: "UNKNOWN", error: String(error?.message ?? error).replace(/\s+/g, " ").slice(0, 2048) }) : { handoff_id: handoffId, outcome: "UNKNOWN", state: null };
+          if (this.reservationAuthority) projectTrustedCanonicalResumeOutcome(this.storage, unknown);
+          else finishTrustedResumeDispatch(this.storage, handoffId, "UNKNOWN", error.message);
           throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Resume might have been accepted; no automatic retry", { cause: error.message });
         }
+        let outcome;
+        try {
+          outcome = this.reservationAuthority ? this.reservationAuthority.requestResumeDispatchOutcome(`ack:${attemptId}`, { dispatch_attempt_id: attemptId, outcome: "ACKNOWLEDGED", error: null }) : null;
+        } catch (error) {
+          throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "External resume returned success but its protected outcome was not committed; reconciliation is required and retry is forbidden", { cause: error.message });
+        }
+        const completed = this.reservationAuthority ? projectTrustedCanonicalResumeOutcome(this.storage, outcome) : finishTrustedResumeDispatch(this.storage, handoffId, "ACKNOWLEDGED");
+        this.metric("COMPLETED", {
+          handoff: completed,
+          session_id: completed.target_session_id,
+          checkpoint_id: completed.checkpoint_id,
+          reason: "RESUME_ACKNOWLEDGED",
+          resume_duration_ms: performance3.now() - resumeStarted
+        });
+        return completed;
       }
       async resumeExisting(h, options) {
         if (h.state === "RESUMED") return h;
@@ -6944,7 +7114,7 @@ var init_handoff = __esm({
           if (await options.confirmResume(options.targetSession, h)) {
             return this.resume(h.handoff_id, { ...options, expectedResume, targetSession: options.targetSession });
           }
-          this.discardResumeConfirmation(expectedResume);
+          this.declineResumeConfirmation(expectedResume, options.actor);
           return h;
         }
         if (h.admission_state === "COMMITTED") throw new GuardianError("RESUME_DISPATCH_UNKNOWN", "Committed admission cannot be reconfirmed or replayed");
@@ -7356,7 +7526,7 @@ function database(storage) {
   invariant(value, "STORAGE_CLOSED", "GuardianStorage is closed or invalid");
   return value;
 }
-function sameHandoffReservationIdentity(existing, projection) {
+function sameHandoffReservationIdentity2(existing, projection) {
   if (!existing || !projection) return false;
   return HANDOFF_RESERVATION_IDENTITY_FIELDS.every((field) => {
     const left = existing[field] ?? null;
@@ -7446,7 +7616,7 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
   invariant(precondition && precondition.latch && Object.hasOwn(precondition, "expectedHandoff"), "HANDOFF_RESERVATION_PRECONDITION_REQUIRED");
   const exact = storage.getHandoff(projection.handoff_id);
   if (exact) {
-    if (sameHandoffReservationIdentity(exact, projection)) return { created: false, handoff: exact };
+    if (sameHandoffReservationIdentity2(exact, projection)) return { created: false, handoff: exact };
     throw new GuardianError("TASK_OPERATION_CONFLICT", "The requested handoff identity already belongs to a different durable operation", { handoff_id: projection.handoff_id });
   }
   const latch = storage.getLatch(projection.task_id);
@@ -7461,7 +7631,7 @@ function reserveHandoffInTransaction(storage, projection, precondition) {
   const active = database(storage).prepare("SELECT handoff_id FROM active_sources WHERE source_session_id=?").get(projection.source_session_id);
   if (active) {
     const existing = storage.getHandoff(active.handoff_id);
-    if (sameHandoffReservationIdentity(existing, projection)) return { created: false, handoff: existing };
+    if (sameHandoffReservationIdentity2(existing, projection)) return { created: false, handoff: existing };
     throw new GuardianError("HANDOFF_ACTIVE_SOURCE_CONFLICT", "The source session is already reserved by a different handoff operation", {
       source_session_id: projection.source_session_id,
       existing_handoff_id: existing?.handoff_id ?? active.handoff_id,
@@ -7606,6 +7776,8 @@ var init_storage = __esm({
             { token: TRUSTED_RECOVERY_RESERVATION, reservation, attestation }
           ),
           authorizeResume: (request) => this.#authorizeAndAdmitTrustedResume(request),
+          projectCanonicalResumeDecision: (result) => this.#projectCanonicalResumeDecision(result),
+          projectCanonicalResumeOutcome: (result) => this.#projectCanonicalResumeOutcome(result),
           resumeEvidence: (handoffId) => Object.freeze({
             authorizations: database(this).prepare("SELECT COUNT(*) AS count FROM authorizations WHERE handoff_id=?").get(handoffId).count,
             admissions: database(this).prepare("SELECT COUNT(*) AS count FROM admissions WHERE handoff_id=?").get(handoffId).count,
@@ -8080,6 +8252,68 @@ var init_storage = __esm({
           return this.getHandoff(id);
         });
       }
+      #projectCanonicalResumeDecision(result) {
+        const state = result?.state;
+        const readiness = state?.readiness;
+        const authorization = state?.authorization;
+        const admission = state?.admission;
+        const dispatch = state?.dispatch;
+        invariant(
+          result?.answer === "YES" && readiness && authorization && admission && dispatch && authorization.handoff_id === readiness.handoff_id && admission.handoff_id === readiness.handoff_id && dispatch.handoff_id === readiness.handoff_id,
+          "RESUME_PROJECTION_PROOF_INVALID"
+        );
+        return this.transaction(() => {
+          const h = this.getHandoff(readiness.handoff_id);
+          invariant(h, "HANDOFF_NOT_FOUND");
+          database(this).prepare("DELETE FROM dispatch_attempts WHERE handoff_id=? OR dispatch_attempt_id=?").run(h.handoff_id, dispatch.dispatch_attempt_id);
+          database(this).prepare("DELETE FROM admissions WHERE handoff_id=? OR admission_id=? OR resume_prompt_id=? OR idempotency_key=?").run(h.handoff_id, admission.admission_id, admission.resume_prompt_id, admission.idempotency_key);
+          database(this).prepare("DELETE FROM authorizations WHERE handoff_id=? OR resume_prompt_id=?").run(h.handoff_id, authorization.resume_prompt_id);
+          database(this).prepare("INSERT INTO authorizations(resume_prompt_id,handoff_id,actor,latch_generation,authorized_at) VALUES(?,?,?,?,?)").run(authorization.resume_prompt_id, h.handoff_id, authorization.actor, authorization.released_latch_generation, authorization.authorized_at);
+          database(this).prepare("INSERT INTO admissions(admission_id,resume_prompt_id,idempotency_key,handoff_id,committed_at) VALUES(?,?,?,?,?)").run(admission.admission_id, admission.resume_prompt_id, admission.idempotency_key, h.handoff_id, admission.committed_at);
+          database(this).prepare("INSERT INTO dispatch_attempts(dispatch_attempt_id,admission_id,handoff_id,attempt_no,state,intent_at,outcome_at,error) VALUES(?,?,?,?,?,?,?,?)").run(dispatch.dispatch_attempt_id, admission.admission_id, h.handoff_id, dispatch.attempt_no, dispatch.state, dispatch.intent_at, dispatch.outcome_at, dispatch.error);
+          const latch = this.getLatch(h.task_id);
+          if (latch && latch.generation <= authorization.released_latch_generation) {
+            database(this).prepare("UPDATE latches SET state='RELEASED',generation=?,reason=NULL,released_at=?,released_by=?,last_event_id=? WHERE task_id=?").run(authorization.released_latch_generation, authorization.authorized_at, authorization.actor, `PROTECTED:${authorization.authorization_id}`, h.task_id);
+          }
+          h.authorization_state = "AUTHORIZED";
+          h.admission_state = "COMMITTED";
+          h.admission_id = admission.admission_id;
+          h.dispatch_state = dispatch.state;
+          h.dispatch_attempt_id = dispatch.dispatch_attempt_id;
+          h.dispatch_attempt_no = dispatch.attempt_no;
+          h.state = "RESUME_DISPATCHING";
+          h.updated_at = dispatch.intent_at;
+          database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), h.updated_at, h.handoff_id);
+          database(this).prepare("DELETE FROM journal WHERE event_key IN (?,?,?)").run(`authorization:${h.resume_prompt_id}`, `admission:${h.resume_prompt_id}`, `dispatch-intent:${dispatch.dispatch_attempt_id}`);
+          this.appendEvent("RESUME_AUTHORIZED", { resume_prompt_id: h.resume_prompt_id, actor: authorization.actor, authorization_id: authorization.authorization_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `authorization:${h.resume_prompt_id}` });
+          this.appendEvent("RESUME_ADMISSION_COMMITTED", { resume_prompt_id: h.resume_prompt_id, admission_id: admission.admission_id, idempotency_key: admission.idempotency_key, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `admission:${h.resume_prompt_id}` });
+          this.appendEvent("RESUME_DISPATCH_INTENT", { dispatch_attempt_id: dispatch.dispatch_attempt_id, admission_id: admission.admission_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-intent:${dispatch.dispatch_attempt_id}` });
+          return this.getHandoff(h.handoff_id);
+        });
+      }
+      #projectCanonicalResumeOutcome(result) {
+        const state = result?.state;
+        const dispatch = state?.dispatch;
+        invariant(
+          dispatch && dispatch.handoff_id === result.handoff_id && dispatch.state === result.outcome,
+          "RESUME_PROJECTION_PROOF_INVALID"
+        );
+        return this.transaction(() => {
+          const h = this.getHandoff(result.handoff_id);
+          invariant(h, "HANDOFF_NOT_FOUND");
+          database(this).prepare("UPDATE dispatch_attempts SET state=?,outcome_at=?,error=? WHERE dispatch_attempt_id=?").run(dispatch.state, dispatch.outcome_at, dispatch.error, dispatch.dispatch_attempt_id);
+          h.dispatch_state = dispatch.state;
+          h.state = dispatch.state === "ACKNOWLEDGED" ? "RESUMED" : dispatch.state === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : dispatch.state === "FAILED" ? "RESUME_DISPATCH_FAILED" : "RESUME_DISPATCHED";
+          h.updated_at = dispatch.outcome_at;
+          database(this).prepare("UPDATE handoffs SET state=?,projection_json=?,updated_at=? WHERE handoff_id=?").run(h.state, JSON.stringify(h), h.updated_at, h.handoff_id);
+          database(this).prepare("DELETE FROM journal WHERE event_key IN (?,?,?)").run(`dispatch-dispatched:${dispatch.dispatch_attempt_id}`, `dispatch-acknowledged:${dispatch.dispatch_attempt_id}`, `dispatch-${dispatch.state.toLowerCase()}:${dispatch.dispatch_attempt_id}`);
+          if (dispatch.state === "ACKNOWLEDGED") {
+            this.appendEvent("RESUME_DISPATCHED", { dispatch_attempt_id: dispatch.dispatch_attempt_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-dispatched:${dispatch.dispatch_attempt_id}` });
+            this.appendEvent("RESUME_ACKNOWLEDGED", { dispatch_attempt_id: dispatch.dispatch_attempt_id, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-acknowledged:${dispatch.dispatch_attempt_id}` });
+          } else this.appendEvent(dispatch.state === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : `RESUME_${dispatch.state}`, { dispatch_attempt_id: dispatch.dispatch_attempt_id, error: dispatch.error, protected_projection: true }, { handoffId: h.handoff_id, eventKey: `dispatch-${dispatch.state.toLowerCase()}:${dispatch.dispatch_attempt_id}` });
+          return this.getHandoff(h.handoff_id);
+        });
+      }
       #authorizeAndAdmitTrustedResume(request) {
         const { handoffId: id, actor, idempotencyKey, admissionId, expected } = request ?? {};
         invariant(expected?.handoff && expected?.binding && expected?.latch && typeof expected?.planSemanticDigest === "string", "RESUME_ATTESTATION_REQUIRED");
@@ -8327,20 +8561,51 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
   let facade = storageReadFacades.get(authorityKey);
   if (facade) return facade;
   const read = (method) => (...args) => detached(storage[method](...args));
+  const protectedHandoff = (handoffId) => {
+    if (!handoffAuthority) return storage.getHandoff(handoffId);
+    const reservation = handoffAuthority.getHandoffReservation(handoffId);
+    if (!reservation) return null;
+    const resume = handoffAuthority.getResumeState?.(handoffId) ?? null;
+    if (!resume?.readiness) return reservation;
+    const dispatchState = resume.dispatch?.state ?? "NOT_STARTED";
+    const state = dispatchState === "ACKNOWLEDGED" ? "RESUMED" : dispatchState === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN" : dispatchState === "FAILED" ? "RESUME_DISPATCH_FAILED" : dispatchState === "DISPATCHED" ? "RESUME_DISPATCHED" : dispatchState === "DISPATCHING" ? "RESUME_DISPATCHING" : "RESUME_READY";
+    return {
+      ...reservation,
+      target_session_id: resume.readiness.replacement_session_id,
+      checkpoint_digest: resume.readiness.checkpoint_digest,
+      resume_manifest_digest: resume.readiness.resume_manifest_digest,
+      resume_prompt_id: resume.readiness.resume_prompt_id,
+      resume_prompt_digest: resume.readiness.resume_prompt_digest,
+      authorization_state: resume.authorization ? "AUTHORIZED" : "NOT_AUTHORIZED",
+      admission_state: resume.admission ? "COMMITTED" : "NOT_COMMITTED",
+      admission_id: resume.admission?.admission_id ?? null,
+      dispatch_state: dispatchState,
+      dispatch_attempt_id: resume.dispatch?.dispatch_attempt_id ?? null,
+      dispatch_attempt_no: resume.dispatch?.attempt_no ?? 0,
+      state
+    };
+  };
   facade = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
     path: storage.path,
     getCalibrationRuntimeIdentity: read("getCalibrationRuntimeIdentity"),
     getLatch: (...args) => detached(latchAuthority.getLatch(...args)),
     isAdmissionOpen: (...args) => latchAuthority.isAdmissionOpen(...args),
-    getHandoff: (...args) => detached(handoffAuthority ? handoffAuthority.getHandoffReservation(...args) : storage.getHandoff(...args)),
-    findHandoffByTarget: (...args) => detached(handoffAuthority ? null : storage.findHandoffByTarget(...args)),
+    getHandoff: (...args) => detached(protectedHandoff(...args)),
+    findHandoffByTarget: (...args) => detached(handoffAuthority ? (() => {
+      const binding = handoffAuthority.getLifecycleBindingBySession?.(...args);
+      return binding ? protectedHandoff(binding.handoff_id) : null;
+    })() : storage.findHandoffByTarget(...args)),
     findHandoffBySource: (...args) => detached(handoffAuthority ? (() => {
       const active = handoffAuthority.getActiveSource(...args);
-      return active ? handoffAuthority.getHandoffReservation(active.handoff_id) : null;
+      return active ? protectedHandoff(active.handoff_id) : null;
     })() : storage.findHandoffBySource(...args)),
     pendingContinuityFailureForTask: (...args) => detached(handoffAuthority ? null : storage.pendingContinuityFailureForTask(...args)),
     getRunnerSessionBinding: (...args) => detached(handoffAuthority?.getLifecycleBinding ? handoffAuthority.getLifecycleBinding(...args) : storage.getRunnerSessionBinding(...args)),
-    latestHandoffForTask: (...args) => detached(handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args)),
+    getResumeAuthority: (...args) => detached(handoffAuthority?.getResumeState ? handoffAuthority.getResumeState(...args) : null),
+    latestHandoffForTask: (...args) => {
+      const latest = handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args);
+      return detached(handoffAuthority && latest ? protectedHandoff(latest.handoff_id) : latest);
+    },
     operationsForTask: read("operationsForTask"),
     getMetricSession: read("getMetricSession"),
     metricSessions: read("metricSessions"),
@@ -8623,6 +8888,10 @@ var init_runner = __esm({
         return ledgerReadFacade(runnerInternals.get(this)?.ledger);
       }
       get storage() {
+        const internal = runnerInternals.get(this);
+        return storageReadFacade(internal?.storage, internal?.latchAuthority, internal?.reservationAuthority ?? null);
+      }
+      get authorityStorage() {
         const internal = runnerInternals.get(this);
         return storageReadFacade(internal?.storage, internal?.latchAuthority, internal?.reservationAuthority ?? null);
       }
@@ -8965,7 +9234,7 @@ var init_runner = __esm({
         });
         const confirmed = await ctx.ui.confirm("Aiopago resume", `Authorize resume for ${h.handoff_id}?`);
         if (!confirmed) {
-          this.handoffService.discardResumeConfirmation(expectedResume);
+          this.handoffService.declineResumeConfirmation(expectedResume, "human:/aio-resume");
           return this.storage.getHandoff(h.handoff_id);
         }
         const result = await this.handoffService.resume(h.handoff_id, {

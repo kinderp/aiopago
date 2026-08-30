@@ -8,6 +8,7 @@ import { OPERATION_AUTHORITY_PROTOCOL, requireSecureOperationAuthority } from ".
 import { requireSecureLatchAuthority } from "./latch-authority.mjs";
 import { requireSecureHandoffAuthority } from "./handoff-reservation-authority.mjs";
 import { requireSecureLifecycleAuthority } from "./lifecycle-binding-authority.mjs";
+import { requireSecureResumeAuthority } from "./resume-authority.mjs";
 import { ProtectedSqliteOperationAuthority } from "./protected-operation-authority.mjs";
 import { ToolOperationTracker } from "./safety.mjs";
 
@@ -112,6 +113,15 @@ function lifecycleBindingResult(binding) {
     schema_version: binding.schema_version,
   } : null;
 }
+function resumeStateResult(state) {
+  if (!state) return null;
+  return {
+    readiness: state.readiness ?? null,
+    authorization: state.authorization ?? null,
+    admission: state.admission ?? null,
+    dispatch: state.dispatch ?? null,
+  };
+}
 
 async function dispatch(frame, hello) {
   if (frame.version !== 1 || frame.protocol !== OPERATION_AUTHORITY_PROTOCOL || frame.capability !== capability) fail("PRIVATE_FRAME_BINDING_REJECTED");
@@ -214,6 +224,27 @@ async function dispatch(frame, hello) {
     case "LIFECYCLE_BIND_EVENTS":
       result = authority.lifecycleBindingEvents(payload.handoffId);
       break;
+    case "RESUME_READY_COMMIT": {
+      const ready = authority.requestResumeReadiness(requestId, payload);
+      result = { ...ready, readiness: authority.getResumeReadiness(payload.handoff_id) };
+      break;
+    }
+    case "RESUME_DECIDE": {
+      const decided = authority.requestResumeDecision(requestId, payload);
+      result = { ...decided, state: resumeStateResult(decided.state) };
+      break;
+    }
+    case "RESUME_DISPATCH_OUTCOME": {
+      const outcome = authority.requestResumeDispatchOutcome(requestId, payload);
+      result = { ...outcome, state: resumeStateResult(outcome.state) };
+      break;
+    }
+    case "RESUME_GET":
+      result = resumeStateResult(authority.getResumeState(payload.handoffId));
+      break;
+    case "RESUME_EVENTS":
+      result = authority.resumeAuthorityEvents(payload.handoffId);
+      break;
     case "OPERATION_RETRY_ADMISSION": {
       result = authority.admitOperation({
         operationId: payload.operationId, taskId: payload.taskId,
@@ -259,6 +290,16 @@ async function dispatch(frame, hello) {
       });
       fail("CRASH_SEAM_RETURNED");
       break;
+    case "TEST_CRASH_BEFORE_RESUME_ADMISSION_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeResumeAdmissionCommitForPhysicalTest(requestId, payload);
+      fail("CRASH_SEAM_RETURNED");
+      break;
+    case "TEST_CRASH_BEFORE_RESUME_OUTCOME_COMMIT":
+      if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
+      authority.crashBeforeResumeOutcomeCommitForPhysicalTest(requestId, payload);
+      fail("CRASH_SEAM_RETURNED");
+      break;
     case "TEST_AUTHORITY_TIMEOUT":
       if (hello.testScope !== true || !hello.serviceName.startsWith("AiopagoOperationAuthorityTest-")) fail("TEST_OPERATION_FORBIDDEN");
       await new Promise(() => {});
@@ -283,6 +324,7 @@ try {
   requireSecureLatchAuthority(authority);
   requireSecureHandoffAuthority(authority);
   requireSecureLifecycleAuthority(authority);
+  requireSecureResumeAuthority(authority);
   output({ version: 1, protocol: OPERATION_AUTHORITY_PROTOCOL, operationType: "SESSION_READY", capability, p2Pid: process.pid, authority: authority.status() });
 
   while (true) {

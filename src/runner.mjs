@@ -81,21 +81,55 @@ function storageReadFacade(storage, latchAuthority = storage, handoffAuthority =
   let facade = storageReadFacades.get(authorityKey);
   if (facade) return facade;
   const read = (method) => (...args) => detached(storage[method](...args));
+  const protectedHandoff = (handoffId) => {
+    if (!handoffAuthority) return storage.getHandoff(handoffId);
+    const reservation = handoffAuthority.getHandoffReservation(handoffId);
+    if (!reservation) return null;
+    const resume = handoffAuthority.getResumeState?.(handoffId) ?? null;
+    if (!resume?.readiness) return reservation;
+    const dispatchState = resume.dispatch?.state ?? "NOT_STARTED";
+    const state = dispatchState === "ACKNOWLEDGED" ? "RESUMED"
+      : dispatchState === "UNKNOWN" ? "RESUME_DISPATCH_UNKNOWN"
+      : dispatchState === "FAILED" ? "RESUME_DISPATCH_FAILED"
+      : dispatchState === "DISPATCHED" ? "RESUME_DISPATCHED"
+      : dispatchState === "DISPATCHING" ? "RESUME_DISPATCHING" : "RESUME_READY";
+    return {
+      ...reservation,
+      target_session_id: resume.readiness.replacement_session_id,
+      checkpoint_digest: resume.readiness.checkpoint_digest,
+      resume_manifest_digest: resume.readiness.resume_manifest_digest,
+      resume_prompt_id: resume.readiness.resume_prompt_id,
+      resume_prompt_digest: resume.readiness.resume_prompt_digest,
+      authorization_state: resume.authorization ? "AUTHORIZED" : "NOT_AUTHORIZED",
+      admission_state: resume.admission ? "COMMITTED" : "NOT_COMMITTED",
+      admission_id: resume.admission?.admission_id ?? null,
+      dispatch_state: dispatchState,
+      dispatch_attempt_id: resume.dispatch?.dispatch_attempt_id ?? null,
+      dispatch_attempt_no: resume.dispatch?.attempt_no ?? 0,
+      state,
+    };
+  };
   facade = Object.freeze(Object.assign(Object.create(null), {
     path: storage.path,
     getCalibrationRuntimeIdentity: read("getCalibrationRuntimeIdentity"),
     getLatch: (...args) => detached(latchAuthority.getLatch(...args)),
     isAdmissionOpen: (...args) => latchAuthority.isAdmissionOpen(...args),
-    getHandoff: (...args) => detached(handoffAuthority ? handoffAuthority.getHandoffReservation(...args) : storage.getHandoff(...args)),
-    findHandoffByTarget: (...args) => detached(handoffAuthority ? null : storage.findHandoffByTarget(...args)),
+    getHandoff: (...args) => detached(protectedHandoff(...args)),
+    findHandoffByTarget: (...args) => detached(handoffAuthority
+      ? (() => { const binding = handoffAuthority.getLifecycleBindingBySession?.(...args); return binding ? protectedHandoff(binding.handoff_id) : null; })()
+      : storage.findHandoffByTarget(...args)),
     findHandoffBySource: (...args) => detached(handoffAuthority
-      ? (() => { const active = handoffAuthority.getActiveSource(...args); return active ? handoffAuthority.getHandoffReservation(active.handoff_id) : null; })()
+      ? (() => { const active = handoffAuthority.getActiveSource(...args); return active ? protectedHandoff(active.handoff_id) : null; })()
       : storage.findHandoffBySource(...args)),
     pendingContinuityFailureForTask: (...args) => detached(handoffAuthority ? null : storage.pendingContinuityFailureForTask(...args)),
     getRunnerSessionBinding: (...args) => detached(handoffAuthority?.getLifecycleBinding
       ? handoffAuthority.getLifecycleBinding(...args)
       : storage.getRunnerSessionBinding(...args)),
-    latestHandoffForTask: (...args) => detached(handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args)),
+    getResumeAuthority: (...args) => detached(handoffAuthority?.getResumeState ? handoffAuthority.getResumeState(...args) : null),
+    latestHandoffForTask: (...args) => {
+      const latest = handoffAuthority ? handoffAuthority.latestHandoffReservationForTask(...args) : storage.latestHandoffForTask(...args);
+      return detached(handoffAuthority && latest ? protectedHandoff(latest.handoff_id) : latest);
+    },
     operationsForTask: read("operationsForTask"),
     getMetricSession: read("getMetricSession"),
     metricSessions: read("metricSessions"),
@@ -306,6 +340,10 @@ export class GuardianRunner {
   get repository() { return detached(runnerInternals.get(this)?.repository ?? null); }
   get ledger() { return ledgerReadFacade(runnerInternals.get(this)?.ledger); }
   get storage() {
+    const internal = runnerInternals.get(this);
+    return storageReadFacade(internal?.storage, internal?.latchAuthority, internal?.reservationAuthority ?? null);
+  }
+  get authorityStorage() {
     const internal = runnerInternals.get(this);
     return storageReadFacade(internal?.storage, internal?.latchAuthority, internal?.reservationAuthority ?? null);
   }
@@ -624,7 +662,7 @@ export class GuardianRunner {
     });
     const confirmed = await ctx.ui.confirm("Aiopago resume", `Authorize resume for ${h.handoff_id}?`);
     if (!confirmed) {
-      this.handoffService.discardResumeConfirmation(expectedResume);
+      this.handoffService.declineResumeConfirmation(expectedResume, "human:/aio-resume");
       return this.storage.getHandoff(h.handoff_id);
     }
     const result = await this.handoffService.resume(h.handoff_id, {

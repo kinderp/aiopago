@@ -363,6 +363,15 @@ var PORTABLE_LATCH_AUTHORITY_LABEL = Object.freeze({
   r1_m_13_latch_isolation: false
 });
 
+// src/resume-authority.mjs
+var RESUME_AUTHORITY_MODES = Object.freeze({ SECURE: "SECURE", PORTABLE: "PORTABLE" });
+var SECURE_RESUME_AUTHORITY_LABEL = Object.freeze({
+  mode: RESUME_AUTHORITY_MODES.SECURE,
+  canonical: true,
+  isolation: "OS_PROTECTED_DISTINCT_IDENTITY",
+  r1_m_13_resume_admission_dispatch_isolation: true
+});
+
 // src/handoff-plan-internal.mjs
 var handoffPlanCapabilities = /* @__PURE__ */ new WeakMap();
 function registerTrustedHandoffPlanCapability(ledger, capability) {
@@ -2091,15 +2100,16 @@ function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
   if (!firstPlan.valid) return Object.freeze({ ...base, runtime: EMPTY_RUNTIME });
   try {
     const taskId = firstPlan.plan.task_id;
+    const authorityStorage = runner.authorityStorage ?? runner.storage;
     const sessionBefore = runner.runtime?.session ?? null;
     if (!sessionBefore?.sessionId) throw new GuardianError("RUNTIME_SESSION_UNAVAILABLE", "The live Runner session cannot be observed");
-    const latchBefore = runner.storage.getLatch(taskId);
+    const latchBefore = authorityStorage.getLatch(taskId);
     if (!latchBefore) throw new GuardianError("RUNTIME_LATCH_UNAVAILABLE", "The live Runner has no latch observation for the authoritative task");
-    const handoffBefore = runner.storage.latestHandoffForTask(taskId);
+    const handoffBefore = authorityStorage.latestHandoffForTask(taskId);
     const git2 = runner.handoffService.observeGit();
     const context = safeContextUsage(ctx);
-    const latchAfter = runner.storage.getLatch(taskId);
-    const handoffAfter = runner.storage.latestHandoffForTask(taskId);
+    const latchAfter = authorityStorage.getLatch(taskId);
+    const handoffAfter = authorityStorage.latestHandoffForTask(taskId);
     const sessionAfter = runner.runtime?.session ?? null;
     const secondPlan = readPlan(runner.ledger.path, planOptions);
     if (!secondPlan.valid || firstPlan.digest !== secondPlan.digest || sessionBefore?.sessionId !== sessionAfter?.sessionId || !sameIdentity(latchIdentity(latchBefore), latchIdentity(latchAfter)) || !sameIdentity(handoffIdentity(handoffBefore), handoffIdentity(handoffAfter))) {
@@ -2117,7 +2127,7 @@ function observeRunnerHumanWorkflow(runner, ctx = null, options = {}) {
     }
     const session = sessionAfter;
     const handoff = handoffAfter;
-    const binding = handoff?.target_session_id === session?.sessionId ? runner.storage.getRunnerSessionBinding(handoff.handoff_id) : null;
+    const binding = handoff?.target_session_id === session?.sessionId ? authorityStorage.getRunnerSessionBinding(handoff.handoff_id) : null;
     const model = session?.model?.provider && session?.model?.id ? `${session.model.provider}/${session.model.id}` : null;
     return Object.freeze({
       ...base,
