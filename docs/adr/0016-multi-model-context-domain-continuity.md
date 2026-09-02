@@ -1,16 +1,17 @@
 # ADR-0016 — Multi-model context-domain continuity and ChatGPT adapter boundary
 
-- **Status:** PROPOSED
+- **Status:** PROPOSED / PROVIDER-NEUTRAL SPIKE VALIDATED, PRODUCTION HARDENING OPEN
 - **Date:** 2026-09-02
 - **Issue:** #32
 - **Depends on:** ADR-0015
-- **Scope:** architecture/spike contract; no production browser automation in this ADR
+- **Companion constraint:** ADR-0016A
+- **Scope:** architecture and provider-neutral continuity contract; production `ChatGPT Normal` transport is gated by ADR-0016A
 
 ## 1. Context
 
 Aiopago currently provides durable continuity across Pi coding sessions by treating the conversation as temporary and reconstructing work from authoritative project state: the Master Task Ledger, Git state, sealed checkpoint/manifest artifacts, runtime ownership and bounded semantic reads. The current handoff creates a fresh Pi session with zero copied conversation history.
 
-The new requirement is different but related: the user wants one Pi experience and one logical project context while switching inference engines with Pi's normal `/model` command. In particular, `ChatGPT Normal` should be selectable beside `openai-codex` and other Pi-native providers while preserving separate ChatGPT-vs-Codex usage pools.
+The new requirement is different but related: the user wants one Pi experience and one logical project context while switching inference engines with Pi's normal `/model` command. In particular, the desired future UX places `ChatGPT Normal` beside `openai-codex` and other Pi-native providers while preserving distinct usage pools.
 
 The target UX is:
 
@@ -19,12 +20,12 @@ Pi session
    |
  /model
    |
-   +-- ChatGPT Normal   -> normal ChatGPT product/session
-   +-- OpenAI Codex     -> Codex provider/quota
-   +-- Claude/Gemini/...-> ordinary Pi-native providers
+   +-- ChatGPT Normal    -> external-stateful domain; official transport required
+   +-- OpenAI Codex      -> Codex provider/quota
+   +-- Claude/Gemini/... -> ordinary Pi-native providers
 ```
 
-The user must not manage a second `/lane` abstraction. The exceptional synchronization behavior of ChatGPT is an internal continuity concern.
+The user must not manage a second `/lane` abstraction. Exceptional synchronization behavior belongs to internal context-domain continuity.
 
 ## 2. Decision
 
@@ -44,24 +45,26 @@ A **model** identifies the inference engine selected in Pi.
 
 A **context domain** identifies where conversational/provider state lives and what synchronization semantics are required.
 
-At minimum the spike must distinguish:
+At minimum:
 
-1. `pi-native` — context is represented by the Pi session and can be handed to ordinary Pi providers using Pi's supported model/provider semantics;
-2. `external-stateful` — context also exists in an external conversational thread that can lag behind the Pi session and therefore requires cursor/watermark synchronization.
+1. `pi-native` — context is represented by the Pi session and ordinary Pi provider semantics are sufficient;
+2. `external-stateful` — context also exists in an external conversational state that can lag behind the Pi session and therefore requires cursor/watermark synchronization and explicit failure semantics.
 
-`ChatGPT Normal` is the first `external-stateful` context domain.
+`ChatGPT Normal` is the motivating future `external-stateful` domain, but the abstraction is provider-neutral.
 
 Claude, Gemini, local models and Codex are not separate Aiopago lanes merely because they are different models. When they operate through normal Pi semantics, `/model` is sufficient.
 
-### D3 — ChatGPT Normal is a custom Pi provider/model
+### D3 — ChatGPT Normal uses a custom Pi provider/model seam
 
-`PROPOSED / REQUIRES SPIKE`
+`PROVIDER SEAM VALIDATED / REAL CHATGPT TRANSPORT BLOCKED`
 
 The preferred integration surface is a Pi custom provider/model exposed in the normal `/model` picker.
 
-The provider must use the normal ChatGPT product/session rather than silently falling back to OpenAI API billing or the Codex provider. The spike must empirically prove transport isolation before this can become `DECIDED`.
+The Pi 0.83 provider-neutral spike demonstrates that an external provider can be registered in the normal model catalog, switched within the same Pi session and isolated from a second provider transport without patching Pi.
 
-### D4 — Aiopago owns continuity, not ChatGPT transport
+A real provider labeled `ChatGPT Normal` must use the normal ChatGPT product/session semantics rather than silently falling back to OpenAI API billing or the Codex provider. ADR-0016A requires an OpenAI-documented/supported external-client transport and empirical usage-pool evidence before that label is admitted.
+
+### D4 — Aiopago owns continuity, not provider-specific transport
 
 `DECIDED`
 
@@ -74,24 +77,18 @@ Aiopago owns provider-neutral continuity concerns:
 - bounded context hydration policy;
 - Git/ledger/evidence provenance;
 - telemetry and attribution;
-- durable Pi-session handoff compatibility.
+- durable Pi-session handoff compatibility;
+- fail-closed handling of ambiguous external transfer state.
 
-ChatGPT-specific implementation details do **not** belong in the Aiopago core:
+Provider-specific implementation details do **not** belong in the Aiopago core, including authentication/session lifecycle and wire/protocol peculiarities of a future supported transport.
 
-- browser automation;
-- DOM selectors;
-- browser profile/session management;
-- ChatGPT page lifecycle;
-- cookie/token handling;
-- site-specific streaming extraction.
-
-Those concerns live behind a versioned adapter/transport boundary, provisionally named `aiopago-chatgpt-adapter`.
+ADR-0016A additionally rejects consumer-web Playwright/Selenium/CDP/DOM extraction, undocumented/private ChatGPT endpoints and cookie/session-token reuse. Those are not valid adapter implementations merely because they would live outside core.
 
 ### D5 — No generic bidirectional synchronization
 
 `DECIDED`
 
-ADR-0015 remains authoritative. There is no last-write-wins synchronization among Pi, ChatGPT, Git and the Ledger.
+ADR-0015 remains authoritative. There is no last-write-wins synchronization among Pi, an external provider, Git and the Ledger.
 
 Authority remains category-specific:
 
@@ -99,13 +96,13 @@ Authority remains category-specific:
 - technical filesystem state: Git/repository;
 - durable checkpoint/transfer artifacts: Aiopago sealed artifacts;
 - runtime control state: Aiopago runtime storage;
-- remote ChatGPT thread: transport/conversation state, not project authority.
+- remote conversational thread: transport/conversation state, not project authority.
 
-A ChatGPT response may propose a decision, but it does not silently mutate the Ledger or become durable authority merely because it exists in the remote thread.
+An external-model response may propose a decision, but it does not silently mutate the Ledger or become durable authority merely because it exists remotely.
 
-### D6 — Context synchronization is incremental
+### D6 — Context synchronization is incremental and must be restart-safe
 
-`DECIDED`
+`DECIDED; PRODUCTION DURABILITY STILL OPEN`
 
 Each external-stateful context domain maintains a durable/observable cursor or watermark identifying the logical Pi/project state already transferred to that domain.
 
@@ -121,13 +118,22 @@ Only the required delta is transferred. The system must not resend the entire Pi
 
 The cursor identifies transfer provenance; it must not imply that a provider exposes or accepts an exact internal token/context position.
 
-### D7 — ChatGPT requires bounded hydration of local evidence
+The spike validates stable Pi-entry cursor planning/acknowledgement, stale-commit rejection, branch-divergence failure and explicit S8 handoff rebasing. Independent review found that the current live cursor/in-flight-transfer state is still memory-resident outside an explicit handoff. Before production merge, ordinary process restart must preserve or fail closed on:
 
-`DECIDED`
+- the acknowledged cursor;
+- an in-flight transfer identity and its source/target cursor;
+- reconciliation-required state after ambiguous interruption;
+- the context-domain/session epoch binding.
 
-A normal Pi-native coding model can read repository files and Git state through Pi tools after model selection. An external ChatGPT thread cannot be assumed to see the local filesystem.
+A crash must never turn an ambiguous in-flight transfer into an automatic resend.
 
-Therefore Aiopago introduces a provider-neutral **Context Hydrator** boundary. For a target domain without direct local-file visibility, it may materialize bounded evidence such as:
+### D7 — External-stateful domains use bounded hydration of local evidence
+
+`DECIDED / PROVIDER-NEUTRAL PATH VALIDATED`
+
+A normal Pi-native coding model can read repository files and Git state through Pi tools after model selection. An external conversational thread cannot be assumed to see the local filesystem.
+
+Aiopago therefore provides a provider-neutral **Context Hydrator** boundary. For a target domain without direct local-file visibility, it may materialize bounded evidence such as:
 
 - current objective and next step;
 - accepted/relevant decisions;
@@ -140,28 +146,32 @@ Therefore Aiopago introduces a provider-neutral **Context Hydrator** boundary. F
 
 Whole repositories, unlimited command output and full transcripts are excluded by default.
 
-Hydration must preserve source/provenance references where possible and must pass existing secret/redaction constraints before transport.
+Hydration preserves source/provenance references where possible and must pass secret/redaction constraints **before** transport. Independent review added the shared Aiopago secret-shaped key/value scan at the complete outbound-envelope boundary. This is a fail-closed minimum, not a claim of complete DLP coverage.
+
+The basic transfer path is deterministic and bounded; it does not make a hidden LLM compaction call.
 
 ### D8 — ChatGPT Normal should remain agentic through Pi
 
-`PROPOSED / REQUIRES SPIKE`
+`READ/QUERY TOOL PATH VALIDATED / MUTATION DEFERRED`
 
-The target capability is not a chat-only provider. ChatGPT Normal should be able to request Pi-mediated tools such as read/edit/write/bash/Git through the custom provider contract.
+The target capability is not a chat-only provider. An eligible external provider should ultimately be able to request Pi-mediated tools through the custom-provider contract.
 
-The first spike gate requires at least a safe read-tool round trip. Mutation/tool expansion is admitted only after tool-call serialization, result correlation, cancellation and failure semantics are demonstrated.
+The spike demonstrates a real Pi `read` round trip through an external-stateful faux provider without invoking the code-provider/Codex sentinel.
 
-Codex must never be invoked as a hidden executor for ChatGPT tool calls.
+Mutation expansion remains deferred until tool-call serialization, result correlation, cancellation, interruption and mutation-effect semantics are demonstrated. Independent review therefore makes external-stateful tool admission **read-only by default** in the current spike (`READ_ONLY` tool profiles such as `read`, `grep`, `find`, `ls`). `edit`, `write` and `bash` are blocked for external-stateful domains even though the normal Runner exposes them to Pi-native providers.
+
+Codex must never be invoked as a hidden executor for external-provider tool calls.
 
 ### D9 — Usage pools and work attribution are separate metrics
 
-`DECIDED`
+`DECIDED / EXACT PRIMITIVES VALIDATED`
 
-Aiopago must not conflate provider usage with contribution to the project.
+Aiopago must not conflate configured provider usage with contribution to the project.
 
 The telemetry model may expose at least:
 
 - current model/provider;
-- current usage pool (`chatgpt`, `codex`, provider API/subscription, `local`, etc.);
+- configured usage pool (`chatgpt`, `codex`, provider API/subscription, `local`, etc.);
 - Pi context usage when Pi exposes an authoritative measure;
 - external remote-context estimate only when clearly marked as estimated;
 - turns and provider calls;
@@ -170,13 +180,15 @@ The telemetry model may expose at least:
 - tests/builds initiated;
 - accepted/recorded decisions with provenance.
 
-A derived `work_mix` score may be displayed later, but it must be documented as a heuristic with visible underlying metrics, not as a scientific measure of value.
+The spike records safe model/domain/pool and bounded tool metadata and correlates tool IDs with Aiopago's existing operation authority. It intentionally does **not** treat the configured `usage_pool` label as proof of real provider billing/quota semantics.
+
+A derived `work_mix` score remains uncomputed until a transparent weighting policy is ratified; it must never be presented as a scientific measure of value.
 
 ### D10 — Estimated context must be visibly estimated
 
 `DECIDED`
 
-If the ChatGPT product does not expose an authoritative context-window percentage, Aiopago must not present one as exact.
+If an external product does not expose an authoritative context-window percentage, Aiopago must not present one as exact.
 
 Example UI:
 
@@ -189,7 +201,7 @@ The `~` (or equivalent explicit label) is mandatory for estimates.
 
 ### D11 — Model switching and durable session handoff remain separate operations
 
-`DECIDED`
+`DECIDED / PROVIDER-NEUTRAL S8 VALIDATED`
 
 A normal `/model` change stays within the same Pi session and must not invoke the full replacement-session handoff state machine.
 
@@ -197,19 +209,19 @@ The existing Aiopago durable handoff remains responsible for rotating the Pi ses
 
 ```text
 Pi session A
-  ChatGPT <-> Codex <-> other models
+  external <-> Codex <-> other models
         |
      Aiopago durable handoff
         v
 Pi session B (history zero)
-  providers rebound from durable project context
+  context domains rebound from durable project context
 ```
 
-The spike must prove that external context-domain bindings can survive/rebind across this durable Pi-session handoff without importing the old Pi transcript.
+The S8 faux-transport spike demonstrates that Aiopago can seal cursor/lag lineage without transcript text, create a history-zero replacement Pi session, run ordinary continuity checks and start a new context epoch from checkpoint/handoff provenance.
 
-## 3. Minimal proposed contracts for the spike
+This does **not** yet prove reattachment to a real remote ChatGPT thread. A real `external_thread_id`/opaque remote binding and its restart/handoff lifecycle remain transport-dependent work.
 
-These names are provisional and may change after code/API inspection.
+## 3. Minimal contracts
 
 ### 3.1 ContextDomainDescriptor
 
@@ -227,21 +239,41 @@ capabilities
 transport_adapter_id?
 ```
 
-### 3.2 ContextDomainBinding
+An adapter that uses an exact `model_id` must not leave sibling models from the same provider silently unclassified. The current spike fails closed on that case; a provider-default descriptor may classify every model until a future multi-descriptor adapter contract is introduced.
+
+### 3.2 ProviderAdapter transport provenance
+
+For external-stateful providers:
+
+```text
+transport_support
+  status                # official-supported | experimental-nonproduction
+  documentation_ref
+  usage_pool_claim
+  usage_pool_evidence
+```
+
+Production rejects experimental/unverified external transports. Spike/test harnesses may opt into `experimental-nonproduction` explicitly.
+
+### 3.3 ContextDomainBinding
 
 ```text
 schema_version
 binding_id
 context_domain_id
 logical_session_id
-external_thread_id?     # opaque/redacted; never contains credentials
+external_thread_id?     # opaque/redacted; never credentials
 cursor
 created_at
 updated_at
 status
 ```
 
-### 3.3 ContextTransferManifest
+The remote-binding portion is intentionally incomplete until a supported real transport exists. Aiopago must not invent a thread identifier merely to make the faux provider look durable.
+
+### 3.4 ContextTransferManifest / envelope
+
+Conceptually:
 
 ```text
 schema_version
@@ -258,13 +290,14 @@ tests[]
 findings[]
 risks[]
 hydrated_evidence[]
+protocol_tool_results[]
+live_user_input
 created_at
-content_digest
 ```
 
-Transfer artifacts must reuse or compose with Aiopago's existing canonicalization, secret scanning, atomic persistence and digest verification rather than creating a competing artifact store.
+Transfer artifacts and outbound envelopes reuse or compose with Aiopago's existing canonicalization, bounded projection and secret scanning rather than creating a competing authority.
 
-### 3.4 ContextHydrator interface
+### 3.5 ContextHydrator interface
 
 Conceptually:
 
@@ -278,23 +311,31 @@ hydrate({
 }) -> HydratedContextBundle
 ```
 
-The first implementation must be deterministic/bounded where possible. No hidden LLM compaction call is required for the basic transfer path.
+The first implementation is deterministic/bounded. No hidden LLM compaction call is required for the basic transfer path.
 
-## 4. PoC acceptance flow
+## 4. Spike evidence and acceptance status
 
-The minimum end-to-end demonstration is:
+The provider-neutral PoC exercises the intended flow using Pi 0.83 faux providers:
 
-1. Start one Runner-owned Pi session in a fixture repository.
-2. Select `ChatGPT Normal` using `/model`.
-3. Discuss a bounded design decision.
-4. Demonstrate at least one ChatGPT→Pi read-tool round trip.
-5. Switch to `openai-codex` using `/model`.
-6. Codex receives the relevant prior decision through the same Pi logical session and performs a bounded implementation/test change.
-7. Switch back to `ChatGPT Normal` using `/model`.
-8. Aiopago observes the external context-domain watermark, creates a bounded delta/hydration bundle and synchronizes it before/with the user's next ChatGPT turn.
-9. ChatGPT can review what Codex changed without the user manually restating the work.
-10. Evidence shows ChatGPT turns did not traverse Codex transport and Codex turns did not traverse ChatGPT transport.
-11. Perform a normal Aiopago durable handoff and demonstrate that the new history-zero Pi session can rebind the same logical project/context-domain state.
+1. one Runner-owned Pi session starts on an external-stateful sentinel;
+2. a bounded design decision is made;
+3. the external provider performs a Pi-mediated `read` tool round trip;
+4. `/model`-equivalent `session.setModel()` switches to a code-provider sentinel in the same session;
+5. the code model consumes the prior decision;
+6. returning to the external model receives one bounded Aiopago capsule containing only post-watermark/context evidence rather than the full Pi transcript;
+7. transport call counters remain isolated and no hidden code-provider execution is used for the external tool round trip;
+8. a normal Aiopago durable handoff creates a history-zero replacement and rebases the external context epoch from durable checkpoint/handoff provenance.
+
+These gates validate **Aiopago/Pi mechanics**, not the existence of a real `ChatGPT Normal` transport or its quota semantics.
+
+Independent review then added adversarial gates for:
+
+- outbound secret rejection before transport;
+- explicit truncation metadata for live user input;
+- remote `error`/`aborted` -> `RECONCILIATION_REQUIRED`, with no automatic stale replay;
+- read-only external tool admission;
+- fail-closed experimental transport eligibility;
+- rejection of unclassified sibling provider models.
 
 ## 5. Relationship to roadmap 0.2-E
 
@@ -302,7 +343,7 @@ This ADR does **not** widen 0.2-E/#30.
 
 0.2-E remains the bounded interactive-human-UX slice and retains its explicit `no new planner/provider` exclusion.
 
-Issue #32 owns the multi-model/context-domain spike. After the spike, roadmap placement (for example 0.3-A or another post-0.2 slice) requires an explicit decision rather than silent insertion into 0.2-E.
+Issue #32 owns the multi-model/context-domain spike. Productionization belongs in an explicit post-0.2 slice rather than silent insertion into 0.2-E.
 
 ## 6. Consequences
 
@@ -311,15 +352,17 @@ Issue #32 owns the multi-model/context-domain spike. After the spike, roadmap pl
 - One user-facing model switch mechanism: `/model`.
 - Aiopago becomes more general without becoming ChatGPT-specific.
 - Existing Pi provider switching remains usable for Codex, Claude, Gemini and local models.
-- Separate provider/quota pools can be measured without fragmenting the logical project context.
+- Provider/pool attribution can be measured without fragmenting the logical project context.
 - Existing durable checkpoint/handoff concepts are reused rather than duplicated.
+- External transport uncertainty is fail-closed rather than silently hidden.
 
 ### Negative / complexity
 
-- External-stateful providers introduce synchronization cursors and partial failure modes absent from ordinary Pi-native model changes.
-- ChatGPT browser/product transport may be fragile and must be isolated from the core.
+- External-stateful providers introduce cursors, in-flight transfer state and ambiguity/reconciliation states absent from ordinary Pi-native model changes.
+- Durable restart semantics require additional runtime state beyond an in-memory cursor book.
+- A real remote conversational binding cannot be completed or tested until an eligible transport exists.
 - Remote context-size estimation may remain approximate.
-- Agentic tool use through a browser-backed provider requires explicit protocol and race/cancellation testing.
+- Mutation-capable agentic tool use requires additional protocol, interruption and effect-evidence gates before admission.
 
 ## 7. Rejected alternatives
 
@@ -327,24 +370,34 @@ Issue #32 owns the multi-model/context-domain spike. After the spike, roadmap pl
 Rejected as unnecessary user-facing state. `/model` already expresses model selection; lane/context-domain complexity should remain internal.
 
 ### B. Treat ChatGPT Normal as ordinary OpenAI API
-Rejected because it would not satisfy the requirement to use the normal ChatGPT usage pool and would create separate API billing semantics.
+Rejected because ChatGPT and the API platform have separate billing/usage semantics; an API provider must be labeled as such.
 
-### C. Route ChatGPT code mutations through Codex
+### C. Route external-model code mutations through Codex
 Rejected because it would mix usage pools and make attribution/behavior misleading.
 
-### D. Copy full Pi transcript into ChatGPT on every switch
+### D. Copy full Pi transcript into the external domain on every switch
 Rejected for context cost, privacy, fragility and conflict with Aiopago's existing history-independent continuity principles.
 
-### E. Put browser automation in Aiopago core
-Rejected because site-specific transport must remain replaceable and optional.
+### E. Automate the consumer ChatGPT web UI
+Rejected by ADR-0016A. Playwright/Selenium/CDP/DOM response extraction, private endpoints and cookie/session-token reuse are not an admissible production transport.
 
-## 8. Open spike questions
+## 8. Review status / remaining open gates
 
-1. Can Pi's current custom-provider API represent the required streaming and tool-call semantics without patching Pi?
-2. What is the least fragile supported way to bind to a normal ChatGPT product session while keeping credentials outside Aiopago artifacts?
-3. Which transport events can be observed to prove ChatGPT-vs-Codex pool isolation?
-4. What deterministic token/byte/evidence budget should the first Context Hydrator enforce?
-5. How should cursors bind to Pi session entries when the Pi session itself is compacted or handed off?
-6. Which attribution metrics can be made exact and which must remain heuristic?
+Resolved by the Pi 0.83 provider-neutral spike:
 
-Until these questions pass the gates in #32, production browser transport and quota guarantees remain unproven.
+1. Pi's custom-provider API can represent the required model registration, streaming and read-tool semantics without a Pi fork.
+2. `/model`-equivalent switching preserves one Pi session while provider transports remain isolated in the harness.
+3. Initial deterministic hydration/protocol budgets and explicit truncation behavior are implemented and tested.
+4. Exact safe attribution primitives can be collected without inventing `work_mix`.
+5. Explicit Aiopago durable handoff can rebase an external context epoch without copying the old Pi transcript.
+
+Still open before productionization:
+
+1. **Official ChatGPT transport:** identify an OpenAI-documented/supported external-client transport satisfying the normal ChatGPT usage-pool requirement.
+2. **Real usage-pool evidence:** determine which authoritative observations prove ChatGPT-vs-Codex accounting rather than merely configured routing.
+3. **Ordinary restart durability:** persist cursor, in-flight transfer and reconciliation-required state so crash/restart cannot duplicate an ambiguous transfer.
+4. **Remote binding:** define and persist the opaque `external_thread_id`/binding lifecycle once a real supported transport exists.
+5. **Mutation tools:** add edit/write/bash only after cancellation, interruption, result correlation and effect-evidence semantics pass dedicated gates.
+6. **Work mix:** ratify a transparent weighting policy or keep the metric intentionally absent.
+
+Until these gates are closed, the provider-neutral spike is valuable evidence and a foundation, but PR #34 should remain draft and must not be described as production-ready `ChatGPT Normal`.
