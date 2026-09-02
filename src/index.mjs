@@ -1,4 +1,5 @@
 export * from "./artifact-store.mjs";
+export * from "./attribution.mjs";
 export * from "./bootstrap.mjs";
 export * from "./canonical.mjs";
 export * from "./cli.mjs";
