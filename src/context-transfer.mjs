@@ -30,11 +30,17 @@ function branch(sessionManager) {
 }
 
 function cursorFor(sessionManager, entries, entry = entries.at(-1) ?? null) {
+  let depth = 0;
+  if (entry) {
+    const index = entries.findIndex((candidate) => candidate.id === entry.id);
+    invariant(index >= 0, "CONTEXT_CURSOR_DIVERGED", `entry ${entry.id} is not on the current Pi branch`);
+    depth = index + 1;
+  }
   return Object.freeze({
     schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
     session_id: sessionId(sessionManager),
     entry_id: entry?.id ?? null,
-    branch_depth: entries.length,
+    branch_depth: depth,
   });
 }
 
@@ -89,39 +95,44 @@ export class ContextCursorBook {
     });
   }
 
-  commit(window) {
-    invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
+  currentForWindow(window) {
     const domainId = requiredString(window.context_domain_id, "CONTEXT_CURSOR_DOMAIN_REQUIRED", "context_domain_id");
-    const current = this.cursors.get(domainId) ?? Object.freeze({
+    return this.cursors.get(domainId) ?? Object.freeze({
       schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
       session_id: window.source_cursor.session_id,
       entry_id: null,
       branch_depth: 0,
     });
+  }
+
+  commit(window) {
+    invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
+    const domainId = requiredString(window.context_domain_id, "CONTEXT_CURSOR_DOMAIN_REQUIRED", "context_domain_id");
+    const current = this.currentForWindow(window);
     invariant(sameCursor(current, window.source_cursor), "CONTEXT_CURSOR_STALE_COMMIT", domainId);
     const committed = Object.freeze({ ...window.target_cursor });
     this.cursors.set(domainId, committed);
     return committed;
   }
 
-  acknowledge(window, sessionManager) {
+  acknowledgeThroughEntry(window, sessionManager, entryId) {
     invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
     const domainId = requiredString(window.context_domain_id, "CONTEXT_CURSOR_DOMAIN_REQUIRED", "context_domain_id");
-    const current = this.cursors.get(domainId) ?? Object.freeze({
-      schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
-      session_id: window.source_cursor.session_id,
-      entry_id: null,
-      branch_depth: 0,
-    });
+    const acknowledgedEntryId = requiredString(entryId, "CONTEXT_CURSOR_ACK_ENTRY_REQUIRED", "entry_id");
+    const current = this.currentForWindow(window);
     invariant(sameCursor(current, window.source_cursor), "CONTEXT_CURSOR_STALE_COMMIT", domainId);
 
     const entries = branch(sessionManager);
     const currentSessionId = sessionId(sessionManager);
     invariant(currentSessionId === window.source_cursor.session_id, "CONTEXT_CURSOR_SESSION_MISMATCH", `${window.source_cursor.session_id} != ${currentSessionId}`);
-    if (window.target_cursor.entry_id !== null) {
-      invariant(entries.some((entry) => entry.id === window.target_cursor.entry_id), "CONTEXT_CURSOR_DIVERGED", `transfer target ${window.target_cursor.entry_id} is not on the current Pi branch`);
-    }
-    const acknowledged = cursorFor(sessionManager, entries);
+    const transferTargetIndex = window.target_cursor.entry_id === null
+      ? -1
+      : entries.findIndex((entry) => entry.id === window.target_cursor.entry_id);
+    invariant(window.target_cursor.entry_id === null || transferTargetIndex >= 0, "CONTEXT_CURSOR_DIVERGED", `transfer target ${window.target_cursor.entry_id} is not on the current Pi branch`);
+    const acknowledgeIndex = entries.findIndex((entry) => entry.id === acknowledgedEntryId);
+    invariant(acknowledgeIndex >= transferTargetIndex && acknowledgeIndex >= 0, "CONTEXT_CURSOR_ACK_BEFORE_TRANSFER", acknowledgedEntryId);
+
+    const acknowledged = cursorFor(sessionManager, entries, entries[acknowledgeIndex]);
     this.cursors.set(domainId, acknowledged);
     return acknowledged;
   }
