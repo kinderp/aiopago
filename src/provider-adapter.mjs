@@ -61,7 +61,12 @@ export function defineProviderAdapter(input) {
   });
 }
 
-export async function installProviderAdapters(adapters = [], { modelRuntime, pi, contextDomains = new ContextDomainRegistry(), allowExperimentalExternal = false } = {}) {
+export async function installProviderAdapters(adapters = [], {
+  modelRuntime,
+  pi,
+  contextDomains = new ContextDomainRegistry(),
+  allowExperimentalExternal = process.env.AIOPAGO_ALLOW_EXPERIMENTAL_EXTERNAL === "1",
+} = {}) {
   invariant(modelRuntime && typeof modelRuntime.getProvider === "function" && typeof modelRuntime.getModels === "function", "PROVIDER_ADAPTER_MODEL_RUNTIME_REQUIRED");
   invariant(contextDomains && typeof contextDomains.register === "function", "CONTEXT_DOMAIN_REGISTRY_REQUIRED");
   const installed = [];
