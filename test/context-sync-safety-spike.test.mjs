@@ -3,6 +3,7 @@ import test from "node:test";
 import { ContextDomainRegistry } from "../src/context-domain.mjs";
 import { ContextSyncCoordinator } from "../src/context-sync.mjs";
 import { createGuardianExtension } from "../src/extension.mjs";
+import { defineProviderAdapter, installProviderAdapters } from "../src/provider-adapter.mjs";
 
 const PROVIDER = "external-safety-spike";
 const MODEL = "external-safety";
@@ -18,6 +19,13 @@ class FakeSessionManager {
   }
   getSessionId() { return "SES-SAFETY"; }
   getBranch() { return this.entries; }
+}
+
+class FakeModelRuntime {
+  constructor() { this.providers = new Map(); }
+  getProvider(id) { return this.providers.get(id) ?? null; }
+  getModels(id) { return this.providers.get(id)?.getModels?.() ?? []; }
+  registerNativeProvider(provider) { this.providers.set(provider.id, provider); }
 }
 
 function registry() {
@@ -45,6 +53,25 @@ function coordinator(entries, protocolBudget = undefined) {
   });
   const ctx = { model: { provider: PROVIDER, id: MODEL }, sessionManager };
   return { sync, ctx, sessionManager };
+}
+
+function adapter({ transportSupport = undefined, models = [MODEL] } = {}) {
+  return defineProviderAdapter({
+    adapter_id: "external-safety-adapter",
+    provider_id: PROVIDER,
+    context_domain: {
+      context_domain_id: DOMAIN,
+      kind: "external-stateful",
+      model_id: MODEL,
+      usage_pool: "external-test",
+      capabilities: { local_files_direct: false, pi_tools: true, authoritative_context_usage: false },
+    },
+    ...(transportSupport ? { transport_support: transportSupport } : {}),
+    install: async ({ modelRuntime }) => modelRuntime.registerNativeProvider({
+      id: PROVIDER,
+      getModels: () => models.map((id) => ({ id })),
+    }),
+  });
 }
 
 test("external context transfer fails closed before transport when a secret-shaped value is present", () => {
@@ -103,4 +130,42 @@ test("external-stateful domains are read-only at the Pi tool admission boundary"
   assert.equal(read, undefined);
   assert.equal(admitted.length, 1);
   assert.equal(admitted[0][1], "read");
+});
+
+test("external adapters are experimental by default and production installation fails closed", async () => {
+  const runtime = new FakeModelRuntime();
+  const candidate = adapter();
+  assert.equal(candidate.transport_support.status, "experimental-nonproduction");
+  await assert.rejects(
+    installProviderAdapters([candidate], { modelRuntime: runtime, pi: {}, allowExperimentalExternal: false }),
+    (error) => error?.code === "PROVIDER_ADAPTER_TRANSPORT_UNVERIFIED",
+  );
+  assert.equal(runtime.getProvider(PROVIDER), null, "unverified transport must be rejected before provider installation");
+});
+
+test("official external transport metadata is required and can pass the fail-closed gate", async () => {
+  const runtime = new FakeModelRuntime();
+  const candidate = adapter({
+    transportSupport: {
+      status: "official-supported",
+      documentation_ref: "https://example.invalid/official-transport-contract",
+      usage_pool_claim: "external-test",
+      usage_pool_evidence: "verified-by-contract-test",
+    },
+  });
+  const installed = await installProviderAdapters([candidate], { modelRuntime: runtime, pi: {}, allowExperimentalExternal: false });
+  assert.equal(installed.installed.length, 1);
+  assert.ok(runtime.getProvider(PROVIDER));
+});
+
+test("an exact-model adapter cannot leave sibling provider models unclassified", async () => {
+  const runtime = new FakeModelRuntime();
+  await assert.rejects(
+    installProviderAdapters([adapter({ models: [MODEL, "unclassified-model"] })], {
+      modelRuntime: runtime,
+      pi: {},
+      allowExperimentalExternal: true,
+    }),
+    (error) => error?.code === "PROVIDER_ADAPTER_UNCLASSIFIED_MODELS",
+  );
 });
