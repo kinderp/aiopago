@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PI_CODING_AGENT_ROOT: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
+
 jobs:
   s1-s2-s5-s6:
     runs-on: ubuntu-latest
