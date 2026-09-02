@@ -68,6 +68,7 @@ export class GuardianRunner {
       runnerInstanceId,
       thresholdPercent: contextAdvisor.thresholdPercent,
       retention: options.metricsRetention,
+      contextDomains,
     });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
