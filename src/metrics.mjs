@@ -1,5 +1,6 @@
 import { statSync } from "node:fs";
 import { performance } from "node:perf_hooks";
+import { extractToolActivity, resolveModelAttribution } from "./attribution.mjs";
 import { opaqueId, utcNow } from "./canonical.mjs";
 
 export const METRICS_SCHEMA_VERSION = "1.0.0";
@@ -74,11 +75,12 @@ export function measureHandoffArtifacts({ taskPlanPath = null, checkpointBytes =
 }
 
 export class MeasurementInstrumentation {
-  constructor({ storage, ledger, runnerInstanceId, thresholdPercent, retention = {} }) {
+  constructor({ storage, ledger, runnerInstanceId, thresholdPercent, retention = {}, contextDomains = null }) {
     this.storage = storage;
     this.ledger = ledger;
     this.runnerInstanceId = runnerInstanceId;
     this.thresholdPercent = thresholdPercent;
+    this.contextDomains = contextDomains;
     this.retention = Object.freeze({ ...DEFAULT_METRICS_RETENTION, ...retention });
     this.handoffStarts = new Map();
   }
@@ -266,6 +268,10 @@ export class MeasurementInstrumentation {
       const usage = event.message.usage;
       const capturedAt = utcNow();
       const equivalentAmount = numberOrNull(usage.cost?.total);
+      const provider = typeof event.message.provider === "string" ? event.message.provider : null;
+      const modelId = typeof event.message.model === "string" ? event.message.model : null;
+      const attribution = resolveModelAttribution(this.contextDomains, provider, modelId);
+      const activity = extractToolActivity(event.message, { cwd: ctx?.cwd ?? null });
       const sample = assertTelemetrySafe({
         schema_version: METRICS_SCHEMA_VERSION,
         sample_id: opaqueId("MS"),
@@ -276,9 +282,11 @@ export class MeasurementInstrumentation {
         task_phase: identity.item_id,
         collection_status: collectionStatus(identity),
         model: {
-          provider: typeof event.message.provider === "string" ? event.message.provider : null,
-          id: typeof event.message.model === "string" ? event.message.model : null,
+          provider,
+          id: modelId,
         },
+        attribution,
+        activity,
         context: this.readContext(ctx, identity),
         usage: {
           input_tokens: numberOrNull(usage.input),
