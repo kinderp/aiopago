@@ -8,32 +8,32 @@
 
 ## 1. Finding
 
-ADR-0016 deliberately left the concrete ChatGPT transport behind a spike. Review of OpenAI's current consumer Terms of Use constrains which transport candidates are admissible.
+ADR-0016 deliberately keeps the concrete `ChatGPT Normal` transport outside Aiopago core. The transport must satisfy both OpenAI product rules and the user's architectural requirement that ordinary ChatGPT usage remain distinct from Codex and API usage.
 
-OpenAI's current Terms prohibit automatically or programmatically extracting data or Output from the Services and prohibit interfering with the Services, including circumventing rate limits/restrictions or protective measures.
+OpenAI's consumer Terms prohibit automatically/programmatically extracting data or Output from the Services and prohibit circumventing service restrictions or protective measures.
 
 Official references rechecked on 2026-09-02:
 
 - <https://openai.com/policies/terms-of-use/>
 - <https://openai.com/policies/eu-terms-of-use/>
 
-Therefore a Playwright/CDP/DOM-scraping bridge that sends prompts through `chatgpt.com` and programmatically extracts assistant Output is **not an accepted implementation path** for Aiopago.
+Therefore a Playwright/CDP/DOM-scraping bridge that drives `chatgpt.com` and programmatically extracts assistant Output is **not an accepted implementation path** for Aiopago.
 
 This is a product/architecture constraint, not merely a preference about fragility.
 
-## 2. Decision
+## 2. Decisions and current OpenAI surfaces
 
-### D1 — ChatGPT Normal requires an officially supported programmatic transport
+### D1 — `ChatGPT Normal` requires an officially supported external-client conversation transport
 
 `DECIDED`
 
-The `ChatGPT Normal` provider seam may be connected only to a transport that OpenAI officially documents/supports for programmatic access and whose usage semantics satisfy the intended ChatGPT-plan usage pool.
+The `ChatGPT Normal` provider seam may be connected only to a transport that OpenAI explicitly documents/supports for external programmatic clients and whose usage semantics can be demonstrated to consume the intended ordinary ChatGPT product usage pool.
 
-Until such a surface is identified and verified, the production `ChatGPT Normal` adapter is **BLOCKED**.
+Until such a surface is identified and verified, the production `ChatGPT Normal` adapter is **BLOCKED EXTERNALLY**.
 
-The offline provider seam, context-domain model and continuity work may continue because they are transport-neutral.
+Provider-neutral context-domain, hydration, durability and handoff work may continue because it does not depend on a particular ChatGPT transport.
 
-### D2 — Browser/DOM extraction is rejected
+### D2 — Browser/DOM extraction and private endpoints are rejected
 
 `DECIDED`
 
@@ -45,79 +45,115 @@ Do not implement or ship:
 - extraction/reuse of ChatGPT browser cookies or session tokens;
 - any mechanism intended to bypass API billing, Codex limits, ChatGPT limits or other product restrictions.
 
-This supersedes any reading of ADR-0016 that browser-specific logic could simply live in an external adapter. The adapter boundary remains valid, but the adapter itself must use an eligible official transport.
+The adapter boundary remains valid, but the adapter itself must use an eligible official transport.
 
-### D3 — `Sign in with ChatGPT` is not conversation transport
+### D3 — `Sign in with ChatGPT` is identity, not ordinary ChatGPT conversation transport
 
 `OBSERVED / NOT SUFFICIENT`
 
-OpenAI currently documents `Sign in with ChatGPT` as an identity-provider flow for supported external applications. It shares identity information, not ChatGPT conversations, memory, files, tokens or billing data by itself.
+OpenAI currently documents `Sign in with ChatGPT` as an identity-provider sign-in mechanism for supported external applications. By itself it shares identity information and does not grant a third-party client access to ChatGPT conversations, memory, files, tokens or billing data.
 
-Reference:
+Reference rechecked on 2026-09-02:
 
 - <https://help.openai.com/en/articles/20001410-sign-in-with-chatgpt>
 
-It may become useful for authentication if OpenAI later exposes the required permissions, but it does not currently satisfy S1/S2 transport requirements.
+It may become useful for authentication if OpenAI later exposes additional supported permissions, but authentication alone does not satisfy the transport or quota requirement.
 
-### D4 — ChatGPT Apps are the opposite integration direction
+### D4 — Apps SDK / MCP is the opposite integration direction for the requested Pi-first UX
 
 `OBSERVED / NOT SUFFICIENT FOR CURRENT UX`
 
-OpenAI's Apps/connector model lets ChatGPT call an external API/MCP service. This can participate in normal ChatGPT product usage, but the primary user interface remains ChatGPT. It does not currently provide the required external Pi client transport for sending prompts to ChatGPT and receiving ChatGPT Output inside Pi.
+OpenAI's Apps SDK and MCP integration model lets ChatGPT call external tools, data and applications. This is useful for bringing Aiopago capabilities **into ChatGPT**, but the primary conversation surface remains ChatGPT.
 
-References:
+It does not currently document the reverse transport required here: Pi acting as the primary client, sending ordinary ChatGPT turns and receiving ChatGPT Output while consuming the user's normal ChatGPT plan quota.
 
-- <https://openai.com/policies/developer-apps-terms/>
+References rechecked on 2026-09-02:
+
+- <https://help.openai.com/en/articles/12515353-build-with-the-apps-sdk>
 - <https://help.openai.com/en/articles/11487775-connected-apps-in-chatgpt>
 
-An Aiopago MCP/App integration could be a separate future product direction, but it does not replace the requested one-Pi-UI `/model` flow.
+An Aiopago MCP/App integration may be a separate future product direction, but it does not replace the requested one-Pi-UI `/model` flow.
 
-### D5 — OpenAI API is technically usable but does not satisfy the quota requirement
+### D5 — Public OpenAI API is supported but is not `ChatGPT Normal`
 
 `OBSERVED / OUT OF SCOPE FOR CHATGPT NORMAL`
 
-The public OpenAI API is a supported programmatic surface for external clients, but ChatGPT and the API platform use separate billing systems. OpenAI explicitly documents that paid API usage is billed separately from a ChatGPT subscription.
+The public OpenAI API is a supported programmatic surface for external clients, but ChatGPT and the API platform remain separately billed and managed. API use therefore cannot truthfully be labeled `ChatGPT Normal` or represented as consuming normal ChatGPT subscription quota.
 
-The API can be used as an optional ordinary Pi provider, but it must not be labeled `ChatGPT Normal` or represented as consuming the normal ChatGPT quota.
-
-References:
+References rechecked on 2026-09-02:
 
 - <https://help.openai.com/en/articles/9039756>
 - <https://help.openai.com/en/articles/8156019>
 
+The API may still use the provider-neutral Aiopago continuity machinery under an explicit API-provider identity and API usage pool.
+
+### D6 — Codex ChatGPT-plan sign-in does not create a generic ordinary-ChatGPT transport
+
+`OBSERVED / NOT SUFFICIENT`
+
+OpenAI explicitly supports Codex clients signed in with a ChatGPT account and documents Codex as included across ChatGPT plans, with its own product usage limits.
+
+Reference rechecked on 2026-09-02:
+
+- <https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan>
+
+This proves that OpenAI can expose subscription-backed product clients, but it establishes **Codex** access, not a generic external-client API for ordinary ChatGPT conversations. Aiopago must not infer ordinary ChatGPT transport eligibility from Codex authentication behavior.
+
 ## 3. Effect on spike #32
 
-### S1
+The provider-neutral S1–S8 mechanics and their durability hardening are now validated independently of the real ChatGPT transport.
 
-The **local provider-registration seam** remains useful and testable.
+Production `ChatGPT Normal` remains blocked only at the external transport/product boundary:
 
-Production S1 becomes:
+- provider registration seam: validated;
+- same-Pi-session transport isolation: validated;
+- A→B→A bounded continuity: validated;
+- Pi-mediated read tool loop: validated;
+- durable cursor and remote binding: validated provider-neutrally;
+- ambiguous delivery reconciliation across restart: validated;
+- history-zero handoff/rebind: validated;
+- real ordinary-ChatGPT transport: **blocked externally**;
+- real ChatGPT-vs-Codex usage-pool proof: **blocked externally**.
 
-> Register `ChatGPT Normal` in Pi `/model` using an officially supported OpenAI transport that demonstrably targets the normal ChatGPT product usage pool.
+No provider-neutral test may be presented as proof that `ChatGPT Normal` itself is available.
 
-Until that transport exists/is identified, production S1 remains blocked after the offline seam.
+## 4. Adapter qualification gate
 
-### S2
+A future transport candidate may be wired as `ChatGPT Normal` only after all seven gates below are evidenced.
 
-Offline transport isolation can still prove that Aiopago/Pi does not accidentally cross-call two configured providers.
+### Q1 — Documented transport
 
-Real ChatGPT-vs-Codex usage-pool isolation cannot be closed using browser automation. It remains blocked until an eligible transport exposes enough evidence to verify the two pools empirically.
+OpenAI explicitly documents/supports the transport for external clients. Authentication documentation alone is insufficient.
 
-### S3–S8
+### Q2 — Conversation capability
 
-Provider-neutral work may proceed behind fake/adversarial transports where useful, especially:
+The transport can send and receive ordinary assistant turns and can carry the bounded Aiopago context capsule without requiring consumer-web scraping.
 
-- context-domain cursors/watermarks;
-- bounded Context Hydrator;
-- attribution primitives;
-- durable handoff rebinding;
-- adapter failure semantics.
+### Q3 — Identity safety
 
-None of those tests may be presented as proof that ChatGPT Normal itself is available.
+No browser cookie/session-token extraction, private endpoint reuse, DOM automation or other circumvention mechanism is required.
 
-## 4. Adapter contract requirement
+### Q4 — State semantics
 
-The future external adapter contract must make transport eligibility explicit. At minimum its metadata includes:
+Remote thread/conversation identity, retry behavior and idempotency/reconciliation semantics are documented or empirically bounded enough for Aiopago to fail closed.
+
+### Q5 — Usage-pool evidence
+
+A controlled before/after experiment demonstrates which product pool changes: ordinary ChatGPT, Codex or API. The configured provider label or authentication method is not accepted as proof.
+
+### Q6 — Pi tool-loop compatibility
+
+Pi-mediated tool results can return to the same external conversational state without invoking Codex as a hidden executor.
+
+### Q7 — Failure semantics
+
+Timeout, ambiguous delivery or process restart cannot silently advance the durable cursor or cause an automatic ambiguous replay.
+
+Until **Q1–Q7** all pass, `ChatGPT Normal` remains feature-gated/unavailable rather than silently falling back to the API or browser automation.
+
+## 5. Adapter contract requirement
+
+The provider adapter exposes transport provenance at minimum:
 
 ```text
 transport_support
@@ -129,19 +165,28 @@ transport_support
 
 Aiopago production configuration must reject a `ChatGPT Normal` adapter whose transport is not marked and verified as officially supported.
 
-The provider-neutral spike now implements this fail-closed shape: external adapters default to `experimental-nonproduction`; experimental installation requires explicit opt-in; `official-supported` requires documentation and usage-pool evidence metadata. That proves the gate mechanics, **not** the existence of an eligible ChatGPT transport.
+The provider-neutral implementation already enforces this fail-closed shape:
 
-## 5. Consequence
+- external adapters default to `experimental-nonproduction`;
+- experimental installation requires explicit Runner opt-in;
+- `official-supported` requires documentation and usage-pool evidence metadata;
+- sibling models cannot remain silently unclassified;
+- outbound secret-shaped values fail before transport;
+- ambiguous delivery does not silently advance the cursor.
 
-The architecture remains valuable even while the final ChatGPT transport is blocked:
+These mechanics prove the qualification boundary, **not** the existence of an eligible OpenAI transport.
+
+## 6. Consequence
+
+The architecture remains useful while the final ChatGPT transport is blocked:
 
 ```text
 Pi /model
    |
-   +-- Codex / Claude / Gemini / local / API providers   -> usable through their supported paths
+   +-- Codex / Claude / Gemini / local / API providers   -> usable through supported paths
    |
-   +-- ChatGPT Normal                                    -> provider seam ready,
-                                                           official transport required
+   +-- ChatGPT Normal                                    -> continuity seam ready,
+                                                           Q1-Q7 transport gate required
 ```
 
-Aiopago continues to evolve toward model-independent continuity without tying its core to an undocumented consumer-web interface.
+Aiopago can therefore productize provider-neutral multi-model continuity without tying its core to an undocumented consumer-web interface. The real `ChatGPT Normal` adapter should be a small transport-specific layer added only when OpenAI exposes a qualifying surface.
