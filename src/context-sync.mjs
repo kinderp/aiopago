@@ -1,6 +1,7 @@
 import { canonicalJson } from "./canonical.mjs";
 import { ContextCursorBook, hydrateContextTransfer } from "./context-transfer.mjs";
 import { invariant } from "./errors.mjs";
+import { assertNoSecrets } from "./secret-scan.mjs";
 
 export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.1.0";
 export const CONTEXT_HANDOFF_BINDING_VERSION = "0.1.0";
@@ -40,7 +41,13 @@ function latestUserInput(entries, maxChars) {
     const entry = entries[index];
     if (entry.type !== "message" || entry.message?.role !== "user") continue;
     const text = textContent(entry.message.content);
-    return text ? text.slice(0, maxChars) : null;
+    if (!text) return null;
+    const clipped = text.slice(0, maxChars);
+    return Object.freeze({
+      text: clipped,
+      truncated: clipped.length < text.length,
+      original_chars: text.length,
+    });
   }
   return null;
 }
@@ -131,6 +138,7 @@ export class ContextSyncCoordinator {
     this.hydrationBudget = hydrationBudget;
     this.protocolBudget = protocolBudget(protocolLimits);
     this.pending = new Map();
+    this.reconciliationRequired = new Map();
     this.lastProjection = new Map();
     this.durableBaselines = new Map();
   }
@@ -145,6 +153,7 @@ export class ContextSyncCoordinator {
     const bindings = [];
     for (const domain of this.externalDomains()) {
       invariant(!this.pending.has(domain.context_domain_id), "CONTEXT_HANDOFF_PENDING_EXTERNAL_REQUEST", domain.context_domain_id);
+      invariant(!this.reconciliationRequired.has(domain.context_domain_id), "CONTEXT_SYNC_RECONCILIATION_REQUIRED", domain.context_domain_id);
       const window = this.cursorBook.plan(domain.context_domain_id, sourceSession.sessionManager);
       bindings.push(Object.freeze({
         schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
@@ -186,6 +195,7 @@ export class ContextSyncCoordinator {
       invariant(sameCursor(actual, expected), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
 
       this.pending.delete(binding.context_domain_id);
+      this.reconciliationRequired.delete(binding.context_domain_id);
       this.cursorBook.reset(binding.context_domain_id);
       const targetWindow = this.cursorBook.plan(binding.context_domain_id, targetSession.sessionManager);
       const targetCursor = this.cursorBook.commit(targetWindow);
@@ -214,6 +224,9 @@ export class ContextSyncCoordinator {
     const domain = this.contextDomains.resolve(model);
     if (domain.kind !== "external-stateful") return null;
 
+    const reconciliation = this.reconciliationRequired.get(domain.context_domain_id);
+    invariant(!reconciliation, "CONTEXT_SYNC_RECONCILIATION_REQUIRED", `${domain.context_domain_id}:${reconciliation?.reason ?? "unknown"}`);
+
     const pending = this.pending.get(domain.context_domain_id);
     if (pending) {
       invariant(pending.session_id === ctx.sessionManager.getSessionId(), "CONTEXT_SYNC_PENDING_SESSION_MISMATCH");
@@ -240,6 +253,9 @@ export class ContextSyncCoordinator {
       live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
       protocol_tool_results: toolResults,
     });
+    // The transfer path must enforce the same secret-shaped field/value policy as
+    // sealed Aiopago artifacts before any external transport sees the capsule.
+    assertNoSecrets(envelope);
     const messages = Object.freeze([transferMessage(envelope)]);
     const record = Object.freeze({
       session_id: ctx.sessionManager.getSessionId(),
@@ -261,17 +277,43 @@ export class ContextSyncCoordinator {
     if (!model) return null;
     const domain = this.contextDomains.resolve(model);
     if (domain.kind !== "external-stateful" || !modelMatchesDomain(message, domain)) return null;
-    if (message.stopReason === "error" || message.stopReason === "aborted") return null;
 
     const pending = this.pending.get(domain.context_domain_id);
     if (!pending) return null;
     invariant(pending.provider_id === model.provider && pending.model_id === model.id, "CONTEXT_SYNC_PENDING_MODEL_MISMATCH");
+
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      this.pending.delete(domain.context_domain_id);
+      const failure = Object.freeze({
+        schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
+        context_domain_id: domain.context_domain_id,
+        session_id: pending.session_id,
+        transfer_id: pending.window.transfer_id,
+        reason: message.stopReason,
+      });
+      this.reconciliationRequired.set(domain.context_domain_id, failure);
+      return Object.freeze({ domain, reconciliation_required: failure });
+    }
+
     const entryId = assistantEntryId(ctx.sessionManager, message, domain);
     invariant(entryId, "CONTEXT_SYNC_ASSISTANT_ENTRY_NOT_PERSISTED");
     const cursor = this.cursorBook.acknowledgeThroughEntry(pending.window, ctx.sessionManager, entryId);
     this.pending.delete(domain.context_domain_id);
+    this.reconciliationRequired.delete(domain.context_domain_id);
     this.durableBaselines.delete(domain.context_domain_id);
     return Object.freeze({ domain, cursor, transfer_id: pending.window.transfer_id });
+  }
+
+  resolveReconciliation(contextDomainId, action) {
+    invariant(action === "retry-from-last-acknowledged", "CONTEXT_SYNC_RECONCILIATION_ACTION_INVALID", action);
+    const failure = this.reconciliationRequired.get(contextDomainId);
+    invariant(failure, "CONTEXT_SYNC_RECONCILIATION_NOT_REQUIRED", contextDomainId);
+    this.reconciliationRequired.delete(contextDomainId);
+    return failure;
+  }
+
+  reconciliationFor(contextDomainId) {
+    return this.reconciliationRequired.get(contextDomainId) ?? null;
   }
 
   projectionFor(contextDomainId) {
