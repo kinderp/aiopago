@@ -202,8 +202,10 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
 
     const taskId = runner.ledger.read().task_id;
     runner.storage.engageLatch(taskId, "INTEGRITY", "test:s1-s2");
-    await assert.rejects(
-      () => runner.modelRuntime.completeSimple(chatModel, { messages: [] }),
+    const guardedChatProvider = runner.modelRuntime.getProvider(CHAT_PROVIDER);
+    assert.ok(guardedChatProvider, "ChatGPT provider must remain registered after gate installation");
+    assert.throws(
+      () => guardedChatProvider.streamSimple(chatModel, { messages: [] }),
       (error) => error?.code === "LLM_ADMISSION_BLOCKED",
       "adapter provider must remain behind Aiopago AdmissionGate",
     );
