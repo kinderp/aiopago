@@ -59,7 +59,7 @@ transport_support.status
   experimental-nonproduction
 ```
 
-An experimental external transport is rejected by default. The spike CI opts into it explicitly with `AIOPAGO_ALLOW_EXPERIMENTAL_EXTERNAL=1`. An `official-supported` adapter must provide documentation and usage-pool claim/evidence metadata.
+An experimental external transport is rejected by default. Spike/tests must opt in explicitly at `GuardianRunner.create()` with `allowExperimentalExternal: true`; environment variables never enable the transport implicitly. An `official-supported` adapter must provide documentation and usage-pool claim/evidence metadata.
 
 An exact-model descriptor is also rejected if the installed provider exposes unclassified sibling models; provider-default descriptors may classify the complete provider.
 
@@ -125,6 +125,7 @@ The fake transport counters prove only that Aiopago/Pi can keep two transport pa
 The independent review added fail-closed requirements before this seam can become production surface:
 
 - external adapters are experimental unless explicit official transport evidence is supplied;
+- experimental transport enablement is an explicit Runner construction option, never ambient environment state;
 - exact-model adapters cannot leave sibling models silently classified as Pi-native;
 - external-stateful tools are read-only in this spike (`read`/query tools); mutation expansion remains deferred;
 - context capsules pass the shared secret scanner before transport;
