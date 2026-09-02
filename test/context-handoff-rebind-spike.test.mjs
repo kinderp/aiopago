@@ -14,6 +14,8 @@ const CODE_PROVIDER = "code-handoff-spike";
 const CODE_MODEL = "code-handoff";
 const DOMAIN_ID = "chatgpt-handoff:spike";
 const HISTORY_TYPES = new Set(["message", "custom_message", "compaction", "branch_summary"]);
+const INDEX_DIGEST = `sha256:${"1".repeat(64)}`;
+const WORKTREE_DIGEST = `sha256:${"2".repeat(64)}`;
 
 function writeLedger(root) {
   const task = {
@@ -67,8 +69,8 @@ function fakeGitState(root) {
     head_sha: "abc123",
     base_sha: "def456",
     commit_shas: [],
-    index_digest: "sha256:index",
-    worktree_digest: "sha256:worktree",
+    index_digest: INDEX_DIGEST,
+    worktree_digest: WORKTREE_DIGEST,
     status_entries: ["M romeo-state.txt"],
     observed_at: "2026-09-02T00:00:00.000Z",
   };
