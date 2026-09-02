@@ -18,6 +18,7 @@ export * from "./human-workflow.mjs";
 export { createPlanAdapter, plan } from "./intent-adapter.mjs";
 export * from "./ledger.mjs";
 export * from "./metrics.mjs";
+export * from "./multi-model-handoff.mjs";
 export * from "./pi-loader.mjs";
 export * from "./provider-adapter.mjs";
 export * from "./runner.mjs";
