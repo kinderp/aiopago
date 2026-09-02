@@ -8,6 +8,8 @@ export const DEFAULT_CONTEXT_HYDRATION_BUDGET = Object.freeze({
   max_total_chars: 12000,
   max_entry_chars: 2000,
   max_evidence_items: 8,
+  max_git_status_entries: 64,
+  max_metadata_chars: 512,
 });
 
 function requiredString(value, code, label) {
@@ -150,19 +152,6 @@ function entryCandidate(entry) {
   return null;
 }
 
-function gitProjection(gitState) {
-  if (!gitState) return null;
-  return Object.freeze({
-    repository_id: gitState.repository_id ?? null,
-    branch: gitState.branch ?? null,
-    head_sha: gitState.head_sha ?? null,
-    base_sha: gitState.base_sha ?? null,
-    index_digest: gitState.index_digest ?? null,
-    worktree_digest: gitState.worktree_digest ?? null,
-    status_entries: Object.freeze([...(gitState.status_entries ?? [])]),
-  });
-}
-
 function boundedCollector(limits) {
   let remaining = limits.max_total_chars;
   let truncated = false;
@@ -186,11 +175,64 @@ function boundedCollector(limits) {
   };
 }
 
+function projectList(values, collector, perItem) {
+  const result = [];
+  for (const value of values ?? []) {
+    const original = String(value ?? "");
+    const text = collector.take(original, perItem);
+    if (!text && original.length > 0) break;
+    result.push(text);
+  }
+  return Object.freeze(result);
+}
+
+function gitProjection(gitState, collector, limits) {
+  if (!gitState) return null;
+  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars);
+  const statuses = [];
+  const rawStatuses = gitState.status_entries ?? [];
+  for (const status of rawStatuses) {
+    if (statuses.length >= limits.max_git_status_entries) {
+      collector.markTruncated();
+      break;
+    }
+    const original = String(status ?? "");
+    const text = collector.take(original, limits.max_metadata_chars);
+    if (!text && original.length > 0) break;
+    statuses.push(text);
+  }
+  return Object.freeze({
+    repository_id: metadata(gitState.repository_id),
+    branch: metadata(gitState.branch),
+    head_sha: metadata(gitState.head_sha),
+    base_sha: metadata(gitState.base_sha),
+    index_digest: metadata(gitState.index_digest),
+    worktree_digest: metadata(gitState.worktree_digest),
+    status_entries: Object.freeze(statuses),
+  });
+}
+
 export function hydrateContextTransfer({ window, targetDomain, ledger = null, gitState = null, evidence = [], hydrationBudget = undefined } = {}) {
   invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
   invariant(targetDomain?.context_domain_id === window.context_domain_id, "CONTEXT_TRANSFER_DOMAIN_MISMATCH");
   const limits = budget(hydrationBudget);
   const collector = boundedCollector(limits);
+  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars);
+
+  // Durable/authoritative project state gets budget priority over conversation history.
+  const project = Object.freeze({
+    task_id: metadata(ledger?.task_id),
+    plan_revision_id: metadata(ledger?.plan_revision_id),
+    requirements_version: metadata(ledger?.requirements_version),
+    current_item: metadata(ledger?.current_item),
+    next_item: metadata(ledger?.next_item),
+    objective: collector.take(ledger?.objective ?? ""),
+    next_step: collector.take(ledger?.next_step ?? ""),
+    decisions: projectList(ledger?.relevant_decisions, collector, limits.max_entry_chars),
+    tests: projectList(ledger?.relevant_tests, collector, limits.max_entry_chars),
+  });
+
+  const git = gitProjection(gitState, collector, limits);
 
   const recent = [];
   for (const entry of window.entries) {
@@ -200,9 +242,15 @@ export function hydrateContextTransfer({ window, targetDomain, ledger = null, gi
       collector.markTruncated();
       break;
     }
-    const text = collector.take(candidate.text);
-    if (!text && candidate.text.length > 0) break;
-    recent.push(Object.freeze({ ...candidate, text }));
+    const original = candidate.text;
+    const text = collector.take(original);
+    if (!text && original.length > 0) break;
+    recent.push(Object.freeze({
+      entry_id: metadata(candidate.entry_id),
+      kind: metadata(candidate.kind),
+      ...(candidate.provider !== undefined ? { provider: metadata(candidate.provider), model: metadata(candidate.model) } : {}),
+      text,
+    }));
   }
 
   const hydratedEvidence = [];
@@ -211,28 +259,14 @@ export function hydrateContextTransfer({ window, targetDomain, ledger = null, gi
       collector.markTruncated();
       break;
     }
-    const text = collector.take(item?.text ?? "");
-    if (!text && String(item?.text ?? "").length > 0) break;
+    const original = String(item?.text ?? "");
+    const text = collector.take(original);
+    if (!text && original.length > 0) break;
     hydratedEvidence.push(Object.freeze({
-      kind: item?.kind ?? "text",
-      source: item?.source ?? null,
+      kind: metadata(item?.kind ?? "text"),
+      source: metadata(item?.source),
       text,
     }));
-  }
-
-  const objective = collector.take(ledger?.objective ?? "");
-  const nextStep = collector.take(ledger?.next_step ?? "");
-  const decisions = [];
-  for (const decision of ledger?.relevant_decisions ?? []) {
-    const text = collector.take(decision);
-    if (!text && String(decision).length > 0) break;
-    decisions.push(text);
-  }
-  const tests = [];
-  for (const test of ledger?.relevant_tests ?? []) {
-    const text = collector.take(test);
-    if (!text && String(test).length > 0) break;
-    tests.push(text);
   }
 
   return Object.freeze({
@@ -241,18 +275,8 @@ export function hydrateContextTransfer({ window, targetDomain, ledger = null, gi
     target_context_domain_id: targetDomain.context_domain_id,
     source_cursor: Object.freeze({ ...window.source_cursor }),
     target_cursor: Object.freeze({ ...window.target_cursor }),
-    project: Object.freeze({
-      task_id: ledger?.task_id ?? null,
-      plan_revision_id: ledger?.plan_revision_id ?? null,
-      requirements_version: ledger?.requirements_version ?? null,
-      current_item: ledger?.current_item ?? null,
-      next_item: ledger?.next_item ?? null,
-      objective,
-      next_step: nextStep,
-      decisions: Object.freeze(decisions),
-      tests: Object.freeze(tests),
-    }),
-    git: gitProjection(gitState),
+    project,
+    git,
     recent_context: Object.freeze(recent),
     hydrated_evidence: Object.freeze(hydratedEvidence),
     budget: limits,
