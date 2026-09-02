@@ -3,6 +3,7 @@ import { ContextCursorBook, hydrateContextTransfer } from "./context-transfer.mj
 import { invariant } from "./errors.mjs";
 
 export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.1.0";
+export const CONTEXT_HANDOFF_BINDING_VERSION = "0.1.0";
 export const CONTEXT_SYNC_PREFIX = `AIOPAGO_CONTEXT_TRANSFER/${CONTEXT_SYNC_ENVELOPE_VERSION}`;
 export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
   max_tool_results: 8,
@@ -108,6 +109,14 @@ function transferMessage(envelope) {
   });
 }
 
+function sameCursor(left, right) {
+  return left?.session_id === right?.session_id && left?.entry_id === right?.entry_id;
+}
+
+function rootCursor(sessionId) {
+  return Object.freeze({ schema_version: "0.1.0", session_id: sessionId, entry_id: null, branch_depth: 0 });
+}
+
 export class ContextSyncCoordinator {
   constructor({ contextDomains, cursorBook = new ContextCursorBook(), ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
     invariant(contextDomains && typeof contextDomains.resolve === "function", "CONTEXT_SYNC_DOMAIN_REGISTRY_REQUIRED");
@@ -123,6 +132,80 @@ export class ContextSyncCoordinator {
     this.protocolBudget = protocolBudget(protocolLimits);
     this.pending = new Map();
     this.lastProjection = new Map();
+    this.durableBaselines = new Map();
+  }
+
+  externalDomains() {
+    return (this.contextDomains.list?.() ?? []).filter((domain) => domain.kind === "external-stateful");
+  }
+
+  captureForHandoff(sourceSession) {
+    invariant(sourceSession?.sessionManager, "CONTEXT_HANDOFF_SOURCE_SESSION_REQUIRED");
+    const sessionId = sourceSession.sessionManager.getSessionId();
+    const bindings = [];
+    for (const domain of this.externalDomains()) {
+      invariant(!this.pending.has(domain.context_domain_id), "CONTEXT_HANDOFF_PENDING_EXTERNAL_REQUEST", domain.context_domain_id);
+      const window = this.cursorBook.plan(domain.context_domain_id, sourceSession.sessionManager);
+      bindings.push(Object.freeze({
+        schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
+        context_domain_id: domain.context_domain_id,
+        provider_id: domain.provider_id,
+        model_id: domain.model_id ?? null,
+        usage_pool: domain.usage_pool,
+        source_session_id: sessionId,
+        source_cursor: Object.freeze({ ...window.source_cursor }),
+        source_tail_cursor: Object.freeze({ ...window.target_cursor }),
+        lag_entry_count: window.entries.length,
+        rebase_policy: "durable_checkpoint_epoch",
+      }));
+    }
+    return Object.freeze(bindings);
+  }
+
+  rebindAfterHandoff({ bindings = [], targetSession, handoffId, checkpointId } = {}) {
+    invariant(targetSession?.sessionManager, "CONTEXT_HANDOFF_TARGET_SESSION_REQUIRED");
+    invariant(typeof handoffId === "string" && handoffId.length > 0, "CONTEXT_HANDOFF_ID_REQUIRED");
+    invariant(typeof checkpointId === "string" && checkpointId.length > 0, "CONTEXT_HANDOFF_CHECKPOINT_REQUIRED");
+    const targetSessionId = targetSession.sessionManager.getSessionId();
+    const results = [];
+
+    for (const binding of bindings) {
+      invariant(binding?.schema_version === CONTEXT_HANDOFF_BINDING_VERSION, "CONTEXT_HANDOFF_BINDING_INVALID");
+      const domain = this.externalDomains().find((candidate) => candidate.context_domain_id === binding.context_domain_id);
+      invariant(domain, "CONTEXT_HANDOFF_DOMAIN_UNKNOWN", binding.context_domain_id);
+      invariant(domain.provider_id === binding.provider_id && (domain.model_id ?? null) === binding.model_id && domain.usage_pool === binding.usage_pool, "CONTEXT_HANDOFF_DOMAIN_MISMATCH", binding.context_domain_id);
+
+      const existingBaseline = this.durableBaselines.get(binding.context_domain_id);
+      const current = this.cursorBook.get(binding.context_domain_id);
+      if (existingBaseline?.handoff_id === handoffId && current?.session_id === targetSessionId) {
+        results.push(existingBaseline);
+        continue;
+      }
+      const expected = binding.source_cursor ?? rootCursor(binding.source_session_id);
+      const actual = current ?? rootCursor(binding.source_session_id);
+      invariant(sameCursor(actual, expected), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
+
+      this.pending.delete(binding.context_domain_id);
+      this.cursorBook.reset(binding.context_domain_id);
+      const targetWindow = this.cursorBook.plan(binding.context_domain_id, targetSession.sessionManager);
+      const targetCursor = this.cursorBook.commit(targetWindow);
+      const baseline = Object.freeze({
+        schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
+        context_domain_id: binding.context_domain_id,
+        handoff_id: handoffId,
+        checkpoint_id: checkpointId,
+        source_session_id: binding.source_session_id,
+        target_session_id: targetSessionId,
+        source_cursor: Object.freeze({ ...binding.source_cursor }),
+        source_tail_cursor: Object.freeze({ ...binding.source_tail_cursor }),
+        source_lag_entry_count: binding.lag_entry_count,
+        target_cursor: Object.freeze({ ...targetCursor }),
+        rebase_policy: binding.rebase_policy,
+      });
+      this.durableBaselines.set(binding.context_domain_id, baseline);
+      results.push(baseline);
+    }
+    return Object.freeze(results);
   }
 
   project(event, ctx) {
@@ -148,9 +231,11 @@ export class ContextSyncCoordinator {
       hydrationBudget: this.hydrationBudget,
     });
     const toolResults = protocolToolResults(window.entries, branchEntries, domain, this.protocolBudget);
+    const durableBaseline = this.durableBaselines.get(domain.context_domain_id) ?? null;
     const envelope = Object.freeze({
       schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
       context_domain_id: domain.context_domain_id,
+      durable_baseline: durableBaseline,
       transfer,
       live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
       protocol_tool_results: toolResults,
@@ -185,6 +270,7 @@ export class ContextSyncCoordinator {
     invariant(entryId, "CONTEXT_SYNC_ASSISTANT_ENTRY_NOT_PERSISTED");
     const cursor = this.cursorBook.acknowledgeThroughEntry(pending.window, ctx.sessionManager, entryId);
     this.pending.delete(domain.context_domain_id);
+    this.durableBaselines.delete(domain.context_domain_id);
     return Object.freeze({ domain, cursor, transfer_id: pending.window.transfer_id });
   }
 
