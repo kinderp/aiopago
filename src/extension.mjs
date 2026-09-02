@@ -165,7 +165,15 @@ export function createGuardianExtension(runner) {
       return { action: "continue" };
     });
 
+    // Pi-native models keep Pi's normal conversation context. Only external-stateful
+    // domains receive a bounded Aiopago transfer projection.
+    pi.on("context", (event, ctx) => {
+      const projection = runner.contextSync?.project(event, ctx);
+      if (projection) return { messages: projection.messages };
+    });
+
     pi.on("turn_end", async (event, ctx) => {
+      runner.contextSync?.acknowledgeTurn(event, ctx);
       safeMetric(runner, "captureModelCall", event, ctx);
       await adviseHandoff(runner, ctx);
     });
