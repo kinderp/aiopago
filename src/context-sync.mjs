@@ -1,0 +1,194 @@
+import { canonicalJson } from "./canonical.mjs";
+import { ContextCursorBook, hydrateContextTransfer } from "./context-transfer.mjs";
+import { invariant } from "./errors.mjs";
+
+export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.1.0";
+export const CONTEXT_SYNC_PREFIX = `AIOPAGO_CONTEXT_TRANSFER/${CONTEXT_SYNC_ENVELOPE_VERSION}`;
+export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
+  max_tool_results: 8,
+  max_total_tool_result_chars: 8000,
+  max_tool_result_chars: 4000,
+  max_live_user_chars: 4000,
+});
+
+function protocolBudget(input = {}) {
+  const merged = { ...DEFAULT_PROTOCOL_BUDGET, ...input };
+  for (const [key, value] of Object.entries(merged)) {
+    invariant(Number.isInteger(value) && value > 0, "CONTEXT_SYNC_PROTOCOL_BUDGET_INVALID", `${key} must be a positive integer`);
+  }
+  return Object.freeze(merged);
+}
+
+function modelMatchesDomain(message, domain) {
+  if (!message || message.role !== "assistant") return false;
+  if (message.provider !== domain.provider_id) return false;
+  return domain.model_id === undefined || message.model === domain.model_id;
+}
+
+function textContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((item) => item?.type === "text" && typeof item.text === "string")
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function latestUserInput(entries, maxChars) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.type !== "message" || entry.message?.role !== "user") continue;
+    const text = textContent(entry.message.content);
+    return text ? text.slice(0, maxChars) : null;
+  }
+  return null;
+}
+
+function toolCallIdsOwnedByDomain(entries, domain) {
+  const ids = new Set();
+  for (const entry of entries) {
+    if (entry.type !== "message" || !modelMatchesDomain(entry.message, domain)) continue;
+    for (const block of entry.message.content ?? []) {
+      if (block?.type === "toolCall" && typeof block.id === "string") ids.add(block.id);
+    }
+  }
+  return ids;
+}
+
+function protocolToolResults(windowEntries, branchEntries, domain, limits) {
+  const owned = toolCallIdsOwnedByDomain(branchEntries, domain);
+  const results = [];
+  let remaining = limits.max_total_tool_result_chars;
+  let truncated = false;
+
+  for (const entry of windowEntries) {
+    if (entry.type !== "message" || entry.message?.role !== "toolResult") continue;
+    if (!owned.has(entry.message.toolCallId)) continue;
+    if (results.length >= limits.max_tool_results) {
+      truncated = true;
+      break;
+    }
+    const raw = textContent(entry.message.content);
+    const allowed = Math.max(0, Math.min(limits.max_tool_result_chars, remaining));
+    const text = raw.slice(0, allowed);
+    if (text.length < raw.length) truncated = true;
+    remaining -= text.length;
+    results.push(Object.freeze({
+      tool_call_id: entry.message.toolCallId,
+      tool_name: entry.message.toolName,
+      is_error: entry.message.isError === true,
+      text,
+    }));
+    if (remaining <= 0) {
+      if (windowEntries.some((candidate) => candidate !== entry && candidate.type === "message" && candidate.message?.role === "toolResult" && owned.has(candidate.message.toolCallId))) truncated = true;
+      break;
+    }
+  }
+
+  return Object.freeze({ items: Object.freeze(results), truncated, remaining_chars: remaining });
+}
+
+function assistantEntryId(sessionManager, message, domain) {
+  const entries = sessionManager.getBranch();
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.type !== "message" || !modelMatchesDomain(entry.message, domain)) continue;
+    if (entry.message.timestamp !== message.timestamp) continue;
+    if (message.responseId && entry.message.responseId !== message.responseId) continue;
+    return entry.id;
+  }
+  return null;
+}
+
+function transferMessage(envelope) {
+  return Object.freeze({
+    role: "user",
+    content: Object.freeze([{ type: "text", text: `${CONTEXT_SYNC_PREFIX}\n${canonicalJson(envelope)}` }]),
+    timestamp: Date.now(),
+  });
+}
+
+export class ContextSyncCoordinator {
+  constructor({ contextDomains, cursorBook = new ContextCursorBook(), ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
+    invariant(contextDomains && typeof contextDomains.resolve === "function", "CONTEXT_SYNC_DOMAIN_REGISTRY_REQUIRED");
+    invariant(ledger && typeof ledger.read === "function", "CONTEXT_SYNC_LEDGER_REQUIRED");
+    invariant(typeof observeGit === "function", "CONTEXT_SYNC_GIT_OBSERVER_REQUIRED");
+    invariant(typeof evidenceProvider === "function", "CONTEXT_SYNC_EVIDENCE_PROVIDER_INVALID");
+    this.contextDomains = contextDomains;
+    this.cursorBook = cursorBook;
+    this.ledger = ledger;
+    this.observeGit = observeGit;
+    this.evidenceProvider = evidenceProvider;
+    this.hydrationBudget = hydrationBudget;
+    this.protocolBudget = protocolBudget(protocolLimits);
+    this.pending = new Map();
+    this.lastProjection = new Map();
+  }
+
+  project(event, ctx) {
+    const model = ctx?.model;
+    if (!model) return null;
+    const domain = this.contextDomains.resolve(model);
+    if (domain.kind !== "external-stateful") return null;
+
+    const pending = this.pending.get(domain.context_domain_id);
+    if (pending) {
+      invariant(pending.session_id === ctx.sessionManager.getSessionId(), "CONTEXT_SYNC_PENDING_SESSION_MISMATCH");
+      return Object.freeze({ messages: pending.messages, envelope: pending.envelope, domain });
+    }
+
+    const window = this.cursorBook.plan(domain.context_domain_id, ctx.sessionManager);
+    const branchEntries = ctx.sessionManager.getBranch();
+    const transfer = hydrateContextTransfer({
+      window,
+      targetDomain: domain,
+      ledger: this.ledger.read(),
+      gitState: this.observeGit(),
+      evidence: this.evidenceProvider({ window, domain, ctx }) ?? [],
+      hydrationBudget: this.hydrationBudget,
+    });
+    const toolResults = protocolToolResults(window.entries, branchEntries, domain, this.protocolBudget);
+    const envelope = Object.freeze({
+      schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
+      context_domain_id: domain.context_domain_id,
+      transfer,
+      live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
+      protocol_tool_results: toolResults,
+    });
+    const messages = Object.freeze([transferMessage(envelope)]);
+    const record = Object.freeze({
+      session_id: ctx.sessionManager.getSessionId(),
+      provider_id: model.provider,
+      model_id: model.id,
+      window,
+      envelope,
+      messages,
+    });
+    this.pending.set(domain.context_domain_id, record);
+    this.lastProjection.set(domain.context_domain_id, record);
+    return Object.freeze({ messages, envelope, domain });
+  }
+
+  acknowledgeTurn(event, ctx) {
+    const message = event?.message;
+    if (!message || message.role !== "assistant") return null;
+    const model = ctx?.model;
+    if (!model) return null;
+    const domain = this.contextDomains.resolve(model);
+    if (domain.kind !== "external-stateful" || !modelMatchesDomain(message, domain)) return null;
+    if (message.stopReason === "error" || message.stopReason === "aborted") return null;
+
+    const pending = this.pending.get(domain.context_domain_id);
+    if (!pending) return null;
+    invariant(pending.provider_id === model.provider && pending.model_id === model.id, "CONTEXT_SYNC_PENDING_MODEL_MISMATCH");
+    const entryId = assistantEntryId(ctx.sessionManager, message, domain);
+    invariant(entryId, "CONTEXT_SYNC_ASSISTANT_ENTRY_NOT_PERSISTED");
+    const cursor = this.cursorBook.acknowledgeThroughEntry(pending.window, ctx.sessionManager, entryId);
+    this.pending.delete(domain.context_domain_id);
+    return Object.freeze({ domain, cursor, transfer_id: pending.window.transfer_id });
+  }
+
+  projectionFor(contextDomainId) {
+    return this.lastProjection.get(contextDomainId) ?? null;
+  }
+}
