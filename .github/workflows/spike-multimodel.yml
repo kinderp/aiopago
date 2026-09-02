@@ -35,6 +35,9 @@ jobs:
       - name: S5/S6 context transfer primitives
         run: node --test test/context-transfer-spike.test.mjs
 
+      - name: External context safety failures
+        run: node --test test/context-sync-safety-spike.test.mjs
+
       - name: S1/S2 provider routing
         run: node --test test/multi-model-spike.test.mjs
 
