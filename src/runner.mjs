@@ -8,9 +8,9 @@ import { ContextSyncCoordinator } from "./context-sync.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
-import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
+import { ContextAwareHandoffService } from "./multi-model-handoff.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
 import { installProviderAdapters } from "./provider-adapter.mjs";
@@ -73,17 +73,6 @@ export class GuardianRunner {
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
     const gitObserver = options.observeGit ?? (() => observeGitState(cwd));
-    runner.handoffService = new HandoffService({
-      storage,
-      artifacts,
-      ledger,
-      observeGit: gitObserver,
-      safePoint: runner.safePoint,
-      runnerInstanceId,
-      modelPolicy,
-      reasoningPolicy,
-      telemetry: runner.metrics,
-    });
     runner.contextSync = options.contextSync ?? new ContextSyncCoordinator({
       contextDomains,
       ledger,
@@ -93,6 +82,18 @@ export class GuardianRunner {
       protocolBudget: options.contextProtocolBudget,
     });
     runner.contextCursors = runner.contextSync.cursorBook;
+    runner.handoffService = new ContextAwareHandoffService({
+      storage,
+      artifacts,
+      ledger,
+      observeGit: gitObserver,
+      safePoint: runner.safePoint,
+      runnerInstanceId,
+      modelPolicy,
+      reasoningPolicy,
+      telemetry: runner.metrics,
+      contextContinuity: runner.contextSync,
+    });
     await runner.createRuntime(options);
     if (!modelPolicy) {
       const selected = runner.runtime.session.model;
