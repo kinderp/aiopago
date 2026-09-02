@@ -19,8 +19,8 @@ class MemoryMetricStorage {
     return record;
   }
   appendMetricDiagnostic(record) { this.diagnostics.push(structuredClone(record)); return record; }
-  metricSamples(sessionId = null) { return this.samples.filter((sample) => sessionId === null || sample.session_id === sessionId).map(structuredClone); }
-  operationsForTask(taskId) { return this.operations.filter((operation) => operation.task_id === taskId).map(structuredClone); }
+  metricSamples(sessionId = null) { return this.samples.filter((sample) => sessionId === null || sample.session_id === sessionId).map((sample) => structuredClone(sample)); }
+  operationsForTask(taskId) { return this.operations.filter((operation) => operation.task_id === taskId).map((operation) => structuredClone(operation)); }
   findHandoffByTarget() { return null; }
   findHandoffBySource() { return null; }
 }
