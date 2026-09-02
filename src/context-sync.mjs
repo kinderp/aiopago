@@ -124,14 +124,28 @@ function rootCursor(sessionId) {
   return Object.freeze({ schema_version: "0.1.0", session_id: sessionId, entry_id: null, branch_depth: 0 });
 }
 
+function durableFailure(delivery, fallbackReason = "durable-unresolved-delivery") {
+  if (!delivery) return null;
+  return Object.freeze({
+    schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
+    context_domain_id: delivery.context_domain_id,
+    session_id: delivery.session_id,
+    transfer_id: delivery.transfer_id,
+    reason: delivery.failure_reason ?? fallbackReason,
+    durable_state: delivery.state,
+  });
+}
+
 export class ContextSyncCoordinator {
-  constructor({ contextDomains, cursorBook = new ContextCursorBook(), ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
+  constructor({ contextDomains, cursorBook = new ContextCursorBook(), stateStore = null, ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
     invariant(contextDomains && typeof contextDomains.resolve === "function", "CONTEXT_SYNC_DOMAIN_REGISTRY_REQUIRED");
     invariant(ledger && typeof ledger.read === "function", "CONTEXT_SYNC_LEDGER_REQUIRED");
     invariant(typeof observeGit === "function", "CONTEXT_SYNC_GIT_OBSERVER_REQUIRED");
     invariant(typeof evidenceProvider === "function", "CONTEXT_SYNC_EVIDENCE_PROVIDER_INVALID");
+    invariant(!stateStore || (typeof stateStore.unresolvedDelivery === "function" && typeof stateStore.prepareDelivery === "function"), "CONTEXT_SYNC_STATE_STORE_INVALID");
     this.contextDomains = contextDomains;
     this.cursorBook = cursorBook;
+    this.stateStore = stateStore;
     this.ledger = ledger;
     this.observeGit = observeGit;
     this.evidenceProvider = evidenceProvider;
@@ -141,6 +155,12 @@ export class ContextSyncCoordinator {
     this.reconciliationRequired = new Map();
     this.lastProjection = new Map();
     this.durableBaselines = new Map();
+    if (this.stateStore) {
+      for (const domain of this.externalDomains()) {
+        const baseline = this.stateStore.getBaseline(domain.context_domain_id);
+        if (baseline) this.durableBaselines.set(domain.context_domain_id, baseline);
+      }
+    }
   }
 
   externalDomains() {
@@ -153,11 +173,13 @@ export class ContextSyncCoordinator {
     const bindings = [];
     for (const domain of this.externalDomains()) {
       invariant(!this.pending.has(domain.context_domain_id), "CONTEXT_HANDOFF_PENDING_EXTERNAL_REQUEST", domain.context_domain_id);
-      invariant(!this.reconciliationRequired.has(domain.context_domain_id), "CONTEXT_SYNC_RECONCILIATION_REQUIRED", domain.context_domain_id);
+      invariant(!this.reconciliationFor(domain.context_domain_id), "CONTEXT_SYNC_RECONCILIATION_REQUIRED", domain.context_domain_id);
       const window = this.cursorBook.plan(domain.context_domain_id, sourceSession.sessionManager);
+      const durableBinding = this.stateStore?.ensureBinding(domain) ?? null;
       bindings.push(Object.freeze({
         schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
         context_domain_id: domain.context_domain_id,
+        binding_id: durableBinding?.binding_id ?? null,
         provider_id: domain.provider_id,
         model_id: domain.model_id ?? null,
         usage_pool: domain.usage_pool,
@@ -183,8 +205,12 @@ export class ContextSyncCoordinator {
       const domain = this.externalDomains().find((candidate) => candidate.context_domain_id === binding.context_domain_id);
       invariant(domain, "CONTEXT_HANDOFF_DOMAIN_UNKNOWN", binding.context_domain_id);
       invariant(domain.provider_id === binding.provider_id && (domain.model_id ?? null) === binding.model_id && domain.usage_pool === binding.usage_pool, "CONTEXT_HANDOFF_DOMAIN_MISMATCH", binding.context_domain_id);
+      const durableBinding = this.stateStore?.ensureBinding(domain) ?? null;
+      if (binding.binding_id !== null && binding.binding_id !== undefined) {
+        invariant(durableBinding?.binding_id === binding.binding_id, "CONTEXT_HANDOFF_BINDING_ID_MISMATCH", binding.context_domain_id);
+      }
 
-      const existingBaseline = this.durableBaselines.get(binding.context_domain_id);
+      const existingBaseline = this.durableBaselines.get(binding.context_domain_id) ?? this.stateStore?.getBaseline(binding.context_domain_id) ?? null;
       const current = this.cursorBook.get(binding.context_domain_id);
       if (existingBaseline?.handoff_id === handoffId && current?.session_id === targetSessionId) {
         results.push(existingBaseline);
@@ -202,6 +228,7 @@ export class ContextSyncCoordinator {
       const baseline = Object.freeze({
         schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
         context_domain_id: binding.context_domain_id,
+        binding_id: durableBinding?.binding_id ?? binding.binding_id ?? null,
         handoff_id: handoffId,
         checkpoint_id: checkpointId,
         source_session_id: binding.source_session_id,
@@ -213,6 +240,7 @@ export class ContextSyncCoordinator {
         rebase_policy: binding.rebase_policy,
       });
       this.durableBaselines.set(binding.context_domain_id, baseline);
+      this.stateStore?.setBaseline(binding.context_domain_id, baseline, { handoffId });
       results.push(baseline);
     }
     return Object.freeze(results);
@@ -224,13 +252,28 @@ export class ContextSyncCoordinator {
     const domain = this.contextDomains.resolve(model);
     if (domain.kind !== "external-stateful") return null;
 
-    const reconciliation = this.reconciliationRequired.get(domain.context_domain_id);
-    invariant(!reconciliation, "CONTEXT_SYNC_RECONCILIATION_REQUIRED", `${domain.context_domain_id}:${reconciliation?.reason ?? "unknown"}`);
+    const memoryReconciliation = this.reconciliationRequired.get(domain.context_domain_id);
+    invariant(!memoryReconciliation, "CONTEXT_SYNC_RECONCILIATION_REQUIRED", `${domain.context_domain_id}:${memoryReconciliation?.reason ?? "unknown"}`);
 
     const pending = this.pending.get(domain.context_domain_id);
     if (pending) {
       invariant(pending.session_id === ctx.sessionManager.getSessionId(), "CONTEXT_SYNC_PENDING_SESSION_MISMATCH");
       return Object.freeze({ messages: pending.messages, envelope: pending.envelope, domain });
+    }
+
+    const durableUnresolved = this.stateStore?.unresolvedDelivery(domain.context_domain_id) ?? null;
+    if (durableUnresolved) {
+      let failure = durableFailure(durableUnresolved);
+      if (durableUnresolved.state === "PREPARED") {
+        const reconciled = this.stateStore.markDeliveryReconciliation(
+          domain.context_domain_id,
+          durableUnresolved.transfer_id,
+          "restart-or-lost-process-with-prepared-transfer",
+        );
+        failure = durableFailure(reconciled);
+      }
+      this.reconciliationRequired.set(domain.context_domain_id, failure);
+      invariant(false, "CONTEXT_SYNC_RECONCILIATION_REQUIRED", `${domain.context_domain_id}:${failure.reason}`);
     }
 
     const window = this.cursorBook.plan(domain.context_domain_id, ctx.sessionManager);
@@ -244,10 +287,13 @@ export class ContextSyncCoordinator {
       hydrationBudget: this.hydrationBudget,
     });
     const toolResults = protocolToolResults(window.entries, branchEntries, domain, this.protocolBudget);
-    const durableBaseline = this.durableBaselines.get(domain.context_domain_id) ?? null;
+    const durableBaseline = this.durableBaselines.get(domain.context_domain_id) ?? this.stateStore?.getBaseline(domain.context_domain_id) ?? null;
+    if (durableBaseline && !this.durableBaselines.has(domain.context_domain_id)) this.durableBaselines.set(domain.context_domain_id, durableBaseline);
+    const binding = this.stateStore?.ensureBinding(domain) ?? null;
     const envelope = Object.freeze({
       schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
       context_domain_id: domain.context_domain_id,
+      context_binding_id: binding?.binding_id ?? null,
       durable_baseline: durableBaseline,
       transfer,
       live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
@@ -256,6 +302,7 @@ export class ContextSyncCoordinator {
     // The transfer path must enforce the same secret-shaped field/value policy as
     // sealed Aiopago artifacts before any external transport sees the capsule.
     assertNoSecrets(envelope);
+    this.stateStore?.prepareDelivery(window, domain);
     const messages = Object.freeze([transferMessage(envelope)]);
     const record = Object.freeze({
       session_id: ctx.sessionManager.getSessionId(),
@@ -284,7 +331,8 @@ export class ContextSyncCoordinator {
 
     if (message.stopReason === "error" || message.stopReason === "aborted") {
       this.pending.delete(domain.context_domain_id);
-      const failure = Object.freeze({
+      const durable = this.stateStore?.markDeliveryReconciliation(domain.context_domain_id, pending.window.transfer_id, message.stopReason) ?? null;
+      const failure = durable ? durableFailure(durable) : Object.freeze({
         schema_version: CONTEXT_SYNC_ENVELOPE_VERSION,
         context_domain_id: domain.context_domain_id,
         session_id: pending.session_id,
@@ -298,22 +346,27 @@ export class ContextSyncCoordinator {
     const entryId = assistantEntryId(ctx.sessionManager, message, domain);
     invariant(entryId, "CONTEXT_SYNC_ASSISTANT_ENTRY_NOT_PERSISTED");
     const cursor = this.cursorBook.acknowledgeThroughEntry(pending.window, ctx.sessionManager, entryId);
+    this.stateStore?.acknowledgeDelivery(domain.context_domain_id, pending.window.transfer_id);
     this.pending.delete(domain.context_domain_id);
     this.reconciliationRequired.delete(domain.context_domain_id);
     this.durableBaselines.delete(domain.context_domain_id);
+    this.stateStore?.clearBaseline(domain.context_domain_id);
     return Object.freeze({ domain, cursor, transfer_id: pending.window.transfer_id });
   }
 
   resolveReconciliation(contextDomainId, action) {
     invariant(action === "retry-from-last-acknowledged", "CONTEXT_SYNC_RECONCILIATION_ACTION_INVALID", action);
-    const failure = this.reconciliationRequired.get(contextDomainId);
+    const failure = this.reconciliationRequired.get(contextDomainId) ?? durableFailure(this.stateStore?.unresolvedDelivery(contextDomainId) ?? null);
     invariant(failure, "CONTEXT_SYNC_RECONCILIATION_NOT_REQUIRED", contextDomainId);
+    if (this.stateStore?.unresolvedDelivery(contextDomainId)?.state === "RECONCILIATION_REQUIRED") {
+      this.stateStore.approveDeliveryRetry(contextDomainId);
+    }
     this.reconciliationRequired.delete(contextDomainId);
     return failure;
   }
 
   reconciliationFor(contextDomainId) {
-    return this.reconciliationRequired.get(contextDomainId) ?? null;
+    return this.reconciliationRequired.get(contextDomainId) ?? durableFailure(this.stateStore?.unresolvedDelivery(contextDomainId) ?? null);
   }
 
   projectionFor(contextDomainId) {
