@@ -11,6 +11,7 @@ permissions:
 
 env:
   PI_CODING_AGENT_ROOT: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
+  AIOPAGO_ALLOW_EXPERIMENTAL_EXTERNAL: "1"
 
 jobs:
   s1-s2-s3-s4-s5-s6-s7-s8:
