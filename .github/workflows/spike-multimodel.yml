@@ -13,7 +13,7 @@ env:
   PI_CODING_AGENT_ROOT: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
 
 jobs:
-  s1-s2-s3-s4-s5-s6:
+  s1-s2-s3-s4-s5-s6-s7:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -40,3 +40,6 @@ jobs:
 
       - name: S3/S4 external-stateful continuity and Pi tool
         run: node --test test/external-stateful-spike.test.mjs
+
+      - name: S7 exact attribution primitives
+        run: node --test test/attribution-spike.test.mjs
