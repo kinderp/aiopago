@@ -120,7 +120,7 @@ function emptyUsageGroup(key, kind = undefined) {
     reasoning_tokens: 0,
     cache_read_tokens: 0,
     cache_write_tokens: 0,
-    total_tokens_observed: 0,
+    primary_tokens_observed: 0,
   };
 }
 
@@ -131,7 +131,9 @@ function accumulateUsage(group, sample) {
   add(group, "reasoning_tokens", sample.usage?.reasoning_tokens);
   add(group, "cache_read_tokens", sample.usage?.cache_read_tokens);
   add(group, "cache_write_tokens", sample.usage?.cache_write_tokens);
-  group.total_tokens_observed = group.input_tokens + group.output_tokens + group.reasoning_tokens + group.cache_read_tokens + group.cache_write_tokens;
+  // Input+output is the only share basis here. Reasoning/cache stay separate because
+  // provider accounting may overlap those categories with primary token counts.
+  group.primary_tokens_observed = group.input_tokens + group.output_tokens;
 }
 
 function operationMap(storage, samples) {
@@ -203,16 +205,16 @@ export function buildAttributionSnapshot({ storage, sessionId = null } = {}) {
   }
 
   const totalCalls = [...poolGroups.values()].reduce((sum, group) => sum + group.model_calls, 0);
-  const totalTokens = [...poolGroups.values()].reduce((sum, group) => sum + group.total_tokens_observed, 0);
+  const totalPrimaryTokens = [...poolGroups.values()].reduce((sum, group) => sum + group.primary_tokens_observed, 0);
   const usagePools = [...poolGroups.values()].map((group) => Object.freeze({
     ...group,
     call_share_percent: percentage(group.model_calls, totalCalls),
-    observed_token_share_percent: percentage(group.total_tokens_observed, totalTokens),
+    primary_token_share_percent: percentage(group.primary_tokens_observed, totalPrimaryTokens),
   }));
   const models = [...modelGroups.values()].map((group) => Object.freeze({
     ...group,
     call_share_percent: percentage(group.model_calls, totalCalls),
-    observed_token_share_percent: percentage(group.total_tokens_observed, totalTokens),
+    primary_token_share_percent: percentage(group.primary_tokens_observed, totalPrimaryTokens),
   }));
   const tools = [...toolGroups.values()].map((group) => Object.freeze({
     ...group,
@@ -224,7 +226,7 @@ export function buildAttributionSnapshot({ storage, sessionId = null } = {}) {
     schema_version: ATTRIBUTION_SCHEMA_VERSION,
     session_id: sessionId,
     model_calls: totalCalls,
-    total_tokens_observed: totalTokens,
+    primary_tokens_observed: totalPrimaryTokens,
     usage_pools: Object.freeze(usagePools.sort((a, b) => b.model_calls - a.model_calls || a.key.localeCompare(b.key))),
     models: Object.freeze(models.sort((a, b) => b.model_calls - a.model_calls || a.key.localeCompare(b.key))),
     tools_by_usage_pool: Object.freeze(tools.sort((a, b) => b.requested_tool_calls - a.requested_tool_calls || a.usage_pool.localeCompare(b.usage_pool))),
