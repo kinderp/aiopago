@@ -1,4 +1,5 @@
 import { GuardianError } from "./errors.mjs";
+import { TOOL_PROFILES } from "./safety.mjs";
 
 function message(error) { return error instanceof GuardianError ? `${error.code}: ${error.message}` : error?.message ?? String(error); }
 function safeNotify(ctx, text, type) {
@@ -32,6 +33,17 @@ function availableContext(ctx) {
     if (!usage || !Number.isFinite(usage.percent)) return "unavailable";
     return `${Math.round(usage.percent)}%`;
   } catch { return "unavailable"; }
+}
+
+function externalToolAdmission(runner, ctx, toolName) {
+  const model = ctx?.model ?? runner.runtime?.session?.model ?? null;
+  if (!model) return { admitted: true, domain: null };
+  let domain;
+  try { domain = runner.contextDomains?.resolve?.(model) ?? null; }
+  catch { return { admitted: false, domain: null }; }
+  if (!domain || domain.kind !== "external-stateful") return { admitted: true, domain };
+  if (domain.capabilities?.pi_tools !== true) return { admitted: false, domain };
+  return { admitted: TOOL_PROFILES[toolName] === "READ_ONLY", domain };
 }
 
 export function formatGuardianStatus(runner, ctx = null) {
@@ -178,7 +190,12 @@ export function createGuardianExtension(runner) {
       await adviseHandoff(runner, ctx);
     });
 
-    pi.on("tool_call", (event) => {
+    pi.on("tool_call", (event, ctx) => {
+      const admission = externalToolAdmission(runner, ctx, event.toolName);
+      if (!admission.admitted) {
+        const domainId = admission.domain?.context_domain_id ?? "unknown";
+        return { block: true, reason: `EXTERNAL_CONTEXT_TOOL_NOT_ADMITTED: ${domainId}/${event.toolName}` };
+      }
       try { runner.toolTracker.admit(event.toolCallId, event.toolName, event.input); }
       catch (error) { return { block: true, reason: message(error) }; }
     });
