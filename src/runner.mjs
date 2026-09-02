@@ -3,6 +3,7 @@ import { ArtifactStore } from "./artifact-store.mjs";
 import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
 import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./context-advisor.mjs";
+import { ContextDomainRegistry } from "./context-domain.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
@@ -11,6 +12,7 @@ import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
+import { installProviderAdapters } from "./provider-adapter.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
 
@@ -30,6 +32,10 @@ export class GuardianRunner {
     storage.ensureLatch(plan.task_id);
     const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
+    const contextDomains = options.contextDomains ?? new ContextDomainRegistry();
+    const adapterInstall = await installProviderAdapters(options.providerAdapters ?? [], { modelRuntime, pi, contextDomains });
+    // Provider adapters must be present before the transport gate is installed.
+    // Otherwise a dynamically-added provider could escape Aiopago's latch/safe-point admission boundary.
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
     const modelPolicy = options.modelPolicy ?? plan.model_policy ?? null;
@@ -54,7 +60,7 @@ export class GuardianRunner {
       runtimeRoot: repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"),
       artifactRoot: repository?.artifactRoot ?? join(cwd, ".guardian"),
     });
-    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
+    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, contextDomains, installedProviderAdapters: adapterInstall.installed, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
     runner.metrics = options.metrics ?? new MeasurementInstrumentation({
       storage,
       ledger,
