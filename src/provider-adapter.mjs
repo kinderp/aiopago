@@ -49,6 +49,14 @@ export async function installProviderAdapters(adapters = [], { modelRuntime, pi,
     invariant(provider, "PROVIDER_ADAPTER_INSTALL_FAILED", `${adapter.provider_id} was not registered`);
     const models = modelRuntime.getModels(adapter.provider_id);
     invariant(Array.isArray(models) && models.length > 0, "PROVIDER_ADAPTER_MODELS_REQUIRED", adapter.provider_id);
+
+    if (adapter.context_domain.model_id) {
+      invariant(models.some((model) => model.id === adapter.context_domain.model_id), "PROVIDER_ADAPTER_DOMAIN_MODEL_MISSING", `${adapter.provider_id}/${adapter.context_domain.model_id}`);
+      invariant(models.length === 1, "PROVIDER_ADAPTER_UNCLASSIFIED_MODELS", `${adapter.provider_id} exposes ${models.length} models but the adapter classifies only ${adapter.context_domain.model_id}`);
+    }
+    // A provider-default descriptor (no model_id) safely classifies every model.
+    // Exact-model descriptors are deliberately restricted to one-model providers
+    // until the adapter contract supports an explicit descriptor per model.
     const domain = contextDomains.register(adapter.context_domain);
     installed.push(Object.freeze({
       adapter_id: adapter.adapter_id,
