@@ -1,0 +1,36 @@
+name: spike-multimodel
+
+on:
+  push:
+    branches:
+      - spike/chatgpt-model-provider
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s1-s2-s5-s6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+
+      - name: Install supported Pi profile
+        run: npm install --no-package-lock --save=false @earendil-works/pi-coding-agent@0.83.0
+
+      - name: Show effective Pi version
+        run: npm list @earendil-works/pi-coding-agent @earendil-works/pi-ai
+
+      - name: Syntax and brand checks
+        run: npm run check
+
+      - name: S5/S6 context transfer
+        run: node --test test/context-transfer-spike.test.mjs
+
+      - name: S1/S2 provider routing
+        run: node --test test/multi-model-spike.test.mjs
