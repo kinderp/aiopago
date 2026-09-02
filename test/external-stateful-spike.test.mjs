@@ -175,6 +175,7 @@ test("S3/S4 spike: external stateful model gets only Aiopago deltas and can use 
       pi,
       modelRuntime,
       providerAdapters: [chatAdapter],
+      allowExperimentalExternal: true,
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 90,

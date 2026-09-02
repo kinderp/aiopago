@@ -1,10 +1,10 @@
 # Spike #32 — S5/S6 context cursor and bounded hydration
 
 **Date:** 2026-09-02  
-**Status:** EXECUTED PROTOTYPE / TARGETED TESTS PASS; PRODUCTION DURABILITY NOT YET CLOSED  
+**Status:** EXECUTED / DURABLE RESTART GATES PASS; PRODUCTION CHATGPT TRANSPORT BLOCKED  
 **Transport:** provider-neutral; no ChatGPT web automation
 
-## S5 — Context cursor prototype
+## S5 — Context cursor and durable state
 
 `ContextCursorBook` uses the stable `id` values on Pi session entries from the active branch (`SessionManager.getBranch()`).
 
@@ -37,20 +37,28 @@ Properties demonstrated by the spike:
 - a cursor from another Pi session fails with `CONTEXT_CURSOR_SESSION_MISMATCH`;
 - S8 can explicitly rebase the domain into a history-zero replacement Pi session using checkpoint/handoff provenance.
 
-### Independent-review durability finding
+### Durability closure after independent review
 
-The current `ContextCursorBook` is an **in-memory prototype**. S8 seals cursor/lag metadata into an explicit handoff manifest, but an ordinary Runner crash/restart outside that handoff does not yet persist the acknowledged watermark or an in-flight transfer intent.
+The first implementation kept `ContextCursorBook` only in memory. The review branch closes that gap with `ContextStateStore` and `DurableContextCursorBook` in `src/context-state.mjs`.
 
-That means S5's algorithm is validated, but ADR-0016 D6's production requirement for a durable/observable external-domain cursor is **not closed yet**. A production slice must persist at least:
+Context continuity state is persisted through the existing append-only `GuardianStorage.journal`; the added index changes lookup cost only and does **not** introduce a second authority beside the existing runtime SQLite journal.
 
-- acknowledged cursor;
-- in-flight transfer identity/source/target cursor;
-- reconciliation-required state after ambiguous interruption;
-- context-domain/session epoch binding.
+The durable state now covers:
 
-After restart, an unresolved in-flight transfer must fail closed rather than be resent automatically.
+- acknowledged external-domain cursor;
+- external context-domain binding identity;
+- opaque external conversation/thread identifier when a transport supplies one;
+- handoff/rebind baseline;
+- external delivery intent and source/target cursors;
+- explicit `PREPARED`, `RECONCILIATION_REQUIRED`, `RETRY_APPROVED`, and `ACKNOWLEDGED` delivery states.
 
-## S6 — Deterministic Context Hydrator prototype
+The remote thread identifier is treated as opaque transport data: it is bounded, conflict-safe and checked by the shared outbound safety policy. Once a domain is bound to a non-null remote thread ID, a conflicting ID fails closed rather than silently rebinding the project to another remote conversation.
+
+Cursor persistence is ordered before delivery acknowledgement. If the process dies between those two durable writes, restart observes the still-`PREPARED` delivery and fails closed instead of replaying it.
+
+A `PREPARED` delivery found after process-style reconstruction therefore requires explicit reconciliation; it is never silently resent. This closes ADR-0016 D6's restart-durability requirement for the provider-neutral mechanics.
+
+## S6 — Deterministic Context Hydrator
 
 `hydrateContextTransfer()` converts a planned delta into a bounded provider-neutral bundle.
 
@@ -78,17 +86,19 @@ Protocol-level live user input and tool results have separate bounded limits. Tr
 
 There is no LLM compaction call in this path.
 
-### Secret gate
+### Outbound safety gate
 
-Independent review found that the first implementation reused the ArtifactStore secret scanner only for sealed artifacts, not for the outbound context capsule. This is now corrected: the complete external transfer envelope is passed through the shared secret-shaped key/value scan **before** `transferMessage()` is created. A rejected secret creates no pending external request.
+Independent review found that the first implementation reused the artifact safety scan only for sealed artifacts, not for the outbound context capsule. This is now corrected: the complete external transfer envelope is checked by the shared outbound safety scan **before** `transferMessage()` is created. A rejected capsule creates no pending external request.
 
-This is a fail-closed guard, not a claim that regex scanning is a complete DLP system. Production policy may later add stronger repository-specific redaction/classification.
+The durable binding and baseline surfaces are checked by the same policy. This is a fail-closed guard, not a claim that the current pattern scan is a complete DLP system. Production policy may later add stronger repository-specific redaction/classification.
 
-## Failure semantics added by review
+## Failure and restart semantics
 
-A remote `error` or `aborted` assistant turn no longer leaves the old transfer silently pending. Aiopago records an in-memory `RECONCILIATION_REQUIRED` state and blocks the next projection until an explicit `retry-from-last-acknowledged` action is chosen.
+A remote `error` or `aborted` assistant turn records `RECONCILIATION_REQUIRED` and blocks the next projection until an explicit retry-from-last-acknowledged decision is made.
 
-This closes the silent stale-replay bug in the live process, but persistence of that reconciliation state across Runner crash/restart remains part of the durability work above.
+That state is no longer process-local. The delivery lifecycle lives in the same authoritative runtime journal and survives `GuardianStorage` close/reopen. A restart with unresolved `PREPARED` or `RECONCILIATION_REQUIRED` state cannot silently replay the transfer.
+
+The same restart reconstruction also restores the durable external-thread binding and the handoff baseline used to re-establish the context domain without relying on Pi conversation history.
 
 ## Tests
 
@@ -106,17 +116,26 @@ This closes the silent stale-replay bug in the live process, but persistence of 
 
 `test/context-sync-safety-spike.test.mjs` adds adversarial review gates for:
 
-- secret-shaped outbound content rejection before transport;
+- outbound safety rejection before transport;
 - explicit reconciliation after provider error;
 - visible live-user truncation metadata;
 - read-only external Pi tool policy;
 - fail-closed experimental transport eligibility;
+- official-transport metadata eligibility;
 - rejection of unclassified sibling models.
 
-These targeted gates execute in GitHub Actions on Node 22.19.0 + Pi 0.83.0.
+`test/context-state-durability-spike.test.mjs` adds process-style restart gates for:
+
+- acknowledged cursor surviving `GuardianStorage` restart without replay;
+- durable, opaque and conflict-safe remote conversation binding;
+- unresolved `PREPARED` delivery becoming reconciliation-required after restart and never silently replaying;
+- provider adapter receiving the restored remote-thread binding;
+- durable handoff baseline surviving state reconstruction.
+
+The final review CI profile runs Node 22.19.0 with `@earendil-works/pi-coding-agent@0.83.0` and `@earendil-works/pi-ai@0.83.0`. On the reviewed head, `npm run check` validates 65 modules; all targeted S1-S8 gates pass and the complete historical suite reports **689/689 tests PASS**, with zero failures, skips or cancellations.
 
 ## Relationship to blocked ChatGPT transport
 
-ADR-0016A rejects consumer-web response scraping and requires an officially supported ChatGPT transport. S5/S6 remain useful because they are transport-neutral: the same cursor/bundle machinery can be hardened independently and connected to an eligible official transport later.
+ADR-0016A rejects consumer-web response scraping and requires an officially supported ChatGPT transport. S5/S6 are transport-neutral and their provider-neutral durability mechanics are now closed for the reviewed profile.
 
-The provider-neutral foundation should not be merged as production-ready until restart durability/in-flight reconciliation is implemented and tested. The real ChatGPT thread binding remains transport-dependent and is intentionally not fabricated by the fake transport.
+What remains blocked is not cursor/restart durability but the product-specific edge: an eligible official OpenAI transport for `ChatGPT Normal`, plus empirical proof that requests through it consume the intended normal ChatGPT usage pool rather than API or Codex accounting.

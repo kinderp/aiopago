@@ -171,6 +171,7 @@ test("S8: Aiopago handoff rebinds external context to a fresh history-zero Pi ep
       pi,
       modelRuntime,
       providerAdapters: [chatAdapter],
+      allowExperimentalExternal: true,
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 90,
@@ -211,6 +212,7 @@ test("S8: Aiopago handoff rebinds external context to a fresh history-zero Pi ep
     assert.equal(manifest.context_domains.length, 1);
     const binding = manifest.context_domains[0];
     assert.equal(binding.context_domain_id, DOMAIN_ID);
+    assert.match(binding.binding_id, /^CTXBIND-/);
     assert.equal(binding.source_session_id, sourceSessionId);
     assert.equal(binding.source_cursor.entry_id, acknowledgedBeforeCode.entry_id);
     assert.equal(binding.source_tail_cursor.entry_id, sourceTailBeforeHandoff);
@@ -225,6 +227,7 @@ test("S8: Aiopago handoff rebinds external context to a fresh history-zero Pi ep
     assert.equal(reboundCursor.session_id, replacementSessionId, "context cursor must be rebound to the replacement Pi session after continuity");
     const baseline = runner.contextSync.durableBaselines.get(DOMAIN_ID);
     assert.ok(baseline, "durable context baseline must exist until first external acknowledgement in the new Pi session");
+    assert.equal(baseline.binding_id, binding.binding_id);
     assert.equal(baseline.handoff_id, handoff.handoff_id);
     assert.equal(baseline.checkpoint_id, handoff.checkpoint_id);
     assert.equal(baseline.source_lag_entry_count, binding.lag_entry_count);
@@ -238,6 +241,7 @@ test("S8: Aiopago handoff rebinds external context to a fresh history-zero Pi ep
     assert.equal(chatTransport.state.callCount, 2, "resume should call only the external provider once");
     assert.equal(codeTransport.state.callCount, 1, "durable external resume must not invoke the code provider");
     assert.equal(runner.contextSync.durableBaselines.has(DOMAIN_ID), false, "successful external reply must acknowledge and clear the durable baseline");
+    assert.equal(runner.contextState.getBaseline(DOMAIN_ID), null, "durable baseline journal projection must clear after acknowledgement");
     assert.equal(runner.contextCursors.get(DOMAIN_ID).session_id, replacementSessionId);
     assert.equal(networkAttempts, 0);
 
