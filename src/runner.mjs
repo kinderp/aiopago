@@ -4,6 +4,7 @@ import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
 import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./context-advisor.mjs";
 import { ContextDomainRegistry } from "./context-domain.mjs";
+import { ContextSyncCoordinator } from "./context-sync.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
@@ -70,17 +71,27 @@ export class GuardianRunner {
     });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
+    const gitObserver = options.observeGit ?? (() => observeGitState(cwd));
     runner.handoffService = new HandoffService({
       storage,
       artifacts,
       ledger,
-      observeGit: options.observeGit ?? (() => observeGitState(cwd)),
+      observeGit: gitObserver,
       safePoint: runner.safePoint,
       runnerInstanceId,
       modelPolicy,
       reasoningPolicy,
       telemetry: runner.metrics,
     });
+    runner.contextSync = options.contextSync ?? new ContextSyncCoordinator({
+      contextDomains,
+      ledger,
+      observeGit: gitObserver,
+      evidenceProvider: options.contextEvidenceProvider,
+      hydrationBudget: options.contextHydrationBudget,
+      protocolBudget: options.contextProtocolBudget,
+    });
+    runner.contextCursors = runner.contextSync.cursorBook;
     await runner.createRuntime(options);
     if (!modelPolicy) {
       const selected = runner.runtime.session.model;
