@@ -8,14 +8,14 @@
 
 ## 1. Finding
 
-ADR-0016 deliberately left the concrete ChatGPT transport behind a spike. Review of OpenAI's current consumer Terms of Use changes which transport candidates are admissible.
+ADR-0016 deliberately left the concrete ChatGPT transport behind a spike. Review of OpenAI's current consumer Terms of Use constrains which transport candidates are admissible.
 
-OpenAI's Terms prohibit automatically or programmatically extracting data or Output from the Services and prohibit interfering with the Services, including circumventing rate limits/restrictions or protective measures.
+OpenAI's current Terms prohibit automatically or programmatically extracting data or Output from the Services and prohibit interfering with the Services, including circumventing rate limits/restrictions or protective measures.
 
-Official references reviewed on 2026-09-02:
+Official references rechecked on 2026-09-02:
 
 - <https://openai.com/policies/terms-of-use/>
-- <https://openai.com/policies/oct-2024-eu-terms/>
+- <https://openai.com/policies/eu-terms-of-use/>
 
 Therefore a Playwright/CDP/DOM-scraping bridge that sends prompts through `chatgpt.com` and programmatically extracts assistant Output is **not an accepted implementation path** for Aiopago.
 
@@ -63,7 +63,7 @@ It may become useful for authentication if OpenAI later exposes the required per
 
 `OBSERVED / NOT SUFFICIENT FOR CURRENT UX`
 
-OpenAI's Apps/connector model lets ChatGPT call an external API/MCP service. This can use normal ChatGPT plan limits, but the primary user interface remains ChatGPT. It does not currently provide the required external Pi client transport for sending prompts to ChatGPT and receiving ChatGPT Output inside Pi.
+OpenAI's Apps/connector model lets ChatGPT call an external API/MCP service. This can participate in normal ChatGPT product usage, but the primary user interface remains ChatGPT. It does not currently provide the required external Pi client transport for sending prompts to ChatGPT and receiving ChatGPT Output inside Pi.
 
 References:
 
@@ -76,13 +76,14 @@ An Aiopago MCP/App integration could be a separate future product direction, but
 
 `OBSERVED / OUT OF SCOPE FOR CHATGPT NORMAL`
 
-The public OpenAI API is the supported way to embed an OpenAI assistant in an external product, but API usage/billing is distinct from the requested normal ChatGPT product usage pool.
+The public OpenAI API is a supported programmatic surface for external clients, but ChatGPT and the API platform use separate billing systems. OpenAI explicitly documents that paid API usage is billed separately from a ChatGPT subscription.
 
 The API can be used as an optional ordinary Pi provider, but it must not be labeled `ChatGPT Normal` or represented as consuming the normal ChatGPT quota.
 
-Reference:
+References:
 
-- <https://help.openai.com/en/articles/8554407-gpts>
+- <https://help.openai.com/en/articles/9039756>
+- <https://help.openai.com/en/articles/8156019>
 
 ## 3. Effect on spike #32
 
@@ -116,7 +117,7 @@ None of those tests may be presented as proof that ChatGPT Normal itself is avai
 
 ## 4. Adapter contract requirement
 
-The future external adapter contract must make transport eligibility explicit. At minimum its metadata should include a provenance field such as:
+The future external adapter contract must make transport eligibility explicit. At minimum its metadata includes:
 
 ```text
 transport_support
@@ -128,7 +129,7 @@ transport_support
 
 Aiopago production configuration must reject a `ChatGPT Normal` adapter whose transport is not marked and verified as officially supported.
 
-The exact schema remains part of the spike; the fail-closed requirement is decided here.
+The provider-neutral spike now implements this fail-closed shape: external adapters default to `experimental-nonproduction`; experimental installation requires explicit opt-in; `official-supported` requires documentation and usage-pool evidence metadata. That proves the gate mechanics, **not** the existence of an eligible ChatGPT transport.
 
 ## 5. Consequence
 
@@ -137,7 +138,7 @@ The architecture remains valuable even while the final ChatGPT transport is bloc
 ```text
 Pi /model
    |
-   +-- Codex / Claude / Gemini / local / API providers   -> usable now
+   +-- Codex / Claude / Gemini / local / API providers   -> usable through their supported paths
    |
    +-- ChatGPT Normal                                    -> provider seam ready,
                                                            official transport required
