@@ -65,10 +65,12 @@ export async function installProviderAdapters(adapters = [], {
   modelRuntime,
   pi,
   contextDomains = new ContextDomainRegistry(),
-  allowExperimentalExternal = process.env.AIOPAGO_ALLOW_EXPERIMENTAL_EXTERNAL === "1",
+  contextState = null,
+  allowExperimentalExternal = false,
 } = {}) {
   invariant(modelRuntime && typeof modelRuntime.getProvider === "function" && typeof modelRuntime.getModels === "function", "PROVIDER_ADAPTER_MODEL_RUNTIME_REQUIRED");
   invariant(contextDomains && typeof contextDomains.register === "function", "CONTEXT_DOMAIN_REGISTRY_REQUIRED");
+  invariant(!contextState || (typeof contextState.getBinding === "function" && typeof contextState.ensureBinding === "function"), "PROVIDER_ADAPTER_CONTEXT_STATE_INVALID");
   const installed = [];
   const adapterIds = new Set();
   const providerIds = new Set();
@@ -84,7 +86,10 @@ export async function installProviderAdapters(adapters = [], {
     adapterIds.add(adapter.adapter_id);
     providerIds.add(adapter.provider_id);
 
-    await adapter.install(Object.freeze({ modelRuntime, pi, adapter }));
+    const existingBinding = adapter.context_domain.kind === "external-stateful"
+      ? contextState?.getBinding(adapter.context_domain.context_domain_id) ?? null
+      : null;
+    await adapter.install(Object.freeze({ modelRuntime, pi, adapter, contextState, binding: existingBinding }));
     const provider = modelRuntime.getProvider(adapter.provider_id);
     invariant(provider, "PROVIDER_ADAPTER_INSTALL_FAILED", `${adapter.provider_id} was not registered`);
     const models = modelRuntime.getModels(adapter.provider_id);
@@ -98,11 +103,16 @@ export async function installProviderAdapters(adapters = [], {
     // Exact-model descriptors are deliberately restricted to one-model providers
     // until the adapter contract supports an explicit descriptor per model.
     const domain = contextDomains.register(adapter.context_domain);
+    const durableBinding = domain.kind === "external-stateful" ? contextState?.ensureBinding(domain) ?? null : null;
     installed.push(Object.freeze({
       adapter_id: adapter.adapter_id,
       provider_id: adapter.provider_id,
       model_ids: Object.freeze(models.map((model) => model.id)),
       context_domain_id: domain.context_domain_id,
+      ...(domain.kind === "external-stateful" ? {
+        binding_id: durableBinding?.binding_id ?? null,
+        transport_support_status: adapter.transport_support.status,
+      } : {}),
     }));
   }
 
