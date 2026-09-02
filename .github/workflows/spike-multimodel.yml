@@ -47,5 +47,8 @@ jobs:
       - name: S8 durable history-zero context rebind
         run: node --test test/context-handoff-rebind-spike.test.mjs
 
+      - name: S8 RESUME_READY telemetry ordering
+        run: node --test test/context-handoff-telemetry-spike.test.mjs
+
       - name: Full regression suite
         run: npm test
