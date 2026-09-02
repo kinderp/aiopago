@@ -7,6 +7,7 @@ export * from "./calibration-finalizer.mjs";
 export * from "./calibration-quality.mjs";
 export * from "./context-advisor.mjs";
 export * from "./context-domain.mjs";
+export * from "./context-sync.mjs";
 export * from "./context-transfer.mjs";
 export * from "./errors.mjs";
 export * from "./extension.mjs";
