@@ -104,6 +104,28 @@ export class ContextCursorBook {
     return committed;
   }
 
+  acknowledge(window, sessionManager) {
+    invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
+    const domainId = requiredString(window.context_domain_id, "CONTEXT_CURSOR_DOMAIN_REQUIRED", "context_domain_id");
+    const current = this.cursors.get(domainId) ?? Object.freeze({
+      schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
+      session_id: window.source_cursor.session_id,
+      entry_id: null,
+      branch_depth: 0,
+    });
+    invariant(sameCursor(current, window.source_cursor), "CONTEXT_CURSOR_STALE_COMMIT", domainId);
+
+    const entries = branch(sessionManager);
+    const currentSessionId = sessionId(sessionManager);
+    invariant(currentSessionId === window.source_cursor.session_id, "CONTEXT_CURSOR_SESSION_MISMATCH", `${window.source_cursor.session_id} != ${currentSessionId}`);
+    if (window.target_cursor.entry_id !== null) {
+      invariant(entries.some((entry) => entry.id === window.target_cursor.entry_id), "CONTEXT_CURSOR_DIVERGED", `transfer target ${window.target_cursor.entry_id} is not on the current Pi branch`);
+    }
+    const acknowledged = cursorFor(sessionManager, entries);
+    this.cursors.set(domainId, acknowledged);
+    return acknowledged;
+  }
+
   reset(contextDomainId) {
     this.cursors.delete(contextDomainId);
   }
