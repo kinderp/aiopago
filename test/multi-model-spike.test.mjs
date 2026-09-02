@@ -144,6 +144,7 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
       pi,
       modelRuntime,
       providerAdapters: [chatAdapter],
+      allowExperimentalExternal: true,
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 50,
@@ -153,12 +154,14 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
     });
     await bindRuntimeExtensions(runner);
 
-    assert.deepEqual(runner.installedProviderAdapters, [{
-      adapter_id: "chatgpt-normal-memory-transport",
-      provider_id: CHAT_PROVIDER,
-      model_ids: [CHAT_MODEL],
-      context_domain_id: "chatgpt-normal:spike",
-    }]);
+    assert.equal(runner.installedProviderAdapters.length, 1);
+    const installed = runner.installedProviderAdapters[0];
+    assert.equal(installed.adapter_id, "chatgpt-normal-memory-transport");
+    assert.equal(installed.provider_id, CHAT_PROVIDER);
+    assert.deepEqual(installed.model_ids, [CHAT_MODEL]);
+    assert.equal(installed.context_domain_id, "chatgpt-normal:spike");
+    assert.match(installed.binding_id, /^CTXBIND-/);
+    assert.equal(installed.transport_support_status, "experimental-nonproduction");
 
     const chatModel = runner.modelRuntime.getModel(CHAT_PROVIDER, CHAT_MODEL);
     const codeModel = runner.modelRuntime.getModel(CODE_PROVIDER, CODE_MODEL);
