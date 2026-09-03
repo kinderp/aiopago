@@ -11,6 +11,7 @@ const PUBLIC_KEYS = Object.freeze([
   "CONTEXT_DELIVERY_SCHEMA_VERSION",
   "CONTEXT_DOMAIN_KINDS",
   "CONTEXT_DOMAIN_SCHEMA_VERSION",
+  "CONTEXT_EPOCH_SCHEMA_VERSION",
   "CONTEXT_SYNC_ENVELOPE_VERSION",
   "CONTEXT_SYNC_PREFIX",
   "CONTEXT_TRANSFER_SCHEMA_VERSION",
@@ -31,6 +32,8 @@ const INTERNAL_KEYS = Object.freeze([
   "DurableContextCursorBook",
   "ContextStateStore",
   "ContextSyncCoordinator",
+  "CONTEXT_STATE_STORAGE_SCHEMA_VERSION",
+  "validateContextStateJournalPayload",
   "installProviderAdapters",
   "installConfiguredProviderAdapters",
   "MultiModelHandoffCoordinator",
@@ -39,7 +42,7 @@ const INTERNAL_KEYS = Object.freeze([
 test("public context-continuity facade is exact and package-addressable", () => {
   assert.deepEqual(Object.keys(publicApi).sort(), PUBLIC_KEYS);
   assert.deepEqual(Object.keys(packageSubpath).sort(), PUBLIC_KEYS);
-  assert.equal(publicApi.CONTEXT_CONTINUITY_PUBLIC_API_VERSION, "0.2.0");
+  assert.equal(publicApi.CONTEXT_CONTINUITY_PUBLIC_API_VERSION, "0.3.0");
 
   for (const key of PUBLIC_KEYS) assert.equal(packageRoot[key], publicApi[key], `${key} must be re-exported by package root`);
   for (const key of INTERNAL_KEYS) {
@@ -48,7 +51,7 @@ test("public context-continuity facade is exact and package-addressable", () => 
   }
 });
 
-test("facade supports adapter declaration and explicit installation config without exposing runtime installation", () => {
+test("facade supports adapter declaration, explicit installation config and epoch version without exposing runtime state", () => {
   const domain = publicApi.createContextDomainDescriptor({
     context_domain_id: "external:example",
     kind: "external-stateful",
@@ -79,6 +82,7 @@ test("facade supports adapter declaration and explicit installation config witho
   assert.deepEqual(config.adapters, [{ adapter_id: "example-adapter", mode: "experimental-nonproduction" }]);
   assert.equal(Object.isFrozen(config), true);
   assert.equal(Object.isFrozen(config.adapters), true);
+  assert.equal(publicApi.CONTEXT_EPOCH_SCHEMA_VERSION, "0.1.0");
   assert.equal("installProviderAdapters" in publicApi, false);
   assert.equal("installConfiguredProviderAdapters" in publicApi, false);
   assert.equal("ContextStateStore" in publicApi, false);
