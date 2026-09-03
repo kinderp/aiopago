@@ -31,8 +31,8 @@ jobs:
         run: node --test test/external-tool-profile-p5.test.mjs
       - name: P6 provider telemetry attribution
         run: node --test test/provider-telemetry-p6.test.mjs
-      - name: P7 handoff compatibility contract
-        run: node --test test/context-handoff-policy-p7.test.mjs
+      - name: P7 handoff compatibility and durable pre-ready ordering
+        run: node --test test/context-handoff-policy-p7.test.mjs test/handoff-pre-ready-hook-p7.test.mjs
       - name: P7 crash-safe context rebind
         run: node --test test/context-handoff-crash-rebind-p7.test.mjs
       - name: S5/S6 context transfer primitives
