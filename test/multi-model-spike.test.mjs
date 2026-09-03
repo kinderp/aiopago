@@ -8,7 +8,7 @@ import { loadPi } from "../src/pi-loader.mjs";
 import { GuardianRunner } from "../src/runner.mjs";
 
 const CHAT_PROVIDER = "chatgpt-normal-spike";
-const CHAT_MODEL = "chatgpt-normal";
+const CHAT_MODEL = "chatgpt/normal";
 const CODE_PROVIDER = "codex-spike";
 const CODE_MODEL = "codex-spike";
 
@@ -39,10 +39,10 @@ function writeLedger(root) {
         task_item_id: "ITEM-S1-S2",
         task_id: "TASK-MULTI-MODEL-SPIKE",
         title: "Provider seam",
-        description: "Prove one Pi session can route ChatGPT-normal and code turns through distinct transports",
+        description: "Prove watermark hydration and provider routing remain exact for model ids containing slash separators",
         status: "IN_PROGRESS",
         depends_on: [],
-        completion_criteria: ["custom provider selectable", "transport counters isolated", "same Pi session preserved"],
+        completion_criteria: ["custom provider selectable", "transport counters isolated", "same Pi session preserved", "slash-containing model id resolved exactly"],
         evidence: [],
         requirements_refs: ["GitHub #32 S1", "GitHub #32 S2"],
         risk: "HIGH",
@@ -55,9 +55,7 @@ function writeLedger(root) {
   writeFileSync(join(root, "TASK_PLAN.md"), `# Multi-model spike ledger\n\n\`\`\`json task-ledger\n${JSON.stringify(task, null, 2)}\n\`\`\`\n`);
 }
 
-function messagesText(messages) {
-  return JSON.stringify(messages);
-}
+function messagesText(messages) { return JSON.stringify(messages); }
 
 async function bindRuntimeExtensions(runner) {
   await runner.runtime.session.bindExtensions({
@@ -81,10 +79,7 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
   const pi = await loadPi();
   const previousFetch = globalThis.fetch;
   let networkAttempts = 0;
-  globalThis.fetch = async () => {
-    networkAttempts += 1;
-    throw new Error("network forbidden in offline multi-model spike");
-  };
+  globalThis.fetch = async () => { networkAttempts += 1; throw new Error("network forbidden in offline multi-model spike"); };
 
   let runner = null;
   try {
@@ -102,20 +97,11 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
     const chatContexts = [];
     const codeContexts = [];
     chatTransport.setResponses([
-      (context) => {
-        chatContexts.push(structuredClone(context.messages));
-        return pi.ai.fauxAssistantMessage("CHAT_DECISION_USE_WEBSOCKET");
-      },
-      (context) => {
-        chatContexts.push(structuredClone(context.messages));
-        return pi.ai.fauxAssistantMessage("CHAT_REVIEW_SEES_CODE_CHANGE");
-      },
+      (context) => { chatContexts.push(structuredClone(context.messages)); return pi.ai.fauxAssistantMessage("CHAT_DECISION_USE_WEBSOCKET"); },
+      (context) => { chatContexts.push(structuredClone(context.messages)); return pi.ai.fauxAssistantMessage("CHAT_REVIEW_SEES_CODE_CHANGE"); },
     ]);
     codeTransport.setResponses([
-      (context) => {
-        codeContexts.push(structuredClone(context.messages));
-        return pi.ai.fauxAssistantMessage("CODE_IMPLEMENTATION_DONE");
-      },
+      (context) => { codeContexts.push(structuredClone(context.messages)); return pi.ai.fauxAssistantMessage("CODE_IMPLEMENTATION_DONE"); },
     ]);
 
     modelRuntime.registerNativeProvider(codeTransport.provider);
@@ -127,15 +113,9 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
         kind: "external-stateful",
         model_id: CHAT_MODEL,
         usage_pool: "chatgpt",
-        capabilities: {
-          local_files_direct: false,
-          pi_tools: true,
-          authoritative_context_usage: false,
-        },
+        capabilities: { local_files_direct: false, pi_tools: true, authoritative_context_usage: false },
       },
-      install: async ({ modelRuntime: runtime }) => {
-        runtime.registerNativeProvider(chatTransport.provider);
-      },
+      install: async ({ modelRuntime: runtime }) => { runtime.registerNativeProvider(chatTransport.provider); },
     });
 
     const settingsManager = pi.coding.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -165,7 +145,7 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
 
     const chatModel = runner.modelRuntime.getModel(CHAT_PROVIDER, CHAT_MODEL);
     const codeModel = runner.modelRuntime.getModel(CODE_PROVIDER, CODE_MODEL);
-    assert.ok(chatModel, "ChatGPT Normal must be registered in Pi ModelRuntime");
+    assert.ok(chatModel, "slash-containing ChatGPT model id must be resolved exactly from model_policy");
     assert.ok(codeModel, "code sentinel provider must be registered in Pi ModelRuntime");
     const availableChat = await runner.modelRuntime.getAvailable(CHAT_PROVIDER);
     assert.equal(availableChat.some((model) => model.id === CHAT_MODEL), true, "ChatGPT Normal must be available to the model picker catalog");
