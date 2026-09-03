@@ -20,6 +20,7 @@ function externalAdapter({
   usagePool = "external-test",
   transportStatus = "experimental-nonproduction",
   models = [modelId],
+  installObserver = null,
 } = {}) {
   return defineProviderAdapter({
     adapter_id: adapterId,
@@ -39,10 +40,13 @@ function externalAdapter({
           usage_pool_evidence: "contract-test-evidence",
         }
       : { status: "experimental-nonproduction" },
-    install: async ({ modelRuntime }) => modelRuntime.registerNativeProvider({
-      id: providerId,
-      getModels: () => models.map((id) => ({ id })),
-    }),
+    install: async (context) => {
+      installObserver?.(context);
+      context.modelRuntime.registerNativeProvider({
+        id: providerId,
+        getModels: () => models.map((id) => ({ id })),
+      });
+    },
   });
 }
 
@@ -169,4 +173,54 @@ test("P2 keeps exact-model sibling classification fail-closed", async () => {
     ),
     (error) => error?.code === "PROVIDER_ADAPTER_UNCLASSIFIED_MODELS",
   );
+});
+
+test("P2 adapter install context never exposes ContextStateStore authority", async () => {
+  const runtime = new FakeModelRuntime();
+  let observed = null;
+  const state = {
+    binding: null,
+    getBinding() { return this.binding; },
+    ensureBinding(domain) {
+      this.binding ??= Object.freeze({
+        binding_id: "CTXBIND-P2",
+        context_domain_id: domain.context_domain_id,
+        external_thread_id: null,
+      });
+      return this.binding;
+    },
+    bindExternalThread(domainId, threadId) {
+      assert.equal(domainId, "external:narrow-authority");
+      this.binding = Object.freeze({ ...this.ensureBinding({ context_domain_id: domainId }), external_thread_id: threadId });
+      return this.binding;
+    },
+  };
+  const candidate = externalAdapter({
+    adapterId: "narrow-authority",
+    providerId: "narrow-authority-provider",
+    domainId: "external:narrow-authority",
+    installObserver(context) {
+      observed = context;
+      assert.equal("contextState" in context, false, "adapter must never receive ContextStateStore");
+      assert.equal(context.binding, null);
+      assert.equal(typeof context.bindExternalThread, "function");
+      assert.throws(
+        () => context.bindExternalThread("remote-too-early"),
+        (error) => error?.code === "PROVIDER_ADAPTER_BINDING_NOT_READY",
+        "remote thread binding must not mutate durable state before provider validation completes",
+      );
+    },
+  });
+
+  const result = await installConfiguredProviderAdapters(
+    { adapters: [{ adapter_id: "narrow-authority", mode: "experimental-nonproduction" }] },
+    [candidate],
+    { modelRuntime: runtime, pi: {}, contextState: state },
+  );
+  assert.equal(result.installed.length, 1);
+  assert.equal(state.binding.binding_id, "CTXBIND-P2");
+  const bound = observed.bindExternalThread("remote-thread-1");
+  assert.equal(bound.external_thread_id, "remote-thread-1");
+  assert.equal("setCursor" in observed, false);
+  assert.equal("prepareDelivery" in observed, false);
 });
