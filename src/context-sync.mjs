@@ -57,26 +57,60 @@ function latestUserInput(entries, maxChars) {
   return null;
 }
 
-function toolCallIdsOwnedByDomain(entries, domain) {
-  const ids = new Set();
-  for (const entry of entries) {
-    if (entry.type !== "message" || !modelMatchesDomain(entry.message, domain)) continue;
-    for (const block of entry.message.content ?? []) {
-      if (block?.type === "toolCall" && typeof block.id === "string") ids.add(block.id);
+function correlatedDomainToolResults(windowEntries, branchEntries, domain) {
+  const windowToolResultIds = new Set(
+    windowEntries
+      .filter((entry) => entry?.type === "message" && entry.message?.role === "toolResult" && typeof entry.id === "string")
+      .map((entry) => entry.id),
+  );
+  const outstanding = new Map();
+  const results = [];
+
+  for (const entry of branchEntries) {
+    if (entry?.type !== "message") continue;
+    const message = entry.message;
+    if (message?.role === "assistant") {
+      const domainOwned = modelMatchesDomain(message, domain);
+      for (const block of message.content ?? []) {
+        if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+        const prior = outstanding.get(block.id);
+        outstanding.set(block.id, Object.freeze({
+          domain_owned: domainOwned,
+          tool_name: typeof block.name === "string" ? block.name : null,
+          ambiguous: prior !== undefined,
+        }));
+      }
+      continue;
     }
+    if (message?.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
+    const owner = outstanding.get(message.toolCallId) ?? null;
+    if (
+      windowToolResultIds.has(entry.id)
+      && owner
+      && owner.ambiguous !== true
+      && owner.domain_owned === true
+      && owner.tool_name !== null
+      && owner.tool_name === message.toolName
+    ) {
+      results.push(entry);
+    }
+    // A tool result closes the outstanding correlation slot regardless of whether
+    // it belongs to the current window/domain. Later reuse of the same provider-
+    // generated id is therefore independent, while overlapping reuse fails closed.
+    outstanding.delete(message.toolCallId);
   }
-  return ids;
+
+  return results;
 }
 
 function protocolToolResults(windowEntries, branchEntries, domain, limits) {
-  const owned = toolCallIdsOwnedByDomain(branchEntries, domain);
+  const candidates = correlatedDomainToolResults(windowEntries, branchEntries, domain);
   const results = [];
   const reasons = new Set();
   let remaining = limits.max_total_tool_result_chars;
 
-  for (const entry of windowEntries) {
-    if (entry.type !== "message" || entry.message?.role !== "toolResult") continue;
-    if (!owned.has(entry.message.toolCallId)) continue;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const entry = candidates[index];
     if (results.length >= limits.max_tool_results) {
       reasons.add("max_tool_results");
       break;
@@ -110,9 +144,7 @@ function protocolToolResults(windowEntries, branchEntries, domain, limits) {
       }),
     }));
     if (remaining <= 0) {
-      if (windowEntries.some((candidate) => candidate !== entry && candidate.type === "message" && candidate.message?.role === "toolResult" && owned.has(candidate.message.toolCallId))) {
-        reasons.add("max_total_tool_result_chars");
-      }
+      if (index < candidates.length - 1) reasons.add("max_total_tool_result_chars");
       break;
     }
   }
