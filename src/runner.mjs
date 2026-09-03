@@ -20,6 +20,14 @@ import { GuardianStorage } from "./storage.mjs";
 
 export const DEFAULT_PORTABLE_TOOLS = Object.freeze(["read", "edit", "write", "grep", "find", "ls", "bash"]);
 
+function parseModelPolicy(value) {
+  if (value === null || value === undefined) return [null, null];
+  invariant(typeof value === "string", "MODEL_POLICY_INVALID", "model policy must be provider/model");
+  const separator = value.indexOf("/");
+  invariant(separator > 0 && separator < value.length - 1, "MODEL_POLICY_INVALID", value);
+  return [value.slice(0, separator), value.slice(separator + 1)];
+}
+
 export class GuardianRunner {
   static async create(options = {}) {
     const repository = options.repository ?? null;
@@ -46,7 +54,7 @@ export class GuardianRunner {
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
     const modelPolicy = options.modelPolicy ?? plan.model_policy ?? null;
-    const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
+    const [policyProvider, policyModel] = parseModelPolicy(modelPolicy);
     const model = options.model ?? (policyProvider && policyModel ? modelRuntime.getModel(policyProvider, policyModel) : undefined);
     const reasoningPolicy = options.reasoningPolicy ?? plan.reasoning_policy ?? "high";
     if (!options.allowMissingModel && modelPolicy) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
