@@ -16,16 +16,6 @@ export class ContextAwareHandoffService extends HandoffService {
     super({ ...options, safePoint });
     this.contextContinuity = contextContinuity;
     this.contextCaptures = captures;
-    this.deferResumeReadyMetric = false;
-    this.deferredResumeReadyMetric = null;
-  }
-
-  metric(lifecycleState, details) {
-    if (lifecycleState === "RESUME_READY" && this.deferResumeReadyMetric) {
-      this.deferredResumeReadyMetric = details;
-      return null;
-    }
-    return super.metric(lifecycleState, details);
   }
 
   buildManifest(h) {
@@ -37,35 +27,15 @@ export class ContextAwareHandoffService extends HandoffService {
     };
   }
 
-  continuity(handoffId, targetSession) {
-    if (!this.contextContinuity) return super.continuity(handoffId, targetSession);
-
-    invariant(!this.deferResumeReadyMetric, "CONTEXT_HANDOFF_CONTINUITY_REENTRANT");
-    this.deferResumeReadyMetric = true;
-    this.deferredResumeReadyMetric = null;
-    try {
-      const ready = super.continuity(handoffId, targetSession);
-      const manifest = this.artifacts.verify("manifest", ready.resume_manifest_id, ready.resume_manifest_digest).payload;
-      const bindings = manifest.context_domains ?? [];
-      invariant(Array.isArray(bindings), "MANIFEST_MISMATCH", "context_domains");
-      this.contextContinuity.rebindAfterHandoff({
-        bindings,
-        targetSession,
-        handoffId: ready.handoff_id,
-        checkpointId: ready.checkpoint_id,
-      });
-
-      const deferred = this.deferredResumeReadyMetric;
-      this.deferResumeReadyMetric = false;
-      this.deferredResumeReadyMetric = null;
-      if (deferred) super.metric("RESUME_READY", deferred);
-      return ready;
-    } catch (error) {
-      // A failed context-domain rebind must never leave a misleading RESUME_READY
-      // telemetry event behind. finishPausedHandoff will persist CONTINUITY_FAILED.
-      this.deferResumeReadyMetric = false;
-      this.deferredResumeReadyMetric = null;
-      throw error;
-    }
+  beforeResumeReady(handoff, targetSession, manifest) {
+    if (!this.contextContinuity) return null;
+    const bindings = manifest.context_domains ?? [];
+    invariant(Array.isArray(bindings), "MANIFEST_MISMATCH", "context_domains");
+    return this.contextContinuity.rebindAfterHandoff({
+      bindings,
+      targetSession,
+      handoffId: handoff.handoff_id,
+      checkpointId: handoff.checkpoint_id,
+    });
   }
 }

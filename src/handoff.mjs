@@ -46,6 +46,12 @@ export class HandoffService {
     catch { return null; }
   }
 
+  // Extension point for continuity layers that must durably establish additional
+  // state before the handoff can truthfully become RESUME_READY. The base runner
+  // has no extra work; ContextAwareHandoffService supplies the external-domain
+  // rebind here.
+  beforeResumeReady(_handoff, _targetSession, _manifest) { return null; }
+
   async handoff({ sourceSession, replacePaused, mode = "manual", actor = "human:command", confirmResume = async () => false, sendResume, recoveryOf = null }) {
     invariant(["manual", "confirm"].includes(mode), "HANDOFF_MODE_INVALID");
     const sourceFile = normalizePath(sourceSession.sessionFile);
@@ -220,9 +226,11 @@ export class HandoffService {
     try { h = this.continuity(handoffId, session); }
     catch (error) {
       h = this.storage.getHandoff(handoffId);
-      h.state = "CONTINUITY_FAILED";
-      h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
-      this.storage.saveHandoff(h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
+      if (h.state !== "CONTINUITY_FAILED") {
+        h.state = "CONTINUITY_FAILED";
+        h.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
+        this.storage.saveHandoff(h, "CONTINUITY_FAILED", { code: h.failure.code, error: error.message });
+      }
       throw error;
     }
     target.setEditor?.(h.resume_prompt);
@@ -313,6 +321,22 @@ export class HandoffService {
     const latch = this.storage.getLatch(h.task_id);
     invariant(latch?.state === "ENGAGED" && latch.generation === h.latch_generation, "LATCH_GENERATION_MISMATCH");
     this.assertModelPolicy(plan, targetSession);
+
+    try {
+      this.beforeResumeReady(h, targetSession, m);
+    } catch (error) {
+      const failed = this.storage.getHandoff(handoffId);
+      if (failed?.state !== "CONTINUITY_FAILED") {
+        failed.state = "CONTINUITY_FAILED";
+        failed.failure = { code: error.code ?? "CONTINUITY_FAILED", message: error.message };
+        this.storage.saveHandoff(failed, "CONTINUITY_FAILED", { code: failed.failure.code, error: error.message });
+      }
+      throw error;
+    }
+
+    // The continuity hook may write provider-neutral durable state, but the
+    // handoff itself must remain MANIFEST_PERSISTED until that work succeeds.
+    h = this.storage.getHandoff(handoffId);
     h.resume_prompt = this.buildPrompt(h, m);
     h.resume_prompt_digest = sha256(Buffer.from(h.resume_prompt, "utf8"));
     h.state = "RESUME_READY";

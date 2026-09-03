@@ -3,7 +3,8 @@ import { ContextCursorBook, hydrateContextTransfer } from "./context-transfer.mj
 import { invariant } from "./errors.mjs";
 import { assertNoSecrets } from "./secret-scan.mjs";
 
-export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.1.0";
+export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.2.0";
+export const CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION = "0.1.0";
 export const CONTEXT_HANDOFF_BINDING_VERSION = "0.1.0";
 export const CONTEXT_SYNC_PREFIX = `AIOPAGO_CONTEXT_TRANSFER/${CONTEXT_SYNC_ENVELOPE_VERSION}`;
 export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
@@ -13,7 +14,11 @@ export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
   max_live_user_chars: 4000,
 });
 
+const PROTOCOL_BUDGET_KEYS = Object.freeze(Object.keys(DEFAULT_PROTOCOL_BUDGET));
+
 function protocolBudget(input = {}) {
+  invariant(input && typeof input === "object" && !Array.isArray(input), "CONTEXT_SYNC_PROTOCOL_BUDGET_INVALID", "protocol budget must be an object");
+  for (const key of Object.keys(input)) invariant(PROTOCOL_BUDGET_KEYS.includes(key), "CONTEXT_SYNC_PROTOCOL_BUDGET_FIELD_UNKNOWN", key);
   const merged = { ...DEFAULT_PROTOCOL_BUDGET, ...input };
   for (const [key, value] of Object.entries(merged)) {
     invariant(Number.isInteger(value) && value > 0, "CONTEXT_SYNC_PROTOCOL_BUDGET_INVALID", `${key} must be a positive integer`);
@@ -52,48 +57,108 @@ function latestUserInput(entries, maxChars) {
   return null;
 }
 
-function toolCallIdsOwnedByDomain(entries, domain) {
-  const ids = new Set();
-  for (const entry of entries) {
-    if (entry.type !== "message" || !modelMatchesDomain(entry.message, domain)) continue;
-    for (const block of entry.message.content ?? []) {
-      if (block?.type === "toolCall" && typeof block.id === "string") ids.add(block.id);
+function correlatedDomainToolResults(windowEntries, branchEntries, domain) {
+  const windowToolResultIds = new Set(
+    windowEntries
+      .filter((entry) => entry?.type === "message" && entry.message?.role === "toolResult" && typeof entry.id === "string")
+      .map((entry) => entry.id),
+  );
+  const outstanding = new Map();
+  const results = [];
+
+  for (const entry of branchEntries) {
+    if (entry?.type !== "message") continue;
+    const message = entry.message;
+    if (message?.role === "assistant") {
+      const domainOwned = modelMatchesDomain(message, domain);
+      for (const block of message.content ?? []) {
+        if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+        const prior = outstanding.get(block.id);
+        outstanding.set(block.id, Object.freeze({
+          domain_owned: domainOwned,
+          tool_name: typeof block.name === "string" ? block.name : null,
+          ambiguous: prior !== undefined,
+        }));
+      }
+      continue;
     }
+    if (message?.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
+    const owner = outstanding.get(message.toolCallId) ?? null;
+    if (
+      windowToolResultIds.has(entry.id)
+      && owner
+      && owner.ambiguous !== true
+      && owner.domain_owned === true
+      && owner.tool_name !== null
+      && owner.tool_name === message.toolName
+    ) {
+      results.push(entry);
+    }
+    outstanding.delete(message.toolCallId);
   }
-  return ids;
+
+  return results;
 }
 
 function protocolToolResults(windowEntries, branchEntries, domain, limits) {
-  const owned = toolCallIdsOwnedByDomain(branchEntries, domain);
+  const candidates = correlatedDomainToolResults(windowEntries, branchEntries, domain);
   const results = [];
+  const reasons = new Set();
   let remaining = limits.max_total_tool_result_chars;
-  let truncated = false;
 
-  for (const entry of windowEntries) {
-    if (entry.type !== "message" || entry.message?.role !== "toolResult") continue;
-    if (!owned.has(entry.message.toolCallId)) continue;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const entry = candidates[index];
     if (results.length >= limits.max_tool_results) {
-      truncated = true;
+      reasons.add("max_tool_results");
       break;
     }
     const raw = textContent(entry.message.content);
     const allowed = Math.max(0, Math.min(limits.max_tool_result_chars, remaining));
     const text = raw.slice(0, allowed);
-    if (text.length < raw.length) truncated = true;
+    const itemReasons = [];
+    if (text.length < raw.length) {
+      if (remaining <= limits.max_tool_result_chars) {
+        reasons.add("max_total_tool_result_chars");
+        itemReasons.push("max_total_tool_result_chars");
+      }
+      if (limits.max_tool_result_chars <= remaining) {
+        reasons.add("max_tool_result_chars");
+        itemReasons.push("max_tool_result_chars");
+      }
+    }
     remaining -= text.length;
     results.push(Object.freeze({
       tool_call_id: entry.message.toolCallId,
       tool_name: entry.message.toolName,
       is_error: entry.message.isError === true,
+      source_ref: Object.freeze({ kind: "pi-tool-result", entry_id: entry.id ?? null }),
       text,
+      truncation: Object.freeze({
+        truncated: text.length < raw.length,
+        reasons: Object.freeze(itemReasons.sort()),
+        original_chars: raw.length,
+        emitted_chars: text.length,
+      }),
     }));
     if (remaining <= 0) {
-      if (windowEntries.some((candidate) => candidate !== entry && candidate.type === "message" && candidate.message?.role === "toolResult" && owned.has(candidate.message.toolCallId))) truncated = true;
+      if (index < candidates.length - 1) reasons.add("max_total_tool_result_chars");
       break;
     }
   }
 
-  return Object.freeze({ items: Object.freeze(results), truncated, remaining_chars: remaining });
+  return Object.freeze({
+    purpose: "live-correlated-tool-continuation",
+    historical_hydration: false,
+    items: Object.freeze(results),
+    truncated: reasons.size > 0,
+    truncation: Object.freeze({
+      truncated: reasons.size > 0,
+      reasons: Object.freeze([...reasons].sort()),
+      emitted_chars: limits.max_total_tool_result_chars - remaining,
+      remaining_chars: remaining,
+    }),
+    remaining_chars: remaining,
+  });
 }
 
 function assistantEntryId(sessionManager, message, domain) {
@@ -117,7 +182,10 @@ function transferMessage(envelope) {
 }
 
 function sameCursor(left, right) {
-  return left?.session_id === right?.session_id && left?.entry_id === right?.entry_id;
+  return left?.schema_version === right?.schema_version
+    && left?.session_id === right?.session_id
+    && left?.entry_id === right?.entry_id
+    && left?.branch_depth === right?.branch_depth;
 }
 
 function rootCursor(sessionId) {
@@ -136,6 +204,28 @@ function durableFailure(delivery, fallbackReason = "durable-unresolved-delivery"
   });
 }
 
+function outboundTruncation(transfer, liveUserInput, toolResults) {
+  const reasons = [
+    ...transfer.truncation.reasons.map((reason) => `hydration:${reason}`),
+    ...(liveUserInput?.truncated ? ["live_user_input:max_live_user_chars"] : []),
+    ...toolResults.truncation.reasons.map((reason) => `tool_continuation:${reason}`),
+  ].sort();
+  return Object.freeze({ truncated: reasons.length > 0, reasons: Object.freeze(reasons) });
+}
+
+function assertSameHandoffEpoch(epoch, { binding, durableBinding, targetSessionId, handoffId, checkpointId, targetCursor }) {
+  invariant(epoch.context_domain_id === binding.context_domain_id, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "context_domain_id");
+  invariant(epoch.handoff_id === handoffId && epoch.checkpoint_id === checkpointId, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "handoff/checkpoint");
+  invariant(epoch.source_session_id === binding.source_session_id && epoch.target_session_id === targetSessionId, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "session lineage");
+  invariant((epoch.binding_id ?? null) === (durableBinding?.binding_id ?? binding.binding_id ?? null), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "binding_id");
+  invariant(sameCursor(epoch.source_cursor, binding.source_cursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_cursor");
+  invariant(sameCursor(epoch.source_tail_cursor, binding.source_tail_cursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_tail_cursor");
+  invariant(epoch.source_lag_entry_count === binding.lag_entry_count, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_lag_entry_count");
+  invariant(sameCursor(epoch.target_cursor, targetCursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "target_cursor");
+  invariant(epoch.rebase_policy === binding.rebase_policy, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "rebase_policy");
+  return epoch;
+}
+
 export class ContextSyncCoordinator {
   constructor({ contextDomains, cursorBook = new ContextCursorBook(), stateStore = null, ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
     invariant(contextDomains && typeof contextDomains.resolve === "function", "CONTEXT_SYNC_DOMAIN_REGISTRY_REQUIRED");
@@ -150,7 +240,7 @@ export class ContextSyncCoordinator {
     this.observeGit = observeGit;
     this.evidenceProvider = evidenceProvider;
     this.hydrationBudget = hydrationBudget;
-    this.protocolBudget = protocolBudget(protocolLimits);
+    this.protocolBudget = protocolBudget(protocolLimits ?? {});
     this.pending = new Map();
     this.reconciliationRequired = new Map();
     this.lastProjection = new Map();
@@ -197,7 +287,13 @@ export class ContextSyncCoordinator {
     invariant(targetSession?.sessionManager, "CONTEXT_HANDOFF_TARGET_SESSION_REQUIRED");
     invariant(typeof handoffId === "string" && handoffId.length > 0, "CONTEXT_HANDOFF_ID_REQUIRED");
     invariant(typeof checkpointId === "string" && checkpointId.length > 0, "CONTEXT_HANDOFF_CHECKPOINT_REQUIRED");
+    invariant(
+      this.stateStore && typeof this.stateStore.getEpoch === "function" && typeof this.stateStore.setEpoch === "function" && typeof this.stateStore.setCursor === "function",
+      "CONTEXT_HANDOFF_DURABLE_STATE_REQUIRED",
+    );
+    invariant(typeof this.cursorBook.rebase === "function", "CONTEXT_HANDOFF_CURSOR_REBASE_REQUIRED");
     const targetSessionId = targetSession.sessionManager.getSessionId();
+    const targetCursor = rootCursor(targetSessionId);
     const results = [];
 
     for (const binding of bindings) {
@@ -205,27 +301,33 @@ export class ContextSyncCoordinator {
       const domain = this.externalDomains().find((candidate) => candidate.context_domain_id === binding.context_domain_id);
       invariant(domain, "CONTEXT_HANDOFF_DOMAIN_UNKNOWN", binding.context_domain_id);
       invariant(domain.provider_id === binding.provider_id && (domain.model_id ?? null) === binding.model_id && domain.usage_pool === binding.usage_pool, "CONTEXT_HANDOFF_DOMAIN_MISMATCH", binding.context_domain_id);
-      const durableBinding = this.stateStore?.ensureBinding(domain) ?? null;
+      const durableBinding = this.stateStore.ensureBinding(domain);
       if (binding.binding_id !== null && binding.binding_id !== undefined) {
         invariant(durableBinding?.binding_id === binding.binding_id, "CONTEXT_HANDOFF_BINDING_ID_MISMATCH", binding.context_domain_id);
       }
 
-      const existingBaseline = this.durableBaselines.get(binding.context_domain_id) ?? this.stateStore?.getBaseline(binding.context_domain_id) ?? null;
-      const current = this.cursorBook.get(binding.context_domain_id);
-      if (existingBaseline?.handoff_id === handoffId && current?.session_id === targetSessionId) {
-        results.push(existingBaseline);
+      const expectedSource = binding.source_cursor ?? rootCursor(binding.source_session_id);
+      const current = this.cursorBook.get(binding.context_domain_id) ?? rootCursor(binding.source_session_id);
+      let epoch = this.stateStore.getEpoch(binding.context_domain_id);
+
+      if (epoch?.handoff_id === handoffId) {
+        assertSameHandoffEpoch(epoch, { binding, durableBinding, targetSessionId, handoffId, checkpointId, targetCursor });
+        this.durableBaselines.set(binding.context_domain_id, epoch);
+        if (sameCursor(current, epoch.target_cursor)) {
+          results.push(epoch);
+          continue;
+        }
+        invariant(sameCursor(current, expectedSource), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
+        const persistedTarget = this.stateStore.setCursor(binding.context_domain_id, epoch.target_cursor);
+        this.cursorBook.rebase(binding.context_domain_id, persistedTarget);
+        results.push(epoch);
         continue;
       }
-      const expected = binding.source_cursor ?? rootCursor(binding.source_session_id);
-      const actual = current ?? rootCursor(binding.source_session_id);
-      invariant(sameCursor(actual, expected), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
 
+      invariant(sameCursor(current, expectedSource), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
       this.pending.delete(binding.context_domain_id);
       this.reconciliationRequired.delete(binding.context_domain_id);
-      this.cursorBook.reset(binding.context_domain_id);
-      const targetWindow = this.cursorBook.plan(binding.context_domain_id, targetSession.sessionManager);
-      const targetCursor = this.cursorBook.commit(targetWindow);
-      const baseline = Object.freeze({
+      epoch = Object.freeze({
         schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
         context_domain_id: binding.context_domain_id,
         binding_id: durableBinding?.binding_id ?? binding.binding_id ?? null,
@@ -236,12 +338,18 @@ export class ContextSyncCoordinator {
         source_cursor: Object.freeze({ ...binding.source_cursor }),
         source_tail_cursor: Object.freeze({ ...binding.source_tail_cursor }),
         source_lag_entry_count: binding.lag_entry_count,
-        target_cursor: Object.freeze({ ...targetCursor }),
+        target_cursor: targetCursor,
         rebase_policy: binding.rebase_policy,
       });
-      this.durableBaselines.set(binding.context_domain_id, baseline);
-      this.stateStore?.setBaseline(binding.context_domain_id, baseline, { handoffId });
-      results.push(baseline);
+
+      // Crash-safe mini-saga: persist the complete epoch first, then perform one
+      // durable cursor rebase. A retry can therefore distinguish both partial
+      // states without replaying or guessing context delivery.
+      const persistedEpoch = this.stateStore.setEpoch(binding.context_domain_id, epoch, { handoffId });
+      this.durableBaselines.set(binding.context_domain_id, persistedEpoch);
+      const persistedTarget = this.stateStore.setCursor(binding.context_domain_id, persistedEpoch.target_cursor);
+      this.cursorBook.rebase(binding.context_domain_id, persistedTarget);
+      results.push(persistedEpoch);
     }
     return Object.freeze(results);
   }
@@ -286,6 +394,7 @@ export class ContextSyncCoordinator {
       evidence: this.evidenceProvider({ window, domain, ctx }) ?? [],
       hydrationBudget: this.hydrationBudget,
     });
+    const liveUserInput = latestUserInput(window.entries, this.protocolBudget.max_live_user_chars);
     const toolResults = protocolToolResults(window.entries, branchEntries, domain, this.protocolBudget);
     const durableBaseline = this.durableBaselines.get(domain.context_domain_id) ?? this.stateStore?.getBaseline(domain.context_domain_id) ?? null;
     if (durableBaseline && !this.durableBaselines.has(domain.context_domain_id)) this.durableBaselines.set(domain.context_domain_id, durableBaseline);
@@ -295,12 +404,21 @@ export class ContextSyncCoordinator {
       context_domain_id: domain.context_domain_id,
       context_binding_id: binding?.binding_id ?? null,
       durable_baseline: durableBaseline,
+      privacy_boundary: Object.freeze({
+        schema_version: CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION,
+        hydration_policy_version: transfer.privacy_policy.schema_version,
+        historical_raw_tool_output: "excluded",
+        live_tool_result_policy: "domain-owned-post-watermark-correlated-bounded",
+        live_user_input_policy: "latest-post-watermark-bounded",
+        transcript_dump: false,
+        summarization: "none",
+        complete_envelope_scan: "fail-closed-before-transport",
+      }),
       transfer,
-      live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
+      live_user_input: liveUserInput,
       protocol_tool_results: toolResults,
+      truncation: outboundTruncation(transfer, liveUserInput, toolResults),
     });
-    // The transfer path must enforce the same secret-shaped field/value policy as
-    // sealed Aiopago artifacts before any external transport sees the capsule.
     assertNoSecrets(envelope);
     this.stateStore?.prepareDelivery(window, domain);
     const messages = Object.freeze([transferMessage(envelope)]);
