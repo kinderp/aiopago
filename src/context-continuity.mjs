@@ -4,7 +4,7 @@
 // facade. External adapters should depend on this module rather than importing
 // spike/runtime internals directly.
 
-export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.1.0";
+export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.2.0";
 
 export {
   CONTEXT_DOMAIN_SCHEMA_VERSION,
@@ -17,6 +17,12 @@ export {
   TRANSPORT_SUPPORT_STATUSES,
   defineProviderAdapter,
 } from "./provider-adapter.mjs";
+
+export {
+  PROVIDER_INSTALLATION_CONFIG_SCHEMA_VERSION,
+  PROVIDER_INSTALLATION_MODES,
+  defineProviderInstallationConfig,
+} from "./provider-installation-config.mjs";
 
 export {
   CONTEXT_CURSOR_SCHEMA_VERSION,

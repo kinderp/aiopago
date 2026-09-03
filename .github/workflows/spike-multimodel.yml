@@ -6,6 +6,7 @@ on:
       - spike/chatgpt-model-provider
       - review/multimodel-durability
       - feat/provider-neutral-public-contracts
+      - feat/explicit-provider-installation
   workflow_dispatch:
 
 permissions:
@@ -34,8 +35,11 @@ jobs:
       - name: Syntax and brand checks
         run: npm run check
 
-      - name: P1 public context-continuity contract
+      - name: Public context-continuity contract
         run: node --test test/context-public-api.test.mjs
+
+      - name: P2 explicit provider installation
+        run: node --test test/provider-installation-p2.test.mjs
 
       - name: S5/S6 context transfer primitives
         run: node --test test/context-transfer-spike.test.mjs
