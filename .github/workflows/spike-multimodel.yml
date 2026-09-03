@@ -1,7 +1,7 @@
 name: spike-multimodel
 on:
   push:
-    branches: [spike/chatgpt-model-provider, review/multimodel-durability, feat/provider-neutral-public-contracts, feat/explicit-provider-installation, feat/durable-context-state-lifecycle, feat/bounded-context-privacy, feat/external-read-query-tool-profile, feat/provider-telemetry-attribution]
+    branches: [spike/chatgpt-model-provider, review/multimodel-durability, feat/provider-neutral-public-contracts, feat/explicit-provider-installation, feat/durable-context-state-lifecycle, feat/bounded-context-privacy, feat/external-read-query-tool-profile, feat/provider-telemetry-attribution, feat/handoff-context-compatibility]
   workflow_dispatch:
 permissions: { contents: read }
 env: { PI_CODING_AGENT_ROOT: "${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent" }
@@ -19,25 +19,29 @@ jobs:
         run: npm list @earendil-works/pi-coding-agent @earendil-works/pi-ai
       - name: Syntax and brand checks
         run: npm run check
-      - name: Public context-continuity contract
-        run: node --test test/context-public-api.test.mjs
+      - name: Public context-continuity contract and release surface
+        run: node --test test/context-public-api.test.mjs test/context-release-surface.test.mjs
       - name: P2 explicit provider installation
-        run: node --test test/provider-installation-p2.test.mjs
+        run: node --test test/provider-installation-p2.test.mjs test/runner-provider-installation-p2.test.mjs
       - name: P3 durable context-state lifecycle
-        run: node --test test/context-state-lifecycle-p3.test.mjs
+        run: node --test test/context-state-lifecycle-p3.test.mjs test/context-state-authority-atomicity-p3.test.mjs
       - name: P4 bounded hydration and privacy
         run: node --test test/context-hydration-privacy-p4.test.mjs
       - name: P5 external read/query tool profile
         run: node --test test/external-tool-profile-p5.test.mjs
       - name: P6 provider telemetry attribution
         run: node --test test/provider-telemetry-p6.test.mjs
+      - name: P7 handoff compatibility and durable pre-ready ordering
+        run: node --test test/context-handoff-policy-p7.test.mjs test/handoff-pre-ready-hook-p7.test.mjs
+      - name: P7 crash-safe context rebind
+        run: node --test test/context-handoff-crash-rebind-p7.test.mjs
       - name: S5/S6 context transfer primitives
         run: node --test test/context-transfer-spike.test.mjs
       - name: External context safety failures
         run: node --test test/context-sync-safety-spike.test.mjs
       - name: Durable cursor, delivery and remote binding restart
         run: node --test test/context-state-durability-spike.test.mjs
-      - name: S1/S2 provider routing
+      - name: S1/S2 provider routing and same-session model switch
         run: node --test test/multi-model-spike.test.mjs
       - name: S3/S4 external-stateful continuity and Pi tool
         run: node --test test/external-stateful-spike.test.mjs

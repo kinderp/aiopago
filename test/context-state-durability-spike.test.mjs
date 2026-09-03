@@ -146,7 +146,7 @@ test("prepared external delivery becomes reconciliation-required after restart a
   }
 });
 
-test("provider adapter receives restored thread binding and reports stable binding id", async () => {
+test("provider adapter receives restored thread binding without receiving durable state authority", async () => {
   const path = storagePath();
   const storage = new GuardianStorage(path);
   try {
@@ -171,9 +171,9 @@ test("provider adapter receives restored thread binding and reports stable bindi
         usage_pool: "external-test",
         capabilities: { local_files_direct: false, pi_tools: true, authoritative_context_usage: false },
       },
-      install: async ({ modelRuntime, binding, contextState }) => {
-        seen.push({ binding, contextState });
-        modelRuntime.registerNativeProvider({ id: PROVIDER, getModels: () => [{ id: MODEL }] });
+      install: async (installContext) => {
+        seen.push(installContext);
+        installContext.modelRuntime.registerNativeProvider({ id: PROVIDER, getModels: () => [{ id: MODEL }] });
       },
     });
 
@@ -186,7 +186,8 @@ test("provider adapter receives restored thread binding and reports stable bindi
     });
     assert.equal(seen.length, 1);
     assert.equal(seen[0].binding.external_thread_id, "conversation-existing-789");
-    assert.equal(seen[0].contextState, state);
+    assert.equal("contextState" in seen[0], false, "adapter install must not receive ContextStateStore");
+    assert.equal(typeof seen[0].bindExternalThread, "function", "adapter may retain only the narrow remote-thread binding capability");
     assert.equal(installed.installed[0].binding_id, original.binding_id);
     assert.equal(installed.installed[0].transport_support_status, "experimental-nonproduction");
   } finally {

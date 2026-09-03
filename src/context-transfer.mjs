@@ -41,6 +41,21 @@ function branch(sessionManager) {
   return entries;
 }
 
+function cursorShape(cursor) {
+  invariant(cursor && typeof cursor === "object" && !Array.isArray(cursor), "CONTEXT_CURSOR_INVALID");
+  invariant(cursor.schema_version === CONTEXT_CURSOR_SCHEMA_VERSION, "CONTEXT_CURSOR_VERSION_INVALID", String(cursor.schema_version));
+  const resolvedSessionId = requiredString(cursor.session_id, "CONTEXT_CURSOR_SESSION_ID_REQUIRED", "session_id");
+  const entryId = cursor.entry_id === null ? null : requiredString(cursor.entry_id, "CONTEXT_CURSOR_ENTRY_INVALID", "entry_id");
+  invariant(Number.isInteger(cursor.branch_depth) && cursor.branch_depth >= 0, "CONTEXT_CURSOR_BRANCH_DEPTH_INVALID");
+  invariant((cursor.branch_depth === 0) === (entryId === null), "CONTEXT_CURSOR_DEPTH_ENTRY_MISMATCH");
+  return Object.freeze({
+    schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
+    session_id: resolvedSessionId,
+    entry_id: entryId,
+    branch_depth: cursor.branch_depth,
+  });
+}
+
 function cursorFor(sessionManager, entries, entry = entries.at(-1) ?? null) {
   let depth = 0;
   if (entry) {
@@ -48,7 +63,7 @@ function cursorFor(sessionManager, entries, entry = entries.at(-1) ?? null) {
     invariant(index >= 0, "CONTEXT_CURSOR_DIVERGED", `entry ${entry.id} is not on the current Pi branch`);
     depth = index + 1;
   }
-  return Object.freeze({
+  return cursorShape({
     schema_version: CONTEXT_CURSOR_SCHEMA_VERSION,
     session_id: sessionId(sessionManager),
     entry_id: entry?.id ?? null,
@@ -147,6 +162,16 @@ export class ContextCursorBook {
     const acknowledged = cursorFor(sessionManager, entries, entries[acknowledgeIndex]);
     this.cursors.set(domainId, acknowledged);
     return acknowledged;
+  }
+
+  // Explicit lineage change used only by durable full-session handoff. Unlike
+  // commit(), rebase does not claim that a transfer window was delivered; it
+  // installs an already-validated cursor belonging to the replacement Pi epoch.
+  rebase(contextDomainId, cursor) {
+    const domainId = requiredString(contextDomainId, "CONTEXT_CURSOR_DOMAIN_REQUIRED", "context_domain_id");
+    const normalized = cursorShape(cursor);
+    this.cursors.set(domainId, normalized);
+    return normalized;
   }
 
   reset(contextDomainId) {

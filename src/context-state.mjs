@@ -25,6 +25,8 @@ const CONTEXT_DELIVERY_STATES = new Set([
   "RETRY_APPROVED",
 ]);
 
+const CONTEXT_STATE_AUTHORITY_NAME = "context_state_journal";
+const CONTEXT_STATE_AUTHORITY = "Guardian SQLite journal; versioned cursor, binding, delivery and context-epoch lifecycle";
 const CONTEXT_STATE_REMEDIATION = "Open this runtime with an Aiopago version compatible with the recorded context-state schema. Do not downgrade or delete runtime state. Reconcile or export with the writer-compatible version; if continuity is intentionally abandoned, explicitly archive guardian.sqlite plus its -wal/-shm sidecars before reinitializing.";
 
 function requiredString(value, code, label) {
@@ -232,6 +234,31 @@ function validatePersistedContextRows(db) {
   }
 }
 
+function validateContextStateAuthority(db, { required = false } = {}) {
+  const authority = db.prepare("SELECT authority,schema_version FROM authorities WHERE name=?").get(CONTEXT_STATE_AUTHORITY_NAME);
+  if (!authority) {
+    invariant(!required, "CONTEXT_STATE_STORAGE_METADATA_INVALID", "context_state_journal authority metadata is missing", {
+      expected_authority: CONTEXT_STATE_AUTHORITY,
+      expected_schema_version: CONTEXT_STATE_SCHEMA_VERSION,
+      remediation: CONTEXT_STATE_REMEDIATION,
+    });
+    return null;
+  }
+  invariant(
+    authority.authority === CONTEXT_STATE_AUTHORITY && authority.schema_version === CONTEXT_STATE_SCHEMA_VERSION,
+    "CONTEXT_STATE_STORAGE_METADATA_INVALID",
+    "context_state_journal authority metadata is incompatible",
+    {
+      observed_authority: authority.authority,
+      observed_schema_version: authority.schema_version,
+      expected_authority: CONTEXT_STATE_AUTHORITY,
+      expected_schema_version: CONTEXT_STATE_SCHEMA_VERSION,
+      remediation: CONTEXT_STATE_REMEDIATION,
+    },
+  );
+  return authority;
+}
+
 function ensureContextStateStorageLifecycle(storage) {
   const { db } = storage;
   let versions = [];
@@ -253,23 +280,23 @@ function ensureContextStateStorageLifecycle(storage) {
     });
   }
 
-  // Validate legacy/current journal bytes before recording any context-state migration.
-  // This makes adoption fail closed rather than silently reinterpreting old payloads.
+  // Validate legacy/current journal bytes and any pre-existing authority claim
+  // before recording context-state migration progress. A conflicting authority
+  // must never be hidden by INSERT OR IGNORE after the migration version is set.
   validatePersistedContextRows(db);
+  validateContextStateAuthority(db, { required: versions.includes(CONTEXT_STATE_STORAGE_SCHEMA_VERSION) });
 
-  if (versions.includes(CONTEXT_STATE_STORAGE_SCHEMA_VERSION)) {
-    const authority = db.prepare("SELECT authority,schema_version FROM authorities WHERE name='context_state_journal'").get();
-    invariant(authority?.schema_version === CONTEXT_STATE_SCHEMA_VERSION, "CONTEXT_STATE_STORAGE_METADATA_INVALID", "context_state_journal authority metadata is missing or incompatible", { remediation: CONTEXT_STATE_REMEDIATION });
-    return;
-  }
+  if (versions.includes(CONTEXT_STATE_STORAGE_SCHEMA_VERSION)) return;
 
   storage.transaction(() => {
     validatePersistedContextRows(db);
+    validateContextStateAuthority(db);
     db.exec("CREATE TABLE IF NOT EXISTS context_state_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
     db.prepare("INSERT INTO context_state_migrations(version,applied_at) VALUES(?,?)")
       .run(CONTEXT_STATE_STORAGE_SCHEMA_VERSION, utcNow());
     db.prepare("INSERT OR IGNORE INTO authorities(name,authority,schema_version) VALUES(?,?,?)")
-      .run("context_state_journal", "Guardian SQLite journal; versioned cursor, binding, delivery and context-epoch lifecycle", CONTEXT_STATE_SCHEMA_VERSION);
+      .run(CONTEXT_STATE_AUTHORITY_NAME, CONTEXT_STATE_AUTHORITY, CONTEXT_STATE_SCHEMA_VERSION);
+    validateContextStateAuthority(db, { required: true });
   });
 }
 

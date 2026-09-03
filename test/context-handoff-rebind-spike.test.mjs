@@ -76,9 +76,7 @@ function fakeGitState(root) {
   };
 }
 
-function serialized(context) {
-  return JSON.stringify(context.messages);
-}
+function serialized(context) { return JSON.stringify(context.messages); }
 
 async function bindRuntimeExtensions(runner) {
   await runner.runtime.session.bindExtensions({
@@ -170,8 +168,10 @@ test("S8: Aiopago handoff rebinds external context to a fresh history-zero Pi ep
       cwd: root,
       pi,
       modelRuntime,
-      providerAdapters: [chatAdapter],
-      allowExperimentalExternal: true,
+      providerAdapterCatalog: [chatAdapter],
+      providerInstallationConfig: {
+        adapters: [{ adapter_id: "chatgpt-handoff-sentinel-adapter", mode: "experimental-nonproduction" }],
+      },
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 90,
