@@ -94,9 +94,6 @@ function correlatedDomainToolResults(windowEntries, branchEntries, domain) {
     ) {
       results.push(entry);
     }
-    // A tool result closes the outstanding correlation slot regardless of whether
-    // it belongs to the current window/domain. Later reuse of the same provider-
-    // generated id is therefore independent, while overlapping reuse fails closed.
     outstanding.delete(message.toolCallId);
   }
 
@@ -185,7 +182,10 @@ function transferMessage(envelope) {
 }
 
 function sameCursor(left, right) {
-  return left?.session_id === right?.session_id && left?.entry_id === right?.entry_id;
+  return left?.schema_version === right?.schema_version
+    && left?.session_id === right?.session_id
+    && left?.entry_id === right?.entry_id
+    && left?.branch_depth === right?.branch_depth;
 }
 
 function rootCursor(sessionId) {
@@ -211,6 +211,19 @@ function outboundTruncation(transfer, liveUserInput, toolResults) {
     ...toolResults.truncation.reasons.map((reason) => `tool_continuation:${reason}`),
   ].sort();
   return Object.freeze({ truncated: reasons.length > 0, reasons: Object.freeze(reasons) });
+}
+
+function assertSameHandoffEpoch(epoch, { binding, durableBinding, targetSessionId, handoffId, checkpointId, targetCursor }) {
+  invariant(epoch.context_domain_id === binding.context_domain_id, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "context_domain_id");
+  invariant(epoch.handoff_id === handoffId && epoch.checkpoint_id === checkpointId, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "handoff/checkpoint");
+  invariant(epoch.source_session_id === binding.source_session_id && epoch.target_session_id === targetSessionId, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "session lineage");
+  invariant((epoch.binding_id ?? null) === (durableBinding?.binding_id ?? binding.binding_id ?? null), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "binding_id");
+  invariant(sameCursor(epoch.source_cursor, binding.source_cursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_cursor");
+  invariant(sameCursor(epoch.source_tail_cursor, binding.source_tail_cursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_tail_cursor");
+  invariant(epoch.source_lag_entry_count === binding.lag_entry_count, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "source_lag_entry_count");
+  invariant(sameCursor(epoch.target_cursor, targetCursor), "CONTEXT_HANDOFF_EPOCH_MISMATCH", "target_cursor");
+  invariant(epoch.rebase_policy === binding.rebase_policy, "CONTEXT_HANDOFF_EPOCH_MISMATCH", "rebase_policy");
+  return epoch;
 }
 
 export class ContextSyncCoordinator {
@@ -274,7 +287,13 @@ export class ContextSyncCoordinator {
     invariant(targetSession?.sessionManager, "CONTEXT_HANDOFF_TARGET_SESSION_REQUIRED");
     invariant(typeof handoffId === "string" && handoffId.length > 0, "CONTEXT_HANDOFF_ID_REQUIRED");
     invariant(typeof checkpointId === "string" && checkpointId.length > 0, "CONTEXT_HANDOFF_CHECKPOINT_REQUIRED");
+    invariant(
+      this.stateStore && typeof this.stateStore.getEpoch === "function" && typeof this.stateStore.setEpoch === "function" && typeof this.stateStore.setCursor === "function",
+      "CONTEXT_HANDOFF_DURABLE_STATE_REQUIRED",
+    );
+    invariant(typeof this.cursorBook.rebase === "function", "CONTEXT_HANDOFF_CURSOR_REBASE_REQUIRED");
     const targetSessionId = targetSession.sessionManager.getSessionId();
+    const targetCursor = rootCursor(targetSessionId);
     const results = [];
 
     for (const binding of bindings) {
@@ -282,27 +301,33 @@ export class ContextSyncCoordinator {
       const domain = this.externalDomains().find((candidate) => candidate.context_domain_id === binding.context_domain_id);
       invariant(domain, "CONTEXT_HANDOFF_DOMAIN_UNKNOWN", binding.context_domain_id);
       invariant(domain.provider_id === binding.provider_id && (domain.model_id ?? null) === binding.model_id && domain.usage_pool === binding.usage_pool, "CONTEXT_HANDOFF_DOMAIN_MISMATCH", binding.context_domain_id);
-      const durableBinding = this.stateStore?.ensureBinding(domain) ?? null;
+      const durableBinding = this.stateStore.ensureBinding(domain);
       if (binding.binding_id !== null && binding.binding_id !== undefined) {
         invariant(durableBinding?.binding_id === binding.binding_id, "CONTEXT_HANDOFF_BINDING_ID_MISMATCH", binding.context_domain_id);
       }
 
-      const existingBaseline = this.durableBaselines.get(binding.context_domain_id) ?? this.stateStore?.getBaseline(binding.context_domain_id) ?? null;
-      const current = this.cursorBook.get(binding.context_domain_id);
-      if (existingBaseline?.handoff_id === handoffId && current?.session_id === targetSessionId) {
-        results.push(existingBaseline);
+      const expectedSource = binding.source_cursor ?? rootCursor(binding.source_session_id);
+      const current = this.cursorBook.get(binding.context_domain_id) ?? rootCursor(binding.source_session_id);
+      let epoch = this.stateStore.getEpoch(binding.context_domain_id);
+
+      if (epoch?.handoff_id === handoffId) {
+        assertSameHandoffEpoch(epoch, { binding, durableBinding, targetSessionId, handoffId, checkpointId, targetCursor });
+        this.durableBaselines.set(binding.context_domain_id, epoch);
+        if (sameCursor(current, epoch.target_cursor)) {
+          results.push(epoch);
+          continue;
+        }
+        invariant(sameCursor(current, expectedSource), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
+        const persistedTarget = this.stateStore.setCursor(binding.context_domain_id, epoch.target_cursor);
+        this.cursorBook.rebase(binding.context_domain_id, persistedTarget);
+        results.push(epoch);
         continue;
       }
-      const expected = binding.source_cursor ?? rootCursor(binding.source_session_id);
-      const actual = current ?? rootCursor(binding.source_session_id);
-      invariant(sameCursor(actual, expected), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
 
+      invariant(sameCursor(current, expectedSource), "CONTEXT_HANDOFF_SOURCE_CURSOR_MISMATCH", binding.context_domain_id);
       this.pending.delete(binding.context_domain_id);
       this.reconciliationRequired.delete(binding.context_domain_id);
-      this.cursorBook.reset(binding.context_domain_id);
-      const targetWindow = this.cursorBook.plan(binding.context_domain_id, targetSession.sessionManager);
-      const targetCursor = this.cursorBook.commit(targetWindow);
-      const baseline = Object.freeze({
+      epoch = Object.freeze({
         schema_version: CONTEXT_HANDOFF_BINDING_VERSION,
         context_domain_id: binding.context_domain_id,
         binding_id: durableBinding?.binding_id ?? binding.binding_id ?? null,
@@ -313,12 +338,18 @@ export class ContextSyncCoordinator {
         source_cursor: Object.freeze({ ...binding.source_cursor }),
         source_tail_cursor: Object.freeze({ ...binding.source_tail_cursor }),
         source_lag_entry_count: binding.lag_entry_count,
-        target_cursor: Object.freeze({ ...targetCursor }),
+        target_cursor: targetCursor,
         rebase_policy: binding.rebase_policy,
       });
-      this.durableBaselines.set(binding.context_domain_id, baseline);
-      this.stateStore?.setBaseline(binding.context_domain_id, baseline, { handoffId });
-      results.push(baseline);
+
+      // Crash-safe mini-saga: persist the complete epoch first, then perform one
+      // durable cursor rebase. A retry can therefore distinguish both partial
+      // states without replaying or guessing context delivery.
+      const persistedEpoch = this.stateStore.setEpoch(binding.context_domain_id, epoch, { handoffId });
+      this.durableBaselines.set(binding.context_domain_id, persistedEpoch);
+      const persistedTarget = this.stateStore.setCursor(binding.context_domain_id, persistedEpoch.target_cursor);
+      this.cursorBook.rebase(binding.context_domain_id, persistedTarget);
+      results.push(persistedEpoch);
     }
     return Object.freeze(results);
   }
@@ -388,9 +419,6 @@ export class ContextSyncCoordinator {
       protocol_tool_results: toolResults,
       truncation: outboundTruncation(transfer, liveUserInput, toolResults),
     });
-    // P4 requires one final scan over the complete assembled envelope, including
-    // live user input and correlated tool continuation, before any transport or
-    // durable delivery prepare can observe it.
     assertNoSecrets(envelope);
     this.stateStore?.prepareDelivery(window, domain);
     const messages = Object.freeze([transferMessage(envelope)]);
