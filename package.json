@@ -34,6 +34,8 @@
     "docs/0.2-c-intent-adapter.md",
     "docs/0.2-d-start-objective.md",
     "docs/0.2-e-unified-human-ux.md",
+    "docs/0.2-e-r1-m-13-whole-candidate-closure.md",
+    "docs/adr/0024-runtime-authority-deployment-profiles.md",
     "docs/portable-alpha.md",
     "docs/rename-aiopago-migration.md"
   ],
