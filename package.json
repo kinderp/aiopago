@@ -1,60 +1,9 @@
 {
-  "name": "aiopago",
-  "version": "0.1.0",
-  "description": "Aiopago local continuity runner for Pi coding sessions",
-  "type": "module",
-  "license": "UNLICENSED",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/kinderp/aiopago.git"
-  },
-  "homepage": "https://github.com/kinderp/aiopago#readme",
-  "bugs": {
-    "url": "https://github.com/kinderp/aiopago/issues"
-  },
-  "keywords": [
-    "aiopago",
-    "pi",
-    "continuity",
-    "handoff"
-  ],
-  "bin": {
-    "aio": "bin/aio.mjs",
-    "eio": "bin/eio.mjs"
-  },
-  "main": "./src/index.mjs",
-  "exports": {
-    ".": "./src/index.mjs",
-    "./context-continuity": "./src/context-continuity.mjs"
-  },
-  "files": [
-    "bin/",
-    "src/",
-    "README.md",
-    "docs/0.2-b-plan-proposal-foundation.md",
-    "docs/0.2-c-intent-adapter.md",
-    "docs/0.2-d-start-objective.md",
-    "docs/portable-alpha.md",
-    "docs/rename-aiopago-migration.md",
-    "docs/adr/0017-provider-neutral-public-contract-surface.md",
-    "docs/adr/0018-explicit-provider-installation.md",
-    "docs/adr/0019-durable-context-state-lifecycle.md",
-    "docs/adr/0020-bounded-hydration-privacy-boundary.md"
-  ],
-  "engines": {
-    "node": ">=22.19.0"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.83.0 <0.84.0"
-  },
-  "scripts": {
-    "check": "node scripts/check.mjs",
-    "test": "node --test --test-concurrency=1 test/*.test.mjs",
-    "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs",
-    "aio": "node bin/aio.mjs",
-    "eio": "node bin/eio.mjs",
-    "calibration": "node scripts/calibration-run.mjs",
-    "calibration:quality": "node scripts/calibration-quality-record.mjs",
-    "calibration:finalize": "node scripts/calibration-finalize.mjs"
-  }
+  "name": "aiopago", "version": "0.1.0", "description": "Aiopago local continuity runner for Pi coding sessions", "type": "module", "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "git+https://github.com/kinderp/aiopago.git" }, "homepage": "https://github.com/kinderp/aiopago#readme", "bugs": { "url": "https://github.com/kinderp/aiopago/issues" },
+  "keywords": ["aiopago","pi","continuity","handoff"], "bin": { "aio": "bin/aio.mjs", "eio": "bin/eio.mjs" }, "main": "./src/index.mjs",
+  "exports": { ".": "./src/index.mjs", "./context-continuity": "./src/context-continuity.mjs" },
+  "files": ["bin/","src/","README.md","docs/0.2-b-plan-proposal-foundation.md","docs/0.2-c-intent-adapter.md","docs/0.2-d-start-objective.md","docs/portable-alpha.md","docs/rename-aiopago-migration.md","docs/adr/0017-provider-neutral-public-contract-surface.md","docs/adr/0018-explicit-provider-installation.md","docs/adr/0019-durable-context-state-lifecycle.md","docs/adr/0020-bounded-hydration-privacy-boundary.md","docs/adr/0021-external-read-query-tool-profile.md"],
+  "engines": { "node": ">=22.19.0" }, "peerDependencies": { "@earendil-works/pi-coding-agent": ">=0.83.0 <0.84.0" },
+  "scripts": { "check": "node scripts/check.mjs", "test": "node --test --test-concurrency=1 test/*.test.mjs", "test:e2e": "node --test --test-concurrency=1 test/pi-e2e.test.mjs", "aio": "node bin/aio.mjs", "eio": "node bin/eio.mjs", "calibration": "node scripts/calibration-run.mjs", "calibration:quality": "node scripts/calibration-quality-record.mjs", "calibration:finalize": "node scripts/calibration-finalize.mjs" }
 }
