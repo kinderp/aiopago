@@ -53,6 +53,25 @@ plan.diff(proposal);
 // A human or upper layer may then choose plan.apply(proposal).
 ```
 
+## Provider-neutral multi-model continuity candidate
+
+The post-0.2 productization candidate exposes a narrow, versioned adapter contract at `aiopago/context-continuity` while keeping runtime storage, synchronization and handoff implementations private:
+
+```js
+import {
+  CONTEXT_CONTINUITY_PUBLIC_API_VERSION,
+  createContextDomainDescriptor,
+  defineProviderAdapter,
+  defineProviderInstallationConfig,
+} from "aiopago/context-continuity";
+```
+
+Pi `/model` remains the only required user-facing model switch. Ordinary Pi-native providers stay in the same Pi session. Providers whose conversation state is independently remote can be declared `external-stateful`; Aiopago then supplies durable binding/cursor/delivery state, bounded hydration and fail-closed reconciliation. External-stateful tool access is initially limited to `read`, `grep`, `find` and `ls`.
+
+This surface is provider-neutral. **It does not make ordinary `ChatGPT Normal` available.** A provider may use that label only after ADR-0016A's official-transport qualification gates pass. Browser DOM automation, cookie/session-token reuse, private ChatGPT endpoints and OpenAI API traffic relabelled as ordinary ChatGPT are not supported fallbacks. A configured `usage_pool` is also not evidence of commercial quota/billing behavior.
+
+See [`docs/adr/0016-multi-model-context-domain-continuity.md`](docs/adr/0016-multi-model-context-domain-continuity.md) for the architecture, [`docs/adr/0016a-official-chatgpt-transport-gate.md`](docs/adr/0016a-official-chatgpt-transport-gate.md) for the real-ChatGPT qualification gate, and ADR-0017 through ADR-0023 for the provider-neutral P1–P7 contract slices.
+
 See [`docs/0.2-c-intent-adapter.md`](docs/0.2-c-intent-adapter.md) for the accepted structured request/response contract, authority rules, errors, and security boundaries. See [`docs/0.2-d-start-objective.md`](docs/0.2-d-start-objective.md) for objective planning and authorization. See [`docs/portable-alpha.md`](docs/portable-alpha.md) for setup, read-only workflow commands, Runner operation and recovery. See [`docs/rename-aiopago-migration.md`](docs/rename-aiopago-migration.md) for legacy data and command compatibility.
 
 Repository: <https://github.com/kinderp/aiopago>
