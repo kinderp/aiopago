@@ -24,7 +24,7 @@ jobs:
       - name: P2 explicit provider installation
         run: node --test test/provider-installation-p2.test.mjs
       - name: P3 durable context-state lifecycle
-        run: node --test test/context-state-lifecycle-p3.test.mjs
+        run: node --test test/context-state-lifecycle-p3.test.mjs test/context-state-authority-atomicity-p3.test.mjs
       - name: P4 bounded hydration and privacy
         run: node --test test/context-hydration-privacy-p4.test.mjs
       - name: P5 external read/query tool profile
