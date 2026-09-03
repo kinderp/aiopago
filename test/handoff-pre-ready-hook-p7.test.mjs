@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { HandoffService } from "../src/handoff.mjs";
 
+const ROOT = mkdtempSync(join(tmpdir(), "aiopago-p7-hook-"));
+writeFileSync(join(ROOT, "TASK_PLAN.md"), "# P7 hook fixture\n");
+
 const GIT = Object.freeze({
   repository_id: "repo-p7-hook",
-  workdir: "/tmp/repo-p7-hook",
+  workdir: ROOT,
   branch: "main",
   base_sha: "base",
   head_sha: "head",
@@ -15,14 +21,15 @@ const GIT = Object.freeze({
 });
 
 function fixture({ failHook = false } = {}) {
+  const sourceFile = join(ROOT, "source.jsonl");
   const handoff = {
     handoff_id: "HO-P7-HOOK",
     source_session_id: "SES-SOURCE",
-    source_session_file: "/tmp/source.jsonl",
+    source_session_file: sourceFile,
     target_session_id: "SES-TARGET",
-    target_session_file: "/tmp/target.jsonl",
+    target_session_file: join(ROOT, "target.jsonl"),
     parent_session_id: "SES-SOURCE",
-    parent_session_file: "/tmp/source.jsonl",
+    parent_session_file: sourceFile,
     runner_instance_id: "RUNNER-P7",
     session_binding_id: "BIND-P7",
     task_id: "TASK-P7",
@@ -90,7 +97,7 @@ function fixture({ failHook = false } = {}) {
     model_policy: null,
     reasoning_policy: null,
     minimal_reads: [],
-    required_local_paths: [],
+    required_local_paths: ["TASK_PLAN.md"],
   };
   const checkpoint = { checkpoint_id: "CP-P7", git_state: GIT };
   const hookStates = [];
@@ -113,7 +120,7 @@ function fixture({ failHook = false } = {}) {
       },
     },
     ledger: {
-      path: "/tmp/TASK_PLAN.md",
+      path: join(ROOT, "TASK_PLAN.md"),
       read: () => ({
         task_id: "TASK-P7",
         plan_revision_id: "PLAN-P7",
@@ -134,7 +141,7 @@ function fixture({ failHook = false } = {}) {
   const target = {
     sessionId: "SES-TARGET",
     sessionManager: {
-      getHeader: () => ({ parentSession: "/tmp/source.jsonl" }),
+      getHeader: () => ({ parentSession: sourceFile }),
       getEntries: () => [],
     },
     isIdle: true,
