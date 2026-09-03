@@ -71,9 +71,7 @@ function fakeGitState(root) {
   };
 }
 
-function serialized(context) {
-  return JSON.stringify(context.messages);
-}
+function serialized(context) { return JSON.stringify(context.messages); }
 
 async function bindRuntimeExtensions(runner) {
   await runner.runtime.session.bindExtensions({
@@ -174,8 +172,10 @@ test("S3/S4 spike: external stateful model gets only Aiopago deltas and can use 
       cwd: root,
       pi,
       modelRuntime,
-      providerAdapters: [chatAdapter],
-      allowExperimentalExternal: true,
+      providerAdapterCatalog: [chatAdapter],
+      providerInstallationConfig: {
+        adapters: [{ adapter_id: "chatgpt-stateful-sentinel-adapter", mode: "experimental-nonproduction" }],
+      },
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 90,
