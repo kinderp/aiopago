@@ -1,20 +1,8 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { canonicalJson, digestObject, sha256, utcNow } from "./canonical.mjs";
-import { fail, invariant } from "./errors.mjs";
-
-const SECRET_KEY = /(^|_)(api_?key|access_?token|refresh_?token|password|secret|credential)s?($|_)/i;
-const SECRET_VALUE = /\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})\b/;
-
-function scan(value, path = "$") {
-  if (Array.isArray(value)) return value.forEach((item, index) => scan(item, `${path}[${index}]`));
-  if (value && typeof value === "object") {
-    for (const [key, child] of Object.entries(value)) {
-      if (SECRET_KEY.test(key) && child != null) fail("SECRET_SCAN_FAILED", `Sensitive field at ${path}.${key}`);
-      scan(child, `${path}.${key}`);
-    }
-  } else if (typeof value === "string" && SECRET_VALUE.test(value)) fail("SECRET_SCAN_FAILED", `Secret-shaped value at ${path}`);
-}
+import { invariant } from "./errors.mjs";
+import { assertNoSecrets } from "./secret-scan.mjs";
 
 function safeId(id) {
   invariant(typeof id === "string" && /^[A-Za-z0-9._-]+$/.test(id), "ARTIFACT_ID_INVALID");
@@ -30,7 +18,7 @@ export class ArtifactStore {
 
   persist(kind, id, payload) {
     safeId(id);
-    scan(payload);
+    assertNoSecrets(payload);
     const contentBase = { ...structuredClone(payload), content_digest: null };
     const contentDigest = digestObject(contentBase);
     const sealedPayload = { ...contentBase, content_digest: contentDigest };
@@ -79,7 +67,7 @@ export class ArtifactStore {
     invariant(envelope.artifact_kind === kind && envelope.artifact_id === id, "ARTIFACT_IDENTITY_MISMATCH");
     const contentDigest = envelope.payload.content_digest;
     invariant(digestObject({ ...envelope.payload, content_digest: null }) === contentDigest && contentDigest === index.content_digest, "ARTIFACT_CONTENT_MISMATCH");
-    scan(envelope.payload);
+    assertNoSecrets(envelope.payload);
     return { ...index, bytes, digest, payload: envelope.payload };
   }
 }

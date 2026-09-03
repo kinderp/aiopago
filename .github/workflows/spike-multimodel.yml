@@ -1,0 +1,61 @@
+name: spike-multimodel
+
+on:
+  push:
+    branches:
+      - spike/chatgpt-model-provider
+      - review/multimodel-durability
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PI_CODING_AGENT_ROOT: ${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent
+
+jobs:
+  s1-s2-s3-s4-s5-s6-s7-s8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+
+      - name: Install supported Pi profile
+        run: npm install --no-package-lock --save=false @earendil-works/pi-coding-agent@0.83.0
+
+      - name: Show effective Pi version
+        run: npm list @earendil-works/pi-coding-agent @earendil-works/pi-ai
+
+      - name: Syntax and brand checks
+        run: npm run check
+
+      - name: S5/S6 context transfer primitives
+        run: node --test test/context-transfer-spike.test.mjs
+
+      - name: External context safety failures
+        run: node --test test/context-sync-safety-spike.test.mjs
+
+      - name: Durable cursor, delivery and remote binding restart
+        run: node --test test/context-state-durability-spike.test.mjs
+
+      - name: S1/S2 provider routing
+        run: node --test test/multi-model-spike.test.mjs
+
+      - name: S3/S4 external-stateful continuity and Pi tool
+        run: node --test test/external-stateful-spike.test.mjs
+
+      - name: S7 exact attribution primitives
+        run: node --test test/attribution-spike.test.mjs
+
+      - name: S8 durable history-zero context rebind
+        run: node --test test/context-handoff-rebind-spike.test.mjs
+
+      - name: S8 RESUME_READY telemetry ordering
+        run: node --test test/context-handoff-telemetry-spike.test.mjs
+
+      - name: Full regression suite
+        run: npm test

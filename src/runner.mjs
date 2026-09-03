@@ -3,14 +3,18 @@ import { ArtifactStore } from "./artifact-store.mjs";
 import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
 import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./context-advisor.mjs";
+import { ContextDomainRegistry } from "./context-domain.mjs";
+import { ContextStateStore, DurableContextCursorBook } from "./context-state.mjs";
+import { ContextSyncCoordinator } from "./context-sync.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
-import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
+import { ContextAwareHandoffService } from "./multi-model-handoff.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
+import { installProviderAdapters } from "./provider-adapter.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
 
@@ -28,8 +32,21 @@ export class GuardianRunner {
     const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join(repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"), "guardian.sqlite"));
     if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
     storage.ensureLatch(plan.task_id);
+    const contextState = options.contextState ?? new ContextStateStore(storage, plan.task_id);
     const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
+    const contextDomains = options.contextDomains ?? new ContextDomainRegistry();
+    const adapterInstall = await installProviderAdapters(options.providerAdapters ?? [], {
+      modelRuntime,
+      pi,
+      contextDomains,
+      contextState,
+      // Experimental transports are never enabled implicitly by environment.
+      // Spike/tests must opt in at Runner creation; production stays fail-closed.
+      allowExperimentalExternal: options.allowExperimentalExternal === true,
+    });
+    // Provider adapters must be present before the transport gate is installed.
+    // Otherwise a dynamically-added provider could escape Aiopago's latch/safe-point admission boundary.
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
     const modelPolicy = options.modelPolicy ?? plan.model_policy ?? null;
@@ -54,26 +71,41 @@ export class GuardianRunner {
       runtimeRoot: repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"),
       artifactRoot: repository?.artifactRoot ?? join(cwd, ".guardian"),
     });
-    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
+    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, contextState, artifacts, modelRuntime, contextDomains, installedProviderAdapters: adapterInstall.installed, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
     runner.metrics = options.metrics ?? new MeasurementInstrumentation({
       storage,
       ledger,
       runnerInstanceId,
       thresholdPercent: contextAdvisor.thresholdPercent,
       retention: options.metricsRetention,
+      contextDomains,
     });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
-    runner.handoffService = new HandoffService({
+    const gitObserver = options.observeGit ?? (() => observeGitState(cwd));
+    const contextCursorBook = options.contextCursorBook ?? new DurableContextCursorBook(contextState);
+    runner.contextSync = options.contextSync ?? new ContextSyncCoordinator({
+      contextDomains,
+      cursorBook: contextCursorBook,
+      stateStore: contextState,
+      ledger,
+      observeGit: gitObserver,
+      evidenceProvider: options.contextEvidenceProvider,
+      hydrationBudget: options.contextHydrationBudget,
+      protocolBudget: options.contextProtocolBudget,
+    });
+    runner.contextCursors = runner.contextSync.cursorBook;
+    runner.handoffService = new ContextAwareHandoffService({
       storage,
       artifacts,
       ledger,
-      observeGit: options.observeGit ?? (() => observeGitState(cwd)),
+      observeGit: gitObserver,
       safePoint: runner.safePoint,
       runnerInstanceId,
       modelPolicy,
       reasoningPolicy,
       telemetry: runner.metrics,
+      contextContinuity: runner.contextSync,
     });
     await runner.createRuntime(options);
     if (!modelPolicy) {
