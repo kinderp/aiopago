@@ -29,7 +29,7 @@ summarization      none
 
 There is deliberately no public `include_raw_tool_results` switch in P4.
 
-The public context-continuity facade advances additively to `0.4.0` and exposes the policy version/profile alongside the existing budget and hydrator.
+The public context-continuity facade advances additively to `0.4.0` at the P4 slice; later slices may advance the facade again without changing this privacy policy.
 
 ### D2 — Durable/evidence state has budget priority
 
@@ -77,9 +77,9 @@ purpose              live-correlated-tool-continuation
 historical_hydration false
 ```
 
-It contains only post-watermark `toolResult` entries whose `toolCallId` belongs to the selected external context domain. Every result carries Pi-entry provenance and its own truncation metadata.
+A post-watermark `toolResult` is eligible only when replay of the Pi branch establishes one unambiguous outstanding tool call with the same `toolCallId`, the same tool name and ownership by the selected external context domain. A tool result closes that outstanding slot. Sequential reuse of an ID after its result is therefore independent; overlapping reuse/collision is treated as ambiguous and excluded fail-closed. A matching ID owned by another model/domain is never enough to carry its result into the external continuation.
 
-This is not an option to replay arbitrary historical tool stdout. P5 separately decides which tool names external-stateful domains may invoke; the product profile remains read/query-only there.
+Every admitted result carries Pi-entry provenance and its own truncation metadata. This is not an option to replay arbitrary historical tool stdout. P5 separately decides which tool names external-stateful domains may invoke; the product profile remains read/query-only there.
 
 ### D6 — Complete outbound envelope is scanned after assembly
 
@@ -107,6 +107,7 @@ A provider receives one Aiopago capsule rather than the Pi transcript.
 - durable facts and evidence cannot be starved by recent conversation until their own shared budget is exhausted;
 - raw tool history stays outside hydration;
 - live read/query continuation remains possible without hidden Codex;
+- tool-call ID collisions across models fail closed instead of leaking another model's result;
 - truncation can be surfaced truthfully to operators/telemetry;
 - final secret scanning covers every outbound payload class.
 
@@ -129,8 +130,9 @@ P4 is acceptable when tests prove:
 5. available Task/Git/evidence/Pi-entry provenance survives projection;
 6. unknown budget fields fail closed;
 7. live external tool continuation is correlated, separate, bounded and explicitly truncated;
-8. a secret-shaped value in that live continuation fails before pending/transport state;
-9. P1-P4 targeted gates, S1-S8 and complete historical regression remain green.
+8. cross-model tool-call ID collisions and tool-name mismatches are excluded fail-closed;
+9. a secret-shaped value in an actually correlated live continuation fails before pending/transport state;
+10. P1-P4 targeted gates, S1-S8 and complete historical regression remain green.
 
 ## 5. Non-goals
 
