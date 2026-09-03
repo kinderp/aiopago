@@ -17,7 +17,7 @@ function user(id, text) {
   return { type: "message", id, parentId: null, timestamp: "2026-09-03T00:00:00.000Z", message: { role: "user", content: text, timestamp: 1 } };
 }
 
-function toolCallingAssistant(id, toolCallId = "read-1") {
+function assistantToolCall(id, provider, model, toolCallId = "read-1", toolName = "read") {
   return {
     type: "message",
     id,
@@ -25,16 +25,20 @@ function toolCallingAssistant(id, toolCallId = "read-1") {
     timestamp: "2026-09-03T00:00:01.000Z",
     message: {
       role: "assistant",
-      provider: PROVIDER,
-      model: MODEL,
-      content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "state.txt" } }],
+      provider,
+      model,
+      content: [{ type: "toolCall", id: toolCallId, name: toolName, arguments: { path: "state.txt" } }],
       stopReason: "toolUse",
       timestamp: 2,
     },
   };
 }
 
-function toolResult(id, toolCallId, text) {
+function toolCallingAssistant(id, toolCallId = "read-1") {
+  return assistantToolCall(id, PROVIDER, MODEL, toolCallId, "read");
+}
+
+function toolResult(id, toolCallId, text, toolName = "read") {
   return {
     type: "message",
     id,
@@ -43,7 +47,7 @@ function toolResult(id, toolCallId, text) {
     message: {
       role: "toolResult",
       toolCallId,
-      toolName: "read",
+      toolName,
       content: [{ type: "text", text }],
       isError: false,
       timestamp: 3,
@@ -167,6 +171,34 @@ test("P4 live tool continuation is separate from hydration, correlated, bounded 
   assert.equal(JSON.stringify(projected.envelope.transfer).includes("ABCD"), false, "live tool output must not be smuggled into historical hydration");
   assert.equal(projected.envelope.truncation.truncated, true);
   assert.ok(projected.envelope.truncation.reasons.includes("tool_continuation:max_total_tool_result_chars") || projected.envelope.truncation.reasons.includes("tool_continuation:max_tool_result_chars"));
+});
+
+test("P4 tool continuation rejects cross-model tool-call id collisions instead of leaking another model result", () => {
+  const initialEntries = [user("u1", "read the state"), toolCallingAssistant("a1", "collision-id")];
+  const { sync, sessionManager, ctx } = coordinator(initialEntries);
+  const acknowledged = sync.cursorBook.plan(DOMAIN, sessionManager);
+  sync.cursorBook.commit(acknowledged);
+  sessionManager.entries = [
+    ...sessionManager.entries,
+    assistantToolCall("a2", "code-provider", "code-model", "collision-id", "read"),
+    toolResult("t2", "collision-id", "OTHER_MODEL_PRIVATE_RESULT"),
+  ];
+
+  const projected = sync.project({}, ctx);
+  assert.equal(projected.envelope.protocol_tool_results.items.length, 0);
+  assert.equal(JSON.stringify(projected.envelope).includes("OTHER_MODEL_PRIVATE_RESULT"), false);
+});
+
+test("P4 tool continuation requires the tool name to match the correlated domain call", () => {
+  const initialEntries = [user("u1", "read the state"), toolCallingAssistant("a1", "name-match")];
+  const { sync, sessionManager, ctx } = coordinator(initialEntries);
+  const acknowledged = sync.cursorBook.plan(DOMAIN, sessionManager);
+  sync.cursorBook.commit(acknowledged);
+  sessionManager.entries = [...sessionManager.entries, toolResult("t1", "name-match", "WRONG_TOOL_RESULT", "ls")];
+
+  const projected = sync.project({}, ctx);
+  assert.equal(projected.envelope.protocol_tool_results.items.length, 0);
+  assert.equal(JSON.stringify(projected.envelope).includes("WRONG_TOOL_RESULT"), false);
 });
 
 test("P4 final complete-envelope secret scan covers correlated tool continuation before pending transport state", () => {
