@@ -1,7 +1,7 @@
 name: spike-multimodel
 on:
   push:
-    branches: [spike/chatgpt-model-provider, review/multimodel-durability, feat/provider-neutral-public-contracts, feat/explicit-provider-installation, feat/durable-context-state-lifecycle, feat/bounded-context-privacy, feat/external-read-query-tool-profile, feat/provider-telemetry-attribution, feat/handoff-context-compatibility, review/provider-neutral-continuity-rollup]
+    branches: [spike/chatgpt-model-provider, review/multimodel-durability, feat/provider-neutral-public-contracts, feat/explicit-provider-installation, feat/durable-context-state-lifecycle, feat/bounded-context-privacy, feat/external-read-query-tool-profile, feat/provider-telemetry-attribution, feat/handoff-context-compatibility]
   workflow_dispatch:
 permissions: { contents: read }
 env: { PI_CODING_AGENT_ROOT: "${{ github.workspace }}/node_modules/@earendil-works/pi-coding-agent" }
@@ -22,7 +22,7 @@ jobs:
       - name: Public context-continuity contract
         run: node --test test/context-public-api.test.mjs
       - name: P2 explicit provider installation
-        run: node --test test/provider-installation-p2.test.mjs
+        run: node --test test/provider-installation-p2.test.mjs test/runner-provider-installation-p2.test.mjs
       - name: P3 durable context-state lifecycle
         run: node --test test/context-state-lifecycle-p3.test.mjs test/context-state-authority-atomicity-p3.test.mjs
       - name: P4 bounded hydration and privacy

@@ -123,8 +123,10 @@ test("S1/S2 spike: ChatGPT Normal and code provider share one Pi session but not
       cwd: root,
       pi,
       modelRuntime,
-      providerAdapters: [chatAdapter],
-      allowExperimentalExternal: true,
+      providerAdapterCatalog: [chatAdapter],
+      providerInstallationConfig: {
+        adapters: [{ adapter_id: "chatgpt-normal-memory-transport", mode: "experimental-nonproduction" }],
+      },
       modelPolicy: `${CHAT_PROVIDER}/${CHAT_MODEL}`,
       reasoningPolicy: "off",
       contextHandoffThresholdPercent: 50,

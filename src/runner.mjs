@@ -14,7 +14,7 @@ import { MeasurementInstrumentation } from "./metrics.mjs";
 import { ContextAwareHandoffService } from "./multi-model-handoff.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
-import { installProviderAdapters } from "./provider-adapter.mjs";
+import { installConfiguredProviderAdapters } from "./provider-installation.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
 
@@ -26,6 +26,15 @@ function parseModelPolicy(value) {
   const separator = value.indexOf("/");
   invariant(separator > 0 && separator < value.length - 1, "MODEL_POLICY_INVALID", value);
   return [value.slice(0, separator), value.slice(separator + 1)];
+}
+
+function providerInstallationOptions(options) {
+  invariant(options.providerAdapters === undefined, "PROVIDER_INSTALLATION_LEGACY_RUNNER_OPTION_UNSUPPORTED", "Use providerAdapterCatalog + providerInstallationConfig; providerAdapters no longer installs adapters implicitly");
+  invariant(options.allowExperimentalExternal === undefined, "PROVIDER_INSTALLATION_LEGACY_RUNNER_OPTION_UNSUPPORTED", "Use per-adapter mode=experimental-nonproduction in providerInstallationConfig; allowExperimentalExternal is not a product option");
+  return Object.freeze({
+    catalog: options.providerAdapterCatalog ?? [],
+    config: options.providerInstallationConfig ?? { adapters: [] },
+  });
 }
 
 export class GuardianRunner {
@@ -44,12 +53,12 @@ export class GuardianRunner {
     const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
     const contextDomains = options.contextDomains ?? new ContextDomainRegistry();
-    const adapterInstall = await installProviderAdapters(options.providerAdapters ?? [], {
+    const providerInstallation = providerInstallationOptions(options);
+    const adapterInstall = await installConfiguredProviderAdapters(providerInstallation.config, providerInstallation.catalog, {
       modelRuntime,
       pi,
       contextDomains,
       contextState,
-      allowExperimentalExternal: options.allowExperimentalExternal === true,
     });
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
