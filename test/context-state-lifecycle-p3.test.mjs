@@ -95,6 +95,10 @@ function contextRows(storage) {
   return storage.db.prepare("SELECT seq,event_type,event_key,data_json FROM journal WHERE event_key LIKE 'context-%' ORDER BY seq").all();
 }
 
+function contextMigrationVersions(storage) {
+  return storage.db.prepare("SELECT version FROM context_state_migrations ORDER BY version").all().map((row) => row.version);
+}
+
 test("P3 adopts compatible pre-productization context state without rewriting journal bytes", () => {
   const storage = new GuardianStorage(storagePath());
   try {
@@ -113,7 +117,7 @@ test("P3 adopts compatible pre-productization context state without rewriting jo
     const state = new ContextStateStore(storage, TASK);
     const after = contextRows(storage);
     assert.deepEqual(after, before, "P3 migration must not rewrite legacy context journal payloads");
-    assert.deepEqual(storage.db.prepare("SELECT version FROM context_state_migrations ORDER BY version").all(), [{ version: CONTEXT_STATE_STORAGE_SCHEMA_VERSION }]);
+    assert.deepEqual(contextMigrationVersions(storage), [CONTEXT_STATE_STORAGE_SCHEMA_VERSION]);
     assert.equal(storage.db.prepare("SELECT schema_version FROM authorities WHERE name='context_state_journal'").get().schema_version, "0.1.0");
     assert.equal(state.getCursor(DOMAIN_ID).entry_id, "a1");
     assert.equal(state.getBinding(DOMAIN_ID).external_thread_id, "thread-existing-p3");
@@ -218,7 +222,7 @@ test("P3 cursor, binding, delivery and epoch round-trip through process-style re
     assert.equal(restoredEpoch.target_session_id, "SES-B");
     assert.equal(Object.isFrozen(restoredEpoch), true);
     assert.equal(Object.isFrozen(restoredEpoch.source_cursor), true);
-    assert.deepEqual(secondStorage.db.prepare("SELECT version FROM context_state_migrations ORDER BY version").all(), [{ version: CONTEXT_STATE_STORAGE_SCHEMA_VERSION }]);
+    assert.deepEqual(contextMigrationVersions(secondStorage), [CONTEXT_STATE_STORAGE_SCHEMA_VERSION]);
   } finally {
     secondStorage.close();
   }
