@@ -2,13 +2,13 @@
 
 - **Status:** DECIDED / BLOCKING CONSTRAINT
 - **Date:** 2026-09-02
-- **Parent:** ADR-0016
+- **Parent:** ADR-0016 (accepted 2026-09-03)
 - **Issue:** #32
 - **Scope:** transport eligibility for `ChatGPT Normal`
 
 ## 1. Finding
 
-ADR-0016 deliberately keeps the concrete `ChatGPT Normal` transport outside Aiopago core. The transport must satisfy both OpenAI product rules and the user's architectural requirement that ordinary ChatGPT usage remain distinct from Codex and API usage.
+ADR-0016 deliberately keeps the concrete `ChatGPT Normal` transport outside Aiopago core. The transport must satisfy both OpenAI product rules and the architectural requirement that ordinary ChatGPT usage remain distinct from Codex and API usage.
 
 OpenAI's consumer Terms prohibit automatically/programmatically extracting data or Output from the Services and prohibit circumventing service restrictions or protective measures.
 
@@ -99,9 +99,9 @@ Reference rechecked on 2026-09-02:
 
 This proves that OpenAI can expose subscription-backed product clients, but it establishes **Codex** access, not a generic external-client API for ordinary ChatGPT conversations. Aiopago must not infer ordinary ChatGPT transport eligibility from Codex authentication behavior.
 
-## 3. Effect on spike #32
+## 3. Effect on spike #32 and accepted 0.3-A architecture
 
-The provider-neutral S1–S8 mechanics and their durability hardening are now validated independently of the real ChatGPT transport.
+The provider-neutral S1–S8 mechanics, P1–P7 productization, durability hardening and release-surface review are validated independently of the real ChatGPT transport. ADR-0016 was accepted on 2026-09-03 and this ADR remains its mandatory transport gate.
 
 Production `ChatGPT Normal` remains blocked only at the external transport/product boundary:
 
@@ -112,6 +112,8 @@ Production `ChatGPT Normal` remains blocked only at the external transport/produ
 - durable cursor and remote binding: validated provider-neutrally;
 - ambiguous delivery reconciliation across restart: validated;
 - history-zero handoff/rebind: validated;
+- explicit provider installation and production admission: validated;
+- public/release boundary: validated;
 - real ordinary-ChatGPT transport: **blocked externally**;
 - real ChatGPT-vs-Codex usage-pool proof: **blocked externally**.
 
@@ -165,10 +167,12 @@ transport_support
 
 Aiopago production configuration must reject a `ChatGPT Normal` adapter whose transport is not marked and verified as officially supported.
 
-The provider-neutral implementation already enforces this fail-closed shape:
+The provider-neutral implementation enforces this fail-closed boundary:
 
+- caller-supplied adapter/catalog entries are revalidated at installation boundaries;
 - external adapters default to `experimental-nonproduction`;
-- experimental installation requires explicit Runner opt-in;
+- experimental installation requires explicit per-adapter `experimental-nonproduction` configuration;
+- the public Runner rejects legacy global experimental opt-in;
 - `official-supported` requires documentation and usage-pool evidence metadata;
 - sibling models cannot remain silently unclassified;
 - outbound secret-shaped values fail before transport;
