@@ -76,7 +76,9 @@ export async function installProviderAdapters(adapters = [], {
   const providerIds = new Set();
 
   for (const candidate of adapters) {
-    const adapter = candidate?.schema_version === PROVIDER_ADAPTER_SCHEMA_VERSION ? candidate : defineProviderAdapter(candidate);
+    // Re-run the public validator for every caller-supplied object. Matching the
+    // schema tag alone must never bypass install/domain/transport validation.
+    const adapter = defineProviderAdapter(candidate);
     invariant(!adapterIds.has(adapter.adapter_id), "PROVIDER_ADAPTER_ID_CONFLICT", adapter.adapter_id);
     invariant(!providerIds.has(adapter.provider_id), "PROVIDER_ADAPTER_PROVIDER_CONFLICT", adapter.provider_id);
     invariant(!modelRuntime.getProvider(adapter.provider_id), "PROVIDER_ADAPTER_PROVIDER_ALREADY_REGISTERED", adapter.provider_id);
@@ -99,9 +101,6 @@ export async function installProviderAdapters(adapters = [], {
       invariant(models.some((model) => model.id === adapter.context_domain.model_id), "PROVIDER_ADAPTER_DOMAIN_MODEL_MISSING", `${adapter.provider_id}/${adapter.context_domain.model_id}`);
       invariant(models.length === 1, "PROVIDER_ADAPTER_UNCLASSIFIED_MODELS", `${adapter.provider_id} exposes ${models.length} models but the adapter classifies only ${adapter.context_domain.model_id}`);
     }
-    // A provider-default descriptor (no model_id) safely classifies every model.
-    // Exact-model descriptors are deliberately restricted to one-model providers
-    // until the adapter contract supports an explicit descriptor per model.
     const domain = contextDomains.register(adapter.context_domain);
     const durableBinding = domain.kind === "external-stateful" ? contextState?.ensureBinding(domain) ?? null : null;
     installed.push(Object.freeze({
