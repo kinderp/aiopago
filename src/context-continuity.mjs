@@ -1,5 +1,5 @@
 // Public provider-neutral context-continuity contract. Runtime/storage internals stay private.
-export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.7.0";
+export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.8.0";
 export { CONTEXT_DOMAIN_SCHEMA_VERSION, CONTEXT_DOMAIN_KINDS, createContextDomainDescriptor } from "./context-domain.mjs";
 export { PROVIDER_ADAPTER_SCHEMA_VERSION, TRANSPORT_SUPPORT_STATUSES, defineProviderAdapter } from "./provider-adapter.mjs";
 export { PROVIDER_INSTALLATION_CONFIG_SCHEMA_VERSION, PROVIDER_INSTALLATION_MODES, defineProviderInstallationConfig } from "./provider-installation-config.mjs";
