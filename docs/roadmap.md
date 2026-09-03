@@ -1,6 +1,6 @@
 # Aiopago/Guardian — roadmap di prodotto
 
-**Versione:** 0.2 — 2026-08-21
+**Versione:** 0.2 + prenotazione 0.3-A — 2026-09-03
 **Fonte autorevole:** questo file governa scope e ordine delle milestone; lo stato runtime dei task appartiene al Master Task Ledger e non viene dedotto da questa roadmap.
 
 ## Sequenza Aiopago 0.2
@@ -26,7 +26,17 @@ Gate vincolante dopo 0.2-A:
 4. **0.2-D Start da obiettivo: CLOSED / ACCEPTED**, independent gate 2/2 CLEAN; PR #28 merged e issue #27 completed;
 5. **0.2-E UX interattiva unificata: NOT STARTED / READY TO START**.
 
-La migration di nome e le slice 0.2-A, 0.2-B, 0.2-C e 0.2-D restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti; 0.2-E è pronta per una futura sessione esplicitamente richiesta, ma non è iniziata.
+La migration di nome e le slice 0.2-A, 0.2-B, 0.2-C e 0.2-D restano chiuse. La storia tecnica 0.2-C è invariata: il candidate `aa1a3d0299d8f032aa4ff96aaf4a1d930284ae70` è stato accettato 2/2 CLEAN e integrato dal merge `488c4fd696003a6987ea50996bbab644e63ab56c`. 0.2-D compone quella superficie `plan.*` senza modificarne i contratti; 0.2-E resta il prossimo lavoro della sequenza 0.2 e non viene ampliata dalla productizzazione multi-model.
+
+## Sequenza Aiopago 0.3 — prenotazione accettata
+
+| Slice | Scope | Gate |
+|---|---|---|
+| **0.3-A — Provider-neutral Multi-model Continuity** | Un solo UX `/model`; context domain `pi-native` / `external-stateful`; contratti pubblici minimi; cursor/binding/delivery/epoch durable; hydration bounded; tool esterni read/query-only; telemetria conservativa; handoff history-zero con rebind pre-`RESUME_READY` | **PLACEMENT ACCEPTED / IMPLEMENTATION CANDIDATE REVIEWED**; ADR-0016 accepted; rollup PR #44 green. Runtime landing solo dopo la sequenza 0.2 e fresh integration CI sul `main` allora corrente. `ChatGPT Normal` resta escluso finché ADR-0016A Q1–Q7 non passano. |
+
+La prenotazione 0.3-A non modifica l'ordine o lo scope delle slice 0.2. Il codice P1–P7 può essere già disponibile come candidato revisionato, ma non deve entrare in `main` come ampliamento silenzioso di 0.2-E. PR #37–#43 restano evidence slices; PR #44 è il rollup tecnico; un solo candidato di integrazione verrà costruito sul `main` corrente al gate di landing 0.3-A.
+
+Non viene fissato ora un numero di release npm/GitHub: il repository non ha una release pubblica da cui derivare un bump automatico e `package.json` resta invariato fino al vero landing/release candidate 0.3-A.
 
 ## Fondazione M0/M1
 
