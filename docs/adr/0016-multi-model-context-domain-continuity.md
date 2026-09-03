@@ -1,7 +1,8 @@
 # ADR-0016 — Multi-model context-domain continuity and ChatGPT adapter boundary
 
-- **Status:** PROPOSED / READY FOR ARCHITECTURE REVIEW
+- **Status:** ACCEPTED — PROVIDER-NEUTRAL ARCHITECTURE; `ChatGPT Normal` REMAINS BLOCKED BY ADR-0016A
 - **Date:** 2026-09-02
+- **Accepted:** 2026-09-03
 - **Reviewed implementation evidence:** 2026-09-03
 - **Issues:** #32 spike, #36 provider-neutral productization
 - **Depends on:** ADR-0015
@@ -261,28 +262,29 @@ The architecture has two evidence layers:
 1. **S1–S8 spike evidence** — provider seam, isolated transports, same-session switching, bounded hydration, Pi read tool loop, telemetry primitives, restart durability and history-zero rebind.
 2. **P1–P7 productization/review evidence** — intentional public API, explicit install policy, durable-state migration semantics, privacy/correlation hardening, closed external tool profile, conservative telemetry and durable pre-ready handoff behavior.
 
-Cumulative reviewed rollup:
+Final cumulative reviewed rollup:
 
 - PR #44 — `0.3-A rollup: provider-neutral continuity P1-P7`;
-- head `fd088312bd057b2e59036ee68fc49f2d5c84bd27`;
-- GitHub Actions run `33722328515`, job `100543861825`;
+- head `36aac13f5ddc19b8ea0a62c6a2ae269c31bd8010`;
+- GitHub Actions run `33731877603`, job `100573451580`;
 - Node 22.19 / Pi 0.83.0;
+- public context-continuity API and release-surface gate PASS;
 - P1–P7 targeted gates PASS;
 - S1–S8 PASS;
 - safety/durability gates PASS;
 - complete historical regression PASS.
 
-The cumulative review additionally closed cross-slice findings for adapter validation trust, migration/authority atomicity, tool-result ID collisions, telemetry correlation/model collisions, slash-containing model IDs, true durable pre-ready ordering, crash-safe rebind and adapter continuity-state authority leakage.
+The cumulative and integration reviews additionally closed cross-slice findings for adapter validation trust, migration/authority atomicity, tool-result ID collisions, telemetry correlation/model collisions, slash-containing model IDs, true durable pre-ready ordering, crash-safe rebind, adapter continuity-state authority leakage, the public Runner bypass around P2 installation semantics, and release/package documentation of the public boundary.
 
 This evidence validates **provider-neutral Aiopago/Pi mechanics**. It does not prove the existence of a qualifying normal-ChatGPT transport or its quota semantics.
 
 ## 5. Roadmap boundary
 
-This ADR does **not** widen 0.2-E/#30. The existing 0.2-E interactive-human-UX scope remains separate.
+This ADR does **not** widen 0.2-E/#30. The existing 0.2-E interactive-human-UX scope remains separate and the Aiopago 0.2 sequence remains authoritative.
 
-Provider-neutral productization is tracked by #36 as a proposed post-0.2 slice. Green tests do not themselves accept that roadmap placement.
+The provider-neutral productization tracked by #36 is accepted as **0.3-A**, the first post-0.2 slice. Its implementation candidate may remain fully reviewed ahead of the roadmap, but runtime code must not land in `main` as a silent widening of 0.2-E.
 
-If the architecture and #36 are accepted, integration should use one coherent candidate against the then-current `main`, not seven independent stacked merges. PRs #37–#43 remain per-slice evidence; PR #44 is the cumulative review boundary. The supported-profile matrix must be rerun on the integration head before any merge to `main`.
+When 0.3-A reaches its landing gate, integration uses one coherent candidate against the then-current `main`, not seven independent stacked merges. PRs #37–#43 remain per-slice evidence; PR #44 is the cumulative review boundary. The supported-profile matrix must be rerun on the integration head before any merge to `main`.
 
 ## 6. ChatGPT Normal remains independently blocked
 
@@ -314,13 +316,14 @@ Until then, `ChatGPT Normal` is unavailable by design.
 - external context occupancy may remain approximate;
 - real ChatGPT Normal cannot ship until ADR-0016A is satisfied.
 
-## 8. Review decision requested
+## 8. Acceptance record
 
-Reviewers are asked to decide the architecture and authority boundaries in this ADR, not to infer acceptance from implementation alone.
+ADR-0016 is accepted on 2026-09-03 with the following governance decisions:
 
-If accepted:
-
-1. ratify #36's post-0.2 productization placement;
-2. create one integration candidate against current `main`;
-3. run the full supported-profile matrix on that integration head;
-4. only then consider a `main` merge.
+1. the provider-neutral architecture and authority boundaries above are accepted;
+2. ADR-0016A remains a mandatory blocking constraint for any provider labelled `ChatGPT Normal`;
+3. #36 is ratified as **0.3-A**, post-0.2, and does not widen 0.2-E/#30;
+4. PRs #37–#43 are evidence slices and are not to be merged independently into `main`;
+5. PR #44 is the coherent reviewed productization boundary;
+6. the package version remains unchanged until the actual 0.3-A landing/release candidate is prepared;
+7. a fresh supported-profile matrix on the then-current integration head is mandatory before runtime code may enter `main`.
