@@ -103,6 +103,8 @@ This proves that OpenAI can expose subscription-backed product clients, but it e
 
 The provider-neutral S1–S8 mechanics, P1–P7 productization, durability hardening and release-surface review are validated independently of the real ChatGPT transport. ADR-0016 was accepted on 2026-09-03 and this ADR remains its mandatory transport gate.
 
+Final provider-neutral evidence is PR #44 head `36aac13f5ddc19b8ea0a62c6a2ae269c31bd8010`, GitHub Actions run `33731877603`, job `100573451580`, fully green on Node 22.19 / Pi 0.83.0 including public/release surface, P1–P7, S1–S8, safety/durability and complete historical regression.
+
 Production `ChatGPT Normal` remains blocked only at the external transport/product boundary:
 
 - provider registration seam: validated;
