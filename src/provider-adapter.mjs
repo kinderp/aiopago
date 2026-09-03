@@ -84,14 +84,33 @@ export async function installProviderAdapters(adapters = [], {
     invariant(!modelRuntime.getProvider(adapter.provider_id), "PROVIDER_ADAPTER_PROVIDER_ALREADY_REGISTERED", adapter.provider_id);
     if (adapter.context_domain.kind === "external-stateful") {
       invariant(adapter.transport_support?.status === "official-supported" || allowExperimentalExternal === true, "PROVIDER_ADAPTER_TRANSPORT_UNVERIFIED", adapter.adapter_id);
+      if (contextState) invariant(typeof contextState.bindExternalThread === "function", "PROVIDER_ADAPTER_CONTEXT_BINDING_CAPABILITY_REQUIRED");
     }
     adapterIds.add(adapter.adapter_id);
     providerIds.add(adapter.provider_id);
 
-    const existingBinding = adapter.context_domain.kind === "external-stateful"
-      ? contextState?.getBinding(adapter.context_domain.context_domain_id) ?? null
+    const external = adapter.context_domain.kind === "external-stateful";
+    const domainId = adapter.context_domain.context_domain_id;
+    const existingBinding = external ? contextState?.getBinding(domainId) ?? null : null;
+    let installationComplete = false;
+    const bindExternalThread = external && contextState
+      ? (externalThreadId) => {
+          invariant(installationComplete, "PROVIDER_ADAPTER_BINDING_NOT_READY", adapter.adapter_id);
+          contextState.ensureBinding(adapter.context_domain);
+          return contextState.bindExternalThread(domainId, externalThreadId);
+        }
       : null;
-    await adapter.install(Object.freeze({ modelRuntime, pi, adapter, contextState, binding: existingBinding }));
+
+    // Adapter code receives only the existing binding snapshot and one narrow,
+    // post-install capability for binding an opaque remote thread. It never gets
+    // ContextStateStore, cursor, delivery, reconciliation or epoch authority.
+    await adapter.install(Object.freeze({
+      modelRuntime,
+      pi,
+      adapter,
+      binding: existingBinding,
+      ...(bindExternalThread ? { bindExternalThread } : {}),
+    }));
     const provider = modelRuntime.getProvider(adapter.provider_id);
     invariant(provider, "PROVIDER_ADAPTER_INSTALL_FAILED", `${adapter.provider_id} was not registered`);
     const models = modelRuntime.getModels(adapter.provider_id);
@@ -103,6 +122,7 @@ export async function installProviderAdapters(adapters = [], {
     }
     const domain = contextDomains.register(adapter.context_domain);
     const durableBinding = domain.kind === "external-stateful" ? contextState?.ensureBinding(domain) ?? null : null;
+    installationComplete = true;
     installed.push(Object.freeze({
       adapter_id: adapter.adapter_id,
       provider_id: adapter.provider_id,
