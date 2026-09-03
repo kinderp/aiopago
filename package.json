@@ -37,7 +37,8 @@
     "docs/portable-alpha.md",
     "docs/rename-aiopago-migration.md",
     "docs/adr/0017-provider-neutral-public-contract-surface.md",
-    "docs/adr/0018-explicit-provider-installation.md"
+    "docs/adr/0018-explicit-provider-installation.md",
+    "docs/adr/0019-durable-context-state-lifecycle.md"
   ],
   "engines": {
     "node": ">=22.19.0"

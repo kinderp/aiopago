@@ -7,6 +7,7 @@ on:
       - review/multimodel-durability
       - feat/provider-neutral-public-contracts
       - feat/explicit-provider-installation
+      - feat/durable-context-state-lifecycle
   workflow_dispatch:
 
 permissions:
@@ -40,6 +41,9 @@ jobs:
 
       - name: P2 explicit provider installation
         run: node --test test/provider-installation-p2.test.mjs
+
+      - name: P3 durable context-state lifecycle
+        run: node --test test/context-state-lifecycle-p3.test.mjs
 
       - name: S5/S6 context transfer primitives
         run: node --test test/context-transfer-spike.test.mjs

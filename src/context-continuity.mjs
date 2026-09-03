@@ -4,7 +4,7 @@
 // facade. External adapters should depend on this module rather than importing
 // spike/runtime internals directly.
 
-export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.2.0";
+export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.3.0";
 
 export {
   CONTEXT_DOMAIN_SCHEMA_VERSION,
@@ -39,4 +39,5 @@ export {
 export {
   CONTEXT_BINDING_SCHEMA_VERSION,
   CONTEXT_DELIVERY_SCHEMA_VERSION,
+  CONTEXT_EPOCH_SCHEMA_VERSION,
 } from "./context-state.mjs";
