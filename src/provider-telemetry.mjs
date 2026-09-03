@@ -22,6 +22,7 @@ function operationKey(taskId, operationId) {
   if (typeof taskId !== "string" || taskId.length === 0 || typeof operationId !== "string" || operationId.length === 0) return null;
   return `${taskId}\u0000${operationId}`;
 }
+function modelKey(provider, model) { return `${provider}\u0000${model}`; }
 
 export function buildProviderTelemetryProjection({ metric_samples = [], operation_outcomes = [] } = {}) {
   invariant(Array.isArray(metric_samples), "PROVIDER_TELEMETRY_SAMPLES_INVALID");
@@ -41,10 +42,11 @@ export function buildProviderTelemetryProjection({ metric_samples = [], operatio
     const pool = sample?.attribution?.usage_pool ?? provider;
     const domainId = sample?.attribution?.context_domain_id ?? `pi-native:${provider}`;
     const domainKind = sample?.attribution?.context_domain_kind ?? "unknown";
+    const mKey = modelKey(provider, model);
     if (!pools.has(pool)) pools.set(pool, usageGroup({ usage_pool: pool, usage_pool_semantic: USAGE_POOL_SEMANTIC }));
-    if (!models.has(`${provider}/${model}`)) models.set(`${provider}/${model}`, usageGroup({ provider, model }));
+    if (!models.has(mKey)) models.set(mKey, usageGroup({ provider, model }));
     if (!domains.has(domainId)) domains.set(domainId, usageGroup({ context_domain_id: domainId, context_domain_kind: domainKind, usage_pool: pool }));
-    addUsage(pools.get(pool), sample); addUsage(models.get(`${provider}/${model}`), sample); addUsage(domains.get(domainId), sample);
+    addUsage(pools.get(pool), sample); addUsage(models.get(mKey), sample); addUsage(domains.get(domainId), sample);
 
     if (!tools.has(pool)) tools.set(pool, toolGroup(pool));
     const group = tools.get(pool);
@@ -66,7 +68,7 @@ export function buildProviderTelemetryProjection({ metric_samples = [], operatio
   const totalPrimary = [...pools.values()].reduce((sum, g) => sum + g.primary_tokens_observed, 0);
   const finishUsage = (g) => Object.freeze({ ...g, usage_measurement_status: g.usage_samples_complete === g.model_calls ? "complete_captured_fields" : "partial_captured_fields", call_share_percent: pct(g.model_calls,totalCalls), primary_token_share_percent: pct(g.primary_tokens_observed,totalPrimary) });
   const poolList = [...pools.values()].map(finishUsage).sort((a,b)=>b.model_calls-a.model_calls || a.usage_pool.localeCompare(b.usage_pool));
-  const modelList = [...models.values()].map(finishUsage).sort((a,b)=>b.model_calls-a.model_calls || `${a.provider}/${a.model}`.localeCompare(`${b.provider}/${b.model}`));
+  const modelList = [...models.values()].map(finishUsage).sort((a,b)=>b.model_calls-a.model_calls || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
   const domainList = [...domains.values()].map(finishUsage).sort((a,b)=>b.model_calls-a.model_calls || a.context_domain_id.localeCompare(b.context_domain_id));
   const toolList = [...tools.values()].map((g)=>Object.freeze({ ...g, successful_file_targets: Object.freeze([...g.successful_file_targets].sort()), successful_file_target_count: g.successful_file_targets.size })).sort((a,b)=>b.requested_tool_calls-a.requested_tool_calls || a.usage_pool.localeCompare(b.usage_pool));
   const successfulFiles = Object.freeze([...new Set(toolList.flatMap((g)=>g.successful_file_targets))].sort());
