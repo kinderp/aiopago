@@ -3,7 +3,8 @@ import { ContextCursorBook, hydrateContextTransfer } from "./context-transfer.mj
 import { invariant } from "./errors.mjs";
 import { assertNoSecrets } from "./secret-scan.mjs";
 
-export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.1.0";
+export const CONTEXT_SYNC_ENVELOPE_VERSION = "0.2.0";
+export const CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION = "0.1.0";
 export const CONTEXT_HANDOFF_BINDING_VERSION = "0.1.0";
 export const CONTEXT_SYNC_PREFIX = `AIOPAGO_CONTEXT_TRANSFER/${CONTEXT_SYNC_ENVELOPE_VERSION}`;
 export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
@@ -13,7 +14,11 @@ export const DEFAULT_PROTOCOL_BUDGET = Object.freeze({
   max_live_user_chars: 4000,
 });
 
+const PROTOCOL_BUDGET_KEYS = Object.freeze(Object.keys(DEFAULT_PROTOCOL_BUDGET));
+
 function protocolBudget(input = {}) {
+  invariant(input && typeof input === "object" && !Array.isArray(input), "CONTEXT_SYNC_PROTOCOL_BUDGET_INVALID", "protocol budget must be an object");
+  for (const key of Object.keys(input)) invariant(PROTOCOL_BUDGET_KEYS.includes(key), "CONTEXT_SYNC_PROTOCOL_BUDGET_FIELD_UNKNOWN", key);
   const merged = { ...DEFAULT_PROTOCOL_BUDGET, ...input };
   for (const [key, value] of Object.entries(merged)) {
     invariant(Number.isInteger(value) && value > 0, "CONTEXT_SYNC_PROTOCOL_BUDGET_INVALID", `${key} must be a positive integer`);
@@ -66,34 +71,65 @@ function toolCallIdsOwnedByDomain(entries, domain) {
 function protocolToolResults(windowEntries, branchEntries, domain, limits) {
   const owned = toolCallIdsOwnedByDomain(branchEntries, domain);
   const results = [];
+  const reasons = new Set();
   let remaining = limits.max_total_tool_result_chars;
-  let truncated = false;
 
   for (const entry of windowEntries) {
     if (entry.type !== "message" || entry.message?.role !== "toolResult") continue;
     if (!owned.has(entry.message.toolCallId)) continue;
     if (results.length >= limits.max_tool_results) {
-      truncated = true;
+      reasons.add("max_tool_results");
       break;
     }
     const raw = textContent(entry.message.content);
     const allowed = Math.max(0, Math.min(limits.max_tool_result_chars, remaining));
     const text = raw.slice(0, allowed);
-    if (text.length < raw.length) truncated = true;
+    const itemReasons = [];
+    if (text.length < raw.length) {
+      if (remaining <= limits.max_tool_result_chars) {
+        reasons.add("max_total_tool_result_chars");
+        itemReasons.push("max_total_tool_result_chars");
+      }
+      if (limits.max_tool_result_chars <= remaining) {
+        reasons.add("max_tool_result_chars");
+        itemReasons.push("max_tool_result_chars");
+      }
+    }
     remaining -= text.length;
     results.push(Object.freeze({
       tool_call_id: entry.message.toolCallId,
       tool_name: entry.message.toolName,
       is_error: entry.message.isError === true,
+      source_ref: Object.freeze({ kind: "pi-tool-result", entry_id: entry.id ?? null }),
       text,
+      truncation: Object.freeze({
+        truncated: text.length < raw.length,
+        reasons: Object.freeze(itemReasons.sort()),
+        original_chars: raw.length,
+        emitted_chars: text.length,
+      }),
     }));
     if (remaining <= 0) {
-      if (windowEntries.some((candidate) => candidate !== entry && candidate.type === "message" && candidate.message?.role === "toolResult" && owned.has(candidate.message.toolCallId))) truncated = true;
+      if (windowEntries.some((candidate) => candidate !== entry && candidate.type === "message" && candidate.message?.role === "toolResult" && owned.has(candidate.message.toolCallId))) {
+        reasons.add("max_total_tool_result_chars");
+      }
       break;
     }
   }
 
-  return Object.freeze({ items: Object.freeze(results), truncated, remaining_chars: remaining });
+  return Object.freeze({
+    purpose: "live-correlated-tool-continuation",
+    historical_hydration: false,
+    items: Object.freeze(results),
+    truncated: reasons.size > 0,
+    truncation: Object.freeze({
+      truncated: reasons.size > 0,
+      reasons: Object.freeze([...reasons].sort()),
+      emitted_chars: limits.max_total_tool_result_chars - remaining,
+      remaining_chars: remaining,
+    }),
+    remaining_chars: remaining,
+  });
 }
 
 function assistantEntryId(sessionManager, message, domain) {
@@ -136,6 +172,15 @@ function durableFailure(delivery, fallbackReason = "durable-unresolved-delivery"
   });
 }
 
+function outboundTruncation(transfer, liveUserInput, toolResults) {
+  const reasons = [
+    ...transfer.truncation.reasons.map((reason) => `hydration:${reason}`),
+    ...(liveUserInput?.truncated ? ["live_user_input:max_live_user_chars"] : []),
+    ...toolResults.truncation.reasons.map((reason) => `tool_continuation:${reason}`),
+  ].sort();
+  return Object.freeze({ truncated: reasons.length > 0, reasons: Object.freeze(reasons) });
+}
+
 export class ContextSyncCoordinator {
   constructor({ contextDomains, cursorBook = new ContextCursorBook(), stateStore = null, ledger, observeGit, evidenceProvider = () => [], hydrationBudget = undefined, protocolBudget: protocolLimits = undefined } = {}) {
     invariant(contextDomains && typeof contextDomains.resolve === "function", "CONTEXT_SYNC_DOMAIN_REGISTRY_REQUIRED");
@@ -150,7 +195,7 @@ export class ContextSyncCoordinator {
     this.observeGit = observeGit;
     this.evidenceProvider = evidenceProvider;
     this.hydrationBudget = hydrationBudget;
-    this.protocolBudget = protocolBudget(protocolLimits);
+    this.protocolBudget = protocolBudget(protocolLimits ?? {});
     this.pending = new Map();
     this.reconciliationRequired = new Map();
     this.lastProjection = new Map();
@@ -286,6 +331,7 @@ export class ContextSyncCoordinator {
       evidence: this.evidenceProvider({ window, domain, ctx }) ?? [],
       hydrationBudget: this.hydrationBudget,
     });
+    const liveUserInput = latestUserInput(window.entries, this.protocolBudget.max_live_user_chars);
     const toolResults = protocolToolResults(window.entries, branchEntries, domain, this.protocolBudget);
     const durableBaseline = this.durableBaselines.get(domain.context_domain_id) ?? this.stateStore?.getBaseline(domain.context_domain_id) ?? null;
     if (durableBaseline && !this.durableBaselines.has(domain.context_domain_id)) this.durableBaselines.set(domain.context_domain_id, durableBaseline);
@@ -295,12 +341,24 @@ export class ContextSyncCoordinator {
       context_domain_id: domain.context_domain_id,
       context_binding_id: binding?.binding_id ?? null,
       durable_baseline: durableBaseline,
+      privacy_boundary: Object.freeze({
+        schema_version: CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION,
+        hydration_policy_version: transfer.privacy_policy.schema_version,
+        historical_raw_tool_output: "excluded",
+        live_tool_result_policy: "domain-owned-post-watermark-correlated-bounded",
+        live_user_input_policy: "latest-post-watermark-bounded",
+        transcript_dump: false,
+        summarization: "none",
+        complete_envelope_scan: "fail-closed-before-transport",
+      }),
       transfer,
-      live_user_input: latestUserInput(window.entries, this.protocolBudget.max_live_user_chars),
+      live_user_input: liveUserInput,
       protocol_tool_results: toolResults,
+      truncation: outboundTruncation(transfer, liveUserInput, toolResults),
     });
-    // The transfer path must enforce the same secret-shaped field/value policy as
-    // sealed Aiopago artifacts before any external transport sees the capsule.
+    // P4 requires one final scan over the complete assembled envelope, including
+    // live user input and correlated tool continuation, before any transport or
+    // durable delivery prepare can observe it.
     assertNoSecrets(envelope);
     this.stateStore?.prepareDelivery(window, domain);
     const messages = Object.freeze([transferMessage(envelope)]);
