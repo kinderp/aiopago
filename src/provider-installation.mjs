@@ -1,6 +1,5 @@
 import { invariant } from "./errors.mjs";
 import {
-  PROVIDER_ADAPTER_SCHEMA_VERSION,
   defineProviderAdapter,
   installProviderAdapters,
 } from "./provider-adapter.mjs";
@@ -10,9 +9,10 @@ function indexAdapterCatalog(adapterCatalog) {
   invariant(Array.isArray(adapterCatalog), "PROVIDER_INSTALLATION_CATALOG_INVALID");
   const byId = new Map();
   for (const candidate of adapterCatalog) {
-    const adapter = candidate?.schema_version === PROVIDER_ADAPTER_SCHEMA_VERSION
-      ? candidate
-      : defineProviderAdapter(candidate);
+    // A schema/version tag is not proof that an object has passed the adapter
+    // validator. Normalize every catalog entry at the trust boundary, including
+    // already-frozen adapters produced by defineProviderAdapter().
+    const adapter = defineProviderAdapter(candidate);
     invariant(!byId.has(adapter.adapter_id), "PROVIDER_INSTALLATION_CATALOG_ADAPTER_DUPLICATE", adapter.adapter_id);
     byId.set(adapter.adapter_id, adapter);
   }
