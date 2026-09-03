@@ -349,7 +349,7 @@ export class ContextSyncCoordinator {
         live_user_input_policy: "latest-post-watermark-bounded",
         transcript_dump: false,
         summarization: "none",
-        complete_envelope_secret_scan: "required-before-transport",
+        complete_envelope_scan: "fail-closed-before-transport",
       }),
       transfer,
       live_user_input: liveUserInput,
