@@ -19,8 +19,8 @@ jobs:
         run: npm list @earendil-works/pi-coding-agent @earendil-works/pi-ai
       - name: Syntax and brand checks
         run: npm run check
-      - name: Public context-continuity contract
-        run: node --test test/context-public-api.test.mjs
+      - name: Public context-continuity contract and release surface
+        run: node --test test/context-public-api.test.mjs test/context-release-surface.test.mjs
       - name: P2 explicit provider installation
         run: node --test test/provider-installation-p2.test.mjs test/runner-provider-installation-p2.test.mjs
       - name: P3 durable context-state lifecycle
