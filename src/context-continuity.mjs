@@ -4,7 +4,7 @@
 // facade. External adapters should depend on this module rather than importing
 // spike/runtime internals directly.
 
-export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.3.0";
+export const CONTEXT_CONTINUITY_PUBLIC_API_VERSION = "0.4.0";
 
 export {
   CONTEXT_DOMAIN_SCHEMA_VERSION,
@@ -27,12 +27,15 @@ export {
 export {
   CONTEXT_CURSOR_SCHEMA_VERSION,
   CONTEXT_TRANSFER_SCHEMA_VERSION,
+  CONTEXT_HYDRATION_POLICY_SCHEMA_VERSION,
   DEFAULT_CONTEXT_HYDRATION_BUDGET,
+  DEFAULT_CONTEXT_HYDRATION_POLICY,
   hydrateContextTransfer,
 } from "./context-transfer.mjs";
 
 export {
   CONTEXT_SYNC_ENVELOPE_VERSION,
+  CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION,
   CONTEXT_SYNC_PREFIX,
 } from "./context-sync.mjs";
 

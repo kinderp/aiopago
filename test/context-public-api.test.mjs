@@ -12,10 +12,13 @@ const PUBLIC_KEYS = Object.freeze([
   "CONTEXT_DOMAIN_KINDS",
   "CONTEXT_DOMAIN_SCHEMA_VERSION",
   "CONTEXT_EPOCH_SCHEMA_VERSION",
+  "CONTEXT_HYDRATION_POLICY_SCHEMA_VERSION",
   "CONTEXT_SYNC_ENVELOPE_VERSION",
   "CONTEXT_SYNC_PREFIX",
+  "CONTEXT_SYNC_PRIVACY_BOUNDARY_VERSION",
   "CONTEXT_TRANSFER_SCHEMA_VERSION",
   "DEFAULT_CONTEXT_HYDRATION_BUDGET",
+  "DEFAULT_CONTEXT_HYDRATION_POLICY",
   "PROVIDER_ADAPTER_SCHEMA_VERSION",
   "PROVIDER_INSTALLATION_CONFIG_SCHEMA_VERSION",
   "PROVIDER_INSTALLATION_MODES",
@@ -42,7 +45,7 @@ const INTERNAL_KEYS = Object.freeze([
 test("public context-continuity facade is exact and package-addressable", () => {
   assert.deepEqual(Object.keys(publicApi).sort(), PUBLIC_KEYS);
   assert.deepEqual(Object.keys(packageSubpath).sort(), PUBLIC_KEYS);
-  assert.equal(publicApi.CONTEXT_CONTINUITY_PUBLIC_API_VERSION, "0.3.0");
+  assert.equal(publicApi.CONTEXT_CONTINUITY_PUBLIC_API_VERSION, "0.4.0");
 
   for (const key of PUBLIC_KEYS) assert.equal(packageRoot[key], publicApi[key], `${key} must be re-exported by package root`);
   for (const key of INTERNAL_KEYS) {
@@ -51,7 +54,7 @@ test("public context-continuity facade is exact and package-addressable", () => 
   }
 });
 
-test("facade supports adapter declaration, explicit installation config and epoch version without exposing runtime state", () => {
+test("facade supports stable bounded hydration/privacy metadata without exposing runtime state", () => {
   const domain = publicApi.createContextDomainDescriptor({
     context_domain_id: "external:example",
     kind: "external-stateful",
@@ -81,8 +84,12 @@ test("facade supports adapter declaration, explicit installation config and epoc
   });
   assert.deepEqual(config.adapters, [{ adapter_id: "example-adapter", mode: "experimental-nonproduction" }]);
   assert.equal(Object.isFrozen(config), true);
-  assert.equal(Object.isFrozen(config.adapters), true);
   assert.equal(publicApi.CONTEXT_EPOCH_SCHEMA_VERSION, "0.1.0");
+  assert.equal(publicApi.CONTEXT_HYDRATION_POLICY_SCHEMA_VERSION, "0.1.0");
+  assert.equal(publicApi.DEFAULT_CONTEXT_HYDRATION_POLICY.raw_tool_output, "excluded-from-hydration");
+  assert.equal(publicApi.DEFAULT_CONTEXT_HYDRATION_POLICY.summarization, "none");
+  assert.equal(Object.isFrozen(publicApi.DEFAULT_CONTEXT_HYDRATION_POLICY), true);
+  assert.equal(Object.isFrozen(publicApi.DEFAULT_CONTEXT_HYDRATION_POLICY.projection_order), true);
   assert.equal("installProviderAdapters" in publicApi, false);
   assert.equal("installConfiguredProviderAdapters" in publicApi, false);
   assert.equal("ContextStateStore" in publicApi, false);

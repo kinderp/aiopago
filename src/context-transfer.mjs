@@ -2,7 +2,8 @@ import { stableId } from "./canonical.mjs";
 import { invariant } from "./errors.mjs";
 
 export const CONTEXT_CURSOR_SCHEMA_VERSION = "0.1.0";
-export const CONTEXT_TRANSFER_SCHEMA_VERSION = "0.1.0";
+export const CONTEXT_TRANSFER_SCHEMA_VERSION = "0.2.0";
+export const CONTEXT_HYDRATION_POLICY_SCHEMA_VERSION = "0.1.0";
 export const DEFAULT_CONTEXT_HYDRATION_BUDGET = Object.freeze({
   max_entries: 16,
   max_total_chars: 12000,
@@ -11,6 +12,17 @@ export const DEFAULT_CONTEXT_HYDRATION_BUDGET = Object.freeze({
   max_git_status_entries: 64,
   max_metadata_chars: 512,
 });
+export const DEFAULT_CONTEXT_HYDRATION_POLICY = Object.freeze({
+  schema_version: CONTEXT_HYDRATION_POLICY_SCHEMA_VERSION,
+  strategy: "durable-state-first-bounded",
+  projection_order: Object.freeze(["project", "git", "hydrated_evidence", "recent_context"]),
+  recent_context: "post-watermark-projection-only",
+  raw_tool_output: "excluded-from-hydration",
+  transcript_dump: false,
+  summarization: "none",
+});
+
+const HYDRATION_BUDGET_KEYS = Object.freeze(Object.keys(DEFAULT_CONTEXT_HYDRATION_BUDGET));
 
 function requiredString(value, code, label) {
   invariant(typeof value === "string" && value.trim().length > 0, code, `${label} must be a non-empty string`);
@@ -143,6 +155,10 @@ export class ContextCursorBook {
 }
 
 function budget(input = {}) {
+  invariant(input && typeof input === "object" && !Array.isArray(input), "CONTEXT_HYDRATION_BUDGET_INVALID", "budget must be an object");
+  for (const key of Object.keys(input)) {
+    invariant(HYDRATION_BUDGET_KEYS.includes(key), "CONTEXT_HYDRATION_BUDGET_FIELD_UNKNOWN", key);
+  }
   const merged = { ...DEFAULT_CONTEXT_HYDRATION_BUDGET, ...input };
   for (const [key, value] of Object.entries(merged)) {
     invariant(Number.isInteger(value) && value > 0, "CONTEXT_HYDRATION_BUDGET_INVALID", `${key} must be a positive integer`);
@@ -158,6 +174,10 @@ function messageText(message) {
     .filter((item) => item?.type === "text" && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n");
+}
+
+function isToolResultEntry(entry) {
+  return entry?.type === "message" && entry.message?.role === "toolResult";
 }
 
 function entryCandidate(entry) {
@@ -187,24 +207,35 @@ function entryCandidate(entry) {
 
 function boundedCollector(limits) {
   let remaining = limits.max_total_chars;
-  let truncated = false;
-  const take = (value, perItem = limits.max_entry_chars) => {
+  const reasons = new Set();
+  const take = (value, perItem = limits.max_entry_chars, perItemReason = "max_entry_chars") => {
     const text = String(value ?? "");
     const allowed = Math.max(0, Math.min(perItem, remaining));
     if (allowed === 0) {
-      if (text.length > 0) truncated = true;
+      if (text.length > 0) reasons.add("max_total_chars");
       return "";
     }
     const clipped = text.slice(0, allowed);
-    if (clipped.length < text.length) truncated = true;
+    if (clipped.length < text.length) {
+      if (remaining <= perItem) reasons.add("max_total_chars");
+      if (perItem <= remaining) reasons.add(perItemReason);
+    }
     remaining -= clipped.length;
     return clipped;
   };
   return {
     take,
-    markTruncated() { truncated = true; },
-    get truncated() { return truncated; },
+    markTruncated(reason) { reasons.add(reason); },
+    get truncated() { return reasons.size > 0; },
     get remaining() { return remaining; },
+    snapshot() {
+      return Object.freeze({
+        truncated: reasons.size > 0,
+        reasons: Object.freeze([...reasons].sort()),
+        emitted_chars: limits.max_total_chars - remaining,
+        remaining_chars: remaining,
+      });
+    },
   };
 }
 
@@ -221,26 +252,33 @@ function projectList(values, collector, perItem) {
 
 function gitProjection(gitState, collector, limits) {
   if (!gitState) return null;
-  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars);
+  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars, "max_metadata_chars");
+  const repositoryId = metadata(gitState.repository_id);
+  const branchName = metadata(gitState.branch);
+  const headSha = metadata(gitState.head_sha);
+  const baseSha = metadata(gitState.base_sha);
+  const indexDigest = metadata(gitState.index_digest);
+  const worktreeDigest = metadata(gitState.worktree_digest);
   const statuses = [];
   const rawStatuses = gitState.status_entries ?? [];
   for (const status of rawStatuses) {
     if (statuses.length >= limits.max_git_status_entries) {
-      collector.markTruncated();
+      collector.markTruncated("max_git_status_entries");
       break;
     }
     const original = String(status ?? "");
-    const text = collector.take(original, limits.max_metadata_chars);
+    const text = collector.take(original, limits.max_metadata_chars, "max_metadata_chars");
     if (!text && original.length > 0) break;
     statuses.push(text);
   }
   return Object.freeze({
-    repository_id: metadata(gitState.repository_id),
-    branch: metadata(gitState.branch),
-    head_sha: metadata(gitState.head_sha),
-    base_sha: metadata(gitState.base_sha),
-    index_digest: metadata(gitState.index_digest),
-    worktree_digest: metadata(gitState.worktree_digest),
+    source_ref: repositoryId || headSha ? Object.freeze({ kind: "git-state", repository_id: repositoryId, head_sha: headSha }) : null,
+    repository_id: repositoryId,
+    branch: branchName,
+    head_sha: headSha,
+    base_sha: baseSha,
+    index_digest: indexDigest,
+    worktree_digest: worktreeDigest,
     status_entries: Object.freeze(statuses),
   });
 }
@@ -248,14 +286,19 @@ function gitProjection(gitState, collector, limits) {
 export function hydrateContextTransfer({ window, targetDomain, ledger = null, gitState = null, evidence = [], hydrationBudget = undefined } = {}) {
   invariant(window?.schema_version === CONTEXT_TRANSFER_SCHEMA_VERSION, "CONTEXT_TRANSFER_WINDOW_INVALID");
   invariant(targetDomain?.context_domain_id === window.context_domain_id, "CONTEXT_TRANSFER_DOMAIN_MISMATCH");
-  const limits = budget(hydrationBudget);
+  invariant(Array.isArray(evidence), "CONTEXT_HYDRATION_EVIDENCE_INVALID", "evidence must be an array");
+  const limits = budget(hydrationBudget ?? {});
   const collector = boundedCollector(limits);
-  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars);
+  const metadata = (value) => value === null || value === undefined ? null : collector.take(value, limits.max_metadata_chars, "max_metadata_chars");
 
-  // Durable/authoritative project state gets budget priority over conversation history.
+  // P4 priority: authoritative/durable project state, Git and evidence consume the
+  // budget before any post-watermark conversation projection.
+  const taskId = metadata(ledger?.task_id);
+  const planRevisionId = metadata(ledger?.plan_revision_id);
   const project = Object.freeze({
-    task_id: metadata(ledger?.task_id),
-    plan_revision_id: metadata(ledger?.plan_revision_id),
+    source_ref: taskId || planRevisionId ? Object.freeze({ kind: "task-ledger", task_id: taskId, plan_revision_id: planRevisionId }) : null,
+    task_id: taskId,
+    plan_revision_id: planRevisionId,
     requirements_version: metadata(ledger?.requirements_version),
     current_item: metadata(ledger?.current_item),
     next_item: metadata(ledger?.next_item),
@@ -267,53 +310,74 @@ export function hydrateContextTransfer({ window, targetDomain, ledger = null, gi
 
   const git = gitProjection(gitState, collector, limits);
 
+  const hydratedEvidence = [];
+  for (const item of evidence) {
+    if (hydratedEvidence.length >= limits.max_evidence_items) {
+      collector.markTruncated("max_evidence_items");
+      break;
+    }
+    const kind = metadata(item?.kind ?? "text");
+    const source = metadata(item?.source);
+    const original = String(item?.text ?? "");
+    const text = collector.take(original);
+    if (!text && original.length > 0) break;
+    hydratedEvidence.push(Object.freeze({
+      source_ref: source ? Object.freeze({ kind: "evidence", ref: source }) : null,
+      kind,
+      source,
+      text,
+      text_truncated: text.length < original.length,
+      original_chars: original.length,
+    }));
+  }
+
   const recent = [];
   for (const entry of window.entries) {
     const candidate = entryCandidate(entry);
     if (!candidate) continue;
     if (recent.length >= limits.max_entries) {
-      collector.markTruncated();
+      collector.markTruncated("max_entries");
       break;
     }
+    const entryId = metadata(candidate.entry_id);
+    const kind = metadata(candidate.kind);
+    const provider = candidate.provider !== undefined ? metadata(candidate.provider) : undefined;
+    const model = candidate.provider !== undefined ? metadata(candidate.model) : undefined;
     const original = candidate.text;
     const text = collector.take(original);
     if (!text && original.length > 0) break;
     recent.push(Object.freeze({
-      entry_id: metadata(candidate.entry_id),
-      kind: metadata(candidate.kind),
-      ...(candidate.provider !== undefined ? { provider: metadata(candidate.provider), model: metadata(candidate.model) } : {}),
+      source_ref: entryId ? Object.freeze({ kind: "pi-entry", entry_id: entryId }) : null,
+      entry_id: entryId,
+      kind,
+      ...(provider !== undefined ? { provider, model } : {}),
       text,
+      text_truncated: text.length < original.length,
+      original_chars: original.length,
     }));
   }
 
-  const hydratedEvidence = [];
-  for (const item of evidence) {
-    if (hydratedEvidence.length >= limits.max_evidence_items) {
-      collector.markTruncated();
-      break;
-    }
-    const original = String(item?.text ?? "");
-    const text = collector.take(original);
-    if (!text && original.length > 0) break;
-    hydratedEvidence.push(Object.freeze({
-      kind: metadata(item?.kind ?? "text"),
-      source: metadata(item?.source),
-      text,
-    }));
-  }
-
+  const truncation = collector.snapshot();
   return Object.freeze({
     schema_version: CONTEXT_TRANSFER_SCHEMA_VERSION,
     transfer_id: window.transfer_id,
     target_context_domain_id: targetDomain.context_domain_id,
     source_cursor: Object.freeze({ ...window.source_cursor }),
     target_cursor: Object.freeze({ ...window.target_cursor }),
+    privacy_policy: DEFAULT_CONTEXT_HYDRATION_POLICY,
     project,
     git,
-    recent_context: Object.freeze(recent),
     hydrated_evidence: Object.freeze(hydratedEvidence),
+    recent_context: Object.freeze(recent),
+    projection_stats: Object.freeze({
+      window_entries: window.entries.length,
+      hydrated_evidence_items: hydratedEvidence.length,
+      recent_context_entries: recent.length,
+      raw_tool_result_entries_excluded: window.entries.filter(isToolResultEntry).length,
+    }),
     budget: limits,
-    truncated: collector.truncated,
-    remaining_chars: collector.remaining,
+    truncation,
+    truncated: truncation.truncated,
+    remaining_chars: truncation.remaining_chars,
   });
 }
