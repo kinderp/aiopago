@@ -3,18 +3,39 @@ import { ArtifactStore } from "./artifact-store.mjs";
 import { verifyCalibrationRuntimeState } from "./calibration-preflight.mjs";
 import { opaqueId, stableId } from "./canonical.mjs";
 import { ContextHandoffAdvisor, contextHandoffThresholdEnvironment } from "./context-advisor.mjs";
+import { ContextDomainRegistry } from "./context-domain.mjs";
+import { ContextStateStore, DurableContextCursorBook } from "./context-state.mjs";
+import { ContextSyncCoordinator } from "./context-sync.mjs";
 import { createGuardianExtension } from "./extension.mjs";
 import { GuardianError, invariant } from "./errors.mjs";
 import { observeGitState } from "./git-state.mjs";
-import { HandoffService } from "./handoff.mjs";
 import { TaskLedger } from "./ledger.mjs";
 import { MeasurementInstrumentation } from "./metrics.mjs";
+import { ContextAwareHandoffService } from "./multi-model-handoff.mjs";
 import { installRunnerSessionBinding } from "./runner-ownership.mjs";
 import { loadPi } from "./pi-loader.mjs";
+import { installConfiguredProviderAdapters } from "./provider-installation.mjs";
 import { AdmissionGate, SafePointCoordinator, ToolOperationTracker } from "./safety.mjs";
 import { GuardianStorage } from "./storage.mjs";
 
 export const DEFAULT_PORTABLE_TOOLS = Object.freeze(["read", "edit", "write", "grep", "find", "ls", "bash"]);
+
+function parseModelPolicy(value) {
+  if (value === null || value === undefined) return [null, null];
+  invariant(typeof value === "string", "MODEL_POLICY_INVALID", "model policy must be provider/model");
+  const separator = value.indexOf("/");
+  invariant(separator > 0 && separator < value.length - 1, "MODEL_POLICY_INVALID", value);
+  return [value.slice(0, separator), value.slice(separator + 1)];
+}
+
+function providerInstallationOptions(options) {
+  invariant(options.providerAdapters === undefined, "PROVIDER_INSTALLATION_LEGACY_RUNNER_OPTION_UNSUPPORTED", "Use providerAdapterCatalog + providerInstallationConfig; providerAdapters no longer installs adapters implicitly");
+  invariant(options.allowExperimentalExternal === undefined, "PROVIDER_INSTALLATION_LEGACY_RUNNER_OPTION_UNSUPPORTED", "Use per-adapter mode=experimental-nonproduction in providerInstallationConfig; allowExperimentalExternal is not a product option");
+  return Object.freeze({
+    catalog: options.providerAdapterCatalog ?? [],
+    config: options.providerInstallationConfig ?? { adapters: [] },
+  });
+}
 
 export class GuardianRunner {
   static async create(options = {}) {
@@ -28,24 +49,28 @@ export class GuardianRunner {
     const storage = options.storage ?? new GuardianStorage(options.storagePath ?? join(repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"), "guardian.sqlite"));
     if (options.calibration) storage.bindCalibrationRuntimeIdentity(options.calibration.runtimeIdentity, { allowExisting: options.calibration.resume === true });
     storage.ensureLatch(plan.task_id);
+    const contextState = options.contextState ?? new ContextStateStore(storage, plan.task_id);
     const artifacts = options.artifacts ?? new ArtifactStore(options.artifactRoot ?? repository?.artifactRoot ?? join(cwd, ".guardian"), storage);
     const modelRuntime = options.modelRuntime ?? await pi.coding.ModelRuntime.create();
+    const contextDomains = options.contextDomains ?? new ContextDomainRegistry();
+    const providerInstallation = providerInstallationOptions(options);
+    const adapterInstall = await installConfiguredProviderAdapters(providerInstallation.config, providerInstallation.catalog, {
+      modelRuntime,
+      pi,
+      contextDomains,
+      contextState,
+    });
     const gate = new AdmissionGate(storage, plan.task_id);
     gate.install(modelRuntime);
     const modelPolicy = options.modelPolicy ?? plan.model_policy ?? null;
-    const [policyProvider, policyModel] = modelPolicy?.split("/") ?? [];
+    const [policyProvider, policyModel] = parseModelPolicy(modelPolicy);
     const model = options.model ?? (policyProvider && policyModel ? modelRuntime.getModel(policyProvider, policyModel) : undefined);
     const reasoningPolicy = options.reasoningPolicy ?? plan.reasoning_policy ?? "high";
     if (!options.allowMissingModel && modelPolicy) invariant(model, "MODEL_POLICY_UNAVAILABLE", modelPolicy);
     const settingsManager = options.settingsManager ?? pi.coding.SettingsManager.create(cwd, options.agentDir);
-    settingsManager.applyOverrides({
-      compaction: { enabled: false },
-      retry: { enabled: false },
-    });
+    settingsManager.applyOverrides({ compaction: { enabled: false }, retry: { enabled: false } });
     const environmentThreshold = contextHandoffThresholdEnvironment(options.processEnv ?? process.env, { warn: options.environmentWarning });
-    const contextAdvisor = options.contextAdvisor ?? new ContextHandoffAdvisor({
-      thresholdPercent: options.contextHandoffThresholdPercent ?? environmentThreshold,
-    });
+    const contextAdvisor = options.contextAdvisor ?? new ContextHandoffAdvisor({ thresholdPercent: options.contextHandoffThresholdPercent ?? environmentThreshold });
     const runnerInstanceId = options.runnerInstanceId ?? opaqueId("RUNNER");
     const roots = Object.freeze({
       installationRoot: repository?.installationRoot ?? null,
@@ -54,26 +79,34 @@ export class GuardianRunner {
       runtimeRoot: repository?.runtimeRoot ?? join(cwd, ".guardian", "runtime"),
       artifactRoot: repository?.artifactRoot ?? join(cwd, ".guardian"),
     });
-    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, artifacts, modelRuntime, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
-    runner.metrics = options.metrics ?? new MeasurementInstrumentation({
-      storage,
-      ledger,
-      runnerInstanceId,
-      thresholdPercent: contextAdvisor.thresholdPercent,
-      retention: options.metricsRetention,
-    });
+    const runner = new GuardianRunner({ cwd, roots, repository, pi, ledger, storage, contextState, artifacts, modelRuntime, contextDomains, installedProviderAdapters: adapterInstall.installed, gate, model, reasoningPolicy, settingsManager, contextAdvisor, runnerInstanceId, confirmMode: options.confirmMode ?? "confirm-or-manual", calibration: options.calibration ?? null, tools: options.tools ?? DEFAULT_PORTABLE_TOOLS });
+    runner.metrics = options.metrics ?? new MeasurementInstrumentation({ storage, ledger, runnerInstanceId, thresholdPercent: contextAdvisor.thresholdPercent, retention: options.metricsRetention, contextDomains });
     runner.toolTracker = new ToolOperationTracker(storage, plan.task_id);
     runner.safePoint = new SafePointCoordinator({ storage, taskId: plan.task_id, gate });
-    runner.handoffService = new HandoffService({
+    const gitObserver = options.observeGit ?? (() => observeGitState(cwd));
+    const contextCursorBook = options.contextCursorBook ?? new DurableContextCursorBook(contextState);
+    runner.contextSync = options.contextSync ?? new ContextSyncCoordinator({
+      contextDomains,
+      cursorBook: contextCursorBook,
+      stateStore: contextState,
+      ledger,
+      observeGit: gitObserver,
+      evidenceProvider: options.contextEvidenceProvider,
+      hydrationBudget: options.contextHydrationBudget,
+      protocolBudget: options.contextProtocolBudget,
+    });
+    runner.contextCursors = runner.contextSync.cursorBook;
+    runner.handoffService = new ContextAwareHandoffService({
       storage,
       artifacts,
       ledger,
-      observeGit: options.observeGit ?? (() => observeGitState(cwd)),
+      observeGit: gitObserver,
       safePoint: runner.safePoint,
       runnerInstanceId,
       modelPolicy,
       reasoningPolicy,
       telemetry: runner.metrics,
+      contextContinuity: runner.contextSync,
     });
     await runner.createRuntime(options);
     if (!modelPolicy) {
@@ -103,33 +136,16 @@ export class GuardianRunner {
         agentDir: options.agentDir,
         settingsManager: this.settingsManager,
         modelRuntime: this.modelRuntime,
-        resourceLoaderOptions: {
-          noExtensions: true,
-          noSkills: true,
-          noPromptTemplates: true,
-          extensionFactories: [inline],
-        },
+        resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, extensionFactories: [inline] },
       });
       return {
-        ...(await coding.createAgentSessionFromServices({
-          services,
-          sessionManager,
-          sessionStartEvent,
-          model: this.model,
-          thinkingLevel: this.reasoningPolicy,
-          tools: this.tools,
-          noTools: options.noTools,
-        })),
+        ...(await coding.createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: this.model, thinkingLevel: this.reasoningPolicy, tools: this.tools, noTools: options.noTools })),
         services,
         diagnostics: services.diagnostics,
       };
     };
     const sessionManager = options.sessionManager ?? coding.SessionManager.create(this.cwd, options.sessionDir);
-    this.runtime = await coding.createAgentSessionRuntime(createRuntime, {
-      cwd: this.cwd,
-      agentDir: options.agentDir ?? coding.getAgentDir(),
-      sessionManager,
-    });
+    this.runtime = await coding.createAgentSessionRuntime(createRuntime, { cwd: this.cwd, agentDir: options.agentDir ?? coding.getAgentDir(), sessionManager });
     this.recoverySourceSession = this.runtime.session;
   }
 
@@ -225,9 +241,9 @@ export class GuardianRunner {
 
   async resumeFromCommand(ctx, handoffId = undefined) {
     const current = this.runtime.session;
-    const h = handoffId ? this.storage.getHandoff(handoffId) : this.storage.findHandoffByTarget(current.sessionId);
+    let h = handoffId ? this.storage.getHandoff(handoffId) : this.storage.findHandoffByTarget(current.sessionId);
     invariant(h, "HANDOFF_NOT_FOUND");
-    if (h.state === "RESUME_READY") this.handoffService.continuity(h.handoff_id, current);
+    if (["MANIFEST_PERSISTED", "RESUME_READY"].includes(h.state)) h = this.handoffService.continuity(h.handoff_id, current);
     const confirmed = await ctx.ui.confirm("Aiopago resume", `Authorize resume for ${h.handoff_id}?`);
     if (!confirmed) return h;
     const result = await this.handoffService.resume(h.handoff_id, { actor: "human:/aio-resume", sendResume: (prompt) => current.sendUserMessage(prompt) });
@@ -243,17 +259,9 @@ export class GuardianRunner {
       replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         try {
-          const result = await this.runtime.newSession({
-            parentSession,
-            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
-          });
+          const result = await this.runtime.newSession({ parentSession, setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); } });
           if (result.cancelled) return result;
-          const target = {
-            session: this.runtime.session,
-            setEditor: () => {},
-            confirm: async () => confirm,
-            sendResume: (prompt) => this.runtime.session.sendUserMessage(prompt),
-          };
+          const target = { session: this.runtime.session, setEditor: () => {}, confirm: async () => confirm, sendResume: (prompt) => this.runtime.session.sendUserMessage(prompt) };
           const pausedResult = await onPaused(target);
           return { ...result, pausedResult };
         } finally { this.revokeReplacementPermit(); }
@@ -271,10 +279,7 @@ export class GuardianRunner {
       replacePaused: async (parentSession, ownership, onPaused) => {
         this.permitReplacement();
         try {
-          const result = await this.runtime.newSession({
-            parentSession,
-            setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); },
-          });
+          const result = await this.runtime.newSession({ parentSession, setup: async (sessionManager) => { installRunnerSessionBinding(sessionManager, ownership); } });
           if (result.cancelled) return result;
           const target = {
             session: this.runtime.session,
@@ -291,12 +296,7 @@ export class GuardianRunner {
   }
 
   async runInteractive() {
-    const mode = new this.pi.coding.InteractiveMode(this.runtime, {
-      migratedProviders: [],
-      modelFallbackMessage: this.runtime.modelFallbackMessage,
-      initialImages: [],
-      initialMessages: [],
-    });
+    const mode = new this.pi.coding.InteractiveMode(this.runtime, { migratedProviders: [], modelFallbackMessage: this.runtime.modelFallbackMessage, initialImages: [], initialMessages: [] });
     await mode.run();
   }
 

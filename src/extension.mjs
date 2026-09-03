@@ -1,4 +1,6 @@
 import { GuardianError } from "./errors.mjs";
+import { evaluateExternalStatefulToolAdmission } from "./external-tool-profile.mjs";
+import { TOOL_PROFILES } from "./safety.mjs";
 
 function message(error) { return error instanceof GuardianError ? `${error.code}: ${error.message}` : error?.message ?? String(error); }
 function safeNotify(ctx, text, type) {
@@ -32,6 +34,16 @@ function availableContext(ctx) {
     if (!usage || !Number.isFinite(usage.percent)) return "unavailable";
     return `${Math.round(usage.percent)}%`;
   } catch { return "unavailable"; }
+}
+
+function externalToolAdmission(runner, ctx, toolName) {
+  const model = ctx?.model ?? runner.runtime?.session?.model ?? null;
+  if (!model) return { admitted: true, domain: null, reason: "NO_MODEL" };
+  let domain;
+  try { domain = runner.contextDomains?.resolve?.(model) ?? null; }
+  catch { return { admitted: false, domain: null, reason: "CONTEXT_DOMAIN_UNRESOLVED" }; }
+  const decision = evaluateExternalStatefulToolAdmission(domain, toolName, TOOL_PROFILES);
+  return { admitted: decision.admitted, domain, reason: decision.reason };
 }
 
 export function formatGuardianStatus(runner, ctx = null) {
@@ -71,23 +83,12 @@ async function adviseHandoff(runner, ctx) {
   if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return;
   const proposal = runner.contextAdvisor.observe(ctx.getContextUsage());
   if (!proposal) return;
-  safeMetric(runner, "recordHandoffEvent", "SUGGESTED", {
-    ctx,
-    threshold_percent: proposal.thresholdPercent,
-    reason: "CONTEXT_THRESHOLD_REACHED",
-  });
+  safeMetric(runner, "recordHandoffEvent", "SUGGESTED", { ctx, threshold_percent: proposal.thresholdPercent, reason: "CONTEXT_THRESHOLD_REACHED" });
   const percent = Math.round(proposal.percent);
   try {
-    const prepare = await ctx.ui.confirm(
-      "Aiopago",
-      `Context: ${percent}% (soglia configurata: ${proposal.thresholdPercent}%)\nHandoff consigliato.\n\nPreparare il passaggio a una nuova sessione?`,
-    );
+    const prepare = await ctx.ui.confirm("Aiopago", `Context: ${percent}% (soglia configurata: ${proposal.thresholdPercent}%)\nHandoff consigliato.\n\nPreparare il passaggio a una nuova sessione?`);
     if (!prepare) return;
-    safeMetric(runner, "recordHandoffEvent", "PREPARED", {
-      ctx,
-      threshold_percent: proposal.thresholdPercent,
-      reason: "USER_CONSENTED_TO_ADVISORY",
-    });
+    safeMetric(runner, "recordHandoffEvent", "PREPARED", { ctx, threshold_percent: proposal.thresholdPercent, reason: "USER_CONSENTED_TO_ADVISORY" });
     ctx.ui.setEditorText("/aio handoff confirm");
     safeNotify(ctx, "Comando /aio handoff confirm preparato. Premi Invio per avviare il percorso M1-H0.", "info");
   } catch (error) {
@@ -97,22 +98,10 @@ async function adviseHandoff(runner, ctx) {
 
 export function createGuardianExtension(runner) {
   return function guardianExtension(pi) {
-    pi.registerCommand("aio", {
-      description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status",
-      handler: async (args, ctx) => runCommand(args, ctx),
-    });
-    pi.registerCommand("aiopago", {
-      description: "Alias of /aio",
-      handler: async (args, ctx) => runCommand(args, ctx),
-    });
+    pi.registerCommand("aio", { description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status", handler: async (args, ctx) => runCommand(args, ctx) });
+    pi.registerCommand("aiopago", { description: "Alias of /aio", handler: async (args, ctx) => runCommand(args, ctx) });
     for (const legacyName of ["eio", "eiopago"]) {
-      pi.registerCommand(legacyName, {
-        description: `Deprecated alias of /aio`,
-        handler: async (args, ctx) => {
-          safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning");
-          return runCommand(args, ctx);
-        },
-      });
+      pi.registerCommand(legacyName, { description: `Deprecated alias of /aio`, handler: async (args, ctx) => { safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning"); return runCommand(args, ctx); } });
     }
 
     async function runCommand(args, ctx) {
@@ -120,79 +109,42 @@ export function createGuardianExtension(runner) {
       try {
         if (subcommand === "status") {
           const handoff = runner.storage.latestHandoffForTask(runner.ledger.read().task_id);
-          ctx.ui.notify(formatGuardianStatus(runner, ctx), ["HANDOFF_FAILED", "CONTINUITY_FAILED"].includes(handoff?.state) ? "warning" : "info");
-          return;
+          ctx.ui.notify(formatGuardianStatus(runner, ctx), ["HANDOFF_FAILED", "CONTINUITY_FAILED"].includes(handoff?.state) ? "warning" : "info"); return;
         }
-        if (subcommand === "handoff") {
-          if (value === "recover") await runner.recoverHandoffFromCommand(ctx, identifier);
-          else await runner.handoffFromCommand(ctx, value ?? "confirm");
-          return;
-        }
-        if (subcommand === "takeover" || subcommand === "pause") {
-          await runner.takeoverFromCommand(ctx);
-          return;
-        }
-        if (subcommand === "resume") {
-          await runner.resumeFromCommand(ctx, value);
-          return;
-        }
+        if (subcommand === "handoff") { if (value === "recover") await runner.recoverHandoffFromCommand(ctx, identifier); else await runner.handoffFromCommand(ctx, value ?? "confirm"); return; }
+        if (subcommand === "takeover" || subcommand === "pause") { await runner.takeoverFromCommand(ctx); return; }
+        if (subcommand === "resume") { await runner.resumeFromCommand(ctx, value); return; }
         ctx.ui.notify("Usage: /aio handoff [manual|confirm] | /aio handoff recover <handoff-id> | /aio takeover | /aio resume [handoff-id] | /aio status", "warning");
-      } catch (error) {
-        safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error");
-      }
+      } catch (error) { safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error"); }
     }
 
-    pi.on("session_start", (event, ctx) => {
-      runner.contextAdvisor.reset();
-      safeMetric(runner, "startSession", ctx, event);
-    });
+    pi.on("session_start", (event, ctx) => { runner.contextAdvisor.reset(); safeMetric(runner, "startSession", ctx, event); });
     pi.on("session_shutdown", (event, ctx) => safeMetric(runner, "endSession", ctx, event));
-
     pi.on("input", (_event, ctx) => {
       if (runner.calibration) {
-        try { runner.requireCalibrationRuntime(ctx.model); }
-        catch (error) {
-          ctx.ui.notify(`RUN INVALID: ${message(error)}`, "error");
-          return { action: "handled" };
-        }
+        try { runner.requireCalibrationRuntime(ctx.model); } catch (error) { ctx.ui.notify(`RUN INVALID: ${message(error)}`, "error"); return { action: "handled" }; }
       }
       const task = readLedgerForHook(runner, ctx);
       if (!task) return { action: "handled" };
-      if (!runner.storage.isAdmissionOpen(task.task_id)) {
-        safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning");
-        return { action: "handled" };
-      }
+      if (!runner.storage.isAdmissionOpen(task.task_id)) { safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning"); return { action: "handled" }; }
       return { action: "continue" };
     });
 
-    pi.on("turn_end", async (event, ctx) => {
-      safeMetric(runner, "captureModelCall", event, ctx);
-      await adviseHandoff(runner, ctx);
-    });
-
-    pi.on("tool_call", (event) => {
+    pi.on("context", (event, ctx) => { const projection = runner.contextSync?.project(event, ctx); if (projection) return { messages: projection.messages }; });
+    pi.on("turn_end", async (event, ctx) => { runner.contextSync?.acknowledgeTurn(event, ctx); safeMetric(runner, "captureModelCall", event, ctx); await adviseHandoff(runner, ctx); });
+    pi.on("tool_call", (event, ctx) => {
+      const admission = externalToolAdmission(runner, ctx, event.toolName);
+      if (!admission.admitted) {
+        const domainId = admission.domain?.context_domain_id ?? "unknown";
+        return { block: true, reason: `EXTERNAL_CONTEXT_TOOL_NOT_ADMITTED: ${domainId}/${event.toolName}/${admission.reason}` };
+      }
       try { runner.toolTracker.admit(event.toolCallId, event.toolName, event.input); }
       catch (error) { return { block: true, reason: message(error) }; }
     });
-    pi.on("tool_execution_end", (event, ctx) => {
-      runner.toolTracker.finish(event.toolCallId, event.isError, event.result, ctx.signal?.aborted === true);
-    });
-    pi.on("session_before_compact", (_event, ctx) => {
-      const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
-    });
-    pi.on("session_before_tree", (_event, ctx) => {
-      const task = readLedgerForHook(runner, ctx);
-      if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true };
-    });
-    pi.on("session_before_switch", (_event, ctx) => {
-      const task = readLedgerForHook(runner, ctx);
-      if (!task) return { cancel: true };
-      if (!runner.consumeReplacementPermit()) return { cancel: true };
-    });
-    pi.on("session_before_fork", (_event, ctx) => {
-      if (!readLedgerForHook(runner, ctx)) return { cancel: true };
-      return { cancel: true };
-    });
+    pi.on("tool_execution_end", (event, ctx) => { runner.toolTracker.finish(event.toolCallId, event.isError, event.result, ctx.signal?.aborted === true); });
+    pi.on("session_before_compact", (_event, ctx) => { const task = readLedgerForHook(runner, ctx); if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true }; });
+    pi.on("session_before_tree", (_event, ctx) => { const task = readLedgerForHook(runner, ctx); if (!task || !runner.storage.isAdmissionOpen(task.task_id)) return { cancel: true }; });
+    pi.on("session_before_switch", (_event, ctx) => { const task = readLedgerForHook(runner, ctx); if (!task) return { cancel: true }; if (!runner.consumeReplacementPermit()) return { cancel: true }; });
+    pi.on("session_before_fork", (_event, ctx) => { if (!readLedgerForHook(runner, ctx)) return { cancel: true }; return { cancel: true }; });
   };
 }
