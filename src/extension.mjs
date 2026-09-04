@@ -47,6 +47,17 @@ function externalToolAdmission(runner, ctx, toolName) {
   return { admitted: decision.admitted, domain, reason: decision.reason };
 }
 
+function canCreateChatgptSidecar(runner) {
+  return Boolean(
+    runner?.contextDomains
+    && runner?.contextCursors
+    && runner?.contextState
+    && runner?.ledger
+    && runner?.handoffService
+    && runner?.contextSync,
+  );
+}
+
 export function formatGuardianStatus(runner, ctx = null) {
   const task = runner.ledger.read();
   const latch = runner.storage.ensureLatch(task.task_id);
@@ -110,20 +121,24 @@ async function adviseHandoff(runner, ctx) {
 }
 
 export function createGuardianExtension(runner) {
-  const chatgptSidecar = new ChatgptHumanSidecar({
-    contextDomains: runner.contextDomains,
-    cursorBook: runner.contextCursors,
-    stateStore: runner.contextState,
-    ledger: runner.ledger,
-    observeGit: () => runner.handoffService.observeGit(),
-    evidenceProvider: runner.contextSync?.evidenceProvider ?? (() => []),
-    hydrationBudget: runner.contextSync?.hydrationBudget,
-  });
+  const chatgptSidecar = canCreateChatgptSidecar(runner)
+    ? new ChatgptHumanSidecar({
+        contextDomains: runner.contextDomains,
+        cursorBook: runner.contextCursors,
+        stateStore: runner.contextState,
+        ledger: runner.ledger,
+        observeGit: () => runner.handoffService.observeGit(),
+        evidenceProvider: runner.contextSync.evidenceProvider ?? (() => []),
+        hydrationBudget: runner.contextSync.hydrationBudget,
+      })
+    : null;
 
   return function guardianExtension(pi) {
     pi.registerCommand("aio", { description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status", handler: async (args, ctx) => runCommand(args, ctx) });
     pi.registerCommand("aiopago", { description: "Alias of /aio", handler: async (args, ctx) => runCommand(args, ctx) });
-    pi.registerCommand("chatgpt", { description: "Human sidecar: /chatgpt ask <question> | import | status | retry [question]", handler: async (args, ctx) => runChatgptCommand(args, ctx) });
+    if (chatgptSidecar) {
+      pi.registerCommand("chatgpt", { description: "Human sidecar: /chatgpt ask <question> | import | status | retry [question]", handler: async (args, ctx) => runChatgptCommand(args, ctx) });
+    }
     for (const legacyName of ["eio", "eiopago"]) {
       pi.registerCommand(legacyName, { description: `Deprecated alias of /aio`, handler: async (args, ctx) => { safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning"); return runCommand(args, ctx); } });
     }
