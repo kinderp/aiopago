@@ -1,0 +1,67 @@
+{
+  "schema": "aiopago.chatgpt-normal-transport-qualification/0.1.0",
+  "candidate_id": "openai-chatgpt-normal-external-transport-baseline-2026-09-04",
+  "observed_at": "2026-09-04",
+  "transport": {
+    "provider": "OpenAI",
+    "name": null,
+    "notes": "No documented external-client ordinary-ChatGPT conversation transport consuming normal ChatGPT plan usage has been identified."
+  },
+  "usage_pool": {
+    "claim": "chatgpt",
+    "before_after_evidence": []
+  },
+  "prohibited_mechanisms": {
+    "browser_automation": false,
+    "dom_extraction": false,
+    "cookie_or_session_token_reuse": false,
+    "private_endpoint_reuse": false,
+    "restriction_circumvention": false
+  },
+  "gates": {
+    "Q1_DOCUMENTED_TRANSPORT": {
+      "status": "BLOCKED",
+      "evidence": [
+        "https://help.openai.com/en/articles/20001410-sign-in-with-chatgpt",
+        "https://help.openai.com/en/articles/12515353-build-with-the-apps-sdk"
+      ]
+    },
+    "Q2_CONVERSATION_CAPABILITY": {
+      "status": "BLOCKED",
+      "evidence": [
+        "Current Apps SDK/MCP documentation describes apps/tools running inside ChatGPT, not Pi submitting ordinary ChatGPT turns through an external-client transport."
+      ]
+    },
+    "Q3_IDENTITY_SAFETY": {
+      "status": "PASS",
+      "evidence": [
+        "ADR-0016A rejects browser automation, DOM extraction, private endpoints, and ChatGPT cookie/session-token reuse."
+      ]
+    },
+    "Q4_STATE_SEMANTICS": {
+      "status": "BLOCKED",
+      "evidence": [
+        "No qualifying external ChatGPT thread/conversation identity and retry/idempotency contract is documented because no qualifying transport has been identified."
+      ]
+    },
+    "Q5_USAGE_POOL_EVIDENCE": {
+      "status": "BLOCKED",
+      "evidence": [
+        "https://help.openai.com/en/articles/9039756-chatgpt-search",
+        "ChatGPT and API billing remain separate; Codex plan access does not prove ordinary ChatGPT pool semantics for a third-party client."
+      ]
+    },
+    "Q6_PI_TOOL_LOOP": {
+      "status": "BLOCKED",
+      "evidence": [
+        "Provider-neutral Pi-mediated tool continuation is validated, but cannot be exercised against ordinary ChatGPT until a qualifying transport exists."
+      ]
+    },
+    "Q7_FAILURE_SEMANTICS": {
+      "status": "BLOCKED",
+      "evidence": [
+        "Aiopago durable delivery/reconciliation semantics are validated provider-neutrally, but transport-specific ambiguous-delivery behavior cannot be qualified without a real supported transport."
+      ]
+    }
+  }
+}
