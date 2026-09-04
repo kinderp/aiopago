@@ -1,3 +1,4 @@
+import { ChatgptHumanSidecar } from "./chatgpt-human-sidecar.mjs";
 import { GuardianError } from "./errors.mjs";
 import { evaluateExternalStatefulToolAdmission } from "./external-tool-profile.mjs";
 import { TOOL_PROFILES } from "./safety.mjs";
@@ -46,6 +47,17 @@ function externalToolAdmission(runner, ctx, toolName) {
   return { admitted: decision.admitted, domain, reason: decision.reason };
 }
 
+function canCreateChatgptSidecar(runner) {
+  return Boolean(
+    runner?.contextDomains
+    && runner?.contextCursors
+    && runner?.contextState
+    && runner?.ledger
+    && runner?.handoffService
+    && runner?.contextSync,
+  );
+}
+
 export function formatGuardianStatus(runner, ctx = null) {
   const task = runner.ledger.read();
   const latch = runner.storage.ensureLatch(task.task_id);
@@ -77,6 +89,18 @@ export function formatGuardianStatus(runner, ctx = null) {
   ].join("\n");
 }
 
+function formatSidecarStatus(status) {
+  const cursor = status.cursor?.entry_id ?? "ROOT";
+  return [
+    "ChatGPT human sidecar",
+    "Transport: human copy/paste (not automated ChatGPT Normal)",
+    `State: ${status.delivery_state}`,
+    `Transfer: ${status.transfer_id ?? "none"}`,
+    `Attempt: ${status.attempt}`,
+    `Cursor: ${cursor}`,
+  ].join("\n");
+}
+
 async function adviseHandoff(runner, ctx) {
   if (!ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
   const task = readLedgerForHook(runner, ctx, "warning");
@@ -97,11 +121,68 @@ async function adviseHandoff(runner, ctx) {
 }
 
 export function createGuardianExtension(runner) {
+  const chatgptSidecar = canCreateChatgptSidecar(runner)
+    ? new ChatgptHumanSidecar({
+        contextDomains: runner.contextDomains,
+        cursorBook: runner.contextCursors,
+        stateStore: runner.contextState,
+        ledger: runner.ledger,
+        observeGit: () => runner.handoffService.observeGit(),
+        evidenceProvider: runner.contextSync.evidenceProvider ?? (() => []),
+        hydrationBudget: runner.contextSync.hydrationBudget,
+      })
+    : null;
+
   return function guardianExtension(pi) {
     pi.registerCommand("aio", { description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status", handler: async (args, ctx) => runCommand(args, ctx) });
     pi.registerCommand("aiopago", { description: "Alias of /aio", handler: async (args, ctx) => runCommand(args, ctx) });
+    if (chatgptSidecar) {
+      pi.registerCommand("chatgpt", { description: "Human sidecar: /chatgpt ask <question> | import | status | retry [question]", handler: async (args, ctx) => runChatgptCommand(args, ctx) });
+    }
     for (const legacyName of ["eio", "eiopago"]) {
       pi.registerCommand(legacyName, { description: `Deprecated alias of /aio`, handler: async (args, ctx) => { safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning"); return runCommand(args, ctx); } });
+    }
+
+    async function runChatgptCommand(args, ctx) {
+      const raw = String(args ?? "").trim();
+      const separator = raw.indexOf(" ");
+      const subcommand = raw.length === 0 ? "status" : separator < 0 ? raw : raw.slice(0, separator);
+      const rest = separator < 0 ? "" : raw.slice(separator + 1).trim();
+      try {
+        if (subcommand === "status") {
+          if (rest) throw new GuardianError("CHATGPT_SIDECAR_USAGE_INVALID", "/chatgpt status takes no arguments");
+          safeNotify(ctx, formatSidecarStatus(chatgptSidecar.status()), "info");
+          return;
+        }
+
+        const task = readLedgerForHook(runner, ctx);
+        if (!task) return;
+        if (!runner.storage.isAdmissionOpen(task.task_id)) {
+          throw new GuardianError("CHATGPT_SIDECAR_ADMISSION_BLOCKED", "Aiopago latch is engaged; human sidecar mutation is unavailable until admission reopens");
+        }
+        await ctx.waitForIdle?.();
+
+        if (subcommand === "ask") {
+          const result = chatgptSidecar.ask({ sessionManager: ctx.sessionManager, question: rest });
+          safeNotify(ctx, `ChatGPT sidecar capsule copied (${result.clipboard_chars} chars). Paste it into ordinary ChatGPT, copy the reply, then run /chatgpt import. No automated ChatGPT transport was used.`, "info");
+          return result;
+        }
+        if (subcommand === "import") {
+          if (rest) throw new GuardianError("CHATGPT_SIDECAR_USAGE_INVALID", "/chatgpt import takes no arguments");
+          const result = chatgptSidecar.importReply({ sessionManager: ctx.sessionManager });
+          const detail = result.response_chars === null ? "existing persisted reply reconciled" : `${result.response_chars} chars imported`;
+          safeNotify(ctx, `ChatGPT sidecar: ${detail}; cursor acknowledged. No Pi model was invoked. Continue normally or switch with /model.`, "info");
+          return result;
+        }
+        if (subcommand === "retry") {
+          const result = chatgptSidecar.retry({ sessionManager: ctx.sessionManager, question: rest || undefined });
+          safeNotify(ctx, `ChatGPT sidecar retry prepared (attempt ${chatgptSidecar.status().attempt}) and copied to clipboard. Paste it into ordinary ChatGPT, then copy the reply and run /chatgpt import.`, "warning");
+          return result;
+        }
+        throw new GuardianError("CHATGPT_SIDECAR_USAGE_INVALID", "Usage: /chatgpt ask <question> | /chatgpt import | /chatgpt status | /chatgpt retry [question]");
+      } catch (error) {
+        safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error");
+      }
     }
 
     async function runCommand(args, ctx) {
