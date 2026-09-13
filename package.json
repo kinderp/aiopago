@@ -37,6 +37,7 @@
     "docs/portable-alpha.md",
     "docs/rename-aiopago-migration.md",
     "docs/chatgpt-human-sidecar.md",
+    "docs/chatgpt-tui-sidecar.md",
     "docs/adr/0016-multi-model-context-domain-continuity.md",
     "docs/adr/0016a-official-chatgpt-transport-gate.md",
     "docs/adr/0017-provider-neutral-public-contract-surface.md",

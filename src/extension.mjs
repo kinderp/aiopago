@@ -1,4 +1,5 @@
 import { ChatgptHumanSidecar } from "./chatgpt-human-sidecar.mjs";
+import { CHATGPT_TUI_MODES, ChatgptTuiModeController } from "./chatgpt-tui-mode.mjs";
 import { GuardianError } from "./errors.mjs";
 import { evaluateExternalStatefulToolAdmission } from "./external-tool-profile.mjs";
 import { TOOL_PROFILES } from "./safety.mjs";
@@ -101,6 +102,27 @@ function formatSidecarStatus(status) {
   ].join("\n");
 }
 
+function chatTuiFooter(status) {
+  if (status.mode === CHATGPT_TUI_MODES.CODE) return "Aiopago CODE";
+  return status.transport_available ? "Aiopago CHAT" : "Aiopago CHAT · transport blocked";
+}
+
+function applyChatTuiStatus(ctx, controller) {
+  const status = controller.status();
+  try { ctx.ui.setStatus("aiopago-chat-mode", chatTuiFooter(status)); } catch {}
+  return status;
+}
+
+function formatChatTuiStatus(status) {
+  return [
+    "Aiopago conversation mode",
+    `Mode: ${status.mode.toUpperCase()}`,
+    `Primary: ${status.primary}`,
+    `Chat transport: ${status.transport_available ? "attached" : "not attached"}`,
+    "Toggle: Ctrl+Alt+G",
+  ].join("\n");
+}
+
 async function adviseHandoff(runner, ctx) {
   if (!ctx.hasUI || typeof ctx.getContextUsage !== "function") return;
   const task = readLedgerForHook(runner, ctx, "warning");
@@ -132,15 +154,50 @@ export function createGuardianExtension(runner) {
         hydrationBudget: runner.contextSync.hydrationBudget,
       })
     : null;
+  const chatTuiMode = new ChatgptTuiModeController();
 
   return function guardianExtension(pi) {
     pi.registerCommand("aio", { description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status", handler: async (args, ctx) => runCommand(args, ctx) });
     pi.registerCommand("aiopago", { description: "Alias of /aio", handler: async (args, ctx) => runCommand(args, ctx) });
+    pi.registerCommand("chatmode", { description: "Aiopago conversation mode: /chatmode [code|chat|toggle|status]", handler: async (args, ctx) => runChatModeCommand(args, ctx) });
+    if (typeof pi.registerShortcut === "function") {
+      pi.registerShortcut("ctrl+alt+g", {
+        description: "Toggle Aiopago CODE/CHAT conversation mode",
+        handler: async (ctx) => {
+          const status = chatTuiMode.toggle();
+          applyChatTuiStatus(ctx, chatTuiMode);
+          safeNotify(ctx, `Aiopago mode: ${status.mode.toUpperCase()}${status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? " (Chat transport not attached; fail-closed)" : ""}`, status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? "warning" : "info");
+        },
+      });
+    }
     if (chatgptSidecar) {
       pi.registerCommand("chatgpt", { description: "Human sidecar: /chatgpt ask <question> | import | status | retry [question]", handler: async (args, ctx) => runChatgptCommand(args, ctx) });
     }
     for (const legacyName of ["eio", "eiopago"]) {
       pi.registerCommand(legacyName, { description: `Deprecated alias of /aio`, handler: async (args, ctx) => { safeNotify(ctx, `/${legacyName} is deprecated; use /aio`, "warning"); return runCommand(args, ctx); } });
+    }
+
+    async function runChatModeCommand(args, ctx) {
+      const subcommand = String(args ?? "").trim().toLowerCase() || "status";
+      try {
+        if (subcommand === "status") {
+          const status = applyChatTuiStatus(ctx, chatTuiMode);
+          safeNotify(ctx, formatChatTuiStatus(status), status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? "warning" : "info");
+          return status;
+        }
+        if (subcommand === "toggle") {
+          chatTuiMode.toggle();
+        } else if (subcommand === CHATGPT_TUI_MODES.CODE || subcommand === CHATGPT_TUI_MODES.CHAT) {
+          chatTuiMode.setMode(subcommand);
+        } else {
+          throw new GuardianError("CHATGPT_TUI_MODE_USAGE_INVALID", "Usage: /chatmode [code|chat|toggle|status]");
+        }
+        const status = applyChatTuiStatus(ctx, chatTuiMode);
+        safeNotify(ctx, `Aiopago mode: ${status.mode.toUpperCase()}${status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? " (Chat transport not attached; input will fail closed)" : ""}`, status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? "warning" : "info");
+        return status;
+      } catch (error) {
+        safeNotify(ctx, message(error), "error");
+      }
     }
 
     async function runChatgptCommand(args, ctx) {
@@ -199,15 +256,33 @@ export function createGuardianExtension(runner) {
       } catch (error) { safeNotify(ctx, isLedgerError(error, runner) ? ledgerDiagnostic(error) : message(error), "error"); }
     }
 
-    pi.on("session_start", (event, ctx) => { runner.contextAdvisor.reset(); safeMetric(runner, "startSession", ctx, event); });
-    pi.on("session_shutdown", (event, ctx) => safeMetric(runner, "endSession", ctx, event));
-    pi.on("input", (_event, ctx) => {
+    pi.on("session_start", (event, ctx) => {
+      runner.contextAdvisor.reset();
+      applyChatTuiStatus(ctx, chatTuiMode);
+      safeMetric(runner, "startSession", ctx, event);
+    });
+    pi.on("session_shutdown", (event, ctx) => {
+      try { ctx.ui.setStatus("aiopago-chat-mode", undefined); } catch {}
+      safeMetric(runner, "endSession", ctx, event);
+    });
+    pi.on("input", (event, ctx) => {
       if (runner.calibration) {
         try { runner.requireCalibrationRuntime(ctx.model); } catch (error) { ctx.ui.notify(`RUN INVALID: ${message(error)}`, "error"); return { action: "handled" }; }
       }
       const task = readLedgerForHook(runner, ctx);
       if (!task) return { action: "handled" };
       if (!runner.storage.isAdmissionOpen(task.task_id)) { safeNotify(ctx, "Aiopago latch engaged: only local /aio commands are admitted", "warning"); return { action: "handled" }; }
+
+      const chatDecision = chatTuiMode.routeInput(event.text);
+      if (chatDecision.action === "handled") {
+        if (chatDecision.error) {
+          const type = chatDecision.error.code === "CHATGPT_TUI_AMBIGUOUS_ACTION_REFERENCE" ? "warning" : "error";
+          safeNotify(ctx, message(chatDecision.error), type);
+        } else {
+          safeNotify(ctx, `Chat route ready: ${chatDecision.route.intent}. Input remains extension-owned.`, "info");
+        }
+        return { action: "handled" };
+      }
       return { action: "continue" };
     });
 
