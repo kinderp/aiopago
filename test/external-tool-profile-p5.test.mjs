@@ -41,7 +41,11 @@ test("P5 Pi extension enforces closed external profile while preserving Pi-nativ
     contextDomains: { resolve: () => mode === "external" ? external : native },
     toolTracker: { admit: (...args) => admitted.push(args), finish() {} },
   };
-  const pi = { registerCommand() {}, on(name, handler) { handlers.set(name, handler); } };
+  const pi = {
+    registerCommand() {},
+    registerShortcut() {},
+    on(name, handler) { handlers.set(name, handler); },
+  };
   createGuardianExtension(runner)(pi);
   const toolCall = handlers.get("tool_call");
   const ctx = { model: { provider: "provider", id: "model" } };
