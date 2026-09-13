@@ -115,6 +115,7 @@ test("external-stateful domains are read-only at the Pi tool admission boundary"
   };
   const pi = {
     registerCommand() {},
+    registerShortcut() {},
     on(name, handler) { handlers.set(name, handler); },
   };
   createGuardianExtension(runner)(pi);
