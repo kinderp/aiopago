@@ -24,7 +24,7 @@ jobs:
       - name: ChatGPT human sidecar
         run: node --test test/chatgpt-human-sidecar.test.mjs
       - name: ChatGPT integrated TUI mode/router
-        run: node --test test/chatgpt-tui-mode.test.mjs
+        run: node --test test/chatgpt-tui-mode.test.mjs test/chatgpt-tui-extension.test.mjs
       - name: P2 explicit provider installation
         run: node --test test/provider-installation-p2.test.mjs test/runner-provider-installation-p2.test.mjs
       - name: P3 durable context-state lifecycle
