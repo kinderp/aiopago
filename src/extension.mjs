@@ -160,14 +160,16 @@ export function createGuardianExtension(runner) {
     pi.registerCommand("aio", { description: "Aiopago: /aio handoff [manual|confirm] | handoff recover <handoff-id> | takeover | resume [handoff-id] | status", handler: async (args, ctx) => runCommand(args, ctx) });
     pi.registerCommand("aiopago", { description: "Alias of /aio", handler: async (args, ctx) => runCommand(args, ctx) });
     pi.registerCommand("chatmode", { description: "Aiopago conversation mode: /chatmode [code|chat|toggle|status]", handler: async (args, ctx) => runChatModeCommand(args, ctx) });
-    pi.registerShortcut("ctrl+alt+g", {
-      description: "Toggle Aiopago CODE/CHAT conversation mode",
-      handler: async (ctx) => {
-        const status = chatTuiMode.toggle();
-        applyChatTuiStatus(ctx, chatTuiMode);
-        safeNotify(ctx, `Aiopago mode: ${status.mode.toUpperCase()}${status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? " (Chat transport not attached; fail-closed)" : ""}`, status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? "warning" : "info");
-      },
-    });
+    if (typeof pi.registerShortcut === "function") {
+      pi.registerShortcut("ctrl+alt+g", {
+        description: "Toggle Aiopago CODE/CHAT conversation mode",
+        handler: async (ctx) => {
+          const status = chatTuiMode.toggle();
+          applyChatTuiStatus(ctx, chatTuiMode);
+          safeNotify(ctx, `Aiopago mode: ${status.mode.toUpperCase()}${status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? " (Chat transport not attached; fail-closed)" : ""}`, status.mode === CHATGPT_TUI_MODES.CHAT && !status.transport_available ? "warning" : "info");
+        },
+      });
+    }
     if (chatgptSidecar) {
       pi.registerCommand("chatgpt", { description: "Human sidecar: /chatgpt ask <question> | import | status | retry [question]", handler: async (args, ctx) => runChatgptCommand(args, ctx) });
     }
